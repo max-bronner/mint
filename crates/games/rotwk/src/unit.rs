@@ -432,6 +432,7 @@ pub(crate) struct Spawn {
     pub(crate) shape: Shape,
     pub(crate) owner: PlayerId,
     pub(crate) health: Option<f32>,
+    pub(crate) initial_health: Option<f32>,
     pub(crate) weapon: Option<WeaponId>,
     pub(crate) armour: Option<ArmorId>,
     pub(crate) kind: Option<Kind>,
@@ -463,6 +464,7 @@ impl Spawn {
             shape,
             owner,
             health: None,
+            initial_health: None,
             weapon: None,
             armour: None,
             kind: None,
@@ -509,6 +511,9 @@ impl Spawn {
         hasher.write_u8(u8::from(self.claim.is_some()));
         hasher.write_u8(u8::from(self.ground_offset.is_some()));
         hasher.write_i64(self.upkeep.map_or(i64::from(i32::MIN), i64::from));
+        if let Some(initial) = self.initial_health {
+            hasher.write_f32(initial);
+        }
     }
 }
 

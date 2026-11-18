@@ -215,6 +215,37 @@ fn local_sim_with(
     Simulation::new(5, rules).unwrap()
 }
 
+#[test]
+fn removing_a_button_edits_the_own_command_set_and_every_command_set_upgrade() {
+    let text = "Object ZKeep
+  Side = Neutral
+  CommandSet = KeepSet
+  Behavior = CommandSetUpgrade Tag_Up
+    TriggeredBy = Upgrade_X
+    CommandSet = KeepSetUpgraded
+  End
+End
+";
+    let remove = action(
+        "COMMANDBAR_REMOVE_BUTTON_OBJECTTYPE",
+        vec![string_param("Fire"), string_param("ZKeep")],
+    );
+    let mut simulation = local_sim_with(once(vec![remove]), text, &["ZKeep"]);
+    for _ in 0..12 {
+        simulation.tick().unwrap();
+    }
+    let view = simulation.rules().script_view(simulation.state());
+    let mut removed = view.hud.removed_buttons;
+    removed.sort();
+    assert_eq!(
+        removed,
+        [
+            ("KeepSet".to_owned(), "Fire".to_owned()),
+            ("KeepSetUpgraded".to_owned(), "Fire".to_owned())
+        ]
+    );
+}
+
 fn selected_flag(deselect: bool) -> i32 {
     selected_flag_of(deselect, "ZGollum", WALKER_DATA)
 }

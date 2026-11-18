@@ -734,8 +734,15 @@ fn last_using_ability_cleared(seen: &[(u64, Effect)]) -> Option<u64> {
     })
 }
 
+fn ai_busy_issued(seen: &[(u64, Effect)]) -> Option<(u64, LogicFrames)> {
+    seen.iter().find_map(|(frame, effect)| match effect {
+        Effect::AiBusy(frames) => Some((*frame, *frames)),
+        _ => None,
+    })
+}
+
 #[test]
-fn paralyze_duration_when_completed_holds_is_using_ability_past_the_end() {
+fn paralyze_duration_when_completed_makes_the_ai_busy_after_the_end() {
     let mut world = World::new();
     let mut registry = ModuleRegistry::new(&mut world);
     registry.register::<SpecialAbilityUpdate>(&mut world, "SpecialAbilityUpdate");
@@ -781,7 +788,12 @@ fn paralyze_duration_when_completed_holds_is_using_ability_past_the_end() {
         );
         seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
     }
-    assert_eq!(last_using_ability_cleared(&seen), Some(12), "{seen:?}");
+    assert_eq!(last_using_ability_cleared(&seen), Some(6), "{seen:?}");
+    assert_eq!(
+        ai_busy_issued(&seen),
+        Some((6, LogicFrames::from_frames(6))),
+        "{seen:?}"
+    );
 }
 
 #[test]
@@ -838,7 +850,70 @@ fn paralyze_duration_when_aborted_applies_on_a_cancelled_cast() {
         );
         seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
     }
-    assert_eq!(last_using_ability_cleared(&seen), Some(9), "{seen:?}");
+    assert_eq!(last_using_ability_cleared(&seen), Some(3), "{seen:?}");
+    assert_eq!(
+        ai_busy_issued(&seen),
+        Some((3, LogicFrames::from_frames(6))),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn skip_packing_with_no_target_spares_a_targetless_cast_its_unpack_and_pack() {
+    let mut world = World::new();
+    let mut registry = ModuleRegistry::new(&mut world);
+    registry.register::<SpecialAbilityUpdate>(&mut world, "SpecialAbilityUpdate");
+    let holder = world.spawn().unwrap();
+    let module = special_ability_update_from_fields(
+        &fields(&[
+            ("SpecialPowerTemplate", "P"),
+            ("UnpackTime", "300"),
+            ("PreparationTime", "100"),
+            ("PackTime", "300"),
+            ("SkipPackingWithNoTarget", "Yes"),
+        ]),
+        Frame::ZERO,
+    )
+    .unwrap();
+    registry
+        .attach(&mut world, holder, Frame::ZERO, module)
+        .unwrap();
+    let mut log = EffectLog::new();
+    let activation = Activation {
+        power: "P",
+        target: None,
+        at: None,
+    };
+    assert!(registry.activate(
+        &mut world,
+        holder,
+        &activation,
+        Frame::ZERO,
+        Effects::into_sink(&mut log)
+    ));
+    let mut rng = Pcg32::new(1);
+    let mut destroy = DestroyRequests::new();
+    let mut seen = Vec::new();
+    for frame in 0..40u64 {
+        let mut log = EffectLog::new();
+        registry.update_with_reads(
+            &mut world,
+            Frame::new(frame),
+            &mut rng,
+            &mut destroy,
+            Effects::into_sink(&mut log),
+            Reads::none(),
+        );
+        seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
+    }
+    let raised = |name: &str| {
+        seen.iter().any(|(_, effect)| {
+            matches!(effect, Effect::ModelConditions { add, .. } if add.iter().any(|n| &**n == name))
+        })
+    };
+    assert!(!raised("UNPACKING"), "{seen:?}");
+    assert!(!raised("PACKING"), "{seen:?}");
+    assert_eq!(last_using_ability_cleared(&seen), Some(6), "{seen:?}");
 }
 
 #[test]

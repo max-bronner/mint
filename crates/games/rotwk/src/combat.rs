@@ -20,8 +20,6 @@ pub(crate) use crate::game_data::{
     SHIPPED_ARMOR_BONUS_CAP, SHIPPED_SELL_PERCENTAGE,
 };
 
-const LAUNCH_HEIGHT_FRACTION: f32 = 0.6;
-
 const AIM_HEIGHT_FRACTION: f32 = 0.5;
 
 pub(crate) const DEFAULT_DESTRUCTION_DELAY: LogicFrames = LogicFrames::from_frames(45);
@@ -190,7 +188,7 @@ pub(crate) struct AttackOrder {
     pub(crate) planned: bool,
     pub(crate) horde: Option<Entity>,
     pub(crate) guard: bool,
-    pub(crate) forced: bool,
+    pub(crate) relation_free: bool,
     pub(crate) order_owner: Option<PlayerId>,
 }
 
@@ -199,7 +197,7 @@ impl Component for AttackOrder {
         self.target.hash_into(hasher);
         hasher.write_bool(self.planned);
         hasher.write_bool(self.guard);
-        hasher.write_bool(self.forced);
+        hasher.write_bool(self.relation_free);
         match self.horde {
             Some(horde) => {
                 hasher.write_u8(1);
@@ -329,6 +327,21 @@ pub(crate) struct ProjectileKind {
     pub(crate) flight_path_adjust: f32,
     pub(crate) pre_landing: Option<LandingEmotion>,
     pub(crate) post_landing: Option<LandingEmotion>,
+    pub(crate) crush_style: bool,
+    pub(crate) pre_landing_time: LogicFrames,
+    pub(crate) final_stuck: LogicFrames,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CrushHits(pub(crate) Vec<Entity>);
+
+impl Component for CrushHits {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_usize(self.0.len());
+        for entity in &self.0 {
+            entity.hash_into(hasher);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -580,6 +593,24 @@ pub(crate) fn in_range(
     within_attack_range(distance_squared, min_range, max_range)
 }
 
+pub(crate) fn in_range_beyond(
+    shooter: Vec2,
+    shooter_radius: f32,
+    target: Vec2,
+    target_radius: f32,
+    extra: f32,
+    min_range: f32,
+    max_range: f32,
+) -> bool {
+    let distance_squared = surface_distance_squared_2d(
+        Point3::new(shooter.x, shooter.y, 0.0),
+        shooter_radius,
+        Point3::new(target.x, target.y, 0.0),
+        target_radius,
+    );
+    within_attack_range(distance_squared + extra * extra, min_range, max_range)
+}
+
 pub(crate) fn target_allowed(mask: mint_sage_combat::AntiMask, foe: &Foe) -> bool {
     class_allowed(mask, foe.is_structure, foe.airborne)
 }
@@ -610,6 +641,10 @@ pub(crate) fn class_allowed(
     mask.contains(mint_sage_combat::AntiMask::GROUND)
 }
 
+pub(crate) fn auto_acquirable(relation: mint_sage_combat::victim::Relation) -> bool {
+    matches!(relation, mint_sage_combat::victim::Relation::Enemies)
+}
+
 pub(crate) fn combat_victim(foe: &Foe) -> mint_sage_combat::Victim {
     let mut kind_of = mint_sage_asset::KindOf::NONE;
     if foe.unattackable {
@@ -629,7 +664,7 @@ pub(crate) fn combat_victim(foe: &Foe) -> mint_sage_combat::Victim {
     }
 }
 
-pub(crate) const MOOD_ATTACK_CHECK: LogicFrames = LogicFrames::from_milliseconds(500);
+pub(crate) const MOOD_ATTACK_CHECK: LogicFrames = mint_sage_modules::retail_duration_ticks(500);
 
 pub(crate) fn staggered_first_acquire(entity: Entity, now: Frame) -> Frame {
     let cadence = MOOD_ATTACK_CHECK.get();
@@ -653,9 +688,9 @@ pub(crate) struct GuardRanges {
 impl Default for GuardRanges {
     fn default() -> Self {
         Self {
-            chase: LogicFrames::from_milliseconds(15_000),
-            enemy_scan: LogicFrames::from_milliseconds(500),
-            return_scan: LogicFrames::from_milliseconds(1_000),
+            chase: mint_sage_modules::retail_duration_ticks(15_000),
+            enemy_scan: mint_sage_modules::retail_duration_ticks(500),
+            return_scan: mint_sage_modules::retail_duration_ticks(1_000),
             repulsed_distance: 120.0,
         }
     }
@@ -693,8 +728,9 @@ pub(crate) fn read_guard_ranges(
         ranges.repulsed_distance = value;
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let frames =
-        |value: f32| LogicFrames::from_milliseconds(value.min(f32::from(u16::MAX) * 1000.0) as u32);
+    let frames = |value: f32| {
+        mint_sage_modules::retail_duration_ticks(value.min(f32::from(u16::MAX) * 1000.0) as u32)
+    };
     if let Some(value) = number("GuardChaseUnitsDuration") {
         ranges.chase = frames(value);
     }
@@ -768,7 +804,7 @@ pub(crate) fn idle_scan(input: ScanInput) -> Option<IdleScan> {
         reach,
         pursues: true,
         structures: input.computer || input.flags.contains(AutoAcquire::ATTACK_BUILDINGS),
-        cadence: LogicFrames::from_milliseconds(cadence_ms),
+        cadence: mint_sage_modules::retail_duration_ticks(cadence_ms),
         shape: input.shape,
         retaliate_only: input.attitude == ATTITUDE_PASSIVE,
     })
@@ -1145,6 +1181,7 @@ pub(crate) struct PendingProjectile {
     pub(crate) speed: f32,
     pub(crate) source: WeaponId,
     pub(crate) nugget: u16,
+    pub(crate) launch_slot: Option<mint_sage_combat::WeaponSlot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1299,6 +1336,7 @@ fn in_radius(
     centre_height: f32,
     radius: f32,
 ) -> Vec<(u32, Entity)> {
+    let _perf = crate::perf::sub(crate::perf::sub_row!("area_victims"));
     let here = Point3::new(centre.x, centre.y, centre_height);
     let mut hit: Vec<(u32, Entity)> = others
         .filter(|foe| {
@@ -1513,6 +1551,7 @@ where
                     to,
                     speed: template.launch_speed(range.length()),
                     source: weapon,
+                    launch_slot: projectile.launch_slot,
                     nugget: match u16::try_from(index) {
                         Ok(nugget) => nugget,
                         Err(_) => continue,
@@ -1621,12 +1660,8 @@ where
     result
 }
 
-pub(crate) fn launch_point(position: Vec2, feet: f32, height: f32) -> Point3 {
-    Point3::new(
-        position.x,
-        position.y,
-        feet + height * LAUNCH_HEIGHT_FRACTION,
-    )
+pub(crate) fn launch_point(position: Vec2, feet: f32) -> Point3 {
+    Point3::new(position.x, position.y, feet)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

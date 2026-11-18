@@ -25,6 +25,7 @@ fn r(x: f32) -> Parameter {
 fn cond(name: &str, params: Vec<Parameter>) -> Condition {
     Condition {
         condition_type: 0,
+        inverted: false,
         enabled: true,
         name: name.to_string(),
         params,
@@ -34,6 +35,7 @@ fn cond(name: &str, params: Vec<Parameter>) -> Condition {
 fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_string(),
         params,
     }

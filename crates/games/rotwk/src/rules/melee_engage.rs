@@ -1,7 +1,7 @@
 use mint_movement::{Passability as _, Vec2};
 use mint_sim::{Entity, Tick};
 
-use super::unit_cells::{UnitCells, HEAVY_MELEE_HITTER};
+use super::unit_cells::{Enemies, UnitCells, HEAVY_MELEE_HITTER};
 use super::{Ids, RotwkRules};
 use crate::goal_cells::{self, Footprint};
 
@@ -203,7 +203,15 @@ impl RotwkRules {
             rules: self,
             tick,
             ids,
-            units: self.unit_cells(tick, ids, attacker, None, victim_at, reach),
+            units: self.unit_cells_reading(
+                tick,
+                ids,
+                attacker,
+                None,
+                victim_at,
+                reach,
+                Enemies::Listed,
+            ),
             footprint: self.footprint_of(tick, ids, attacker),
             heavy: self.has_kind_bit(world, ids, attacker, HEAVY_MELEE_HITTER),
             mover: self.mover_class(tick, ids, attacker),
@@ -263,13 +271,22 @@ impl RotwkRules {
         victim: &crate::combat::Foe,
         range: f32,
     ) -> bool {
+        let footprint = self.footprint_of(tick, ids, attacker.entity);
+        self.melee_in_reach_from(tick, ids, attacker, footprint, victim, range)
+    }
+
+    pub(super) fn melee_in_reach_from(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        attacker: &crate::combat::Foe,
+        footprint: Footprint,
+        victim: &crate::combat::Foe,
+        range: f32,
+    ) -> bool {
         melee_reach(
             self,
-            (
-                attacker.position,
-                attacker.radius,
-                self.footprint_of(tick, ids, attacker.entity),
-            ),
+            (attacker.position, attacker.radius, footprint),
             (
                 victim.position,
                 victim.radius,

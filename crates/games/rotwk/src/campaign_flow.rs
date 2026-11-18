@@ -66,6 +66,40 @@ fn read_documents(vfs: &Vfs, suffix: &str) -> Vec<Document> {
         .collect()
 }
 
+fn carry_line(carry: &mint_sage_campaign::Carryover) -> String {
+    let records: Vec<String> = carry
+        .available()
+        .iter()
+        .map(|record| {
+            let upgrades: Vec<String> = record
+                .upgrades
+                .0
+                .iter()
+                .map(|name| name.to_string_lossy())
+                .collect();
+            format!(
+                "{} x{} xp {} level {} missions {} kills {} upgrades [{}]",
+                record.template_name.to_string_lossy(),
+                record.count,
+                record.experience,
+                record.level,
+                record.carried.missions,
+                record.carried.kills_total,
+                upgrades.join(" ")
+            )
+        })
+        .collect();
+    format!(
+        "{} record(s) {{{}}}, skill points {}, cash bounty {}, sciences [{}], upgrades [{}]",
+        records.len(),
+        records.join("; "),
+        carry.skill_points(),
+        carry.cash_bounty(),
+        carry.sciences().join(" "),
+        carry.upgrades().join(" ")
+    )
+}
+
 pub(crate) fn linear_campaigns(vfs: &Vfs) -> LinearCampaignIndex {
     let mut index = LinearCampaignIndex::new();
     let mut paths: Vec<String> = vfs
@@ -304,9 +338,7 @@ impl AppState {
         };
         match tutorial {
             Some(OnTutorial::Start(kind)) => self.begin_tutorial(kind),
-            Some(OnTutorial::WarOfTheRing) => {
-                println!("tutorial: Strategic is the War of the Ring tutorial, which is not built");
-            }
+            Some(OnTutorial::WarOfTheRing) => self.begin_wotr_tutorial(renderer),
             Some(OnTutorial::Nothing) | None => {}
         }
         if matches!(self.screen, AppScreen::Shell(_)) {
@@ -341,6 +373,9 @@ impl AppState {
             AppScreen::Match(_) => None,
         };
         match exit {
+            Some(crate::save_load::Exit::Load(path)) if crate::wotr_save::is_session(&path) => {
+                self.wotr_load = Some(path);
+            }
             Some(crate::save_load::Exit::Load(path)) => self.load_campaign_save(&path),
             Some(crate::save_load::Exit::Save { stem, description }) => {
                 self.save_campaign(&stem, &description);
@@ -690,17 +725,14 @@ impl AppState {
         }
     }
 
-    pub(crate) fn campaign_match_ended(
-        &mut self,
-        end: Option<MissionEnd>,
-        carried: Option<mint_sage_campaign::Carryover>,
-    ) {
+    pub(crate) fn campaign_match_ended(&mut self, result: &crate::match_values::MatchResult) {
         let Some(run) = &mut self.campaign_flow.run else {
             return;
         };
-        match end {
+        match result.end {
             Some(MissionEnd::Victory) => {
-                if let Some(carried) = carried {
+                if let Some(carried) = result.carryover() {
+                    println!("campaign: carryover captured - {}", carry_line(&carried));
                     run.carry = carried;
                 }
                 run.state.script_action("VICTORY");

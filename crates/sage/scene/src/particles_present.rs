@@ -8,8 +8,8 @@ use mint_sage_ini::{
 use mint_sage_map::{HeightMapData, Object, MAP_XY_FACTOR};
 use mint_sage_model::{load_texture, missing_texture, ModelCache, ObjectIndex, Resolver};
 use mint_sage_particle::{
-    CollisionEvent, DrawShape, FxFrame, FxSpawn, Ground, ParticleWorld, SystemId, TemplateHandle,
-    MAX_COMPOUND_DEPTH,
+    Collision, CollisionEvent, DrawShape, FxFrame, FxSpawn, Ground, ParticleWorld, SystemId,
+    TemplateHandle, MAX_COMPOUND_DEPTH,
 };
 use mint_vfs::Vfs;
 
@@ -70,6 +70,7 @@ pub struct FireReport {
     pub bone_missing: usize,
     pub nested_list_missing: usize,
     pub camera_shakes: Vec<CameraShakerVolume>,
+    pub dynamic_decals: Vec<crate::dynamic_decal::FiredDecal>,
     pub create_bone: usize,
     pub create_bone_found: usize,
     pub target_bone: usize,
@@ -166,6 +167,8 @@ enum AttachTarget {
         generation: u32,
         template: usize,
         bone: Option<String>,
+        owner: usize,
+        search: BoneSearch,
     },
     UnitOffset {
         drawable: u32,
@@ -204,11 +207,85 @@ pub struct ParticleScene {
     templates: BTreeMap<String, TemplateHandle>,
     attachments: Vec<Attachment>,
     bone_frame: BoneFrameMode,
+    bone_lookup: BoneLookup,
     hidden_systems: HashSet<String>,
     particle_models: BTreeMap<TemplateHandle, ParticleModel>,
     pose_scratch: PoseScratch,
+    bones: Vec<Mat4>,
     clock: f32,
     attachments_start_held: bool,
+    follow_ups: Vec<String>,
+    collisions: Vec<Collision>,
+    collision_decals: Vec<crate::dynamic_decal::FiredDecal>,
+}
+
+const MAX_PENDING_COLLISION_DECALS: usize = 1024;
+
+fn heading_matrix([x, y]: [f32; 2]) -> Mat4 {
+    let length = (x * x + y * y).sqrt();
+    if !(length.is_finite() && length > 0.0) {
+        return Mat4::IDENTITY;
+    }
+    let (c, s) = (x / length, y / length);
+    Mat4::from_cols([
+        [c, s, 0.0, 0.0],
+        [-s, c, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoneLookup {
+    #[default]
+    DrawableWide,
+    ModuleLocal,
+}
+
+impl BoneLookup {
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::DrawableWide => Self::ModuleLocal,
+            Self::ModuleLocal => Self::DrawableWide,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DrawableWide => "drawable-wide (first module declaring the bone)",
+            Self::ModuleLocal => {
+                "module-local (own module's skeleton unless ParticleBonesCheckDrawable)"
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn searches_drawable(self, check_drawable: bool) -> bool {
+        check_drawable || matches!(self, Self::DrawableWide)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoneSearch {
+    OwnModule,
+    Drawable { check_drawable: bool },
+}
+
+pub(crate) fn bone_source<'a>(
+    units: &'a UnitScene,
+    drawable: &'a UnitDrawable,
+    bone: Option<&str>,
+    wide: bool,
+) -> &'a UnitDrawable {
+    let Some(bone) = bone.filter(|_| wide) else {
+        return drawable;
+    };
+    units
+        .module_drawables(drawable)
+        .find(|module| module.model.pivot_named(bone).is_some())
+        .unwrap_or(drawable)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -251,12 +328,21 @@ impl ParticleScene {
             templates: BTreeMap::new(),
             attachments: Vec::new(),
             bone_frame: BoneFrameMode::default(),
+            bone_lookup: BoneLookup::default(),
             hidden_systems: HashSet::new(),
             particle_models: BTreeMap::new(),
             pose_scratch: PoseScratch::default(),
+            bones: Vec::new(),
             clock: 0.0,
             attachments_start_held: false,
+            follow_ups: Vec::new(),
+            collisions: Vec::new(),
+            collision_decals: Vec::new(),
         }
+    }
+
+    pub fn take_collision_decals(&mut self) -> Vec<crate::dynamic_decal::FiredDecal> {
+        std::mem::take(&mut self.collision_decals)
     }
 
     pub fn hold_attachments_from_birth(&mut self) {
@@ -397,6 +483,7 @@ impl ParticleScene {
     }
 
     fn update_unit_attachments(&mut self, units: &UnitScene) {
+        let lookup = self.bone_lookup;
         let mut attachments = std::mem::take(&mut self.attachments);
         attachments.retain(|attachment| {
             let frame = match &attachment.target {
@@ -406,6 +493,8 @@ impl ParticleScene {
                     generation,
                     template,
                     bone,
+                    owner,
+                    search,
                 } => {
                     let Some(drawable) = units.drawable_by_key(*drawable, *generation, *template)
                     else {
@@ -413,13 +502,26 @@ impl ParticleScene {
                     };
                     self.world
                         .set_swirl_bones(attachment.system, &unit_swirl_bones(units, drawable));
-                    let local =
-                        if reposes_every_frame(attachment.module_flag, attachment.follow_bone) {
-                            unit_bone_follow(drawable, bone.as_deref())
-                        } else {
-                            attachment.local
-                        };
-                    drawable.placement().mul_mat4(local)
+                    let reposes =
+                        reposes_every_frame(attachment.module_flag, attachment.follow_bone);
+                    let source = match search {
+                        BoneSearch::Drawable { check_drawable } if reposes => bone_source(
+                            units,
+                            drawable,
+                            bone.as_deref(),
+                            lookup.searches_drawable(*check_drawable),
+                        ),
+                        BoneSearch::Drawable { .. } => units
+                            .drawable_by_key(drawable.id, drawable.generation, *owner)
+                            .unwrap_or(drawable),
+                        BoneSearch::OwnModule => drawable,
+                    };
+                    let local = if reposes {
+                        unit_bone_follow(source, bone.as_deref())
+                    } else {
+                        attachment.local
+                    };
+                    source.placement().mul_mat4(local)
                 }
                 AttachTarget::UnitOffset {
                     drawable,
@@ -541,6 +643,15 @@ impl ParticleScene {
         self.world.attached_frame()
     }
 
+    #[must_use]
+    pub const fn bone_lookup(&self) -> BoneLookup {
+        self.bone_lookup
+    }
+
+    pub fn set_bone_lookup(&mut self, lookup: BoneLookup) {
+        self.bone_lookup = lookup;
+    }
+
     pub fn set_attached_frame(&mut self, frame: mint_sage_particle::AttachedFrame) {
         self.world.set_attached_frame(frame);
     }
@@ -582,19 +693,63 @@ impl ParticleScene {
             self.clock += seconds;
         }
         self.world.advance(seconds, ground);
+        self.world.take_collisions(&mut self.collisions);
+        for collision in std::mem::take(&mut self.collisions) {
+            let Some(list) = usize::try_from(collision.follow_up)
+                .ok()
+                .and_then(|token| self.follow_ups.get(token))
+                .and_then(|name| self.lists.get(name))
+            else {
+                continue;
+            };
+            let matrix = collision.heading.map(heading_matrix);
+            for decal in list
+                .nuggets
+                .iter()
+                .filter_map(|nugget| nugget.dynamic_decal.as_ref())
+            {
+                if self.collision_decals.len() < MAX_PENDING_COLLISION_DECALS {
+                    self.collision_decals
+                        .push(crate::dynamic_decal::FiredDecal::place(
+                            decal,
+                            collision.at,
+                            matrix,
+                        ));
+                }
+            }
+        }
     }
 
-    pub fn draw(&mut self, renderer: &mut Renderer, camera: &Camera, out: &mut Vec<Instance>) {
+    pub fn draw(
+        &mut self,
+        renderer: &mut Renderer,
+        camera: &Camera,
+        out: &mut Vec<Instance>,
+        palette_base: usize,
+    ) {
+        self.bones.clear();
         if let Err(error) = self.world.draw(renderer, camera, out) {
             crate::once::report_once(&format!("  particles: {error}"));
         }
         for draw in self.world.model_draws() {
             if let Some(model) = self.particle_models.get(&draw.template) {
                 if model.needs_frame() {
-                    model.animate(draw, out, self.clock, &mut self.pose_scratch);
+                    model.animate(
+                        draw,
+                        out,
+                        self.clock,
+                        &mut self.pose_scratch,
+                        &mut self.bones,
+                        palette_base,
+                    );
                 }
             }
         }
+    }
+
+    #[must_use]
+    pub fn bones(&self) -> &[Mat4] {
+        &self.bones
     }
 
     fn template(
@@ -643,9 +798,31 @@ impl ParticleScene {
             fires: self.list_spawns(renderer, vfs, resolver, &event.fx, depth.saturating_add(1)),
             height_offset: event.height_offset.midpoint(),
             kill_after: event.kill_after_event,
+            follow_up: self.follow_up(&event.fx),
+            orient: event.orient_to_terrain,
         });
         self.world.link(handle, slave, attached, event);
         Some(handle)
+    }
+
+    fn follow_up(&mut self, list: &str) -> Option<u32> {
+        let has_decal = self
+            .lists
+            .get(list)?
+            .nuggets
+            .iter()
+            .any(|nugget| nugget.dynamic_decal.is_some());
+        if !has_decal {
+            return None;
+        }
+        let index = match self.follow_ups.iter().position(|known| known == list) {
+            Some(index) => index,
+            None => {
+                self.follow_ups.push(list.to_owned());
+                self.follow_ups.len().saturating_sub(1)
+            }
+        };
+        u32::try_from(index).ok()
     }
 
     fn list_spawns(
@@ -916,6 +1093,8 @@ impl ParticleScene {
                         generation: drawable.generation,
                         template: drawable.template,
                         bone: leaf.bone.clone(),
+                        owner: drawable.template,
+                        search: BoneSearch::OwnModule,
                     },
                     local,
                     leaf.follow_bone,
@@ -924,6 +1103,16 @@ impl ParticleScene {
             }
         }
         report.camera_shakes.extend(self.list_camera_shakes(name));
+        if let Some(list) = self.lists.get(name) {
+            report.dynamic_decals.extend(
+                list.nuggets
+                    .iter()
+                    .filter_map(|nugget| nugget.dynamic_decal.as_ref())
+                    .map(|decal| {
+                        crate::dynamic_decal::FiredDecal::place(decal, frame.at, frame.matrix)
+                    }),
+            );
+        }
         if depth >= MAX_FX_LIST_DEPTH {
             return;
         }
@@ -1049,6 +1238,7 @@ impl ParticleScene {
     pub fn clear(&mut self) {
         self.world.clear();
         self.attachments.clear();
+        self.collision_decals.clear();
     }
 
     pub fn stop(&mut self, id: SystemId) {
@@ -1144,7 +1334,7 @@ impl ParticleScene {
             return (Vec::new(), None);
         };
         let instances = model.parts.iter().map(|part| part.instance).collect();
-        let bound = ParticleModel::bind(vfs, resolver, name, model);
+        let bound = ParticleModel::bind(renderer, vfs, resolver, name, model);
         (instances, Some(bound))
     }
 }
@@ -1396,19 +1586,19 @@ fn unit_bone_frames(drawable: &UnitDrawable, bone: Option<&str>) -> Vec<Mat4> {
     frames
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum HeldModule {
     Model,
     Companion(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum HeldKind {
     Model,
     Animation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct HeldKey {
     drawable: (u32, u32, usize),
     module: HeldModule,
@@ -1512,8 +1702,9 @@ impl ConditionParticles {
         particles: &mut ParticleScene,
         units: &UnitScene,
     ) {
-        let mut seen: HashSet<HeldKey> = HashSet::new();
-        let mut seen_modules: HashSet<ModuleKey> = HashSet::new();
+        let mut seen: Vec<HeldKey> = Vec::new();
+        let prune_persisted = !self.persisted.is_empty();
+        let mut seen_modules: Vec<ModuleKey> = Vec::new();
         for drawable in units
             .drawables()
             .iter()
@@ -1527,6 +1718,7 @@ impl ConditionParticles {
                 vfs,
                 resolver,
                 particles,
+                units,
                 drawable,
                 HeldModule::Model,
                 drawable
@@ -1537,7 +1729,7 @@ impl ConditionParticles {
                     .and_then(|state| Some((state, template.states.get(state)?))),
                 true,
                 &mut seen,
-                &mut seen_modules,
+                prune_persisted.then_some(&mut seen_modules),
             );
             let companion_states = drawable.companion_states();
             for (index, companion) in template.companions.iter().enumerate() {
@@ -1548,34 +1740,39 @@ impl ConditionParticles {
                     vfs,
                     resolver,
                     particles,
+                    units,
                     drawable,
                     HeldModule::Companion(index),
                     model.and_then(|state| Some((state, companion.model_states.get(state)?))),
                     animation.and_then(|state| Some((state, companion.states.get(state)?))),
                     false,
                     &mut seen,
-                    &mut seen_modules,
+                    prune_persisted.then_some(&mut seen_modules),
                 );
             }
         }
+        seen.sort_unstable();
         let gone: Vec<HeldKey> = self
             .held
             .keys()
             .copied()
-            .filter(|key| !seen.contains(key))
+            .filter(|key| seen.binary_search(key).is_err())
             .collect();
         for key in gone {
             self.stop(particles, key);
         }
-        let gone: Vec<ModuleKey> = self
-            .persisted
-            .keys()
-            .copied()
-            .filter(|key| !seen_modules.contains(key))
-            .collect();
-        for key in gone {
-            for entry in self.persisted.remove(&key).unwrap_or_default() {
-                particles.stop(entry.system);
+        if prune_persisted {
+            seen_modules.sort_unstable();
+            let gone: Vec<ModuleKey> = self
+                .persisted
+                .keys()
+                .copied()
+                .filter(|key| seen_modules.binary_search(key).is_err())
+                .collect();
+            for key in gone {
+                for entry in self.persisted.remove(&key).unwrap_or_default() {
+                    particles.stop(entry.system);
+                }
             }
         }
         particles.update_unit_attachments(units);
@@ -1588,27 +1785,28 @@ impl ConditionParticles {
         vfs: &Vfs,
         resolver: &Resolver,
         particles: &mut ParticleScene,
+        units: &UnitScene,
         drawable: &UnitDrawable,
         module: HeldModule,
         model: Option<(usize, &impl HasParticles)>,
         animation: Option<(usize, &impl HasParticles)>,
         real_bone: bool,
-        seen: &mut HashSet<HeldKey>,
-        seen_modules: &mut HashSet<ModuleKey>,
+        seen: &mut Vec<HeldKey>,
+        seen_modules: Option<&mut Vec<ModuleKey>>,
     ) {
-        seen_modules.insert((
-            (drawable.id, drawable.generation, drawable.template),
-            module,
-        ));
-        let model_key = HeldKey::new(drawable, module, HeldKind::Model);
-        let animation_key = HeldKey::new(drawable, module, HeldKind::Animation);
+        if let Some(seen_modules) = seen_modules {
+            seen_modules.push((
+                (drawable.id, drawable.generation, drawable.template),
+                module,
+            ));
+        }
         let model_attaches = model.is_some_and(|(_, def)| !def.particles().is_empty());
         let animation_attaches = animation.is_some_and(|(_, def)| !def.particles().is_empty());
         if !model_attaches && !animation_attaches {
-            self.stop(particles, model_key);
-            self.stop(particles, animation_key);
             return;
         }
+        let model_key = HeldKey::new(drawable, module, HeldKind::Model);
+        let animation_key = HeldKey::new(drawable, module, HeldKind::Animation);
         let held_state = |key: &HeldKey| self.held.get(key).map(|held| held.state);
         let unchanged = held_state(&model_key) == model.map(|(state, _)| state)
             && held_state(&animation_key) == animation.map(|(state, _)| state);
@@ -1617,7 +1815,7 @@ impl ConditionParticles {
             (animation_key, animation.map(|(state, _)| state)),
         ] {
             if wanted.is_some() {
-                seen.insert(key);
+                seen.push(key);
             }
         }
         if unchanged {
@@ -1631,6 +1829,7 @@ impl ConditionParticles {
             vfs,
             resolver,
             particles,
+            units,
             drawable,
             animation_key,
             animation,
@@ -1642,6 +1841,7 @@ impl ConditionParticles {
             vfs,
             resolver,
             particles,
+            units,
             drawable,
             model_key,
             model,
@@ -1657,6 +1857,7 @@ impl ConditionParticles {
         vfs: &Vfs,
         resolver: &Resolver,
         particles: &mut ParticleScene,
+        units: &UnitScene,
         drawable: &UnitDrawable,
         key: HeldKey,
         wanted: Option<(usize, &impl HasParticles)>,
@@ -1694,13 +1895,21 @@ impl ConditionParticles {
             } else {
                 None
             };
-            let local = unit_bone_entry(drawable, bone.as_deref(), attachment.follow_bone);
+            let source = bone_source(
+                units,
+                drawable,
+                bone.as_deref(),
+                particles
+                    .bone_lookup()
+                    .searches_drawable(attachment.check_drawable),
+            );
+            let local = unit_bone_entry(source, bone.as_deref(), attachment.follow_bone);
             let Some(system) = particles.attach_named(
                 renderer,
                 vfs,
                 resolver,
                 &attachment.system,
-                drawable.placement().mul_mat4(local),
+                source.placement().mul_mat4(local),
             ) else {
                 continue;
             };
@@ -1711,6 +1920,10 @@ impl ConditionParticles {
                     generation,
                     template,
                     bone,
+                    owner: source.template,
+                    search: BoneSearch::Drawable {
+                        check_drawable: attachment.check_drawable,
+                    },
                 },
                 local,
                 attachment.follow_bone,

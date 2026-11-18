@@ -47,9 +47,7 @@ fn simulation() -> (Simulation<RotwkRules>, Ids) {
     (simulation, ids)
 }
 
-#[test]
-fn a_toggle_press_on_a_horde_reaches_every_member() {
-    let (mut simulation, ids) = simulation();
+fn spawn_horde(simulation: &mut Simulation<RotwkRules>, ids: Ids) -> (Entity, Vec<Entity>) {
     let recipe = simulation
         .rules()
         .buildable_catalogue()
@@ -73,6 +71,13 @@ fn a_toggle_press_on_a_horde_reaches_every_member() {
     let horde = store.entities()[0];
     let members = store.get(horde).unwrap().members.clone();
     assert_eq!(members.len(), 2, "the fixture's premise");
+    (horde, members)
+}
+
+#[test]
+fn a_toggle_press_on_a_horde_reaches_every_member() {
+    let (mut simulation, ids) = simulation();
+    let (horde, members) = spawn_horde(&mut simulation, ids);
 
     let state_id = simulation.rules().upgrade_state_id().unwrap();
     let has_flag = |simulation: &Simulation<RotwkRules>, entity: Entity, flag: &str| {
@@ -122,6 +127,37 @@ fn a_toggle_press_on_a_horde_reaches_every_member() {
         assert!(
             !has_flag(&simulation, *entity, "WEAPONSET_TOGGLE_1"),
             "entity {} must drop the flag on the second press",
+            entity.index()
+        );
+    }
+}
+
+#[test]
+fn a_toggle_press_led_by_a_soldier_still_toggles_its_horde() {
+    let (mut simulation, ids) = simulation();
+    let (horde, members) = spawn_horde(&mut simulation, ids);
+    let state_id = simulation.rules().upgrade_state_id().unwrap();
+    let press = RotwkCommand::ToggleWeaponSet {
+        button: "Command_ToggleMounted".to_owned(),
+        lead: Some(members[0]),
+    };
+    for command in [
+        RotwkCommand::SetSelection {
+            replace: true,
+            units: vec![horde],
+        },
+        press,
+    ] {
+        simulation.submit(PLAYER, command).unwrap();
+    }
+    simulation.tick().unwrap();
+    for entity in members.iter().chain([&horde]) {
+        assert!(
+            simulation
+                .state()
+                .get(state_id, *entity)
+                .is_some_and(|state| state.has_weapon_set_flag("WEAPONSET_TOGGLE_1")),
+            "entity {} must hold the toggle flag",
             entity.index()
         );
     }

@@ -239,7 +239,7 @@ impl RotwkRules {
             let Some(seconds) = entry.record.rebuild_seconds else {
                 continue;
             };
-            let frames = LogicFrames::from_seconds(seconds).get().max(1);
+            let frames = crate::game_data::rebuild_time_ticks(seconds);
             self.rebuild_rubble(tick, ids, structure, &entry.record, player, frames)?;
             diag!(
                 "rebuild: frame {} entity {} rebuilding for player {} over {frames} frame(s)",
@@ -292,6 +292,7 @@ impl RotwkRules {
         }
         let worker_kind = self.getting_built_worker(record, owner);
         let worker = self.spawn_site_worker(tick, ids, worker_kind, structure, owner)?;
+        let created = tick.frame();
         tick.state_mut().insert(
             ids.construction,
             structure,
@@ -301,6 +302,7 @@ impl RotwkRules {
                 rebuild: Some(frames),
                 worker,
                 delay: 0,
+                created,
             },
         )?;
         Ok(())
@@ -779,13 +781,17 @@ impl RotwkRules {
         ) else {
             return Ok(());
         };
-        let frames = entry
-            .record
-            .rebuild_seconds
-            .or(entry.record.build_time)
-            .filter(|seconds| (0.0..=crate::templates::MAX_BUILD_SECONDS).contains(seconds))
-            .map_or(1, |seconds| LogicFrames::from_seconds(seconds).get())
-            .max(1);
+        let in_range =
+            |seconds: &f32| (0.0..=crate::templates::MAX_BUILD_SECONDS).contains(seconds);
+        let frames = match entry.record.rebuild_seconds.filter(in_range) {
+            Some(seconds) => crate::game_data::rebuild_time_ticks(seconds),
+            None => entry
+                .record
+                .build_time
+                .filter(in_range)
+                .map_or(1, |seconds| LogicFrames::from_seconds(seconds).get())
+                .max(1),
+        };
         let worker_kind = self
             .modules
             .as_ref()
@@ -809,6 +815,7 @@ impl RotwkRules {
             tick.state_mut().insert(ids.health, structure, health)?;
         }
         let worker = self.spawn_site_worker(tick, ids, worker_kind, structure, owner)?;
+        let created = tick.frame();
         tick.state_mut().insert(
             ids.construction,
             structure,
@@ -818,6 +825,7 @@ impl RotwkRules {
                 rebuild: Some(frames),
                 worker,
                 delay: 0,
+                created,
             },
         )?;
         self.transfer_attackers(tick, ids, hole, structure)?;

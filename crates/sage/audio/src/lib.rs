@@ -6,7 +6,7 @@ pub mod music;
 pub mod rng;
 pub mod runtime;
 
-pub use bank::{BankStats, SoundBank, MIN_BUDGET_BYTES};
+pub use bank::{BankStats, Lookup, SoundBank, MIN_BUDGET_BYTES};
 pub use eva::{Eva, EvaLine};
 pub use library::{AudioLibrary, EventKey};
 pub use music::{MusicEvent, MusicRequest, MusicSystem};

@@ -52,7 +52,7 @@ pub fn lifetime_update_from_fields(
         return Err(FieldError::new(format!("MaxLifetime '{ms}' is negative")));
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let lifetime = LogicFrames::from_milliseconds(ms as u32);
+    let lifetime = crate::special_ability_update::retail_duration_ticks(ms as u32);
     Ok(LifetimeUpdate::new(now, lifetime))
 }
 

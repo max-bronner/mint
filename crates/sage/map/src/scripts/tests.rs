@@ -429,3 +429,37 @@ fn initial_int_values_reads_the_last_set_counter_per_name_in_file_order() {
     assert_eq!(values.get("g_ATTACK_LAUNCH"), Some(&999));
     assert_eq!(values.len(), 1);
 }
+
+#[test]
+fn the_not_flag_negates_every_condition_type_but_the_five_the_engine_evaluates() {
+    let decode = |name: &str, not: u32| {
+        let mut b = MapBuilder::new();
+        let mut payload = condition_payload(&mut b, 1, name, &[]);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&not.to_le_bytes());
+        let chunk = b.nested_chunk("Condition", 6, &payload);
+        let names = b.name_table();
+        let chunks = read_chunks(&chunk, 0, chunk.len(), &names).unwrap();
+        read_condition(&chunk, &chunks[0], &names).unwrap()
+    };
+    assert!(decode("NAMED_BUILDING_IS_EMPTY", 1).negates());
+    assert!(!decode("NAMED_BUILDING_IS_EMPTY", 0).negates());
+    assert!(decode("FLAG", 1).inverted && !decode("FLAG", 1).negates());
+}
+
+#[test]
+fn a_version_three_action_with_a_zero_trailer_is_disabled() {
+    let decode = |trailer: u32| {
+        let mut b = MapBuilder::new();
+        let mut action = 1i32.to_le_bytes().to_vec();
+        action.extend_from_slice(&b.name_key("SET_FLAG").to_le_bytes());
+        action.extend_from_slice(&0i32.to_le_bytes());
+        action.extend_from_slice(&trailer.to_le_bytes());
+        let chunk = b.nested_chunk("ScriptAction", 3, &action);
+        let names = b.name_table();
+        let chunks = read_chunks(&chunk, 0, chunk.len(), &names).unwrap();
+        read_script_action(&chunk, &chunks[0], &names, "ScriptAction").unwrap()
+    };
+    assert!(!decode(0).enabled);
+    assert!(decode(1).enabled);
+}

@@ -384,6 +384,7 @@ mod admit_tests {
             at_bone_pos: None,
             camera_shaker: None,
             eva_event: None,
+            dynamic_decal: None,
         }
     }
 

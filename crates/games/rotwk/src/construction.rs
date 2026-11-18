@@ -1,7 +1,7 @@
 use mint_movement::Vec2;
 use mint_sage_modules::{ObjectRecord, PieceShape};
 use mint_sage_passability::{Footprint, FootprintRecord};
-use mint_sim::{Component, Entity, LogicFrames, StateHasher};
+use mint_sim::{Component, Entity, Frame, LogicFrames, StateHasher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Construction {
@@ -10,6 +10,7 @@ pub(crate) struct Construction {
     pub(crate) rebuild: Option<u32>,
     pub(crate) worker: Option<Entity>,
     pub(crate) delay: u32,
+    pub(crate) created: Frame,
 }
 
 impl Component for Construction {
@@ -23,6 +24,7 @@ impl Component for Construction {
         }
         hasher.write_u32(self.elapsed);
         hasher.write_u32(self.delay);
+        self.created.hash_into(hasher);
         hasher.write_bool(self.rebuild.is_some());
         if let Some(frames) = self.rebuild {
             hasher.write_u32(frames);
@@ -121,6 +123,7 @@ impl Component for AutoRepair {
 pub(crate) enum Reason {
     OffMap,
     Blocked,
+    NotFlat,
     Planned,
     Ford,
     EnemyUnit,
@@ -137,6 +140,7 @@ impl Reason {
         match self {
             Self::OffMap => "off the map",
             Self::Blocked => "blocked by terrain or another structure",
+            Self::NotFlat => "the ground is not flat enough",
             Self::Planned => "a planned building is there",
             Self::Ford => "in a ford",
             Self::EnemyUnit => "an enemy unit is there",
@@ -156,8 +160,56 @@ impl Reason {
             Self::NoMoney => 7,
             Self::Blocked | Self::Planned | Self::EnemyUnit => 8,
             Self::WallHubTooFar => 9,
-            Self::Ford | Self::NoFootprint | Self::NotOffered | Self::Disallowed => 1,
+            Self::NotFlat
+            | Self::Ford
+            | Self::NoFootprint
+            | Self::NotOffered
+            | Self::Disallowed => 1,
         }
+    }
+}
+
+const FLATNESS_SAMPLE_STEP: f32 = 10.0;
+
+pub(crate) fn height_variation(
+    footprint: &[FootprintRecord],
+    centre: Vec2,
+    angle: f32,
+    height_at: impl Fn(f32, f32) -> Option<f32>,
+) -> f32 {
+    let (sin, cos) = mint_math::f32::sin_cos(angle);
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for record in footprint {
+        let (half_x, half_y, disc) = match record.footprint {
+            Footprint::Box { major, minor } => (major, minor, false),
+            Footprint::Disc { radius } => (radius, radius, true),
+        };
+        let mut local_y = -half_y;
+        while local_y < half_y + FLATNESS_SAMPLE_STEP {
+            let y = local_y.min(half_y);
+            let mut local_x = -half_x;
+            while local_x < half_x + FLATNESS_SAMPLE_STEP {
+                let x = local_x.min(half_x);
+                local_x += FLATNESS_SAMPLE_STEP;
+                if disc && x * x + y * y > half_x * half_x {
+                    continue;
+                }
+                let (px, py) = (x + record.offset.x, y + record.offset.y);
+                let at_x = centre.x + px * cos - py * sin;
+                let at_y = centre.y + px * sin + py * cos;
+                if let Some(z) = height_at(at_x, at_y) {
+                    low = low.min(z);
+                    high = high.max(z);
+                }
+            }
+            local_y += FLATNESS_SAMPLE_STEP;
+        }
+    }
+    if high < low {
+        0.0
+    } else {
+        high - low
     }
 }
 
@@ -303,11 +355,46 @@ mod tests {
         production_cost_change_percent: 0.0,
         kind_of_modifier: 1.0,
         handicap: 1.0,
+        brutal_reduction: 0.0,
     };
     const TIME: mint_sage_economy::TimeModifiers = mint_sage_economy::TimeModifiers {
         handicap: 1.0,
         production_time_change_percent: 0.0,
+        builder_modifier: 1.0,
+        speed_multiplier: 1.0,
+        brutal_reduction: 0.0,
     };
+
+    #[test]
+    fn height_variation_spans_the_rotated_footprint_and_skips_off_map_samples() {
+        let slope = |x: f32, _y: f32| Some(x * 0.5);
+        let boxed = [FootprintRecord {
+            offset: Vec2::ZERO,
+            footprint: Footprint::Box {
+                major: 40.0,
+                minor: 10.0,
+            },
+        }];
+        assert!(
+            (height_variation(&boxed, Vec2::new(100.0, 100.0), 0.0, slope) - 40.0).abs() < 1e-3
+        );
+        let across = height_variation(
+            &boxed,
+            Vec2::new(100.0, 100.0),
+            core::f32::consts::FRAC_PI_2,
+            slope,
+        );
+        assert!(
+            across < 11.0,
+            "turned a quarter, only the minor radius lies along the slope: {across}"
+        );
+        let disc = [FootprintRecord {
+            offset: Vec2::ZERO,
+            footprint: Footprint::Disc { radius: 20.0 },
+        }];
+        assert!((height_variation(&disc, Vec2::new(100.0, 100.0), 0.0, slope) - 20.0).abs() < 1e-3);
+        assert_eq!(height_variation(&boxed, Vec2::ZERO, 0.0, |_, _| None), 0.0);
+    }
 
     fn record_with(pieces: Vec<(f32, f32, PieceShape)>) -> ObjectRecord {
         ObjectRecord {

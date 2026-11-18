@@ -1,9 +1,4 @@
 use super::*;
-use crate::command_points::CommandPointPool;
-
-fn pool() -> CommandPointPool {
-    CommandPointPool::new(300)
-}
 
 fn request(cost: i64, frames: u32) -> QueueRequest {
     QueueRequest {
@@ -24,7 +19,7 @@ fn always_fits(_: ItemId) -> bool {
 fn queueing_charges_the_full_cost_immediately() {
     let mut purse = Money::new(1_000);
     let mut queue = ProductionQueue::new(5);
-    queue.queue(request(400, 30), &mut purse, &pool()).unwrap();
+    queue.queue(request(400, 30), &mut purse).unwrap();
     assert_eq!(purse.amount(), 600);
     for _ in 0..29 {
         queue.advance();
@@ -36,7 +31,7 @@ fn queueing_charges_the_full_cost_immediately() {
 fn a_player_who_cannot_pay_is_refused_and_charged_nothing() {
     let mut purse = Money::new(100);
     let mut queue = ProductionQueue::new(5);
-    let refusal = queue.queue(request(400, 30), &mut purse, &pool());
+    let refusal = queue.queue(request(400, 30), &mut purse);
     assert!(matches!(
         refusal,
         Err(Refusal::CannotAfford {
@@ -56,11 +51,11 @@ fn a_player_who_cannot_pay_is_refused_and_charged_nothing() {
 fn a_full_queue_rejects_rather_than_dropping_and_charges_nothing() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(2);
-    queue.queue(request(100, 30), &mut purse, &pool()).unwrap();
-    queue.queue(request(100, 30), &mut purse, &pool()).unwrap();
+    queue.queue(request(100, 30), &mut purse).unwrap();
+    queue.queue(request(100, 30), &mut purse).unwrap();
     assert_eq!(purse.amount(), 9_800);
     assert!(matches!(
-        queue.queue(request(100, 30), &mut purse, &pool()),
+        queue.queue(request(100, 30), &mut purse),
         Err(Refusal::QueueFull { limit: 2 })
     ));
     assert_eq!(purse.amount(), 9_800);
@@ -71,8 +66,8 @@ fn a_full_queue_rejects_rather_than_dropping_and_charges_nothing() {
 fn only_the_front_entry_advances() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(4);
-    queue.queue(request(10, 10), &mut purse, &pool()).unwrap();
-    queue.queue(request(10, 10), &mut purse, &pool()).unwrap();
+    queue.queue(request(10, 10), &mut purse).unwrap();
+    queue.queue(request(10, 10), &mut purse).unwrap();
     for _ in 0..5 {
         queue.advance();
     }
@@ -88,19 +83,45 @@ fn the_first_and_last_entry_of_an_item_are_found() {
         item: ItemId::new(9),
         ..request(10, 5)
     };
-    let first = queue.queue(request(10, 5), &mut purse, &pool()).unwrap();
-    queue.queue(other, &mut purse, &pool()).unwrap();
-    let last = queue.queue(request(10, 5), &mut purse, &pool()).unwrap();
-    assert_eq!(queue.first_of(ItemId::new(7)).map(|e| e.id), Some(first));
-    assert_eq!(queue.last_of(ItemId::new(7)).map(|e| e.id), Some(last));
-    assert!(queue.last_of(ItemId::new(3)).is_none());
+    let first = queue.queue(request(10, 5), &mut purse).unwrap();
+    queue.queue(other, &mut purse).unwrap();
+    let last = queue.queue(request(10, 5), &mut purse).unwrap();
+    let objects = ItemTable::Objects;
+    assert_eq!(
+        queue.first_of(objects, ItemId::new(7)).map(|e| e.id),
+        Some(first)
+    );
+    assert_eq!(
+        queue.last_of(objects, ItemId::new(7)).map(|e| e.id),
+        Some(last)
+    );
+    assert!(queue.last_of(objects, ItemId::new(3)).is_none());
+}
+
+#[test]
+fn an_upgrade_is_not_found_as_the_unit_sharing_its_index() {
+    let mut purse = Money::new(10_000);
+    let mut queue = ProductionQueue::new(4);
+    let upgrade = QueueRequest {
+        kind: EntryKind::Upgrade,
+        ..request(10, 5)
+    };
+    let id = queue.queue(upgrade, &mut purse).unwrap();
+    assert!(queue.first_of(ItemTable::Objects, ItemId::new(7)).is_none());
+    assert!(queue.last_of(ItemTable::Objects, ItemId::new(7)).is_none());
+    assert_eq!(
+        queue
+            .first_of(ItemTable::Upgrades, ItemId::new(7))
+            .map(|e| e.id),
+        Some(id)
+    );
 }
 
 #[test]
 fn an_entry_completes_on_its_declared_frame_and_not_before() {
     let mut purse = Money::new(1_000);
     let mut queue = ProductionQueue::new(2);
-    let id = queue.queue(request(10, 4), &mut purse, &pool()).unwrap();
+    let id = queue.queue(request(10, 4), &mut purse).unwrap();
     for frame in 1..4 {
         assert!(
             matches!(queue.advance(), Progress::Building { .. }),
@@ -120,7 +141,7 @@ fn an_entry_completes_on_its_declared_frame_and_not_before() {
 fn a_blocked_exit_keeps_overbuilding_rather_than_losing_the_unit() {
     let mut purse = Money::new(1_000);
     let mut queue = ProductionQueue::new(2);
-    let id = queue.queue(request(10, 2), &mut purse, &pool()).unwrap();
+    let id = queue.queue(request(10, 2), &mut purse).unwrap();
     queue.advance();
     assert!(matches!(queue.advance(), Progress::Ready { .. }));
     for _ in 0..10 {
@@ -147,7 +168,7 @@ fn a_quantity_modifier_produces_n_units_for_one_payment() {
         quantity: 4,
         ..request(200, 2)
     };
-    queue.queue(batch, &mut purse, &pool()).unwrap();
+    queue.queue(batch, &mut purse).unwrap();
     assert_eq!(purse.amount(), 800);
     queue.advance();
     queue.advance();
@@ -171,7 +192,6 @@ fn a_zero_quantity_is_read_as_one() {
                 ..request(10, 1)
             },
             &mut purse,
-            &pool(),
         )
         .unwrap();
     assert_eq!(queue.entries().first().map(|e| e.quantity_total), Some(1));
@@ -181,7 +201,7 @@ fn a_zero_quantity_is_read_as_one() {
 fn cancelling_refunds_the_full_amount_that_was_paid() {
     let mut purse = Money::new(1_000);
     let mut queue = ProductionQueue::new(3);
-    let id = queue.queue(request(400, 60), &mut purse, &pool()).unwrap();
+    let id = queue.queue(request(400, 60), &mut purse).unwrap();
     queue.advance();
     queue.advance();
     let cancelled = queue.cancel(id, &mut purse).unwrap();
@@ -194,7 +214,7 @@ fn cancelling_refunds_the_full_amount_that_was_paid() {
 fn cancelling_an_id_that_is_not_there_changes_nothing() {
     let mut purse = Money::new(1_000);
     let mut queue = ProductionQueue::new(3);
-    queue.queue(request(400, 60), &mut purse, &pool()).unwrap();
+    queue.queue(request(400, 60), &mut purse).unwrap();
     assert!(queue
         .cancel(ProductionId::from_raw(999), &mut purse)
         .is_none());
@@ -206,9 +226,9 @@ fn cancelling_an_id_that_is_not_there_changes_nothing() {
 fn cancelling_from_the_middle_keeps_the_others_in_order() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(5);
-    let first = queue.queue(request(100, 60), &mut purse, &pool()).unwrap();
-    let second = queue.queue(request(200, 60), &mut purse, &pool()).unwrap();
-    let third = queue.queue(request(300, 60), &mut purse, &pool()).unwrap();
+    let first = queue.queue(request(100, 60), &mut purse).unwrap();
+    let second = queue.queue(request(200, 60), &mut purse).unwrap();
+    let third = queue.queue(request(300, 60), &mut purse).unwrap();
     queue.cancel(second, &mut purse).unwrap();
     let ids: Vec<_> = queue.entries().iter().map(|e| e.id).collect();
     assert_eq!(ids, vec![first, third]);
@@ -216,41 +236,29 @@ fn cancelling_from_the_middle_keeps_the_others_in_order() {
 }
 
 #[test]
-fn command_points_gate_the_queue_and_are_reserved_until_delivery() {
-    let mut purse = Money::new(100_000);
-    let mut queue = ProductionQueue::new(16);
+fn twenty_hordes_queue_whatever_their_command_points_and_the_twenty_first_is_refused() {
+    let mut purse = Money::new(1_000_000);
+    let mut queue = ProductionQueue::new(20);
     let horde = QueueRequest {
         command_points: 60,
         ..request(10, 30)
     };
-    for _ in 0..5 {
-        queue.queue(horde, &mut purse, &pool()).unwrap();
+    for _ in 0..20 {
+        queue.queue(horde, &mut purse).unwrap();
     }
-    assert_eq!(queue.reserved_command_points(), 300);
+    assert_eq!(queue.reserved_command_points(), 1_200);
     assert!(matches!(
-        queue.queue(horde, &mut purse, &pool()),
-        Err(Refusal::NoCommandPoints {
-            needed: 60,
-            free: 0,
-            limit: 300
-        })
+        queue.queue(horde, &mut purse),
+        Err(Refusal::QueueFull { limit: 20 })
     ));
-}
-
-#[test]
-fn a_free_item_queues_even_at_the_command_point_limit() {
-    let mut purse = Money::new(1_000);
-    let mut queue = ProductionQueue::new(4);
-    let full = CommandPointPool::with_used(300, 300);
-    assert!(queue.queue(request(10, 30), &mut purse, &full).is_ok());
 }
 
 #[test]
 fn a_destroyed_factory_gives_every_queued_payment_back() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(5);
-    queue.queue(request(100, 60), &mut purse, &pool()).unwrap();
-    queue.queue(request(250, 60), &mut purse, &pool()).unwrap();
+    queue.queue(request(100, 60), &mut purse).unwrap();
+    queue.queue(request(250, 60), &mut purse).unwrap();
     assert_eq!(queue.cancel_all(&mut purse), 350);
     assert_eq!(purse.amount(), 10_000);
     assert!(queue.is_empty());
@@ -278,10 +286,10 @@ fn the_hash_moves_with_the_queues_order_and_its_progress() {
         item: ItemId::new(2),
         ..request(100, 60)
     };
-    a.queue(one, &mut purse, &pool()).unwrap();
-    a.queue(two, &mut purse, &pool()).unwrap();
-    b.queue(two, &mut purse, &pool()).unwrap();
-    b.queue(one, &mut purse, &pool()).unwrap();
+    a.queue(one, &mut purse).unwrap();
+    a.queue(two, &mut purse).unwrap();
+    b.queue(two, &mut purse).unwrap();
+    b.queue(one, &mut purse).unwrap();
 
     let mut hasher_a = StateHasher::new();
     let mut hasher_b = StateHasher::new();
@@ -301,7 +309,7 @@ fn the_hash_moves_with_the_queues_order_and_its_progress() {
 fn the_progress_fraction_is_derived_and_never_leaves_zero_to_one() {
     let mut purse = Money::new(1_000);
     let mut queue = ProductionQueue::new(2);
-    queue.queue(request(10, 4), &mut purse, &pool()).unwrap();
+    queue.queue(request(10, 4), &mut purse).unwrap();
     assert_eq!(
         queue.entries().first().map(ProductionEntry::fraction),
         Some(0.0)
@@ -313,7 +321,7 @@ fn the_progress_fraction_is_derived_and_never_leaves_zero_to_one() {
     assert_eq!(fraction, Some(1.0), "overbuilding must not exceed 100%");
 
     let mut instant = ProductionQueue::new(2);
-    instant.queue(request(0, 0), &mut purse, &pool()).unwrap();
+    instant.queue(request(0, 0), &mut purse).unwrap();
     assert!(matches!(instant.advance(), Progress::Ready { .. }));
 }
 
@@ -325,7 +333,7 @@ fn builder_preempts_upgrade_and_upgrade_keeps_progress() {
         kind: EntryKind::Upgrade,
         ..request(10, 100)
     };
-    let upgrade_id = queue.queue(upgrade, &mut purse, &pool()).unwrap();
+    let upgrade_id = queue.queue(upgrade, &mut purse).unwrap();
     for _ in 0..40 {
         queue.tick(1, true, always_fits);
     }
@@ -342,7 +350,7 @@ fn builder_preempts_upgrade_and_upgrade_keeps_progress() {
         kind: EntryKind::Unit { builder: true },
         ..request(10, 10)
     };
-    let porter_id = queue.queue(porter, &mut purse, &pool()).unwrap();
+    let porter_id = queue.queue(porter, &mut purse).unwrap();
     for _ in 0..5 {
         queue.tick(1, true, always_fits);
     }
@@ -370,13 +378,13 @@ fn revival_behind_unit_finishes_in_parallel() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(4);
     let unit = request(10, 100);
-    queue.queue(unit, &mut purse, &pool()).unwrap();
+    queue.queue(unit, &mut purse).unwrap();
     let hero = QueueRequest {
         item: ItemId::new(2),
         kind: EntryKind::Revival { builder: false },
         ..request(0, 30)
     };
-    let hero_id = queue.queue(hero, &mut purse, &pool()).unwrap();
+    let hero_id = queue.queue(hero, &mut purse).unwrap();
     for _ in 0..30 {
         queue.tick(1, true, always_fits);
     }
@@ -396,7 +404,7 @@ fn revival_clock_freezes_without_command_points() {
         kind: EntryKind::Revival { builder: false },
         ..request(0, 30)
     };
-    let hero_id = queue.queue(hero, &mut purse, &pool()).unwrap();
+    let hero_id = queue.queue(hero, &mut purse).unwrap();
     for _ in 0..10 {
         queue.tick(1, true, |_| false);
     }
@@ -427,12 +435,12 @@ fn unready_revival_at_head_blocks_upgrade() {
         kind: EntryKind::Revival { builder: false },
         ..request(0, 30)
     };
-    queue.queue(hero, &mut purse, &pool()).unwrap();
+    queue.queue(hero, &mut purse).unwrap();
     let upgrade = QueueRequest {
         kind: EntryKind::Upgrade,
         ..request(10, 50)
     };
-    let upgrade_id = queue.queue(upgrade, &mut purse, &pool()).unwrap();
+    let upgrade_id = queue.queue(upgrade, &mut purse).unwrap();
     for _ in 0..29 {
         queue.tick(1, true, always_fits);
     }
@@ -455,7 +463,7 @@ fn delivering_batch_beats_builder() {
         quantity: 3,
         ..request(300, 10)
     };
-    let batch_id = queue.queue(batch, &mut purse, &pool()).unwrap();
+    let batch_id = queue.queue(batch, &mut purse).unwrap();
     for _ in 0..10 {
         queue.tick(1, true, always_fits);
     }
@@ -465,7 +473,7 @@ fn delivering_batch_beats_builder() {
         kind: EntryKind::Unit { builder: true },
         ..request(10, 10)
     };
-    queue.queue(porter, &mut purse, &pool()).unwrap();
+    queue.queue(porter, &mut purse).unwrap();
     assert_eq!(
         queue.entry_to_process(),
         Some(batch_id),
@@ -477,19 +485,19 @@ fn delivering_batch_beats_builder() {
 fn one_cap_counts_units_upgrades_and_revivals() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(3);
-    queue.queue(request(10, 10), &mut purse, &pool()).unwrap();
+    queue.queue(request(10, 10), &mut purse).unwrap();
     let upgrade = QueueRequest {
         kind: EntryKind::Upgrade,
         ..request(10, 10)
     };
-    queue.queue(upgrade, &mut purse, &pool()).unwrap();
+    queue.queue(upgrade, &mut purse).unwrap();
     let hero = QueueRequest {
         kind: EntryKind::Revival { builder: false },
         ..request(10, 10)
     };
-    queue.queue(hero, &mut purse, &pool()).unwrap();
+    queue.queue(hero, &mut purse).unwrap();
     assert!(matches!(
-        queue.queue(request(10, 10), &mut purse, &pool()),
+        queue.queue(request(10, 10), &mut purse),
         Err(Refusal::QueueFull { limit: 3 })
     ));
 }
@@ -498,7 +506,7 @@ fn one_cap_counts_units_upgrades_and_revivals() {
 fn misfit_unit_stalls_in_place() {
     let mut purse = Money::new(10_000);
     let mut queue = ProductionQueue::new(2);
-    let id = queue.queue(request(10, 100), &mut purse, &pool()).unwrap();
+    let id = queue.queue(request(10, 100), &mut purse).unwrap();
     for _ in 0..50 {
         queue.tick(1, true, always_fits);
     }
@@ -543,8 +551,8 @@ fn second_ready_revival_waits_for_cooldown() {
         kind: EntryKind::Revival { builder: false },
         ..request(0, 1)
     };
-    let first = queue.queue(hero, &mut purse, &pool()).unwrap();
-    let second = queue.queue(hero, &mut purse, &pool()).unwrap();
+    let first = queue.queue(hero, &mut purse).unwrap();
+    let second = queue.queue(hero, &mut purse).unwrap();
     queue.tick_revivals(always_fits);
     assert!(matches!(
         queue.tick(1, true, always_fits),

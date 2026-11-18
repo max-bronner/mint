@@ -55,10 +55,9 @@ pub(crate) fn encode(autosave: &Autosave) -> Result<Vec<u8>, SaveError> {
 
 pub(crate) fn file_name(format: Option<&str>, map_name: &str) -> String {
     let stem = match format {
-        Some(format) => format
-            .replace("%ls", map_name)
-            .replace("%s", map_name)
-            .replace("%S", map_name),
+        Some(format) => {
+            mint_sage_str::format_placeholder(format, mint_sage_str::Placeholder::Str(map_name))
+        }
         None => NAME_MISSING.to_owned(),
     };
     format!("{}{}", sanitised(&stem), mint_extension(BETWEEN_MISSIONS))
@@ -97,7 +96,7 @@ pub(crate) fn map_display_name(
         .unwrap_or_else(|| label.to_owned())
 }
 
-fn date_of(now: SystemTime) -> [u16; 8] {
+pub(crate) fn date_of(now: SystemTime) -> [u16; 8] {
     let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = i64::try_from(since.as_secs()).unwrap_or(0);
     let days = secs.div_euclid(86_400);
@@ -130,7 +129,7 @@ fn date_of(now: SystemTime) -> [u16; 8] {
     ]
 }
 
-fn save_folder() -> std::io::Result<PathBuf> {
+pub(crate) fn save_folder() -> std::io::Result<PathBuf> {
     crate::user_data::dir()
         .map(|dir| dir.join("Save"))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no user data folder"))
@@ -189,7 +188,7 @@ pub(crate) fn write_user_save(
     write_into(&folder, &name, &bytes)
 }
 
-fn write_into(folder: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+pub(crate) fn write_into(folder: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
     if has_retail_extension(name) || is_scratch_map_name(name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

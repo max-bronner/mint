@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn milliseconds_from_the_shipped_data_land_on_the_right_frame() {
-        let timing = LogicFrames::from_milliseconds(1_000);
+        let timing = LogicFrames::from_engine_milliseconds(1_000);
         assert_eq!(timing.get(), 30);
         let mut purse = Money::new(0);
         let mut deposit = AutoDeposit::new(timing, 20);

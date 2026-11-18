@@ -150,7 +150,8 @@ pub fn large_group_bonus_update_from_fields(
     }
     Ok(LargeGroupBonusUpdate {
         data: Arc::new(GroupBonusData {
-            cadence: LogicFrames::from_milliseconds(rate_ms).max(LogicFrames::ONE),
+            cadence: crate::special_ability_update::retail_duration_ticks(rate_ms)
+                .max(LogicFrames::ONE),
             member_filter: ObjectFilter::parse(&member_tokens),
             count,
             radius,

@@ -58,7 +58,7 @@ fn milliseconds_unchecked(ms: f32) -> LogicFrames {
     const MAX_MILLISECONDS: f32 = 86_400_000.0;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(MAX_MILLISECONDS) as u32;
-    LogicFrames::from_milliseconds(whole)
+    crate::special_ability_update::retail_duration_ticks(whole)
 }
 
 #[derive(Debug, Clone, PartialEq)]

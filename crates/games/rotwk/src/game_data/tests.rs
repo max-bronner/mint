@@ -1,6 +1,11 @@
 use super::*;
 
 #[test]
+fn rebuild_time_seconds_truncate_to_retail_frames_with_a_one_frame_floor() {
+    assert_eq!([0.3, 2.5, 0.0].map(rebuild_time_ticks), [6, 72, 6]);
+}
+
+#[test]
 fn retail_ini_order_never_loads_an_inc_fragment_directly() {
     let mut sources = MemorySources::new();
     sources.insert(
@@ -178,6 +183,21 @@ End
 ",
     );
     assert_eq!(data.builder_cycle_timeout_ms, SHIPPED_BUILDER_CYCLE_MS);
+}
+
+#[test]
+fn the_user_data_leaf_travels_in_the_parsed_data() {
+    let table = BlockTable::corpus_path();
+    let with = mint_sage_ini::Document::parse(
+        "gamedata.ini",
+        "GameData\n  UserDataLeafName = SomeLeaf\nEnd\n",
+        &table,
+    )
+    .unwrap();
+    let (data, _) = game_data_from_documents(&[with], 0, std::time::Instant::now());
+    assert_eq!(data.user_data_leaf.as_deref(), Some("SomeLeaf"));
+    let (without, _) = game_data_from_documents(&[], 0, std::time::Instant::now());
+    assert_eq!(without.user_data_leaf, None);
 }
 
 #[test]

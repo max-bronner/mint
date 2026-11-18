@@ -159,6 +159,7 @@ struct NodeState {
     g: u32,
     parent: u32,
     closed: bool,
+    extra: u32,
 }
 
 const NEIGHBOURS: [(i32, i32); 8] = [
@@ -260,13 +261,13 @@ impl<H: Heuristic> AStar<H> {
     }
 }
 
-fn step_cost(grid: &dyn Passability, to: Cell, diagonal: bool) -> u32 {
+const fn step_cost(extra: u32, diagonal: bool) -> u32 {
     let base = if diagonal {
         COST_DIAGONAL
     } else {
         COST_ORTHOGONAL
     };
-    base.saturating_add(grid.extra_cost(to))
+    base.saturating_add(extra)
 }
 
 pub(crate) fn offset(cell: Cell, delta: (i32, i32), extent: GridExtent) -> Option<Cell> {
@@ -324,6 +325,7 @@ impl<H: Heuristic> AStar<H> {
                 g: 0,
                 parent: start,
                 closed: false,
+                extra: grid.extra_cost(request.start),
             },
         );
         let h0 = self.heuristic.estimate(request.start, request.goal);
@@ -401,10 +403,18 @@ impl<H: Heuristic> AStar<H> {
                 let Some(index) = extent.index(neighbour) else {
                     continue;
                 };
-                let tentative = state.g.saturating_add(step_cost(grid, neighbour, diagonal));
                 let existing = self.state(index).unwrap_or_default();
                 let seen = existing.stamp == stamp;
-                if seen && (existing.closed || existing.g <= tentative) {
+                if seen && existing.closed {
+                    continue;
+                }
+                let extra = if seen {
+                    existing.extra
+                } else {
+                    grid.extra_cost(neighbour)
+                };
+                let tentative = state.g.saturating_add(step_cost(extra, diagonal));
+                if seen && existing.g <= tentative {
                     continue;
                 }
                 self.write(
@@ -414,6 +424,7 @@ impl<H: Heuristic> AStar<H> {
                         g: tentative,
                         parent: entry.node,
                         closed: false,
+                        extra,
                     },
                 );
                 let h = self.heuristic.estimate(neighbour, request.goal);
@@ -464,6 +475,7 @@ impl<H: Heuristic> AStar<H> {
                 g: 0,
                 parent: start_index,
                 closed: false,
+                extra: grid.extra_cost(start),
             },
         );
         let h0 = self
@@ -537,10 +549,18 @@ impl<H: Heuristic> AStar<H> {
                 let Some(index) = extent.index(neighbour) else {
                     continue;
                 };
-                let tentative = state.g.saturating_add(step_cost(grid, neighbour, diagonal));
                 let existing = self.state(index).unwrap_or_default();
                 let seen = existing.stamp == stamp;
-                if seen && (existing.closed || existing.g <= tentative) {
+                if seen && existing.closed {
+                    continue;
+                }
+                let extra = if seen {
+                    existing.extra
+                } else {
+                    grid.extra_cost(neighbour)
+                };
+                let tentative = state.g.saturating_add(step_cost(extra, diagonal));
+                if seen && existing.g <= tentative {
                     continue;
                 }
                 self.write(
@@ -550,6 +570,7 @@ impl<H: Heuristic> AStar<H> {
                         g: tentative,
                         parent: entry.node,
                         closed: false,
+                        extra,
                     },
                 );
                 let h = self

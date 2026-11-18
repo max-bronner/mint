@@ -156,27 +156,34 @@ pub(crate) fn launch_bones(
         let Some(state) = module.model_states.iter().find(|state| state.is_default()) else {
             continue;
         };
-        let wanted: Vec<(usize, &str)> = state
-            .launch_bones
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, bone)| Some((slot, bone.as_deref()?)))
-            .filter(|(slot, _)| found.get(*slot).is_some_and(|held| held.rest.is_empty()))
+        let open: Vec<usize> = (0..found.len())
+            .filter(|slot| found.get(*slot).is_some_and(|held| held.rest.is_empty()))
             .collect();
-        let Some(model) = state.model.as_deref().or(module.model) else {
-            continue;
-        };
-        if wanted.is_empty() {
-            continue;
-        }
-        let Ok(loaded) = mint_sage_model::load_model(vfs, resolver, model) else {
-            continue;
-        };
-        let Some(hierarchy) = loaded.hierarchy.as_ref() else {
-            continue;
-        };
-        for (slot, bone) in wanted {
-            let rest = numbered_bones(hierarchy, bone);
+        let hierarchy = state
+            .model
+            .as_deref()
+            .or(module.model)
+            .and_then(|model| mint_sage_model::load_model(vfs, resolver, model).ok())
+            .and_then(|loaded| loaded.hierarchy);
+        for slot in open {
+            let rest = state
+                .launch_bones
+                .get(slot)
+                .and_then(Option::as_deref)
+                .zip(hierarchy.as_ref())
+                .map(|(bone, hierarchy)| numbered_bones(hierarchy, bone))
+                .unwrap_or_default();
+            if rest.is_empty() {
+                let conditioned = conditioned_launch(vfs, resolver, template, &module, slot);
+                if let Some(held) = found.get_mut(slot) {
+                    held.poses.extend(conditioned);
+                }
+                continue;
+            }
+            let Some(bone) = state.launch_bones.get(slot).and_then(Option::as_deref) else {
+                continue;
+            };
+            let model = state.model.as_deref().or(module.model).unwrap_or("");
             crate::diag::diag!(
                 "weapon: {template} slot {slot} launches from {} {bone} bone(s) on {model}, the first at {:?}",
                 rest.len(),
@@ -208,13 +215,55 @@ pub(crate) fn launch_bones(
                         bones: posed.unwrap_or_else(|| rest.clone()),
                     }
                 })
-                .collect();
+                .collect::<Vec<_>>();
             if let Some(held) = found.get_mut(slot) {
-                *held = SlotLaunch { rest, poses };
+                held.poses.extend(poses);
+                held.rest = rest;
             }
         }
     }
     found
+}
+
+fn conditioned_launch(
+    vfs: &Vfs,
+    resolver: &Resolver,
+    template: &str,
+    module: &mint_sage_ini::DrawModuleView<'_>,
+    slot: usize,
+) -> Vec<FiringPose> {
+    let mut poses = Vec::new();
+    for state in module
+        .model_states
+        .iter()
+        .filter(|state| !state.is_default())
+    {
+        let (Some(bone), Some(model)) = (
+            state.launch_bones.get(slot).and_then(Option::as_deref),
+            state.model.as_deref(),
+        ) else {
+            continue;
+        };
+        let bones = mint_sage_model::load_model(vfs, resolver, model)
+            .ok()
+            .and_then(|loaded| loaded.hierarchy)
+            .map(|hierarchy| numbered_bones(&hierarchy, bone))
+            .unwrap_or_default();
+        if bones.is_empty() {
+            continue;
+        }
+        crate::diag::diag!(
+            "weapon: {template} slot {slot} [{}] launches from {} {bone} bone(s) on {model}, the first at {:?}",
+            state.conditions.join(" "),
+            bones.len(),
+            bones.first().map(|perch| perch.position)
+        );
+        poses.push(FiringPose {
+            requires: state.conditions.clone(),
+            bones,
+        });
+    }
+    poses
 }
 
 #[cfg(test)]

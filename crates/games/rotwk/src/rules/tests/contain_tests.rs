@@ -165,8 +165,25 @@ Object TestPrivileged\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   LocomotorSet\n    Locomotor = TestFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Locomotor TestSwivel\n  Surfaces = GROUND\n  TurnTime = 2000\nEnd\n\
-Weapon TestBow\n  AttackRange = 100\n  DelayBetweenShots = 500\n  \
+Weapon TestBow\n  AttackRange = 100\n  DelayBetweenShots = 500\n  CanFireWhileMoving = Yes\n  \
   DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+Weapon TestMuteBow\n  AttackRange = 100\n  DelayBetweenShots = 500\n  \
+  DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+Object TestMuteRider\n  Side = Men\n  KindOf = INFANTRY IMMOBILE UNATTACKABLE\n  VisionRange = 200\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY TestMuteBow\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes\n    \
+    CanAttackWhileContained = Yes\n    MoodAttackCheckRate = 100\n  End\n  \
+  LocomotorSet\n    Locomotor = TestSwivel\n    Condition = SET_NORMAL\n    Speed = 0\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object TestMuteMount\n  Side = Men\n  KindOf = SELECTABLE TRANSPORT\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = HordeTransportContain Tag_Howdah\n    \
+    ObjectStatusOfContained = UNSELECTABLE UNATTACKABLE CAN_ATTACK\n    Slots = 1\n    \
+    PassengerFilter = NONE +TestMuteRider\n    AllowOwnPlayerInsideOverride = Yes\n    \
+    ForceOrientationContainer = No\n    InitialPayload = TestMuteRider 1\n  End\n  \
+  LocomotorSet\n    Locomotor = TestFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 40\nEnd\n\
 Weapon TestSmash\n  AttackRange = 100\n  DelayBetweenShots = 60000\n  HitPercentage = 100\n  \
   DamageNugget\n    Damage = 920\n    DamageType = CRUSH\n  End\nEnd\n\
 Object TestBasher\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
@@ -322,6 +339,8 @@ fn load() -> Base {
         "TestLaggard",
         "TestPricker",
         "TestMount",
+        "TestMuteMount",
+        "TestMuteRider",
         "TestCrewMember",
         "TestSiege",
         "TestSiegeNoCrew",
@@ -1018,16 +1037,25 @@ fn a_rider_turns_on_its_mount_to_face_its_victim_and_then_shoots() {
 }
 
 #[test]
-fn a_riders_shot_does_not_wait_for_its_mount_to_stop() {
+fn a_flagged_riders_shot_does_not_wait_for_its_mount_to_stop() {
+    assert!(rider_shoots_while_mount_walks("TestMount"));
+}
+
+#[test]
+fn an_unflagged_rider_holds_fire_while_its_mount_moves() {
+    assert!(!rider_shoots_while_mount_walks("TestMuteMount"));
+}
+
+fn rider_shoots_while_mount_walks(mount_name: &str) -> bool {
     let b = load();
     let (mut simulation, ids) = start_owned(
         &b,
         &[
-            ("TestMount", 300.0, 300.0, PLAYER),
+            (mount_name, 300.0, 300.0, PLAYER),
             ("TestSoldier", 300.0, 360.0, OTHER),
         ],
     );
-    let mount = of_kind(&b, &simulation, ids, "TestMount");
+    let mount = of_kind(&b, &simulation, ids, mount_name);
     let victim = of_kind(&b, &simulation, ids, "TestSoldier");
     simulation
         .submit(
@@ -1064,10 +1092,15 @@ fn a_riders_shot_does_not_wait_for_its_mount_to_stop() {
                 pos.x > 300.5,
                 "the mount never got moving before the shot landed: {pos:?}"
             );
-            return;
+            return true;
         }
     }
-    panic!("the rider never shot while its mount moved");
+    let pos = simulation.state().get(ids.body, mount).unwrap().0.position;
+    assert!(
+        pos.x > 300.5,
+        "the mount never moved, so holding fire proves nothing: {pos:?}"
+    );
+    false
 }
 
 #[test]

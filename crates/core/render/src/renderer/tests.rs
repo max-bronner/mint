@@ -45,9 +45,9 @@ fn the_uniform_block_is_exactly_what_the_shader_declares() {
         shadow_params: [0.0; 4],
         shadow_filter: [0.0; 4],
         shadow_cascade_params: [[0.0; 4]; MAX_SHADOW_CASCADES],
-        set_directions: [[0.0; 4]; 6],
-        set_colors: [[0.0; 4]; 6],
-        set_ambient: [[0.0; 4]; 2],
+        set_directions: [[0.0; 4]; SET_LIGHTS],
+        set_colors: [[0.0; 4]; SET_LIGHTS],
+        set_ambient: [[0.0; 4]; LIGHT_SET_COUNT],
         cookie: [0.0; 4],
         cookie_tint: [0.0; 4],
         inv_view_proj: Mat4::IDENTITY.to_cols(),
@@ -58,9 +58,9 @@ fn the_uniform_block_is_exactly_what_the_shader_declares() {
     assert_eq!(
         frame.to_bytes().len() as u64,
         FRAME_UNIFORM_SIZE,
-        "`Frame` declares three mat4x4, two three-element vec4 arrays, six vec4, the light \
-             sets' two six-element and one two-element vec4 arrays and two vec4: \
-             48 + 24 + 24 + 64 floats"
+        "`Frame` declares the matrices, light and shadow arrays, the light sets' two \
+             twelve-element and one four-element vec4 arrays and the trailing vec4s: \
+             316 floats"
     );
     assert_eq!(frame.floats().1, FRAME_UNIFORM_FLOATS);
     assert_eq!(FRAME_UNIFORM_FLOATS as u64 * 4, FRAME_UNIFORM_SIZE);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::lobby::{Catalogue, Difficulty, SlotSetup};
+use crate::lobby::{Catalogue, Difficulty, Occupant, SlotSetup};
 
 fn labels() -> GridLabels {
     GridLabels {
@@ -33,6 +33,8 @@ fn setup() -> SkirmishSetup {
         spawn_buildings: None,
         dummies: None,
         dummies_attack: false,
+        drive_templates: Vec::new(),
+        wotr: None,
         cah_hero: None,
         random_seed: 5,
         resolved: None,
@@ -90,6 +92,39 @@ fn occupied_slots_take_consecutive_rows_in_slot_order() {
     let rows = rows_of(&setup());
     let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, ["Me", "H", "B"]);
+    assert_eq!(
+        rows.iter().map(|r| r.local).collect::<Vec<_>>(),
+        [true, false, false]
+    );
+}
+
+#[test]
+fn a_setup_with_only_resolved_seats_marks_its_human_row_local() {
+    let mut setup = setup();
+    let players = {
+        let catalogue = Catalogue {
+            factions: vec!["Mine".to_owned()],
+            random_pool: vec!["PoolOnly".to_owned()],
+            colours: 3,
+            starts: 4,
+            ..Catalogue::default()
+        };
+        let starts = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]];
+        setup.resolve(5, &catalogue, &starts).unwrap()
+    };
+    setup.slots.clear();
+    let show = ShowRandom {
+        template: true,
+        colour: true,
+    };
+    let rows = rows(
+        &setup,
+        &players,
+        &labels(),
+        show,
+        &|n| n.to_owned(),
+        &|_| true,
+    );
     assert_eq!(
         rows.iter().map(|r| r.local).collect::<Vec<_>>(),
         [true, false, false]

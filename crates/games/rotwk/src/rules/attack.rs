@@ -7,11 +7,22 @@ pub(super) const CLAIM_BUCKET: f32 = 128.0;
 
 const STOP_CHASE_DISTANCE: f32 = 500.0;
 
+const SHORTCUT_STEP: f32 = 5.0;
+const SHORTCUT_STEPS: u8 = 9;
+const SHORTCUT_EXTRA: f32 = 10.0;
+
 const MELEE_GOAL_STEP: f32 = 10.0;
 
 const ATTACK_MOVE_RETRY_LIMIT: u32 = 5;
 
 const ATTACK_MOVE_DONE_RADIUS: f32 = 80.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Order,
+    Force,
+    Script,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RangedApproach {
@@ -107,7 +118,22 @@ struct GroupFacts {
 }
 
 impl RotwkRules {
+    pub(super) fn tick_snapshot(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+    ) -> (Vec<(Foe, PlayerId)>, TargetGrid, f32) {
+        let living = self.living(tick, ids);
+        let grid = TargetGrid::build(&living);
+        let global_max_radius = living
+            .iter()
+            .map(|(foe, _)| foe.radius)
+            .fold(0.0f32, f32::max);
+        (living, grid, global_max_radius)
+    }
+
     pub(super) fn living(&self, tick: &Tick<'_>, ids: Ids) -> Vec<(Foe, PlayerId)> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("living_walk"));
         let Some(health) = tick.state().store(ids.health) else {
             return Vec::new();
         };
@@ -159,7 +185,7 @@ impl RotwkRules {
         player: PlayerId,
         target: Entity,
     ) -> Result<()> {
-        self.attack_object_order(tick, ids, player, target, false)
+        self.attack_object_order(tick, ids, player, target, Admission::Order)
     }
 
     pub(super) fn force_attack_object(
@@ -169,7 +195,17 @@ impl RotwkRules {
         player: PlayerId,
         target: Entity,
     ) -> Result<()> {
-        self.attack_object_order(tick, ids, player, target, true)
+        self.attack_object_order(tick, ids, player, target, Admission::Force)
+    }
+
+    pub(super) fn script_attack_object(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        player: PlayerId,
+        target: Entity,
+    ) -> Result<()> {
+        self.attack_object_order(tick, ids, player, target, Admission::Script)
     }
 
     fn attack_object_order(
@@ -178,8 +214,10 @@ impl RotwkRules {
         ids: Ids,
         player: PlayerId,
         target: Entity,
-        forced: bool,
+        admission: Admission,
     ) -> Result<()> {
+        let forced = admission == Admission::Force;
+        let relation_free = admission != Admission::Order;
         if !tick.state().is_live(target) || tick.state().contains(ids.concealed, target) {
             return Ok(());
         }
@@ -204,7 +242,8 @@ impl RotwkRules {
                 contained: false,
                 kind_of: target_kind_of,
                 is_structure: target_kind_of.contains(KindOf::STRUCTURE),
-                seen: self.sees(tick.state(), ids, player, target),
+                seen: admission == Admission::Script
+                    || self.sees(tick.state(), ids, player, target),
                 script_targetable: self.script_status_bit(
                     tick.state(),
                     ids,
@@ -212,7 +251,7 @@ impl RotwkRules {
                     super::map_scripts::ScriptStatusBit::Targetable,
                 ),
             },
-            if forced {
+            if relation_free {
                 mint_sage_combat::Mode::Force
             } else {
                 mint_sage_combat::Mode::Order
@@ -270,7 +309,7 @@ impl RotwkRules {
                     planned: false,
                     horde: None,
                     guard: false,
-                    forced,
+                    relation_free,
                     order_owner: target_owner,
                 },
             )?;
@@ -327,7 +366,7 @@ impl RotwkRules {
                     planned: false,
                     horde,
                     guard: false,
-                    forced,
+                    relation_free,
                     order_owner: victim_owner,
                 },
             )?;
@@ -616,6 +655,7 @@ impl RotwkRules {
         victim: Entity,
         victim_at: Vec2,
     ) -> Option<Vec2> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("melee_destination"));
         let back = from.minus(victim_at);
         let facing = Facing::from_vector(back.scale(-1.0))?;
         let (square, _, offset) = self.claim_at(tick, ids, horde_entity, victim_at, facing)?;
@@ -880,10 +920,27 @@ impl RotwkRules {
         entity: Entity,
         template: &mint_sage_combat::WeaponTemplate,
     ) -> f32 {
-        let range = template.attack_range * self.weapon_bonus(world, ids, entity, template).range();
+        let range = template.reach(self.weapon_bonus(world, ids, entity, template).range());
         world
             .get(ids.bonuses, entity)
             .map_or(range, |bonuses| bonuses.0.range(range))
+    }
+
+    pub(super) fn min_range_of(
+        &self,
+        world: &World,
+        entity: Entity,
+        template: &mint_sage_combat::WeaponTemplate,
+    ) -> f32 {
+        let contesting = self
+            .modules
+            .as_ref()
+            .is_some_and(|wiring| wiring.carries_status(world, entity, "CONTESTING_BUILDING"));
+        if contesting {
+            0.0
+        } else {
+            template.minimum_reach()
+        }
     }
 
     pub(super) fn idle_scan_of(
@@ -1024,6 +1081,131 @@ impl RotwkRules {
             .flatten()
     }
 
+    pub(super) fn horde_rangefinder_weapon(
+        &self,
+        horde: &Horde,
+    ) -> Option<(
+        mint_sage_combat::WeaponId,
+        &mint_sage_combat::WeaponTemplate,
+    )> {
+        let id = self
+            .horde_rangefinder_weapons
+            .get(usize::from(horde.formation))
+            .copied()
+            .flatten()?;
+        Some((id, self.combat.weapons.get(id)?))
+    }
+
+    pub(super) fn horde_rangefinder_min(&self, horde: &Horde) -> f32 {
+        self.horde_rangefinder_weapon(horde)
+            .map_or(0.0, |(_, template)| template.minimum_reach())
+    }
+
+    pub(super) fn rangefinder_fired(&self, horde: &Horde, now: Frame) -> bool {
+        self.horde_rangefinder_weapon(horde).is_none()
+            || horde
+                .rangefinder
+                .is_some_and(|state| state.last_shot() == Some(now))
+    }
+
+    fn fire_rangefinder(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        horde_entity: Entity,
+        horde: &Horde,
+        goal: Entity,
+    ) -> Result<()> {
+        let (Some(range), Some((_, template))) = (
+            self.horde_rangefinder(horde),
+            self.horde_rangefinder_weapon(horde),
+        ) else {
+            return Ok(());
+        };
+        let bonuses = tick.state().get(ids.bonuses, horde_entity).map(|b| b.0);
+        let (Some(here), Some(theirs)) = (
+            tick.state()
+                .get(ids.body, horde_entity)
+                .map(|b| b.0.position),
+            tick.state().get(ids.body, goal).map(|b| b.0.position),
+        ) else {
+            return Ok(());
+        };
+        let reaches = in_range(
+            here,
+            Self::mover_radius(tick, ids, horde_entity),
+            theirs,
+            Self::mover_radius(tick, ids, goal),
+            self.horde_rangefinder_min(horde),
+            bonuses.map_or(range, |bonuses| bonuses.range(range)),
+        );
+        if !reaches {
+            return Ok(());
+        }
+        let now = tick.frame();
+        let mut state = horde
+            .rangefinder
+            .unwrap_or_else(|| mint_sage_combat::WeaponState::new(template));
+        if state.status(now) != mint_sage_combat::WeaponStatus::ReadyToFire {
+            return Ok(());
+        }
+        let rate = bonuses.map_or(1.0, |bonuses| bonuses.rate_of_fire);
+        state.fire_at_rate(template, now, rate, tick.rng());
+        if let Some(live) = tick.state_mut().get_mut(ids.horde, horde_entity) {
+            live.rangefinder = Some(state);
+        }
+        Ok(())
+    }
+
+    fn ground_test<'a>(
+        &'a self,
+        tick: &'a Tick<'_>,
+        ids: Ids,
+        mover: Entity,
+        here: Vec2,
+    ) -> impl Fn(Vec2) -> bool + 'a {
+        let class = self.mover_class(tick, ids, mover);
+        let start = self.passable_cell(tick, ids, here);
+        let view = self.dynamic_view(tick, ids);
+        move |at: Vec2| {
+            self.passability.cell_at(at).is_some_and(|cell| {
+                view.is_passable(cell, class)
+                    && start.is_none_or(|s| self.reachable(class, s, cell))
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attack_shortcut(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        mover: Entity,
+        (here, mover_radius): (Vec2, f32),
+        (theirs, their_radius): (Vec2, f32),
+        (min_range, max_range): (f32, f32),
+        allowed: impl Fn(Vec2) -> bool,
+    ) -> Option<Vec2> {
+        let direction = theirs.minus(here).normalised()?;
+        let class = self.mover_class(tick, ids, mover);
+        let ground = self.ground_test(tick, ids, mover, here);
+        (1u8..=SHORTCUT_STEPS)
+            .map(|i| here.plus(direction.scale(SHORTCUT_STEP * f32::from(i))))
+            .find(|&at| {
+                crate::combat::in_range_beyond(
+                    at,
+                    mover_radius,
+                    theirs,
+                    their_radius,
+                    SHORTCUT_EXTRA,
+                    min_range,
+                    max_range,
+                ) && ground(at)
+                    && allowed(at)
+                    && self.line_clear(tick, ids, class, here, at)
+            })
+    }
+
     fn ranged_horde_spot(
         &self,
         tick: &mut Tick<'_>,
@@ -1052,7 +1234,8 @@ impl RotwkRules {
             Self::mover_radius(tick, ids, horde_entity),
             Self::mover_radius(tick, ids, goal),
         );
-        let reaches = |at: Vec2| in_range(at, mine_r, theirs, their_r, 0.0, range);
+        let minimum = self.horde_rangefinder_min(horde);
+        let reaches = |at: Vec2| in_range(at, mine_r, theirs, their_r, minimum, range);
         let routed = tick
             .state()
             .get(ids.path, horde_entity)
@@ -1085,6 +1268,9 @@ impl RotwkRules {
                 if !(cooled && super::movement::goal_moved(here, plan.victim_at, theirs)) {
                     return Ok(plan.attack_path.then_some(plan.goal));
                 }
+                if reaches(here) {
+                    return Ok(Some(here));
+                }
                 tick.state_mut().insert(
                     ids.ranged_approach,
                     horde_entity,
@@ -1094,6 +1280,9 @@ impl RotwkRules {
                     },
                 )?;
             }
+        }
+        if self.fleeing(tick, ids, here, goal) {
+            return Ok(None);
         }
         let away = here.minus(theirs);
         let facing = Facing::from_vector(away.scale(-1.0)).unwrap_or(Facing::EAST);
@@ -1109,26 +1298,17 @@ impl RotwkRules {
         let allies = |at: Vec2| {
             units.allied_goals(square_cells(geometry, at.plus(offset), square.half_along))
         };
-        let mover = self.mover_class(tick, ids, horde_entity);
-        let start = self.passable_cell(tick, ids, here);
-        let view = self.dynamic_view(tick, ids);
-        let ground = |at: Vec2| {
-            self.passability.cell_at(at).is_some_and(|cell| {
-                view.is_passable(cell, mover)
-                    && start.is_none_or(|s| self.reachable(mover, s, cell))
-            })
-        };
-        if let Some(direction) = theirs.minus(here).normalised() {
-            for i in 1u8..=9 {
-                let at = here.plus(direction.scale(5.0 * f32::from(i)));
-                if reaches(at)
-                    && ground(at)
-                    && allies(at).is_some()
-                    && self.line_clear(tick, ids, mover, here, at)
-                {
-                    return Ok(Some(at));
-                }
-            }
+        let ground = self.ground_test(tick, ids, horde_entity, here);
+        if let Some(at) = self.attack_shortcut(
+            tick,
+            ids,
+            horde_entity,
+            (here, mine_r),
+            (theirs, their_r),
+            (minimum, range),
+            |at| allies(at).is_some(),
+        ) {
+            return Ok(Some(at));
         }
         let mut fewest: Option<(u32, Vec2)> = None;
         for &(x, y) in melee_search_offsets(self.max_cells_adjust_destination) {
@@ -1151,7 +1331,40 @@ impl RotwkRules {
         Ok(fewest.map(|(_, at)| at))
     }
 
-    fn note_ranged_plan(
+    pub(super) fn ranged_plan_victim_at(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        planned: Vec2,
+        victim: Entity,
+    ) -> Option<Vec2> {
+        tick.state()
+            .get(ids.ranged_approach, entity)
+            .filter(|plan| plan.goal == planned && plan.victim == victim)
+            .map(|plan| plan.victim_at)
+    }
+
+    pub(super) fn walking_attack_path(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        victim: Entity,
+    ) -> bool {
+        tick.state()
+            .get(ids.path, entity)
+            .filter(|path| path.kind == PathKind::Closing)
+            .is_some_and(|path| {
+                tick.state()
+                    .get(ids.ranged_approach, entity)
+                    .is_some_and(|plan| {
+                        plan.attack_path && plan.goal == path.goal && plan.victim == victim
+                    })
+            })
+    }
+
+    pub(super) fn note_ranged_plan(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
@@ -1197,6 +1410,10 @@ impl RotwkRules {
         world
             .get(ids.shape, target)
             .is_some_and(|shape| shape.kind_of.contains(KindOf::UNATTACKABLE))
+            || self
+                .modules
+                .as_ref()
+                .is_some_and(|wiring| wiring.carries_status(world, target, "UNATTACKABLE"))
             || self
                 .contained_status(world, ids, target)
                 .is_some_and(|status| {
@@ -1307,6 +1524,7 @@ impl RotwkRules {
         clicked: Option<Entity>,
         spillover: Option<(&[(Foe, PlayerId)], PlayerId)>,
     ) -> Option<Entity> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("adjust_victim"));
         let mut members: Vec<Foe> = tick
             .state()
             .get(ids.horde, horde)?
@@ -1390,7 +1608,23 @@ impl RotwkRules {
         member: &Foe,
         range: f32,
         current: Option<Entity>,
+        living: &[(Foe, PlayerId)],
     ) -> Result<Option<Foe>> {
+        let now = tick.frame();
+        let horde_state = tick
+            .state()
+            .get(ids.member, member.entity)
+            .and_then(|entry| tick.state().get(ids.horde, entry.horde))
+            .map(|horde| {
+                (
+                    self.horde_rangefinder(horde).is_some(),
+                    self.rangefinder_fired(horde, now),
+                )
+            });
+        if let Some((true, fired)) = horde_state {
+            return self
+                .rangefinder_member_victim(tick, ids, member, range, current, living, fired);
+        }
         let released = tick
             .state()
             .get(ids.member, member.entity)
@@ -1457,6 +1691,92 @@ impl RotwkRules {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn rangefinder_member_victim(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        member: &Foe,
+        range: f32,
+        current: Option<Entity>,
+        living: &[(Foe, PlayerId)],
+        fired: bool,
+    ) -> Result<Option<Foe>> {
+        let keep = current.and_then(|victim| {
+            let at = living
+                .binary_search_by_key(&victim, |(foe, _)| foe.entity)
+                .ok()?;
+            living.get(at).map(|(foe, _)| *foe)
+        });
+        if !fired {
+            return Ok(keep);
+        }
+        let Some(entry) = tick.state().get(ids.member, member.entity).copied() else {
+            return Ok(keep);
+        };
+        let rank = entry.slot.and_then(|slot| {
+            let horde = tick.state().get(ids.horde, entry.horde)?;
+            Some((horde.slots.get(usize::from(slot))?.rank, horde.formation))
+        });
+        let Some((rank, formation)) = rank else {
+            return Ok(keep);
+        };
+        if super::upgrades::is_moving(tick, ids, member.entity) {
+            return Ok(keep);
+        }
+        let melee = tick
+            .state()
+            .get(ids.armed, member.entity)
+            .and_then(|armed| self.combat.weapons.get(armed.weapon))
+            .is_some_and(|template| template.melee);
+        if melee {
+            self.stop_to_fire(tick, ids, member.entity)?;
+            return Ok(keep);
+        }
+        let released = self
+            .formations
+            .get(usize::from(formation))
+            .is_some_and(|table| table.settings().ranks_to_release.contains(&rank));
+        if !released {
+            return Ok(keep);
+        }
+        let Some(victims) = self.horde_victims(tick, ids, member.entity) else {
+            return Ok(keep);
+        };
+        if keep.is_some_and(|held| victims.iter().any(|foe| foe.entity == held.entity)) {
+            return Ok(keep);
+        }
+        let from_horde = victims
+            .first()
+            .is_some_and(|foe| tick.state().contains(ids.member, foe.entity));
+        if !from_horde {
+            return Ok(victims.into_iter().next().or(keep));
+        }
+        let mut best: Option<(f32, Foe)> = None;
+        for foe in victims {
+            let (dx, dy, dz) = (
+                foe.position.x - member.position.x,
+                foe.position.y - member.position.y,
+                foe.z - member.z,
+            );
+            let distance =
+                ((dx * dx + dy * dy + dz * dz).sqrt() - member.radius - foe.radius).max(0.0);
+            if range > 0.0 && distance >= range {
+                continue;
+            }
+            let jittered = if range > 0.0 {
+                let draw = tick.rng().next_f32();
+                distance * (SELECT_JITTER_LOW + (SELECT_JITTER_HIGH - SELECT_JITTER_LOW) * draw)
+            } else {
+                distance
+            };
+            if best.is_none_or(|(held, _)| jittered < held) {
+                best = Some((jittered, foe));
+            }
+        }
+        Ok(best.map(|(_, foe)| foe).or(keep))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn advance_group_attacks(
         &self,
         tick: &mut Tick<'_>,
@@ -1476,10 +1796,12 @@ impl RotwkRules {
             .unwrap_or_default();
         let formations_on = self.modes(tick, ids).formation == FormationMode::On;
         let mut fighting: BTreeSet<Entity> = BTreeSet::new();
+        let decide_perf = crate::perf::sub(crate::perf::sub_row!("decide_group_attacks"));
         let decided: Vec<GroupDecision> = hordes
             .iter()
             .map(|&horde_entity| self.decide_group_attack(tick, ids, horde_entity))
             .collect();
+        drop(decide_perf);
         for (horde_entity, decision) in hordes.into_iter().zip(decided) {
             debug_assert_eq!(
                 format!("{decision:?}"),
@@ -1547,7 +1869,7 @@ impl RotwkRules {
                     }
                 }
             }
-            if let (Some(order), Some(_)) = (ordered.filter(|order| order.forced), owner) {
+            if let (Some(order), Some(_)) = (ordered.filter(|order| order.relation_free), owner) {
                 let target_owner = tick.state().get(ids.owner, order.target).map(|o| o.0);
                 let changed = target_owner != order.order_owner;
                 let still_non_enemy =
@@ -1559,7 +1881,8 @@ impl RotwkRules {
             }
             let ordered_target = ordered
                 .filter(|order| {
-                    order.forced || self.object_hostile(tick.state(), horde_entity, order.target)
+                    order.relation_free
+                        || self.object_hostile(tick.state(), horde_entity, order.target)
                 })
                 .map(|order| order.target)
                 .filter(|target| self.target_is_live(tick, ids, *target));
@@ -1704,6 +2027,9 @@ impl RotwkRules {
             if let Some(owner) = owner {
                 self.attack_state_uncohere(tick, ids, horde_entity, owner, target);
             }
+            if formations_on && self.melee_rangefinder(&horde).is_none() {
+                self.fire_rangefinder(tick, ids, horde_entity, &horde, goal)?;
+            }
             let dx = body.0.position.x - target_body.0.position.x;
             let dy = body.0.position.y - target_body.0.position.y;
             let holds = ordered_target.is_none()
@@ -1712,9 +2038,11 @@ impl RotwkRules {
             let stand_off_spot = horde
                 .members
                 .iter()
-                .filter_map(|member| tick.state().get(ids.armed, *member))
-                .filter_map(|armed| self.combat.weapons.get(armed.weapon))
-                .map(|template| template.minimum_attack_range)
+                .filter_map(|member| {
+                    let armed = tick.state().get(ids.armed, *member)?;
+                    let template = self.combat.weapons.get(armed.weapon)?;
+                    Some(self.min_range_of(tick.state(), *member, template))
+                })
                 .reduce(f32::min)
                 .filter(|min_range| *min_range > 0.0 && !holds)
                 .and_then(|min_range| {
@@ -1794,14 +2122,12 @@ impl RotwkRules {
                 if spot.minus(body.0.position).length() < 1.0 {
                     self.end_group_closing(tick, ids, horde_entity);
                 } else {
-                    self.close_on_target(
+                    self.close_on_attack_spot(
                         tick,
                         ids,
                         horde_entity,
                         body.0.position,
                         spot,
-                        0.0,
-                        PathKind::Closing,
                         budgets,
                     )?;
                     self.note_ranged_plan(
@@ -1878,6 +2204,7 @@ impl RotwkRules {
             .get(ids.guard, horde_entity)
             .is_some_and(super::guard::Guard::returning)
             || Self::emotion_holds(world, ids, horde_entity)
+            || world.contains(ids.ai_busy, horde_entity)
         {
             return GroupDecision::Skip;
         }

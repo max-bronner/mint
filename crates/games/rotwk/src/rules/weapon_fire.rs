@@ -2,7 +2,7 @@ use mint_movement::{MoverClass, Vec2};
 use mint_sage_asset::KindOf;
 use mint_sage_combat::{Point3, RadiusAffects, Relation, VictimRuleTable, WeaponId, WeaponStatus};
 use mint_sim::module::DestroyRequests;
-use mint_sim::{Effects, Entity, Frame, LogicFrames, PlayerId, Result, Tick, World};
+use mint_sim::{Effects, Entity, Frame, PlayerId, Result, Tick, World};
 
 use super::{Ids, RotwkRules};
 use crate::combat::{
@@ -1306,18 +1306,88 @@ impl RotwkRules {
                 shot.source.index(),
                 shot.weapon.index()
             );
-            self.fire_at_place(
-                tick,
-                ids,
-                shot.source,
-                shot.weapon,
-                shot.at,
-                shot.owner_if_gone,
-                events,
-                living,
-            )?;
+            let aimed_at = shot
+                .victim
+                .filter(|victim| !tick.state().contains(ids.horde, *victim))
+                .and_then(|victim| self.foe_of(tick, ids, victim));
+            match aimed_at {
+                Some(foe) => self.fire_at_object(
+                    tick,
+                    ids,
+                    shot.source,
+                    shot.weapon,
+                    &foe,
+                    shot.owner_if_gone,
+                    events,
+                    living,
+                )?,
+                None => self.fire_at_place(
+                    tick,
+                    ids,
+                    shot.source,
+                    shot.weapon,
+                    shot.at,
+                    shot.owner_if_gone,
+                    events,
+                    living,
+                )?,
+            }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fire_at_object(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        weapon: WeaponId,
+        target: &Foe,
+        owner_if_gone: Option<PlayerId>,
+        events: &mut Vec<DamageEvent>,
+        living: &[(Foe, PlayerId)],
+    ) -> Result<()> {
+        let roll = self.roll_shot(tick, ids, weapon, target);
+        let Some(launch) = self.module_launch(tick, ids, source, None) else {
+            return self.fire_at_place(
+                tick,
+                ids,
+                source,
+                weapon,
+                target.position,
+                owner_if_gone,
+                events,
+                living,
+            );
+        };
+        let shot = Shot {
+            owner_if_gone,
+            ..self.shot_at_foe(weapon, source, launch, target, roll.outcome)
+        };
+        diag!(
+            "weapon: fired from ({:.0},{:.0},{:.0}) at entity {}",
+            launch.x,
+            launch.y,
+            launch.z,
+            target.entity.index()
+        );
+        let melee = self
+            .combat
+            .weapons
+            .get(weapon)
+            .is_some_and(|template| template.melee);
+        let fx = if melee { target.entity } else { source };
+        self.launch_shot(
+            tick,
+            ids,
+            &shot,
+            fx,
+            target.position,
+            roll.passenger_roll,
+            living,
+            events,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1332,6 +1402,21 @@ impl RotwkRules {
         events: &mut Vec<DamageEvent>,
         living: &[(Foe, PlayerId)],
     ) -> Result<()> {
+        if let Some(launch) = self.module_launch(tick, ids, source, None) {
+            let shot = Shot {
+                owner_if_gone,
+                ..Shot::at_ground(weapon, source, launch, at, self.ground_height(at.x, at.y))
+            };
+            diag!(
+                "weapon: fired from ({:.0},{:.0},{:.0}) at the ground at ({:.0},{:.0})",
+                launch.x,
+                launch.y,
+                launch.z,
+                at.x,
+                at.y
+            );
+            return self.launch_shot(tick, ids, &shot, source, at, None, living, events);
+        }
         let shot = Shot {
             weapon,
             attacker: source,
@@ -1343,27 +1428,7 @@ impl RotwkRules {
             owner_if_gone,
         };
         let result = self.fire_shot(tick, ids, &shot, living)?;
-        let shooter_at = tick
-            .state()
-            .get(ids.body, source)
-            .map_or(at, |body| body.0.position);
-        diag!(
-            "weapon: fired at ({:.0},{:.0}); its FireFX plays at the shooter ({:.0},{:.0})",
-            at.x,
-            at.y,
-            shooter_at.x,
-            shooter_at.y
-        );
-        self.emit_weapon_fx(
-            tick,
-            ids,
-            weapon,
-            shooter_at,
-            source,
-            source,
-            Some(at),
-            None,
-        )?;
+        self.emit_weapon_fx(tick, ids, weapon, at, source, source, Some(at), None)?;
         if result.projectiles_unaimed > 0 {
             diag!(
                 "weapon: {} projectile nugget(s) fired at a place with nothing to fly at",
@@ -1373,6 +1438,31 @@ impl RotwkRules {
         self.apply_fire_result(tick, ids, weapon, &shot, result, events)
     }
 
+    pub(super) fn module_launch(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        slot: Option<usize>,
+    ) -> Option<Point3> {
+        let world = tick.state();
+        let position = world.get(ids.body, source)?.0.position;
+        let shape = world.get(ids.shape, source)?;
+        let me = Foe {
+            entity: source,
+            position,
+            z: Self::feet(world, ids, source),
+            radius: shape.radius,
+            height: shape.height,
+            is_structure: shape.kind_of.contains(KindOf::STRUCTURE),
+            airborne: None,
+            unattackable: false,
+            not_autoacquirable: false,
+            ai_kind_of: None,
+        };
+        Some(self.take_launch(tick, source, &me, slot))
+    }
+
     pub(super) fn fire_shot(
         &self,
         tick: &mut Tick<'_>,
@@ -1380,6 +1470,7 @@ impl RotwkRules {
         shot: &Shot,
         living: &[(Foe, PlayerId)],
     ) -> Result<FireResult> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("fire_shot"));
         let held = self.shooter_upgrades(tick, ids, shot.weapon, shot.attacker);
         let travel = shot
             .victim
@@ -1839,6 +1930,7 @@ impl RotwkRules {
                         },
                         (shot.centre.x, shot.centre.y),
                         direction,
+                        &|x, y| self.passability.underwater(Vec2::new(x, y)),
                     );
                     diag!(
                         "fire: FireLogicNugget {} lit at ({:.0},{:.0}), {} cell(s) now burning",
@@ -1910,7 +2002,7 @@ impl RotwkRules {
             .and_then(|list| list.duration_ms)
             .filter(|ms| *ms > 0)
             .map_or(Frame::FOREVER, |ms| {
-                now.checked_add(LogicFrames::from_milliseconds(ms))
+                now.checked_add(mint_sage_modules::retail_duration_ticks(ms))
                     .unwrap_or(Frame::FOREVER)
             })
     }

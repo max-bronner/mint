@@ -39,8 +39,8 @@ pub use nugget::{
     ProjectileNugget,
 };
 pub use projectile::{
-    highest_terrain_along, BezierArc, ProjectileFlight, DEFAULT_FIRST_PERCENT_HEIGHT,
-    DEFAULT_SECOND_PERCENT_HEIGHT,
+    bezier_length, bezier_points, highest_terrain_along, BezierArc, ProjectileFlight,
+    DEFAULT_FIRST_PERCENT_HEIGHT, DEFAULT_SECOND_PERCENT_HEIGHT,
 };
 pub use slow_death::{choose_slow_death, SlowDeathOption};
 pub use target::{nearest_target, sort_candidates, sort_victims, Candidate};

@@ -22,7 +22,7 @@ const OATH_FULLFILLED: &str = "OATH_FULLFILLED";
 const AOD_JUST_BUILT: &str = "JUST_BUILT";
 
 pub(crate) const JOIN_FADE_DURATION: mint_sim::LogicFrames =
-    mint_sim::LogicFrames::from_milliseconds(5_000);
+    mint_sim::LogicFrames::from_engine_milliseconds(5_000);
 
 const CATCH_UP_STEPS: f32 = 4.0;
 
@@ -70,6 +70,8 @@ pub(crate) struct Horde {
     pub(crate) centre: Vec2,
     pub(crate) climb_wall: Option<Entity>,
     pub(crate) climb_quiet: u8,
+    pub(crate) rangefinder: Option<mint_sage_combat::WeaponState>,
+    pub(crate) pools: Vec<(u16, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,6 +138,20 @@ impl Component for Horde {
             None => hasher.write_u8(0),
         }
         hasher.write_u8(self.climb_quiet);
+        match &self.rangefinder {
+            Some(state) => {
+                hasher.write_u8(1);
+                state.hash_into(hasher);
+            }
+            None => hasher.write_u8(0),
+        }
+        if !self.pools.is_empty() {
+            hasher.write_usize(self.pools.len());
+            for (kind, pool) in &self.pools {
+                hasher.write_u16(*kind);
+                hasher.write_f32(*pool);
+            }
+        }
     }
 }
 
@@ -665,7 +681,7 @@ fn large_unit_lift(
 ) -> f32 {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let timeout =
-        mint_sim::LogicFrames::from_milliseconds(sway.large_unit_timeout_ms.max(0.0) as u32);
+        mint_sage_modules::retail_duration_ticks(sway.large_unit_timeout_ms.max(0.0) as u32);
     if timeout.is_zero() || sway.large_unit_tail_off <= 0.0 {
         return 0.0;
     }
@@ -2036,6 +2052,8 @@ pub(crate) fn spawn_horde(
         centre,
         climb_wall: None,
         climb_quiet: 0,
+        rangefinder: None,
+        pools: Vec::new(),
     };
     let held: Vec<u16> = held.into_iter().flatten().collect();
     horde.free = free_slots(&horde, &held);
@@ -2157,6 +2175,8 @@ pub(crate) fn spawn_horde_shell(
         centre,
         climb_wall: None,
         climb_quiet: 0,
+        rangefinder: None,
+        pools: Vec::new(),
     };
     horde.free = free_slots(&horde, &[]);
     tick.state_mut().insert(ids.horde, horde_entity, horde)?;
@@ -2570,6 +2590,8 @@ mod tests {
             centre: Vec2::ZERO,
             climb_wall: None,
             climb_quiet: 0,
+            rangefinder: None,
+            pools: Vec::new(),
         };
         let mut other_formation = base.clone();
         other_formation.formation = 1;
@@ -3099,6 +3121,8 @@ mod tests {
             centre: Vec2::ZERO,
             climb_wall: None,
             climb_quiet: 0,
+            rangefinder: None,
+            pools: Vec::new(),
         };
         let east = slot_poses(
             &horde,

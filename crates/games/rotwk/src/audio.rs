@@ -421,7 +421,7 @@ impl GameAudio {
             }
         };
         let events = library.len();
-        let audio = SageAudio::open(library);
+        let audio = SageAudio::open_named(library, "match");
 
         let mut voices = BTreeMap::new();
         let mut unit_sounds = BTreeMap::new();
@@ -779,7 +779,7 @@ impl GameAudio {
                                 .and_then(|ms| u32::try_from(ms).ok())
                                 .unwrap_or(0);
                             let draw_ms = self.audio.random_delay_ms(low, high);
-                            emitter.cooldown = mint_sim::LogicFrames::from_milliseconds(
+                            emitter.cooldown = mint_sim::LogicFrames::from_engine_milliseconds(
                                 clip_ms.saturating_add(draw_ms),
                             )
                             .get();
@@ -944,6 +944,13 @@ impl GameAudio {
 
     pub(crate) fn readout(&self) -> String {
         self.audio.readout()
+    }
+
+    pub(crate) fn hitch_counters(&self) -> (u64, u64) {
+        (
+            self.audio.device_stats().underruns,
+            self.audio.bank_stats().load_us,
+        )
     }
 
     pub(crate) fn is_enabled(&self) -> bool {

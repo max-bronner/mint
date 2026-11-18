@@ -138,6 +138,7 @@ pub struct Passability {
     boundary_cells: Vec<(u16, u16)>,
     obstacle_ids: Vec<u32>,
     rivers: Vec<bool>,
+    underwater: Vec<bool>,
     counts: Counts,
 }
 
@@ -319,6 +320,7 @@ impl Passability {
         let mut extra_passable_mask =
             vec![false; usize::try_from(extent.cell_count()).unwrap_or(0)];
         let mut rivers: Vec<bool> = Vec::new();
+        let mut underwater: Vec<bool> = Vec::new();
 
         for y in 0..height {
             for x in 0..width {
@@ -376,6 +378,18 @@ impl Passability {
                         .saturating_mul(usize::from(width))
                         .saturating_add(usize::from(x));
                     if let Some(slot) = rivers.get_mut(index) {
+                        *slot = true;
+                    }
+                }
+                if wetness != Wetness::Dry {
+                    let cells = usize::try_from(extent.cell_count()).unwrap_or(0);
+                    if underwater.is_empty() {
+                        underwater = vec![false; cells];
+                    }
+                    let index = usize::from(y)
+                        .saturating_mul(usize::from(width))
+                        .saturating_add(usize::from(x));
+                    if let Some(slot) = underwater.get_mut(index) {
                         *slot = true;
                     }
                 }
@@ -477,6 +491,7 @@ impl Passability {
             boundary_cells,
             obstacle_ids,
             rivers,
+            underwater,
             counts,
         })
     }
@@ -490,6 +505,17 @@ impl Passability {
             .saturating_mul(usize::from(self.grid.extent().width))
             .saturating_add(usize::from(cell.x));
         self.rivers.get(index).copied().unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn underwater(&self, point: Vec2) -> bool {
+        let Some(cell) = self.cell_at(point) else {
+            return false;
+        };
+        let index = usize::from(cell.y)
+            .saturating_mul(usize::from(self.grid.extent().width))
+            .saturating_add(usize::from(cell.x));
+        self.underwater.get(index).copied().unwrap_or(false)
     }
 
     #[must_use]

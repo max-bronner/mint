@@ -1,3 +1,5 @@
+use core::num::NonZeroU32;
+
 use mint_ecs::StateHasher;
 
 pub const SIMULATION_HZ: u32 = 30;
@@ -6,6 +8,8 @@ pub const SIMULATION_HZ: u32 = 30;
 const SECONDS_PER_FRAME: f32 = 1.0 / SIMULATION_HZ as f32;
 
 const MSEC_PER_SECOND: u64 = 1_000;
+
+const MAX_AUTHORED_MILLISECONDS: f32 = 86_400_000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct LogicFrames(u32);
@@ -22,7 +26,7 @@ impl LogicFrames {
     }
 
     #[must_use]
-    pub const fn from_milliseconds(milliseconds: u32) -> Self {
+    pub const fn from_engine_milliseconds(milliseconds: u32) -> Self {
         let scaled = (milliseconds as u64).saturating_mul(SIMULATION_HZ as u64);
         let rounded = match scaled
             .saturating_add(MSEC_PER_SECOND / 2)
@@ -31,11 +35,68 @@ impl LogicFrames {
             Some(frames) => frames,
             None => 0,
         };
-        if rounded > u32::MAX as u64 {
+        Self::saturating_from_u64(rounded)
+    }
+
+    #[must_use]
+    pub const fn from_authored_milliseconds(milliseconds: u32, authored_hz: NonZeroU32) -> Self {
+        let hz = authored_hz.get() as u64;
+        let authored_frames = (milliseconds as u64)
+            .saturating_mul(hz)
+            .div_ceil(MSEC_PER_SECOND);
+        let ticks = authored_frames
+            .saturating_mul(SIMULATION_HZ as u64)
+            .div_ceil(hz);
+        Self::saturating_from_u64(ticks)
+    }
+
+    #[must_use]
+    pub fn from_authored_milliseconds_f32(milliseconds: f32, authored_hz: NonZeroU32) -> Self {
+        if !milliseconds.is_finite() || milliseconds <= 0.0 {
+            return Self::ZERO;
+        }
+        let bounded = milliseconds.min(MAX_AUTHORED_MILLISECONDS);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let whole = bounded.ceil() as u32;
+        Self::from_authored_milliseconds(whole, authored_hz)
+    }
+
+    #[must_use]
+    pub const fn from_authored_frames(frames: u32, authored_hz: NonZeroU32) -> Self {
+        let ticks = (frames as u64)
+            .saturating_mul(SIMULATION_HZ as u64)
+            .div_ceil(authored_hz.get() as u64);
+        Self::saturating_from_u64(ticks)
+    }
+
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn authored_frames_truncated(seconds: f32, authored_hz: NonZeroU32) -> u32 {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return 0;
+        }
+        let bounded = seconds.min(MAX_AUTHORED_MILLISECONDS / 1000.0);
+        (bounded * authored_hz.get() as f32) as u32
+    }
+
+    #[must_use]
+    pub fn from_authored_seconds_truncated(seconds: f32, authored_hz: NonZeroU32) -> Self {
+        Self::from_authored_frames(
+            Self::authored_frames_truncated(seconds, authored_hz),
+            authored_hz,
+        )
+    }
+
+    const fn saturating_from_u64(ticks: u64) -> Self {
+        if ticks > u32::MAX as u64 {
             return Self::MAX;
         }
         #[allow(clippy::cast_possible_truncation)]
-        Self(rounded as u32)
+        Self(ticks as u32)
     }
 
     #[must_use]
@@ -185,23 +246,23 @@ mod tests {
     #[test]
     fn milliseconds_round_halves_up_on_an_exact_half_frame() {
         assert_eq!(
-            LogicFrames::from_milliseconds(50),
+            LogicFrames::from_engine_milliseconds(50),
             LogicFrames::from_frames(2)
         );
         assert_eq!(
-            LogicFrames::from_milliseconds(150),
+            LogicFrames::from_engine_milliseconds(150),
             LogicFrames::from_frames(5)
         );
         assert_eq!(
-            LogicFrames::from_milliseconds(250),
+            LogicFrames::from_engine_milliseconds(250),
             LogicFrames::from_frames(8)
         );
         assert_eq!(
-            LogicFrames::from_milliseconds(49),
+            LogicFrames::from_engine_milliseconds(49),
             LogicFrames::from_frames(1)
         );
         assert_eq!(
-            LogicFrames::from_milliseconds(51),
+            LogicFrames::from_engine_milliseconds(51),
             LogicFrames::from_frames(2)
         );
     }
@@ -209,20 +270,48 @@ mod tests {
     #[test]
     fn milliseconds_convert_at_the_rate_the_original_engine_declares() {
         assert_eq!(
-            LogicFrames::from_milliseconds(1_000),
+            LogicFrames::from_engine_milliseconds(1_000),
             LogicFrames::SECOND,
             "one second of milliseconds is one second of frames"
         );
-        assert_eq!(LogicFrames::from_milliseconds(0), LogicFrames::ZERO);
+        assert_eq!(LogicFrames::from_engine_milliseconds(0), LogicFrames::ZERO);
         assert_eq!(
-            LogicFrames::from_milliseconds(3_000),
+            LogicFrames::from_engine_milliseconds(3_000),
             LogicFrames::from_frames(90),
             "the 90-frame reaction time, expressed the other way"
         );
         assert_eq!(
-            LogicFrames::from_milliseconds(u32::MAX),
+            LogicFrames::from_engine_milliseconds(u32::MAX),
             LogicFrames::from_frames(128_849_019)
         );
+    }
+
+    #[test]
+    fn authored_milliseconds_ceil_to_the_authored_frame_then_scale() {
+        let hz = NonZeroU32::new(5).unwrap();
+        let ticks = |ms| LogicFrames::from_authored_milliseconds(ms, hz).get();
+        assert_eq!(ticks(0), 0);
+        assert_eq!(ticks(5), 6, "one 200 ms frame, not the 1 tick of 30 Hz");
+        assert_eq!(ticks(40), 6, "round-to-nearest would give 0");
+        assert_eq!(ticks(200), 6);
+        assert_eq!(ticks(210), 12, "round-to-nearest would give 6");
+        assert_eq!(ticks(u32::MAX), u32::MAX / 200 * 6 + 6);
+        let float = |ms| LogicFrames::from_authored_milliseconds_f32(ms, hz).get();
+        assert_eq!((float(40.0), float(200.5), float(-1.0)), (6, 12, 0));
+        let own = NonZeroU32::new(SIMULATION_HZ).unwrap();
+        assert_eq!(LogicFrames::from_authored_milliseconds(50, own).get(), 2);
+    }
+
+    #[test]
+    fn authored_seconds_truncate_to_the_authored_frame_then_scale() {
+        let hz = NonZeroU32::new(5).unwrap();
+        let ticks = |s| LogicFrames::from_authored_seconds_truncated(s, hz).get();
+        assert_eq!((ticks(0.3), ticks(2.5), ticks(0.19)), (6, 72, 0));
+        assert_eq!(
+            (ticks(-1.0), ticks(f32::NAN), ticks(f32::INFINITY)),
+            (0, 0, 0)
+        );
+        assert_eq!(LogicFrames::from_authored_frames(7, hz).get(), 42);
     }
 
     #[test]
@@ -242,12 +331,12 @@ mod tests {
     fn the_three_constructors_agree_where_the_units_do() {
         assert_eq!(
             LogicFrames::from_seconds(3.0),
-            LogicFrames::from_milliseconds(3_000)
+            LogicFrames::from_engine_milliseconds(3_000)
         );
         assert_eq!(LogicFrames::from_seconds(3.0), LogicFrames::from_frames(90));
         assert_eq!(
             LogicFrames::from_seconds(0.05),
-            LogicFrames::from_milliseconds(50)
+            LogicFrames::from_engine_milliseconds(50)
         );
     }
 

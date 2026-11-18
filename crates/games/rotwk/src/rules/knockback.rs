@@ -729,7 +729,7 @@ impl RotwkRules {
                 .filter(|ms| ms.is_finite() && *ms >= 0.0)
                 .unwrap_or(default);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            LogicFrames::from_milliseconds(ms.min(f32::from(u16::MAX)) as u32)
+            mint_sage_modules::retail_duration_ticks(ms.min(f32::from(u16::MAX)) as u32)
         };
         let written = |read: fn(&mint_sage_modules::PhysicsBehavior) -> Option<f32>| {
             physics.as_ref().and_then(read)

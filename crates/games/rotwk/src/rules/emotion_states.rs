@@ -25,7 +25,7 @@ const BACK_AWAY_MOVEMENT_CONDITIONS: [&str; 8] = [
     "ENGAGED",
 ];
 
-const RECENT_DAMAGE: LogicFrames = LogicFrames::from_milliseconds(4000);
+const RECENT_DAMAGE: LogicFrames = LogicFrames::from_engine_milliseconds(4000);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Phase {
@@ -679,7 +679,7 @@ fn has_own_walk(world: &World, ids: Ids, entity: Entity) -> bool {
         .is_some_and(|path| path.kind == PathKind::Emotion)
 }
 
-fn take_route(tick: &mut Tick<'_>, ids: Ids, entity: Entity) -> Option<Path> {
+pub(super) fn take_route(tick: &mut Tick<'_>, ids: Ids, entity: Entity) -> Option<Path> {
     let kind = tick.state().get(ids.path, entity)?.kind;
     if matches!(kind, PathKind::Burning | PathKind::Emotion) {
         return None;

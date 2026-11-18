@@ -142,21 +142,24 @@ pub(crate) fn reap_dead_portals(
     else {
         return;
     };
-    let Some(mut layer) = world.get(id, clock_entity).cloned() else {
-        return;
-    };
-    let dead: Vec<Entity> = layer
-        .entities()
-        .into_iter()
-        .filter(|entity| !world.is_live(*entity))
-        .collect();
+    let dead: Vec<Entity> = world
+        .get(id, clock_entity)
+        .map(|layer| {
+            layer
+                .entities()
+                .into_iter()
+                .filter(|entity| !world.is_live(*entity))
+                .collect()
+        })
+        .unwrap_or_default();
     if dead.is_empty() {
         return;
     }
-    for entity in dead {
-        layer.unstamp(geometry, extent, entity);
+    if let Some(layer) = world.get_mut(id, clock_entity) {
+        for entity in dead {
+            layer.unstamp(geometry, extent, entity);
+        }
     }
-    let _ = world.insert(id, clock_entity, layer);
 }
 
 #[cfg(test)]

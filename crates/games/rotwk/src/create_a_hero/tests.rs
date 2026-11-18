@@ -51,7 +51,7 @@ fn a_bound_hero_is_given_mode_then_bling_then_class_then_subclass() {
         blings: vec![(b"G_Hat".to_vec(), 1), (b"G_Cape".to_vec(), 0)],
         ..HeroRecord::default()
     };
-    let (grants, removes) = upgrade_names(&data(), &record, &|_| true);
+    let (grants, removes) = upgrade_names(&data(), &record, &[], &|_| true);
     assert_eq!(
         grants,
         ["Up_Game", "Up_HatLate", "Up_Cape", "Up_Class", "Up_Sub"]
@@ -61,8 +61,9 @@ fn a_bound_hero_is_given_mode_then_bling_then_class_then_subclass() {
 
 #[test]
 fn the_mode_swap_needs_both_upgrades_to_exist() {
-    let (grants, removes) =
-        upgrade_names(&data(), &HeroRecord::default(), &|name| name != "Up_Map");
+    let (grants, removes) = upgrade_names(&data(), &HeroRecord::default(), &[], &|name| {
+        name != "Up_Map"
+    });
     assert!(!grants.iter().any(|name| name == "Up_Game"));
     assert!(removes.is_empty());
 }

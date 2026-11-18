@@ -23,13 +23,22 @@ pub(super) struct BodySight {
     large: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+impl BodySight {
+    fn passes(self, each_other: bool, infantry: bool, large: bool, ally: bool) -> bool {
+        self.submarine
+            || (ally && self.each_other && each_other)
+            || (self.through_infantry && infantry)
+            || (ally && self.large && !large)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Bodies {
     refused: bool,
     allied: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct BodyCells {
     width: usize,
     height: usize,
@@ -57,6 +66,22 @@ impl BodyCells {
         }
         self.cells
             .get_mut(y.checked_mul(self.width)?.checked_add(x)?)
+    }
+
+    fn mark(&mut self, extent: GridExtent, rect: goal_cells::CellRect, enemy: bool) {
+        let (x0, y0, x1, y1) = rect.span();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let Some(held) = self.entry(extent, x, y) else {
+                    continue;
+                };
+                if enemy {
+                    held.refused = true;
+                } else {
+                    held.allied = true;
+                }
+            }
+        }
     }
 }
 
@@ -141,22 +166,25 @@ impl UnitCostView<'_> {
         let (x1, y1) = (x0 + self.side, y0 + self.side);
         let centre = self.geometry.centre_of(cell);
         let own = centre.minus(self.position).length() / self.speed.max(f32::EPSILON);
-        let mut seen: Vec<usize> = Vec::new();
         let mut total = 0u32;
         let mut claimed = false;
-        for bx in x0.div_euclid(BUCKET)..=(x1 - 1).div_euclid(BUCKET) {
-            for by in y0.div_euclid(BUCKET)..=(y1 - 1).div_euclid(BUCKET) {
+        let (first_bx, first_by) = (x0.div_euclid(BUCKET), y0.div_euclid(BUCKET));
+        for bx in first_bx..=(x1 - 1).div_euclid(BUCKET) {
+            for by in first_by..=(y1 - 1).div_euclid(BUCKET) {
                 let Some(list) = self.buckets.get(&(bx, by)) else {
                     continue;
                 };
                 for &index in list {
-                    if seen.contains(&index) {
-                        continue;
-                    }
-                    seen.push(index);
                     let Some(claim) = self.claims.get(index) else {
                         continue;
                     };
+                    let first = (
+                        first_bx.max(claim.x0.div_euclid(BUCKET)),
+                        first_by.max(claim.y0.div_euclid(BUCKET)),
+                    );
+                    if (bx, by) != first {
+                        continue;
+                    }
                     let w = x1.min(claim.x1) - x0.max(claim.x0);
                     let h = y1.min(claim.y1) - y0.max(claim.y0);
                     if w <= 0 || h <= 0 {
@@ -279,10 +307,12 @@ impl RotwkRules {
                 if owner.is_some() && relation.to(other) == super::map_scripts::Relation::Enemies {
                     continue;
                 }
+                let part = crate::perf::sub(crate::perf::sub_row!("unit_cost_limits"));
                 let limits = self.mover_limits(tick, ids, other);
                 if limits.max_speed <= 0.0 || self.path_priority(tick, ids, other) < own_priority {
                     continue;
                 }
+                drop(part);
                 let Some(body) = world.get(ids.body, other) else {
                     continue;
                 };
@@ -350,25 +380,21 @@ impl RotwkRules {
         ally: bool,
     ) -> bool {
         let facts = self.kind_facts(world, ids, other);
-        sight.submarine
-            || (ally && sight.each_other && facts.path_through_each_other)
-            || (sight.through_infantry && facts.infantry)
-            || (ally && sight.large && !facts.large_rectangle_pathfind)
+        sight.passes(
+            facts.path_through_each_other,
+            facts.infantry,
+            facts.large_rectangle_pathfind,
+            ally,
+        )
     }
 
     fn body_cells(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> BodyCells {
         let _perf = crate::perf::sub(crate::perf::sub_row!("body_cells"));
         let world = tick.state();
-        let mut cells = BodyCells::default();
         let Some(_) = world.get(ids.owner, entity).map(|owner| owner.0) else {
-            return cells;
+            return BodyCells::default();
         };
-        let geometry = self.passability.geometry;
-        let extent = self.passability.grid.extent();
         let record = self.record_of(tick, ids, entity);
-        let hero = self.kind_facts(world, ids, entity).hero;
-        let crusher = record.map_or(0, |record| record.crush.crusher_level);
-        let sight = self.body_sight(world, ids, entity);
         let target = world
             .get(ids.attack_order, entity)
             .map(|order| order.target)
@@ -379,14 +405,78 @@ impl RotwkRules {
             })
             .or_else(|| world.get(ids.horde_melee, entity).map(|melee| melee.goal))
             .or_else(|| world.get(ids.armed, entity).and_then(|armed| armed.target));
-        let horde_of = |of: Entity| world.get(ids.member, of).map(|member| member.horde);
-        let target_horde = target.map(|target| horde_of(target).unwrap_or(target));
+        let target_horde = target.map(|target| {
+            world
+                .get(ids.member, target)
+                .map_or(target, |member| member.horde)
+        });
+        let asker = BodyAsker {
+            entity,
+            hero: self.kind_facts(world, ids, entity).hero,
+            crusher: record.map_or(0, |record| record.crush.crusher_level),
+            sight: self.body_sight(world, ids, entity),
+            target,
+            target_horde,
+        };
+        let rows = self.mover_rows.try_borrow_mut().ok();
+        let synced = rows.and_then(|mut rows| {
+            rows.sync(self, tick, ids).then(|| {
+                let relation = self.relation_from(world, entity);
+                let mut cells = BodyCells::default();
+                let extent = self.passability.grid.extent();
+                for row in rows.listed() {
+                    if row.entity == entity {
+                        continue;
+                    }
+                    let enemy = relation.to_owned_by(row.entity, row.owner)
+                        == super::map_scripts::Relation::Enemies;
+                    if asker
+                        .sight
+                        .passes(row.each_other, row.infantry, row.large, !enemy)
+                    {
+                        continue;
+                    }
+                    if enemy
+                        && (asker.hero
+                            || Some(row.entity) == asker.target
+                            || Some(row.horde.unwrap_or(row.entity)) == asker.target_horde
+                            || row
+                                .crushable
+                                .is_some_and(|theirs| i16::from(asker.crusher) > theirs))
+                    {
+                        continue;
+                    }
+                    if let Some(rect) = row.rect {
+                        cells.mark(extent, rect, enemy);
+                    }
+                }
+                cells
+            })
+        });
+        match synced {
+            Some(cells) => {
+                debug_assert_eq!(
+                    cells,
+                    self.body_cells_walk(tick, ids, &asker),
+                    "the mover rows differ from the full walk for {entity:?}"
+                );
+                cells
+            }
+            None => self.body_cells_walk(tick, ids, &asker),
+        }
+    }
+
+    fn body_cells_walk(&self, tick: &Tick<'_>, ids: Ids, asker: &BodyAsker) -> BodyCells {
+        let world = tick.state();
+        let mut cells = BodyCells::default();
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
         let Some(store) = world.store(ids.shape) else {
             return cells;
         };
-        let relation = self.relation_from(world, entity);
+        let relation = self.relation_from(world, asker.entity);
         for (other, shape) in store.iter() {
-            if other == entity
+            if other == asker.entity
                 || world.contains(ids.horde, other)
                 || shape.kind_of.contains(super::KindOf::IMMOBILE)
                 || world.contains(ids.flight, other)
@@ -405,15 +495,16 @@ impl RotwkRules {
                 continue;
             }
             let enemy = relation.to(other) == super::map_scripts::Relation::Enemies;
-            if self.sees_past(world, ids, sight, other, !enemy) {
+            if self.sees_past(world, ids, asker.sight, other, !enemy) {
                 continue;
             }
             if enemy {
-                let walked_into = hero
-                    || Some(other) == target
-                    || Some(horde_of(other).unwrap_or(other)) == target_horde
+                let horde_of = |of: Entity| world.get(ids.member, of).map(|member| member.horde);
+                let walked_into = asker.hero
+                    || Some(other) == asker.target
+                    || Some(horde_of(other).unwrap_or(other)) == asker.target_horde
                     || self.record_of(tick, ids, other).is_some_and(|theirs| {
-                        i16::from(crusher) > i16::from(theirs.crush.crushable_level)
+                        i16::from(asker.crusher) > i16::from(theirs.crush.crushable_level)
                     });
                 if walked_into {
                     continue;
@@ -427,22 +518,19 @@ impl RotwkRules {
             ) else {
                 continue;
             };
-            let (x0, y0, x1, y1) = rect.span();
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let Some(held) = cells.entry(extent, x, y) else {
-                        continue;
-                    };
-                    if enemy {
-                        held.refused = true;
-                    } else {
-                        held.allied = true;
-                    }
-                }
-            }
+            cells.mark(extent, rect, enemy);
         }
         cells
     }
+}
+
+struct BodyAsker {
+    entity: Entity,
+    hero: bool,
+    crusher: u8,
+    sight: BodySight,
+    target: Option<Entity>,
+    target_horde: Option<Entity>,
 }
 
 #[cfg(test)]

@@ -210,10 +210,13 @@ impl RotwkRules {
     ) -> Result<()> {
         match flag {
             "Enabled" => {
-                state
+                if state
                     .rt
                     .statuses
-                    .set(entity, ScriptStatusBit::Disabled, !on);
+                    .set(entity, ScriptStatusBit::Disabled, !on)
+                {
+                    self.pause_special_powers(tick, ids, entity, !on)?;
+                }
             }
             "Powered" => {
                 state

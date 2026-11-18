@@ -83,4 +83,6 @@ pub enum Error {
         offset: usize,
         value: u16,
     },
+    #[error("HLOD states {stated} LOD array(s) but holds {found}")]
+    MissingLodArrays { stated: u32, found: usize },
 }

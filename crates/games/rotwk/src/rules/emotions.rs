@@ -51,7 +51,7 @@ pub(super) const TICKS_PER_FRAME: u32 = mint_sim::SIMULATION_HZ / crate::game_da
 
 const CHEER_PULSE_FRAMES: u32 = 10;
 
-const HERO_CHEER_COOLDOWN: LogicFrames = LogicFrames::from_milliseconds(60_000);
+const HERO_CHEER_COOLDOWN: LogicFrames = LogicFrames::from_engine_milliseconds(60_000);
 
 const RESIST_IMMUNE: f32 = 0.5;
 

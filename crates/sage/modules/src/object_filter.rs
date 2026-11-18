@@ -165,6 +165,11 @@ impl ObjectFilter {
     }
 
     #[must_use]
+    pub fn matches_something(&self) -> bool {
+        !(self.base == FilterBase::Any && self.add.is_empty())
+    }
+
+    #[must_use]
     pub fn excludes(&self, token: &str) -> bool {
         self.remove
             .iter()

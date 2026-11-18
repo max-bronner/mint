@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum GameMode {
     SinglePlayer = 0,
     Lan = 1,
+    #[default]
     Skirmish = 2,
     Replay = 3,
     Shell = 4,

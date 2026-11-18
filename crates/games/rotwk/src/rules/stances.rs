@@ -109,6 +109,7 @@ impl RotwkRules {
             .collect();
         units.sort_unstable_by_key(|entity| entity.index());
         units.dedup();
+        let lead = lead.map(|lead| Self::commanded_unit(tick.state(), ids, lead));
         let target = lead.map(|lead| !self.weapon_set_toggle_raised(tick, lead));
         for unit in units {
             if lead.is_some_and(|lead| {

@@ -92,7 +92,7 @@ pub fn sink_delay_from_fields(
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(MAX_MILLISECONDS) as u32;
-    Ok(LogicFrames::from_milliseconds(whole))
+    Ok(crate::special_ability_update::retail_duration_ticks(whole))
 }
 
 impl ModuleKind for SlowDeathBehavior {
@@ -221,10 +221,13 @@ mod tests {
         ]));
         let module = slow_death_behavior_from_fields(&fields, Frame::ZERO).unwrap();
         assert!((module.sink_rate() - 0.40).abs() < 1e-6);
-        assert_eq!(module.sink_delay(), LogicFrames::from_milliseconds(3000));
+        assert_eq!(
+            module.sink_delay(),
+            LogicFrames::from_engine_milliseconds(3000)
+        );
         assert_eq!(
             module.sink_delay_variance(),
-            LogicFrames::from_milliseconds(500)
+            crate::special_ability_update::retail_duration_ticks(500)
         );
     }
 

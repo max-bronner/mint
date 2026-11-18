@@ -61,7 +61,7 @@ fn it_waits_its_delay_then_sinks_its_depth_and_is_removed_only_when_the_data_say
             &mut rng,
             &mut destroy_requests,
         );
-        for frame in 5..18 {
+        for frame in 5..20 {
             registry.update(
                 &mut world,
                 Frame::new(frame),
@@ -75,7 +75,7 @@ fn it_waits_its_delay_then_sinks_its_depth_and_is_removed_only_when_the_data_say
             );
         }
         assert_eq!(state(&mut world, entity), CollapseState::Collapsing);
-        registry.update(&mut world, Frame::new(18), &mut rng, &mut destroy_requests);
+        registry.update(&mut world, Frame::new(20), &mut rng, &mut destroy_requests);
         assert_eq!(state(&mut world, entity), CollapseState::Done);
         let expected = if removed { vec![entity] } else { Vec::new() };
         assert_eq!(destroy_requests.drain_sorted(), expected, "{destroy}");
@@ -107,7 +107,7 @@ fn the_initial_list_plays_at_death_and_the_final_one_once_sunk() {
             .collect()
     };
     assert_eq!(fx(&mut log), vec!["FX_Start"]);
-    for frame in 5..=18 {
+    for frame in 5..=20 {
         registry.update_into(
             &mut world,
             Frame::new(frame),
@@ -144,7 +144,7 @@ fn every_phase_plays_at_the_structures_own_position() {
         mint_sim::module::Death::NONE,
     );
     assert_eq!(places(&mut log), vec![PowerPlace::Source], "INITIAL");
-    for frame in 5..=18 {
+    for frame in 5..=20 {
         registry.update_into(
             &mut world,
             Frame::new(frame),
@@ -185,7 +185,7 @@ fn a_second_death_broadcast_does_not_restart_the_collapse() {
     let mut destroy = DestroyRequests::new();
     registry.broadcast_die(&mut world, entity, Frame::new(5), &mut rng, &mut destroy);
     registry.broadcast_die(&mut world, entity, Frame::new(14), &mut rng, &mut destroy);
-    for frame in 5..=18 {
+    for frame in 5..=20 {
         registry.update(&mut world, Frame::new(frame), &mut rng, &mut destroy);
     }
     assert_eq!(state(&mut world, entity), CollapseState::Done);
@@ -199,13 +199,13 @@ fn a_sunk_structure_stays_at_its_depth_until_it_is_removed() {
     registry.broadcast_die(&mut world, entity, Frame::new(5), &mut rng, &mut destroy);
     let id = world.register::<ModuleColumn<StructureCollapseUpdate>>();
     let sink = |world: &World| world.get(id, entity).unwrap().0[0].state.sink();
-    for frame in 5..=18 {
+    for frame in 5..=20 {
         registry.update(&mut world, Frame::new(frame), &mut rng, &mut destroy);
     }
     assert_eq!(state(&mut world, entity), CollapseState::Done);
     let sunk = sink(&world);
     assert!(sunk >= 3.0, "sunk its depth: {sunk}");
-    for frame in 19..60 {
+    for frame in 21..60 {
         registry.update(&mut world, Frame::new(frame), &mut rng, &mut destroy);
         assert_eq!(sink(&world).to_bits(), sunk.to_bits(), "frame {frame}");
     }

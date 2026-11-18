@@ -9,6 +9,7 @@ use mint_sim::LogicFrames;
 
 use crate::captured::{CapturedField, CapturedModule};
 use crate::effects::{build_modifier_rule, names, ModifierFieldValues, ModifierRule};
+use crate::set_conditions::{condition_flags, SetKind};
 use crate::template::{ModuleDeclaration, TemplateIndex};
 
 mod contact;
@@ -112,6 +113,7 @@ pub struct PowerSlot {
     pub initiate_sound: Option<String>,
     pub initiate_fx: Option<String>,
     pub on_trigger_recharge: Option<String>,
+    pub chained_button: Option<String>,
     pub available_at_start: bool,
     pub obey_recharge_on_unpause: bool,
     pub unlock_upgrade: Option<String>,
@@ -171,7 +173,8 @@ fn upgraded_command_sets(modules: &[ModuleDeclaration<'_>]) -> Vec<String> {
     sets
 }
 
-pub const SPAWNED_OBJECT_FIELDS: [&str; 21] = [
+pub const SPAWNED_OBJECT_FIELDS: [&str; 23] = [
+    "GrabObject",
     "InitialPayload",
     "InitialCrew",
     "TaintObject",
@@ -193,6 +196,7 @@ pub const SPAWNED_OBJECT_FIELDS: [&str; 21] = [
     "BorderCapTemplateName",
     "ElevatedSegmentTemplateName",
     "AlternateFormation",
+    "MemberTemplateName",
 ];
 
 pub const UNCRUSHABLE: i8 = i8::MAX;
@@ -285,11 +289,13 @@ pub struct ObjectRecord {
     pub pathfind_diameter: Option<f32>,
     pub fence_width: Option<f32>,
     pub max_health: Option<f32>,
+    pub initial_health: Option<f32>,
     pub max_health_damaged: Option<f32>,
     pub max_health_really_damaged: Option<f32>,
     pub dodge_percent: Option<f32>,
     pub cheer_radius: Option<f32>,
     pub damage_creations: Vec<crate::body::DamageCreation>,
+    pub grab: crate::body::BodyGrab,
     pub permanently_killed_by_filter: Vec<String>,
     pub vision_range: Option<f32>,
     pub shroud_clearing_range: Option<f32>,
@@ -313,6 +319,7 @@ pub struct ObjectRecord {
     pub mood_attack_check_ms: Option<f32>,
     pub crush: Crush,
     pub command_set: Option<String>,
+    pub auto_resolve_unit_type: Option<String>,
     pub build_variations: Vec<String>,
     pub equivalent_to: Vec<String>,
     pub experience_scalar_table: Option<String>,
@@ -363,6 +370,9 @@ pub struct ObjectRecord {
     pub button_image: Option<String>,
     pub display_name: Option<String>,
     pub description: Option<String>,
+    pub hotkey: Option<String>,
+    pub revive_text: Option<String>,
+    pub recruit_text: Option<String>,
     pub powers: Vec<PowerSlot>,
     pub menu_point: Option<[f32; 3]>,
     pub contact_points: Vec<ContactPoint>,
@@ -406,6 +416,7 @@ pub struct ObjectRecord {
     pub supply_center_dock: Option<SupplyCenterDockDef>,
     pub aod_crush: Option<AodCrush>,
     pub teleport_max_distance: Option<f32>,
+    pub critter_emitter: Option<CritterEmitter>,
     pub dead_collide_size: DeadCollideSize,
     pub formation_preview_decal: Option<FormationPreviewDecal>,
     pub formation_preview_item_decal: Option<FormationPreviewDecal>,
@@ -475,6 +486,13 @@ pub struct AnimalWander {
     pub flee_range: f32,
     pub flee_distance: f32,
     pub update_timer: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CritterEmitter {
+    pub fx: Vec<String>,
+    pub spawn_objects: Vec<String>,
+    pub reload_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -737,6 +755,7 @@ impl ObjectRecord {
             pathfind_diameter: numeric("PathfindDiameter").filter(|value| *value > 0.0),
             fence_width: numeric("FenceWidth"),
             max_health: body.and_then(|decl| reads.number(decl.block.field("MaxHealth"))),
+            initial_health: body.and_then(|decl| reads.number(decl.block.field("InitialHealth"))),
             max_health_damaged: body
                 .and_then(|decl| reads.number(decl.block.field("MaxHealthDamaged"))),
             max_health_really_damaged: body
@@ -745,6 +764,9 @@ impl ObjectRecord {
             cheer_radius: body.and_then(|decl| reads.number(decl.block.field("CheerRadius"))),
             damage_creations: body
                 .map(|decl| reads.damage_creations(decl.block))
+                .unwrap_or_default(),
+            grab: body
+                .map(|decl| reads.body_grab(decl.block))
                 .unwrap_or_default(),
             permanently_killed_by_filter: body
                 .and_then(|decl| decl.block.field("PermanentlyKilledByFilter"))
@@ -810,6 +832,7 @@ impl ObjectRecord {
                 }),
             },
             command_set: text("CommandSet"),
+            auto_resolve_unit_type: text("AutoResolveUnitType"),
             build_variations: nearest(&lineage, "BuildVariations")
                 .map(|field| field.args.clone())
                 .unwrap_or_default(),
@@ -916,6 +939,9 @@ impl ObjectRecord {
             button_image: text("ButtonImage"),
             display_name: text("DisplayName"),
             description: text("Description"),
+            hotkey: text("Hotkey"),
+            revive_text: text("ReviveText"),
+            recruit_text: text("RecruitText"),
             powers: powers(&modules, &reads),
             menu_point: geometry_block(&lineage).and_then(|block| menu_point(block, &reads)),
             contact_points: contact::contact_points(&lineage, &reads),
@@ -1088,6 +1114,23 @@ impl ObjectRecord {
             teleport_max_distance: module(&modules, "TeleportSpecialAbilityUpdate")
                 .and_then(|block| reads.number(block.field("MaxDistance")))
                 .filter(|value| *value > 0.0),
+            critter_emitter: module(&modules, "CritterEmitterUpdate").map(|block| {
+                let names = |keyword: &str| -> Vec<String> {
+                    block
+                        .fields_named(keyword)
+                        .flat_map(|field| field.args.iter().cloned())
+                        .collect()
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let reload_ms = reads
+                    .number(block.field("ReloadTime"))
+                    .map_or(0, |ms| ms.max(0.0) as u32);
+                CritterEmitter {
+                    fx: names("FX"),
+                    spawn_objects: names("SpawnObject"),
+                    reload_ms,
+                }
+            }),
             dead_collide_size: nearest(&lineage, "DeadCollideSize")
                 .and_then(Field::value)
                 .map_or(DeadCollideSize::Small, |value| {
@@ -1560,6 +1603,7 @@ fn powers(modules: &[ModuleDeclaration<'_>], reads: &Reads<'_>) -> Vec<PowerSlot
                     initiate_sound: None,
                     initiate_fx: None,
                     on_trigger_recharge: None,
+                    chained_button: None,
                     available_at_start: true,
                     obey_recharge_on_unpause: false,
                     unlock_upgrade: None,
@@ -1611,6 +1655,11 @@ fn powers(modules: &[ModuleDeclaration<'_>], reads: &Reads<'_>) -> Vec<PowerSlot
             .field("OnTriggerRechargeSpecialPower")
             .and_then(Field::value)
             .filter(|value| !value.eq_ignore_ascii_case("NONE"));
+        let chained = decl
+            .block
+            .field("ChainedButton")
+            .and_then(Field::value)
+            .filter(|name| !mint_sage_ini::value::is_none(name));
         let available_at_start = reads
             .flag(decl.block.field("AvailableAtStart"))
             .unwrap_or(true);
@@ -1629,6 +1678,9 @@ fn powers(modules: &[ModuleDeclaration<'_>], reads: &Reads<'_>) -> Vec<PowerSlot
             }
             if slot.on_trigger_recharge.is_none() {
                 slot.on_trigger_recharge = recharges.map(str::to_owned);
+            }
+            if slot.chained_button.is_none() {
+                slot.chained_button = chained.map(str::to_owned);
             }
             slot.available_at_start &= available_at_start;
             if effect_captured.get(at) == Some(&false)
@@ -1723,7 +1775,7 @@ fn set_model_condition(field: Option<&Field>, reads: &Reads<'_>) -> Option<Strin
 fn retail_condition_frames(seconds: f32) -> LogicFrames {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let fifths = (seconds * 5.0).clamp(0.0, f32::from(u16::MAX)) as u32;
-    LogicFrames::from_milliseconds(fifths.saturating_mul(200))
+    LogicFrames::from_engine_milliseconds(fifths.saturating_mul(200))
 }
 
 fn sets(
@@ -1740,6 +1792,11 @@ fn sets(
         return Vec::new();
     };
     let weapons = keyword.eq_ignore_ascii_case("WeaponSet");
+    let kind = if weapons {
+        SetKind::Weapon
+    } else {
+        SetKind::Armor
+    };
     owner
         .blocks_named(keyword)
         .map(|set| {
@@ -1752,12 +1809,14 @@ fn sets(
                 conditions: set
                     .field("Conditions")
                     .map(|field| {
-                        field
-                            .args
-                            .iter()
-                            .filter(|token| !token.eq_ignore_ascii_case("None"))
-                            .map(|token| token.to_ascii_uppercase())
-                            .collect()
+                        condition_flags(kind, &field.args).unwrap_or_else(|| {
+                            reads.errors.field(
+                                reads.context,
+                                field,
+                                "a list of set condition flags",
+                            );
+                            Vec::new()
+                        })
                     })
                     .unwrap_or_default(),
                 value: value(set),
@@ -1991,6 +2050,29 @@ impl Reads<'_> {
                 .field(self.context, field, "a list of idle-acquisition flags");
         }
         read
+    }
+
+    fn body_grab(&self, body: &Block) -> crate::body::BodyGrab {
+        let name = |keyword: &str| {
+            body.field(keyword)
+                .and_then(|field| field.args.first())
+                .cloned()
+        };
+        let defaults = crate::body::BodyGrab::default();
+        let offset = body.field("GrabOffset").map_or(defaults.offset, |field| {
+            (
+                self.tagged(field, "X").unwrap_or(0.0),
+                self.tagged(field, "Y").unwrap_or(0.0),
+            )
+        });
+        crate::body::BodyGrab {
+            object: name("GrabObject"),
+            fx: name("GrabFX"),
+            damage: self
+                .number(body.field("GrabDamage"))
+                .unwrap_or(defaults.damage),
+            offset,
+        }
     }
 
     fn damage_creations(&self, body: &Block) -> Vec<crate::body::DamageCreation> {
@@ -2494,12 +2576,13 @@ fn default_set<'b>(lineage: &[&'b Block], keyword: &str) -> Option<&'b Block> {
         .blocks()
         .filter(|set| set.keyword.eq_ignore_ascii_case(keyword))
     {
+        let kind = if keyword.eq_ignore_ascii_case("WeaponSet") {
+            SetKind::Weapon
+        } else {
+            SetKind::Armor
+        };
         let conditions = set.field("Conditions").map_or(0, |field| {
-            field
-                .args
-                .iter()
-                .filter(|token| !token.eq_ignore_ascii_case("None"))
-                .count()
+            condition_flags(kind, &field.args).map_or(0, |flags| flags.len())
         });
         if best.is_none_or(|(fewest, _)| conditions < fewest) {
             best = Some((conditions, set));

@@ -227,7 +227,8 @@ pub fn invisibility_update_from_fields(
     Ok(InvisibilityUpdate {
         data: Arc::new(InvisibilityData {
             nugget,
-            update_period: LogicFrames::from_milliseconds(period_ms).max(LogicFrames::ONE),
+            update_period: crate::special_ability_update::retail_duration_ticks(period_ms)
+                .max(LogicFrames::ONE),
             starts_active: flag(fields, "StartsActive")?.unwrap_or(false),
             required_upgrades: fields.field_upgrade_mask("RequiredUpgrades"),
             forbidden_upgrades: fields.field_upgrade_mask("ForbiddenUpgrades"),
@@ -388,7 +389,10 @@ mod tests {
         };
         let read = invisibility_update_from_fields(&fields, Frame::ZERO).unwrap();
         assert!(read.starts_active());
-        assert_eq!(read.update_period(), LogicFrames::from_milliseconds(2000));
+        assert_eq!(
+            read.update_period(),
+            LogicFrames::from_engine_milliseconds(2000)
+        );
         assert_eq!(read.nugget().kind, InvisibilityType::Camouflage);
         assert_eq!(
             read.nugget().forbidden,

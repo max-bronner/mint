@@ -41,8 +41,8 @@ fn main() {
                 ));
                 for mesh in &model.meshes {
                     let h: &MeshHeader3 = &mesh.header;
-                    let two_sided = h.attributes & 0x0000_1000 != 0;
-                    let hidden = h.attributes & 0x0000_2000 != 0;
+                    let two_sided = h.is_two_sided();
+                    let hidden = h.is_hidden();
                     let names: Vec<&str> = mesh.textures.iter().map(|t| t.name.as_str()).collect();
                     out.push_str(&format!(
                         "  {:<18} {:>6} vert {:>6} tri  bbox ({:.0},{:.0},{:.0})..({:.0},{:.0},{:.0})  \

@@ -429,6 +429,7 @@ impl RotwkRules {
         };
         let modes = self.modes(tick, ids);
         crate::perf::note_plan_call();
+        let _site = crate::perf::sub(crate::perf::sub_row!("path_site_contact"));
         let outcome = self
             .plan_path(modes.config(), &view, &request, budget)
             .map_err(|e| mint_sim::Error::Rules {
@@ -660,6 +661,7 @@ impl RotwkRules {
         };
         let modes = self.modes(tick, ids);
         crate::perf::note_plan_call();
+        let _site = crate::perf::sub(crate::perf::sub_row!("path_site_contact"));
         let outcome = self
             .plan_path(modes.config(), &clear, &request, budget)
             .map_err(|e| mint_sim::Error::Rules {

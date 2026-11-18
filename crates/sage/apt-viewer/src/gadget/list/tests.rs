@@ -272,3 +272,17 @@ fn a_row_is_its_tallest_cell_and_text_sits_centred() {
     assert_eq!(text_top(100.0, 24.0, 16.0), 104.0);
     assert_eq!(text_top(100.0, 16.0, 32.0), 100.0, "never above the row");
 }
+
+#[test]
+fn a_scrolllistbox_bar_is_there_only_when_the_content_overflows() {
+    let layout = Layout::parse(TEMPLATE).unwrap();
+    assert!(ListLook::read(&layout).auto_hide);
+    let bounds = [0.0, 0.0, 200.0, 100.0];
+    let frame = ListFrame::new(bounds, true, &[]);
+    let short = frame.clone().hiding_bar_while_content_fits(&[20.0]);
+    assert_eq!((short.up, short.down, short.track), (None, None, None));
+    assert_eq!(short.columns, frame.columns);
+    let tall = frame.clone().hiding_bar_while_content_fits(&[60.0, 60.0]);
+    assert_eq!(tall, frame);
+    assert!(tall.up.is_some() && tall.track.is_some());
+}

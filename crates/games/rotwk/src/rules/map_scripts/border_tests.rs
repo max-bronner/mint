@@ -62,6 +62,7 @@ fn script(name: &str, timer: Option<&str>, actions: Vec<ScriptAction>) -> Script
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 name: condition.to_owned(),
                 params,
                 enabled: true,
@@ -81,6 +82,7 @@ fn switch(name: &str, timer: &str, indices: &[i32]) -> Script {
             .iter()
             .map(|index| ScriptAction {
                 action_type: 0,
+                enabled: true,
                 name: "MAP_SWITCH_BORDER".to_owned(),
                 params: vec![number(*index)],
             })
@@ -91,6 +93,7 @@ fn switch(name: &str, timer: &str, indices: &[i32]) -> Script {
 fn simulation() -> Simulation<RotwkRules> {
     let arm = |timer: &str, frames: i32| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: "SET_TIMER".to_owned(),
         params: vec![text(timer), number(frames)],
     };
@@ -290,11 +293,13 @@ fn a_switch_narrows_what_the_shroud_answers_without_losing_what_it_held() {
 fn a_human_impassable_area_bars_only_human_movers_until_it_is_freed() {
     let area = |name: &str, flag: i32| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: "HUMAN_IMPASSABLE_AREA".to_owned(),
         params: vec![text(name), number(flag)],
     };
     let arm = |timer: &str, frames: i32| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: "SET_TIMER".to_owned(),
         params: vec![text(timer), number(frames)],
     };

@@ -201,7 +201,8 @@ pub fn radiate_fear_update_from_fields(
         data: Arc::new(RadiatorData {
             initially_active,
             radius: number("EmotionPulseRadius")?.unwrap_or(0.0),
-            interval: LogicFrames::from_milliseconds(interval_ms).max(LogicFrames::ONE),
+            interval: crate::special_ability_update::retail_duration_ticks(interval_ms)
+                .max(LogicFrames::ONE),
             kinds,
             victim_filter: Arc::new(ObjectFilter::parse(&victim_tokens)),
             which_special_power: number("WhichSpecialPower")?.map(|value| {

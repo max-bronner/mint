@@ -1,4 +1,6 @@
-use crate::hud::{ComboItemSpec, ComboSpec, MapWindowSpec};
+use std::sync::Arc;
+
+use crate::hud::{ComboItemSpec, ComboSpec, ImageSource, MapWindowSpec};
 use crate::lobby::{
     Catalogue, Difficulty, HeroPick, Occupant, SkirmishSetup, SlotSetup, HANDICAP_MAX,
     HANDICAP_STEP, MAX_SLOTS, TEAMS,
@@ -38,12 +40,32 @@ impl Column {
     }
 }
 
+pub(crate) fn list_path(setup_clip: &str) -> String {
+    format!("{setup_clip}.#1.PlayerList")
+}
+
 pub(crate) fn cell_path(list: &str, row: usize, column: Column) -> String {
     format!("{list}.~{row}.{}", column.surface())
 }
 
 pub(crate) fn connection_icon(row: usize) -> String {
     format!("ConnectionIcon~{row}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapType {
+    OpenPlay,
+    Strategic,
+}
+
+const STRATEGIC_ROWS: usize = 6;
+
+pub(crate) fn cell_source(map_type: MapType, row: usize, spec: Arc<ComboSpec>) -> ImageSource {
+    if map_type == MapType::Strategic && row >= STRATEGIC_ROWS {
+        ImageSource::Hidden
+    } else {
+        ImageSource::Combo(spec)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -142,6 +164,7 @@ pub(crate) fn cell(
                 .faction
                 .as_deref()
                 .and_then(|name| catalogue.faction_bit(name));
+            entries.push((white(&labels.none), Choice::Hero(HeroPick::None)));
             entries.push((white(&labels.random), Choice::Hero(HeroPick::Random)));
             for (index, hero) in catalogue.heroes.iter().enumerate().rev() {
                 let label = if hero.system {

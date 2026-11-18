@@ -244,6 +244,9 @@ impl Stage {
             }
         }
         if let Value::Object(id) = object {
+            if *id == self.heap.global {
+                self.take_shared_global();
+            }
             if Some(*id) == self.extern_object {
                 if let Some(answer) = self.extern_query(name) {
                     return answer;
@@ -384,6 +387,9 @@ impl Stage {
         if Some(*id) == self.extern_object {
             self.write_extern_live(name, &value);
         }
+        if *id == self.heap.global && !matches!(value, Value::Object(_)) {
+            self.share_global_member(name, &value);
+        }
         let Some(obj) = self.heap.objects.get(*id) else {
             return Ok(());
         };
@@ -515,6 +521,7 @@ impl Stage {
         if name.eq_ignore_ascii_case("this") {
             return (frame.this.clone(), None);
         }
+        self.take_shared_global();
         let mut scope = Some(frame.scope);
         let mut hops = 0u32;
         while let Some(id) = scope {
@@ -604,6 +611,7 @@ impl Stage {
         frame: &Frame,
         path: &str,
     ) -> (Value, Option<ObjectId>) {
+        self.take_shared_global();
         if let Some(sep) = path.rfind([':', '.']) {
             let (target, var) = (
                 path.get(..sep).unwrap_or(""),
@@ -883,6 +891,35 @@ impl Stage {
         let live = host.get_extern(name);
         self.sync_host = Some(host);
         live
+    }
+
+    fn take_shared_global(&mut self) {
+        let Some(shared) = &self.shared_global else {
+            return;
+        };
+        if shared.version() == self.shared_seen {
+            return;
+        }
+        let Some((version, members)) = shared.snapshot() else {
+            return;
+        };
+        if let Some(global) = self.heap.objects.get_mut(self.heap.global) {
+            for (name, value) in members {
+                global.props.set(&name, value);
+            }
+        }
+        self.shared_seen = version;
+    }
+
+    fn share_global_member(&mut self, name: &str, value: &Value) {
+        let Some(shared) = &self.shared_global else {
+            return;
+        };
+        if let Some((after, before)) = shared.set(name, value.clone()) {
+            if before == self.shared_seen {
+                self.shared_seen = after;
+            }
+        }
     }
 
     fn write_extern_live(&mut self, name: &str, value: &Value) {

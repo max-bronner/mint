@@ -35,6 +35,7 @@ mod contain_tests;
 mod corpse_fade_tests;
 mod corpse_sink_tests;
 mod cost_modifier_tests;
+mod critter_emitter_tests;
 mod crush_blocked_attack_tests;
 mod crush_notice_tests;
 mod crush_weapon_tests;
@@ -59,6 +60,8 @@ mod fire_tests;
 mod flank_tests;
 mod fling_tests;
 mod force_attack_tests;
+mod forfeit_score_tests;
+mod forfeit_tests;
 mod formation_preview_tests;
 mod fx_frame_tests;
 mod fxlist_die_tests;
@@ -84,6 +87,7 @@ mod idle_acquire_tests;
 mod invisibility_special_power_tests;
 mod knockback_tests;
 mod launch_height_tests;
+mod level_grant_tests;
 mod location_cast_tests;
 mod loose_approach_tests;
 mod loose_melee_tests;
@@ -102,6 +106,7 @@ mod nugget_dispatch_tests;
 mod ocl_angle_tests;
 mod ocl_callers_tests;
 mod ocl_forest_tests;
+mod ocl_nesting_tests;
 mod ocl_upgrade_gate_tests;
 mod off_map_entry_tests;
 mod order_queue_tests;
@@ -123,6 +128,7 @@ mod recharge_timing_tests;
 mod refund_die_tests;
 mod replace_footprint_tests;
 mod replenish_tests;
+mod resimulation_tests;
 mod reveal_to_all_tests;
 mod rock_reload_tests;
 mod selection_tests;
@@ -155,6 +161,7 @@ mod wall_top_route_tests;
 mod weapon_behaviour_tests;
 mod weapon_toggle_horde_tests;
 mod weapon_toggle_sync_tests;
+mod wotr_battle_tests;
 
 use super::*;
 use crate::combat::acquire_target;
@@ -746,6 +753,7 @@ fn combat_data() -> (
                     projectile_template: Some("TestArrow".to_owned()),
                     warhead: "TestWarhead".to_owned(),
                     requires_upgrade: false,
+                    launch_slot: None,
                 })],
                 ..WeaponTemplate::default()
             },
@@ -2309,6 +2317,7 @@ fn a_missed_lob_still_hurts_what_it_lands_on_whatever_the_collide_mask_names() {
                         projectile_template: None,
                         warhead: "TestLobWarhead".to_owned(),
                         requires_upgrade: false,
+                        launch_slot: None,
                     })],
                     ..WeaponTemplate::default()
                 },
@@ -2317,7 +2326,10 @@ fn a_missed_lob_still_hurts_what_it_lands_on_whatever_the_collide_mask_names() {
         let map = flat_map(96, 96);
         let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
         let spawns = vec![
-            armed_spawn(200.0, 200.0, PLAYER, Some(lob), Some(armour), 100.0),
+            Spawn {
+                ground_offset: Some(10.0),
+                ..armed_spawn(200.0, 200.0, PLAYER, Some(lob), Some(armour), 100.0)
+            },
             armed_spawn(260.0, 200.0, OTHER, None, Some(armour), 100.0),
         ];
         let mut simulation =
@@ -4961,7 +4973,7 @@ fn economy_sim_income(use_shroud: bool, income_frames: u32) -> (Simulation<Rotwk
             output: crate::economy::Output::Unit(built),
             kind: crate::unit::Kind(0),
             cost: 200,
-            build_time: mint_sim::LogicFrames::from_frames(10),
+            build_seconds: 1.0,
             command_points: 0,
             label: String::from("test unit"),
             builder: false,
@@ -4973,7 +4985,7 @@ fn economy_sim_income(use_shroud: bool, income_frames: u32) -> (Simulation<Rotwk
             }),
             kind: crate::unit::Kind(1),
             cost: 200,
-            build_time: mint_sim::LogicFrames::from_frames(10),
+            build_seconds: 1.0,
             command_points: 0,
             label: String::from("test unit"),
             builder: false,
@@ -5435,7 +5447,7 @@ fn a_structure_earns_on_its_timer_and_a_queued_unit_is_charged_at_once() {
     assert_eq!(queued(&simulation, ids, structure), 1);
     assert_eq!(bodies(&simulation, ids), before, "the unit appeared early");
 
-    for _ in 0..10 {
+    for _ in 0..30 {
         simulation.tick().unwrap();
     }
     assert_eq!(queued(&simulation, ids, structure), 0);
@@ -6132,6 +6144,66 @@ fn a_moving_unit_replans_around_a_site_placed_across_its_path() {
         "replan_if_due never ran - the mover reaching its goal must have been luck, not a re-plan"
     );
     assert!(!simulation.is_poisoned());
+}
+
+fn defeated_holding(held: &str, mode: crate::defeat::DefeatMode, filter: &[&str]) -> bool {
+    let (data, kinds) = construction_kinds();
+    let spawn = |name: &str, at: f32, player| {
+        kinds
+            .spawn(
+                &data.combat,
+                kinds.kind(name).unwrap(),
+                Vec2::new(at, 100.0),
+                Facing::EAST,
+                player,
+            )
+            .unwrap()
+    };
+    let objects = vec![spawn(held, 100.0, PLAYER), spawn("Shed", 400.0, OTHER)];
+    let passability = Passability::build(&flat_map(160, 60), 5.0 / 128.0).unwrap();
+    let structure =
+        crate::defeat::ObjectFilter::parse(&["NONE".to_owned(), "+STRUCTURE".to_owned()]);
+    let unit = crate::defeat::ObjectFilter::parse(
+        &filter.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>(),
+    );
+    let mut simulation = Simulation::new(
+        62,
+        RotwkRules::new(passability, objects)
+            .with_combat(data.combat.clone())
+            .with_victory(Arc::clone(&kinds), structure)
+            .with_victory_units(unit)
+            .with_defeat_mode(mode),
+    )
+    .unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    simulation.tick().unwrap();
+    let clock = simulation
+        .state()
+        .store(ids.clock)
+        .and_then(|store| store.entities().first().copied())
+        .unwrap();
+    simulation.state().get(ids.outcome, clock).is_some()
+}
+
+#[test]
+fn a_players_units_keep_it_alive_by_the_defeat_mode() {
+    use crate::defeat::DefeatMode::{Dozer, UnitFilter};
+    let shipped = ["ANY", "-DOZER", "-NOT_AUTOACQUIRABLE"];
+    let rows = [
+        ("Porter", Dozer, &shipped[..], false),
+        ("Attacker", Dozer, &shipped[..], true),
+        ("Porter", UnitFilter, &shipped[..], true),
+        ("Attacker", UnitFilter, &shipped[..], true),
+        ("Attacker", UnitFilter, &["ALL", "-DOZER"][..], false),
+        ("Porter", UnitFilter, &["ALL", "-DOZER"][..], true),
+    ];
+    for (held, mode, filter, defeated) in rows {
+        assert_eq!(
+            defeated_holding(held, mode, filter),
+            defeated,
+            "{held} under {mode:?} with {filter:?}"
+        );
+    }
 }
 
 #[test]
@@ -7763,6 +7835,7 @@ fn a_lit_cell_damages_an_own_unit_standing_in_it_with_no_attacker() {
         },
         (60.0, 60.0),
         None,
+        &|_, _| false,
     );
 
     let mut simulation = Simulation::new(

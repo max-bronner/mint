@@ -120,9 +120,18 @@ fn finish_ability<T: Trigger>(
     active_slot: &mut Option<Active>,
     entity: Entity,
     ctx: &mut UpdateContext<'_>,
-    hold: LogicFrames,
+    paralyze: LogicFrames,
     completed: bool,
 ) -> Sleep {
+    if let Some(active) = active_slot.as_ref() {
+        data.trigger
+            .finish_ability(entity, active.target, active.triggers, ctx);
+    }
+    if !paralyze.is_zero() {
+        if let Some(log) = ctx.effects.get::<EffectLog>() {
+            log.push(entity, Effect::AiBusy(paralyze));
+        }
+    }
     if completed {
         if let Some(button) = &data.chained_button {
             if let Some(log) = ctx.effects.get::<EffectLog>() {
@@ -132,7 +141,7 @@ fn finish_ability<T: Trigger>(
     }
     let hold = active_slot
         .as_ref()
-        .map_or(hold, |active| hold.max(active.frozen));
+        .map_or(LogicFrames::ZERO, |active| active.frozen);
     if hold.is_zero() {
         *active_slot = None;
         end_ability(data, entity, ctx);
@@ -198,11 +207,20 @@ pub const RETAIL_LOGIC_HZ: u32 = 5;
 
 const TICKS_PER_RETAIL_FRAME: u32 = mint_sim::SIMULATION_HZ / RETAIL_LOGIC_HZ;
 
+pub(crate) const RETAIL_LOGIC_NONZERO: core::num::NonZeroU32 =
+    match core::num::NonZeroU32::new(RETAIL_LOGIC_HZ) {
+        Some(hz) => hz,
+        None => core::num::NonZeroU32::MIN,
+    };
+
 #[must_use]
-pub fn retail_duration_ticks(milliseconds: u32) -> LogicFrames {
-    let ms_per_retail_frame = 1000 / RETAIL_LOGIC_HZ;
-    let retail_frames = milliseconds.div_ceil(ms_per_retail_frame);
-    LogicFrames::from_frames(retail_frames.saturating_mul(TICKS_PER_RETAIL_FRAME))
+pub const fn retail_duration_ticks(milliseconds: u32) -> LogicFrames {
+    LogicFrames::from_authored_milliseconds(milliseconds, RETAIL_LOGIC_NONZERO)
+}
+
+#[must_use]
+pub fn retail_duration_ticks_f32(milliseconds: f32) -> LogicFrames {
+    LogicFrames::from_authored_milliseconds_f32(milliseconds, RETAIL_LOGIC_NONZERO)
 }
 
 pub(crate) fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> (bool, LogicFrames) {
@@ -251,6 +269,7 @@ pub(crate) struct Active {
     last_approach_aim: Option<(f32, f32)>,
     pending_custom_anim: Option<Frame>,
     capture_phase: f32,
+    no_target: bool,
 }
 
 fn ignores_orders<T: Trigger>(data: &AbilityData<T>, active: &Active) -> bool {
@@ -277,6 +296,15 @@ pub trait Trigger: 'static + Clone + std::fmt::Debug + PartialEq {
     }
 
     fn abort(&self, _entity: Entity, _target: AbilityTarget, _ctx: &mut UpdateContext<'_>) {}
+
+    fn finish_ability(
+        &self,
+        _entity: Entity,
+        _target: AbilityTarget,
+        _triggers: u32,
+        _ctx: &mut UpdateContext<'_>,
+    ) {
+    }
 
     fn finish(&self, _entity: Entity, _ctx: &mut UpdateContext<'_>) {}
 
@@ -335,6 +363,16 @@ impl Trigger for PowerTrigger {
     fn abort(&self, entity: Entity, target: AbilityTarget, ctx: &mut UpdateContext<'_>) {
         self.report(entity, target, CastEdge::Abort, ctx);
     }
+
+    fn finish_ability(
+        &self,
+        entity: Entity,
+        target: AbilityTarget,
+        triggers: u32,
+        ctx: &mut UpdateContext<'_>,
+    ) {
+        self.report(entity, target, CastEdge::Finish { triggers }, ctx);
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -345,6 +383,7 @@ pub(crate) struct AbilityData<T: Trigger> {
     unpack_frames: LogicFrames,
     pack_needed: bool,
     pack_frames: LogicFrames,
+    skip_packing_with_no_target: bool,
     prep_frames: LogicFrames,
     persistent_frames: Option<LogicFrames>,
     persistent_count: Option<u32>,
@@ -394,6 +433,53 @@ impl<T: Trigger> AbilityUpdate<T> {
         if let Some(active) = &mut self.active {
             active.last_period = true;
         }
+    }
+
+    pub fn end_persistence_now(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.last_period = true;
+            if active.phase == Phase::Preparing {
+                active.remaining = LogicFrames::ZERO;
+            }
+        }
+    }
+
+    pub fn cut_period(&mut self) {
+        if let Some(active) = &mut self.active {
+            if active.phase == Phase::Preparing {
+                active.remaining = LogicFrames::ZERO;
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn triggers(&self) -> u32 {
+        self.active.as_ref().map_or(0, |active| active.triggers)
+    }
+
+    #[must_use]
+    pub fn target_position(&self) -> Option<(f32, f32)> {
+        match self.active.as_ref()?.target {
+            AbilityTarget::Position(x, y) => Some((x, y)),
+            AbilityTarget::Object(_) | AbilityTarget::None => None,
+        }
+    }
+
+    pub fn retarget(&mut self, target: Entity) {
+        if let Some(active) = &mut self.active {
+            active.target = AbilityTarget::Object(target);
+        }
+    }
+
+    pub fn mark_no_target(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.no_target = true;
+        }
+    }
+
+    #[must_use]
+    pub fn packing_type(&self) -> Option<&Name> {
+        self.data.packing_type.as_ref()
     }
 
     pub(crate) fn trigger_nearness(&self) -> f32 {
@@ -461,6 +547,9 @@ impl<T: Trigger> Component for AbilityUpdate<T> {
                 }
                 hasher.write_bool(active.pending_custom_anim.is_some());
                 hasher.write_u64(active.pending_custom_anim.map_or(0, Frame::get));
+                if active.no_target != matches!(active.target, AbilityTarget::None) {
+                    hasher.write_bool(active.no_target);
+                }
             }
         }
         hasher.write_bool(self.effect_until.is_some());
@@ -505,6 +594,7 @@ impl<T: Trigger> ModuleKind for AbilityUpdate<T> {
             last_approach_aim: None,
             pending_custom_anim: None,
             capture_phase: 0.0,
+            no_target: matches!(target, AbilityTarget::None),
         });
         if !(self.data.instant && matches!(target, AbilityTarget::None)) {
             report_status_bit(&mut ctx.effects, ctx.entity, NO_AUTO_ACQUIRE, true);
@@ -927,7 +1017,7 @@ impl<T: Trigger> AbilityUpdate<T> {
                         {
                             active.remaining = persistent;
                         }
-                        _ if self.data.pack_needed => {
+                        _ if self.data.pack_needed && !skips_packing(&self.data, active) => {
                             active.phase = Phase::Packing;
                             active.remaining = self.data.pack_frames;
                             stop_active_loop_sound(&self.data, entity, ctx);
@@ -965,7 +1055,7 @@ impl<T: Trigger> AbilityUpdate<T> {
                             })
                         });
                     if !continue_preparation || out_of_range {
-                        if self.data.pack_needed {
+                        if self.data.pack_needed && !skips_packing(&self.data, active) {
                             active.phase = Phase::Packing;
                             active.remaining = self.data.pack_frames;
                             stop_active_loop_sound(&self.data, entity, ctx);
@@ -1026,6 +1116,10 @@ impl<T: Trigger> AbilityUpdate<T> {
     }
 }
 
+fn skips_packing<T: Trigger>(data: &AbilityData<T>, active: &Active) -> bool {
+    data.skip_packing_with_no_target && active.no_target
+}
+
 const fn preparing(active: &Active) -> bool {
     active.prepare_reported && active.triggers == 0
 }
@@ -1044,7 +1138,7 @@ fn begin_unpack_or_prepare<T: Trigger>(
         .trigger
         .effect_timer()
         .and_then(|lasts| ctx.now.checked_add(lasts));
-    if data.unpack_needed {
+    if data.unpack_needed && !skips_packing(data, active) {
         let mut add = whole_cast;
         add.push(Name::from(UNPACKING));
         push_conditions(ctx, entity, add, Vec::new());
@@ -1339,6 +1433,10 @@ pub(crate) fn ability_data_from_fields_with_persistence<T: Trigger>(
         unpack_frames,
         pack_needed,
         pack_frames,
+        skip_packing_with_no_target: crate::fire_weapon_update::flag(
+            fields,
+            "SkipPackingWithNoTarget",
+        ) == Some(true),
         prep_frames,
         persistent_frames: (persists && persistent_needed).then_some(persistent_frames),
         persistent_count: if skip_continue_persists {
@@ -1405,7 +1503,6 @@ fn packing_type_condition(value: Option<f32>) -> Option<Name> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrabPassengerEat {
     pub state: Name,
-    pub after: LogicFrames,
     pub lasts: LogicFrames,
     pub trigger: LogicFrames,
     pub heal: Option<f32>,
@@ -1417,7 +1514,7 @@ pub(crate) fn millisecond_token(token: &str, key: &str) -> Option<LogicFrames> {
         return None;
     }
     let ms: u32 = value.trim().parse().ok()?;
-    Some(LogicFrames::from_milliseconds(ms.min(86_400_000)))
+    Some(retail_duration_ticks(ms.min(86_400_000)))
 }
 
 fn retail_ms_token(token: &str, key: &str) -> Option<u32> {
@@ -1542,10 +1639,6 @@ pub fn grab_passenger_eat(
     };
     Ok(Some(GrabPassengerEat {
         state,
-        after: duration(fields, "PersistentPrepTime")
-            .1
-            .checked_add(duration(fields, "PackTime").1)
-            .ok_or_else(|| FieldError::new("PersistentPrepTime + PackTime overflows"))?,
         lasts,
         trigger,
         heal,

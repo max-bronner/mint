@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn the_totals_match_table_rs_own_tally() {
-        assert_eq!(openers().len(), 366);
+        assert_eq!(openers().len(), 389);
         assert_eq!(closed_contexts().len(), 172);
         assert_eq!(aliases().len(), OBJECT_MODEL_ALIASES.len());
     }

@@ -28,7 +28,7 @@ mod vm_tests;
 
 pub use actions::{clip_event, ActionQueue, ActionSource, Priority, QueuedAction};
 pub use arena::{Arena, Full, Handle};
-pub use avm::{Halt, ObjectId, Outward, ScriptStats, SyncHost, Value, VmLimits};
+pub use avm::{Halt, ObjectId, Outward, ScriptStats, SharedGlobal, SyncHost, Value, VmLimits};
 pub use expose::{Exposure, ExposureStats, ImageChange, ImageKey, MovieEvent, Readiness};
 pub use geom::{ColorTransform, Matrix};
 pub use instance::{ButtonVisual, ClipState, Instance, InstanceId, InstanceKind};

@@ -33,7 +33,7 @@ fn weather_duration(fields: &dyn ModuleFieldSource) -> mint_sim::LogicFrames {
         .min(86_400_000.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms as u32;
-    mint_sim::LogicFrames::from_milliseconds(whole)
+    crate::special_ability_update::retail_duration_ticks(whole)
 }
 
 fn change_weather(fields: &dyn ModuleFieldSource) -> Result<Option<WeatherKind>, FieldError> {
@@ -584,7 +584,7 @@ mod tests {
                 Effect::ClearWeatherEffect,
                 Effect::ChangeWeather {
                     kind: WeatherKind::Sunny,
-                    lasts: mint_sim::LogicFrames::from_milliseconds(5000),
+                    lasts: mint_sim::LogicFrames::from_engine_milliseconds(5000),
                 },
                 Effect::CreateObjects {
                     list: Name::from("OCL_Sunflare"),

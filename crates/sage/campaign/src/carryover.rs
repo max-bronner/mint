@@ -51,10 +51,10 @@ pub struct UpgradeFact {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlayerCapture {
-    pub money: f32,
+    pub skill_points: f32,
     pub sciences: Vec<ScienceFact>,
     pub upgrades: Vec<UpgradeFact>,
-    pub cost_multiplier: f32,
+    pub cash_bounty: f32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -62,10 +62,10 @@ pub struct Carryover {
     available: Vec<CarryoverUnit>,
     used: Vec<CarryoverUnit>,
     hero_record_count: i32,
-    money: f32,
+    skill_points: f32,
     sciences: Vec<String>,
     upgrades: Vec<String>,
-    cost_multiplier: f32,
+    cash_bounty: f32,
 }
 
 fn same(record: &CarryoverUnit, name: &str) -> bool {
@@ -120,8 +120,13 @@ impl Carryover {
     }
 
     #[must_use]
-    pub fn money(&self) -> f32 {
-        self.money
+    pub fn skill_points(&self) -> f32 {
+        self.skill_points
+    }
+
+    #[must_use]
+    pub fn cash_bounty(&self) -> f32 {
+        self.cash_bounty
     }
 
     #[must_use]
@@ -132,11 +137,6 @@ impl Carryover {
     #[must_use]
     pub fn upgrades(&self) -> &[String] {
         &self.upgrades
-    }
-
-    #[must_use]
-    pub fn cost_multiplier(&self) -> f32 {
-        self.cost_multiplier
     }
 
     #[must_use]
@@ -212,7 +212,8 @@ impl Carryover {
         }
         self.used.clear();
         if let Some(player) = player {
-            self.money = player.money;
+            self.skill_points = player.skill_points;
+            self.cash_bounty = player.cash_bounty;
             self.sciences = player
                 .sciences
                 .iter()
@@ -225,7 +226,6 @@ impl Carryover {
                 .filter(|upgrade| upgrade.persists)
                 .map(|upgrade| upgrade.name.clone())
                 .collect();
-            self.cost_multiplier = player.cost_multiplier;
         }
     }
 
@@ -233,14 +233,14 @@ impl Carryover {
         state.available.clone_from(&self.available);
         state.used.clone_from(&self.used);
         state.hero_record_count = self.hero_record_count;
-        state.money = self.money;
+        state.skill_points = self.skill_points;
         state.sciences = self
             .sciences
             .iter()
             .map(|name| AsciiString::from(name.as_str()))
             .collect();
         state.player_upgrades = upgrade_list(&self.upgrades);
-        state.cost_multiplier_b0 = self.cost_multiplier;
+        state.cash_bounty = self.cash_bounty;
     }
 
     pub(crate) fn from_state(state: &mint_sage_save::CampaignState) -> Self {
@@ -248,7 +248,7 @@ impl Carryover {
             available: state.available.clone(),
             used: state.used.clone(),
             hero_record_count: state.hero_record_count,
-            money: state.money,
+            skill_points: state.skill_points,
             sciences: state
                 .sciences
                 .iter()
@@ -260,7 +260,7 @@ impl Carryover {
                 .iter()
                 .map(AsciiString::to_string_lossy)
                 .collect(),
-            cost_multiplier: state.cost_multiplier_b0,
+            cash_bounty: state.cash_bounty,
         }
     }
 }

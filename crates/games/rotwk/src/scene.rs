@@ -31,6 +31,22 @@ fn static_lod_documents(vfs: &Vfs) -> Option<[mint_sage_ini::Document; 1]> {
         .map(|document| [document])
 }
 
+pub(crate) fn static_lod_shadow_decals(vfs: &Vfs) -> bool {
+    let decals = static_lod_documents(vfs).and_then(|documents| {
+        mint_sage_particle::static_lod_shadow_decals(&documents, ACTIVE_STATIC_LOD)
+    });
+    println!(
+        "decals: StaticGameLOD {} {}",
+        ACTIVE_STATIC_LOD.label(),
+        match decals {
+            Some(true) => "makes shadow decals",
+            Some(false) => "makes no shadow decals; only ShadowOverrideLODVisibility ones draw",
+            None => "does not say; every shadow decal draws",
+        }
+    );
+    decals.unwrap_or(true)
+}
+
 pub(crate) fn static_lod_effects_index(vfs: &Vfs) -> u8 {
     use mint_sage_particle::DetailLevel;
     let level = static_lod_documents(vfs).and_then(|documents| {
@@ -89,6 +105,7 @@ pub(crate) struct MatchScene {
     pub(crate) terrain: Terrain,
     pub(crate) drawn: Vec<Instance>,
     pub(crate) composed_len: usize,
+    pub(crate) palette: Vec<mint_render::Mat4>,
     pub(crate) surface_overlays: Vec<usize>,
     pub(crate) object_span: std::ops::Range<usize>,
     pub(crate) tree_pose_drawn: Vec<Option<crate::forest::TreePose>>,
@@ -164,6 +181,7 @@ pub(crate) struct MatchScene {
     pub(crate) cloud_darkening_on: bool,
     pub(crate) fog: Option<mint_render::DistanceFog>,
     pub(crate) fog_on: bool,
+    pub(crate) fog_shift: f32,
     pub(crate) post: mint_sage_scene::post_present::PostPresent,
     pub(crate) script_bloom: Option<bool>,
     pub(crate) script_view: crate::rules::map_scripts::ScriptView,
@@ -766,6 +784,7 @@ pub(crate) fn begin_match_scene(
                             terrain: built.terrain,
                             drawn,
                             composed_len,
+                            palette: Vec::new(),
                             surface_overlays,
                             object_span,
                             tree_pose_drawn,
@@ -836,6 +855,7 @@ pub(crate) fn begin_match_scene(
                             cloud_darkening_on: true,
                             fog,
                             fog_on: true,
+                            fog_shift: 0.0,
                             post,
                             script_bloom: None,
                             script_view: crate::rules::map_scripts::ScriptView::default(),
@@ -1145,7 +1165,27 @@ pub(crate) fn drawn_visibility_mask(scene: &MatchScene) -> Option<mint_render::V
 }
 
 pub(crate) fn drawn_fog(scene: &MatchScene) -> Option<mint_render::DistanceFog> {
-    scene.fog.filter(|_| scene.fog_on)
+    let shift = if scene.fog_shift.is_finite() {
+        scene.fog_shift.max(0.0)
+    } else {
+        0.0
+    };
+    scene
+        .fog
+        .filter(|_| scene.fog_on)
+        .map(|fog| mint_render::DistanceFog {
+            start: fog.start + shift,
+            end: fog.end + shift,
+            ..fog
+        })
+}
+
+pub(crate) fn fog_shift(distance: f32, pitch: f32, max_height: f32) -> f32 {
+    let sine = mint_math::f32::sin(pitch);
+    if !(sine > 1e-3 && max_height > 0.0 && distance.is_finite()) {
+        return 0.0;
+    }
+    (distance - max_height / sine).max(0.0)
 }
 
 fn particle_delta(seconds: f32, last: f32) -> f32 {
@@ -1180,6 +1220,15 @@ mod tests {
     #[test]
     fn a_later_clock_reading_advances_by_the_difference() {
         assert_eq!(particle_delta(1.5, 1.0), 0.5);
+    }
+
+    #[test]
+    fn the_fog_range_moves_out_only_past_the_widest_retail_zoom() {
+        let pitch = 37.5f32.to_radians();
+        let widest = 300.0 / mint_math::f32::sin(pitch);
+        assert_eq!(fog_shift(widest * 0.5, pitch, 300.0), 0.0);
+        let shift = fog_shift(widest + 1000.0, pitch, 300.0);
+        assert!((shift - 1000.0).abs() < 0.05, "{shift}");
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub(crate) enum HeldOrder {
     AttackMove(Vec2, bool),
     AttackGround { slot: u8, at: Vec2 },
     ForceAttackObject(Entity),
+    ScriptAttackObject(Entity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +18,22 @@ pub(crate) struct DeferredOrder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IgnoreAiCommand(pub(crate) Frame);
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AiBusy {
+    until: Frame,
+    stash: Option<crate::unit::Path>,
+}
+
+impl Component for AiBusy {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        self.until.hash_into(hasher);
+        hasher.write_bool(self.stash.is_some());
+        if let Some(path) = &self.stash {
+            Component::hash_into(path, hasher);
+        }
+    }
+}
 
 impl Component for IgnoreAiCommand {
     fn hash_into(&self, hasher: &mut StateHasher) {
@@ -54,12 +71,19 @@ impl Component for DeferredOrder {
                 hasher.write_u8(4);
                 target.hash_into(hasher);
             }
+            HeldOrder::ScriptAttackObject(target) => {
+                hasher.write_u8(5);
+                target.hash_into(hasher);
+            }
         }
     }
 }
 
 impl RotwkRules {
     pub(super) fn busy(&self, world: &World, ids: Ids, entity: Entity, now: Frame) -> bool {
+        if Self::ai_busy(world, ids, entity, now) {
+            return true;
+        }
         let Some(armed) = world.get(ids.armed, entity) else {
             return false;
         };
@@ -77,6 +101,63 @@ impl RotwkRules {
             .last_shot()
             .and_then(|shot| shot.checked_add(hold))
             .is_some_and(|until| now < until)
+    }
+
+    pub(super) fn ai_busy(world: &World, ids: Ids, entity: Entity, now: Frame) -> bool {
+        world
+            .get(ids.ai_busy, entity)
+            .is_some_and(|busy| now < busy.until)
+    }
+
+    pub(super) fn start_ai_busy(
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        frames: LogicFrames,
+    ) -> Result<()> {
+        if frames.is_zero() || !tick.state().is_live(entity) {
+            return Ok(());
+        }
+        let frames = frames.min(LogicFrames::from_engine_milliseconds(60_000));
+        let until = tick.frame().checked_add(frames).unwrap_or(Frame::FOREVER);
+        let stash = match tick.state_mut().remove(ids.ai_busy, entity) {
+            Some(running) => running.stash,
+            None => super::emotion_states::take_route(tick, ids, entity),
+        };
+        diag!(
+            "busy: entity {} in AIBusyState until frame {}",
+            entity.index(),
+            until.get()
+        );
+        tick.state_mut()
+            .insert(ids.ai_busy, entity, AiBusy { until, stash })?;
+        Ok(())
+    }
+
+    pub(super) fn end_ai_busy(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
+        let now = tick.frame();
+        let ended: Vec<Entity> = tick
+            .state()
+            .store(ids.ai_busy)
+            .map(|store| {
+                store
+                    .iter()
+                    .filter(|(_, busy)| now >= busy.until)
+                    .map(|(entity, _)| entity)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for entity in ended {
+            let Some(busy) = tick.state_mut().remove(ids.ai_busy, entity) else {
+                continue;
+            };
+            if let Some(path) = busy.stash {
+                if !tick.state().contains(ids.path, entity) {
+                    tick.state_mut().insert(ids.path, entity, path)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn issue_order(
@@ -261,6 +342,10 @@ impl RotwkRules {
             HeldOrder::ForceAttackObject(target) => {
                 self.uncohere_move_speed(tick, ids, player);
                 self.force_attack_object(tick, ids, player, target)
+            }
+            HeldOrder::ScriptAttackObject(target) => {
+                self.uncohere_move_speed(tick, ids, player);
+                self.script_attack_object(tick, ids, player, target)
             }
         }
     }

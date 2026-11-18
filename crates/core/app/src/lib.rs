@@ -9,7 +9,7 @@ mod window;
 
 pub use clock::{FixedTimestep, SIMULATION_HZ};
 pub use frame_log::{FrameLog, FrameMarks};
-pub use input::{InputEvent, Key, PointerButton};
+pub use input::{InputEvent, Key, PointerButton, DOUBLE_CLICK_SPAN, DOUBLE_CLICK_TIME};
 pub use orbit::OrbitCamera;
 pub use rts_camera::{RtsCamera, DEFAULT_EDGE_SCROLL_MARGIN};
 pub use window::{run, App, CursorRequest, WindowConfig};

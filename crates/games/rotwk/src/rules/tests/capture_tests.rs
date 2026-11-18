@@ -216,7 +216,7 @@ impl Scenario {
                 state
                     .sub_objects
                     .iter()
-                    .map(|(name, shown)| (name.to_string(), *shown))
+                    .map(|write| (write.name.to_string(), write.shown))
                     .collect()
             })
             .unwrap_or_default();

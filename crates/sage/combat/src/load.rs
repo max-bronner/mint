@@ -21,6 +21,7 @@ use crate::weapon::{
     WeaponTemplate,
 };
 use crate::weapon_bonus::WeaponBonusSet;
+use crate::weapon_slots::WeaponSlot;
 
 pub const WEAPON_KEYWORD: &str = "Weapon";
 pub const ARMOR_KEYWORD: &str = "Armor";
@@ -334,6 +335,7 @@ impl CombatData {
                 .unwrap_or(0.0),
             projectile_filter_in_container: self
                 .object_filter(block, "ProjectileFilterInContainer"),
+            projectile_self: flag("ProjectileSelf"),
             fx_trigger: self.fx_trigger(block),
             bonus: self.weapon_bonus(block, macros),
         };
@@ -470,6 +472,10 @@ impl CombatData {
                     .map(str::to_owned),
                 warhead: warhead.to_owned(),
                 requires_upgrade: requires_upgrade(block),
+                launch_slot: block
+                    .field("WeaponLaunchBoneSlotOverride")
+                    .and_then(Field::value)
+                    .and_then(WeaponSlot::parse),
             });
         }
         if block.keyword.eq_ignore_ascii_case("MetaImpactNugget") {
@@ -605,13 +611,11 @@ impl CombatData {
         if block.keyword.eq_ignore_ascii_case("EmotionWeaponNugget") {
             let emotion = block.field("EmotionType").and_then(Field::value)?;
             let seconds = self.number(block, "Duration", macros).unwrap_or(0.0);
-            let milliseconds = (seconds * 1000.0).clamp(0.0, f32::from(u16::MAX) * 1000.0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let milliseconds = milliseconds as u32;
+            let milliseconds = seconds.trunc().clamp(0.0, f32::from(u16::MAX)) * 1000.0;
             return Some(EffectNugget::EmotionWeapon(EmotionWeaponNugget {
                 emotion: emotion.to_owned(),
                 radius: self.number(block, "Radius", macros).unwrap_or(0.0),
-                duration: LogicFrames::from_milliseconds(milliseconds),
+                duration: milliseconds_to_frames(milliseconds, self.authored_logic_hz),
             }));
         }
         if block.keyword.eq_ignore_ascii_case("OpenGateNugget") {
@@ -824,27 +828,10 @@ fn milliseconds_to_frames(
     milliseconds: f32,
     authored: Option<core::num::NonZeroU32>,
 ) -> LogicFrames {
-    if !milliseconds.is_finite() || milliseconds <= 0.0 {
-        return LogicFrames::ZERO;
-    }
-    let bounded = if milliseconds > 86_400_000.0 {
-        86_400_000.0
-    } else {
-        milliseconds
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let ours = mint_sim::SIMULATION_HZ as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let frames = match authored {
-        Some(hz) => {
-            let theirs = hz.get() as f32;
-            (bounded * theirs / 1000.0).ceil() * ours / theirs
-        }
-        None => bounded * ours / 1000.0,
-    };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let whole = frames.ceil() as u32;
-    LogicFrames::from_frames(whole)
+    let hz = authored
+        .or(core::num::NonZeroU32::new(mint_sim::SIMULATION_HZ))
+        .unwrap_or(core::num::NonZeroU32::MIN);
+    LogicFrames::from_authored_milliseconds_f32(milliseconds, hz)
 }
 
 fn retail_frames(count: u32, authored: Option<core::num::NonZeroU32>) -> LogicFrames {

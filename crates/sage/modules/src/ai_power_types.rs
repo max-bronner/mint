@@ -166,6 +166,19 @@ impl AiPowerKind for ToggleMeleeAndRange {
     }
 }
 
+struct GoblinPoison;
+
+const GOBLIN_POISON_RANGE: f32 = 100.0;
+
+impl AiPowerKind for GoblinPoison {
+    fn should_activate(&self, ctx: AiPowerContext, _candidates: &[AiPowerCandidate]) -> bool {
+        !ctx.victim_excluded
+            && ctx
+                .victim_distance
+                .is_some_and(|distance| distance < GOBLIN_POISON_RANGE)
+    }
+}
+
 struct Inert;
 
 impl AiPowerKind for Inert {
@@ -184,6 +197,7 @@ const INERT_TYPES: &[&str] = &[
     "AI_SPECIAL_POWER_ELENDIL",
     "AI_SPECIAL_POWER_ENEMY_TYPE_KILLER_STRUCTURES",
     "AI_SPECIAL_POWER_GANDALF_WIZARD_BLAST",
+    "AI_SPECIAL_POWER_GOBLINKING_BATTLEFRENZY",
     "AI_SPECIAL_POWER_GOBLINKING_CALLOFTHEDEEP",
     "AI_SPECIAL_POWER_GOBLINKING_MOUNTED",
     "AI_SPECIAL_POWER_HEAL_AOE",
@@ -232,6 +246,8 @@ fn build_registry() -> AiPowerRegistry {
         "AI_SPECIAL_POWER_ENEMY_TYPE_KILLER_RANGED",
         Arc::new(EnemyTypeKiller),
     );
+    registry.register("AI_SPECIAL_POWER_MORGUL_BLADE", Arc::new(EnemyTypeKiller));
+    registry.register("AI_SPECIAL_POWER_GOBLIN_POISON", Arc::new(GoblinPoison));
     registry.register("AI_SPECIAL_POWER_CHARGE", Arc::new(Charge));
     registry.register(
         "AI_SPECIAL_POWER_RANGED_AOE_ATTACK",
@@ -276,6 +292,7 @@ mod tests {
         rng_unit: 0.0,
         victim_distance: None,
         weapon_is_melee: false,
+        victim_excluded: false,
     };
 
     fn entities(n: u32) -> Vec<Entity> {
@@ -509,5 +526,28 @@ mod tests {
             ..melee_far
         };
         assert!(!kind.should_activate(melee_close, &[]));
+    }
+
+    #[test]
+    fn goblin_poison_fires_only_on_a_near_victim_of_an_allowed_kind() {
+        let kind = ai_power_registry()
+            .get("AI_SPECIAL_POWER_GOBLIN_POISON")
+            .unwrap();
+        let near = AiPowerContext {
+            victim_distance: Some(99.0),
+            ..BASE_CTX
+        };
+        assert!(kind.should_activate(near, &[]));
+        let at_limit = AiPowerContext {
+            victim_distance: Some(100.0),
+            ..BASE_CTX
+        };
+        assert!(!kind.should_activate(at_limit, &[]));
+        let structure = AiPowerContext {
+            victim_excluded: true,
+            ..near
+        };
+        assert!(!kind.should_activate(structure, &[]));
+        assert!(!kind.should_activate(BASE_CTX, &[]));
     }
 }

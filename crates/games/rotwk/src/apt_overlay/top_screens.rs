@@ -18,6 +18,10 @@ impl AptOverlay {
         self.campaign = campaign;
     }
 
+    pub(crate) fn set_skirmish_or_multiplayer(&mut self, mode: crate::game_mode::GameMode) {
+        self.skirmish_or_multiplayer = mode.is_skirmish_or_multiplayer(None);
+    }
+
     pub(crate) fn set_objectives_feed(&mut self, feed: Feed) {
         self.objectives_feed = feed;
     }

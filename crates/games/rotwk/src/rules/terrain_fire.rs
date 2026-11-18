@@ -61,6 +61,22 @@ pub(crate) struct FireLighting {
     pub(crate) max_resistance: u16,
 }
 
+impl FireLighting {
+    pub(crate) fn clear_fuel(radius: f32) -> Self {
+        Self {
+            logic_type: FireLogicKind::IncreaseFuel {
+                existing_only: false,
+            },
+            radius,
+            damage: -2_147_483_648.0,
+            damage_arc: DEFAULT_DAMAGE_ARC,
+            min_max_burn_rate: None,
+            min_decay: None,
+            max_resistance: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FireLogicKind {
     IncreaseFuel { existing_only: bool },
@@ -243,6 +259,7 @@ impl FireGrid {
         nugget: &FireLighting,
         centre: (f32, f32),
         source_direction: Option<(f32, f32)>,
+        underwater: &dyn Fn(f32, f32) -> bool,
     ) {
         if nugget.radius <= 0.0 || nugget.damage == 0.0 {
             return;
@@ -258,7 +275,7 @@ impl FireGrid {
         let dir = source_direction.unwrap_or((1.0, 0.0));
         let cos_limit = mint_math::f32::cos(nugget.damage_arc);
         disc_spans(cx, cy, r0, |row, x0, x1| {
-            self.light_row(nugget, centre, dir, cos_limit, row, x0, x1);
+            self.light_row(nugget, centre, dir, cos_limit, underwater, (row, x0, x1));
         });
     }
 
@@ -269,9 +286,8 @@ impl FireGrid {
         centre: (f32, f32),
         dir: (f32, f32),
         cos_limit: f32,
-        row: i32,
-        x0: i32,
-        x1: i32,
+        underwater: &dyn Fn(f32, f32) -> bool,
+        (row, x0, x1): (i32, i32, i32),
     ) {
         let (Ok(y), Ok(lo), Ok(hi)) = (
             usize::try_from(row),
@@ -286,6 +302,14 @@ impl FireGrid {
             };
             match nugget.logic_type {
                 FireLogicKind::IncreaseFuel { existing_only } => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let (wx, wy) = (
+                        x as f32 * CELL_SIZE + CELL_SIZE * 0.5,
+                        y as f32 * CELL_SIZE + CELL_SIZE * 0.5,
+                    );
+                    if underwater(wx, wy) {
+                        continue;
+                    }
                     self.apply_increase_fuel(index, nugget, existing_only);
                 }
                 FireLogicKind::IncreaseBurnRate { existing_only, arc } => {
@@ -1549,5 +1573,28 @@ mod tests {
         let taken = forest.take_supply(handles[0], u32::from(amount));
         assert_eq!(taken, 5, "capped at the tree's own supply");
         assert_eq!(forest.len(), 0, "an emptied tree sinks");
+    }
+
+    #[test]
+    fn an_increase_fuel_row_skips_a_cell_whose_centre_is_wet() {
+        let system = system_with([
+            FireMaterial::default(),
+            material(100, 20, 0, 0),
+            FireMaterial::default(),
+            FireMaterial::default(),
+        ]);
+        let mut grid = FireGrid::build(5, 5, |_, _| Some(1), &system);
+        let wet = |x: f32, y: f32| (x, y) == (25.0, 25.0);
+        grid.light(&FireLighting::clear_fuel(30.0), (20.0, 20.0), None, &wet);
+        assert_eq!(
+            grid.test_fuel(2, 2),
+            Some(100),
+            "the wet cell keeps its fuel"
+        );
+        assert_eq!(
+            grid.test_fuel(1, 1),
+            Some(0),
+            "a dry cell in the disc is cleared"
+        );
     }
 }

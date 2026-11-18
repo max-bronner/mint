@@ -4,6 +4,7 @@ use mint_sim::PlayerId;
 use crate::setup_heroes::{self, HeroEntry};
 
 pub(crate) const MAX_SLOTS: usize = 8;
+const NET_MIN_PLAYERS: usize = 1;
 pub(crate) const TEAMS: u8 = 4;
 pub(crate) const HANDICAP_STEP: u8 = 5;
 pub(crate) const HANDICAP_MAX: u8 = 95;
@@ -123,6 +124,8 @@ pub(crate) struct SkirmishSetup {
     pub(crate) spawn_buildings: Option<String>,
     pub(crate) dummies: Option<String>,
     pub(crate) dummies_attack: bool,
+    pub(crate) drive_templates: Vec<String>,
+    pub(crate) wotr: Option<crate::wotr_battle::SpecHandle>,
     pub(crate) cah_hero: Option<String>,
     pub(crate) random_seed: u64,
     pub(crate) resolved: Option<Vec<ResolvedPlayer>>,
@@ -155,7 +158,7 @@ impl Catalogue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupError {
     TooManySlots(usize),
-    TooFewPlayers(usize),
+    NeedHumanPlayers,
     TooManyPlayers { players: usize, starts: u8 },
     UnknownFaction(String),
     UnknownHero(usize),
@@ -174,7 +177,7 @@ impl std::fmt::Display for SetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooManySlots(n) => write!(f, "{n} slots, at most {MAX_SLOTS}"),
-            Self::TooFewPlayers(n) => write!(f, "{n} player(s), a match needs two"),
+            Self::NeedHumanPlayers => write!(f, "GUI:NeedHumanPlayers - no human player"),
             Self::TooManyPlayers { players, starts } => {
                 write!(
                     f,
@@ -244,6 +247,8 @@ impl SkirmishSetup {
             spawn_buildings: None,
             dummies: None,
             dummies_attack: false,
+            drive_templates: Vec::new(),
+            wotr: None,
             cah_hero: None,
             random_seed,
             resolved: None,
@@ -285,6 +290,12 @@ impl SkirmishSetup {
     }
 
     #[must_use]
+    pub(crate) fn with_drive_templates(mut self, names: Vec<String>) -> Self {
+        self.drive_templates = names;
+        self
+    }
+
+    #[must_use]
     pub(crate) fn with_dummies_attack(mut self, attack: bool) -> Self {
         self.dummies_attack = attack;
         self
@@ -299,6 +310,15 @@ impl SkirmishSetup {
 
     pub(crate) fn players(&self) -> usize {
         self.slots.iter().filter(|s| s.occupant.occupied()).count()
+    }
+
+    pub(crate) fn is_sandbox(&self) -> bool {
+        let occupied = || self.slots.iter().filter(|s| s.occupant.occupied());
+        let mut teams: Vec<u8> = occupied().filter_map(|s| s.team).collect();
+        teams.sort_unstable();
+        teams.dedup();
+        let teamless = occupied().filter(|s| s.team.is_none()).count();
+        teams.len().saturating_add(teamless) < 2
     }
 
     pub(crate) fn colour_taken(&self, colour: u8, except: usize) -> bool {
@@ -369,14 +389,14 @@ impl SkirmishSetup {
             return Err(SetupError::TooManySlots(self.slots.len()));
         }
         let players = self.players();
-        if players < 2 {
-            return Err(SetupError::TooFewPlayers(players));
-        }
         if players > usize::from(catalogue.starts) {
             return Err(SetupError::TooManyPlayers {
                 players,
                 starts: catalogue.starts,
             });
+        }
+        if players < NET_MIN_PLAYERS {
+            return Err(SetupError::NeedHumanPlayers);
         }
         check_starting_money(self.rules.starting_money)?;
         if self.rules.command_point_factor == 0 {
@@ -384,6 +404,14 @@ impl SkirmishSetup {
         }
         for index in 0..self.slots.len() {
             self.check_slot(index, catalogue)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_play(&self, catalogue: &Catalogue) -> Result<(), SetupError> {
+        self.validate(catalogue)?;
+        if !self.slots.iter().any(|s| s.occupant == Occupant::Human) {
+            return Err(SetupError::NeedHumanPlayers);
         }
         Ok(())
     }
@@ -595,7 +623,7 @@ impl SkirmishSetup {
                 player.hero = catalogue
                     .heroes
                     .get(h)
-                    .map(|hero| CarriedHero(hero.record.clone()));
+                    .map(|hero| CarriedHero::new(hero.record.clone()));
             }
         }
         Ok(out)
@@ -715,19 +743,39 @@ pub(crate) fn playable_factions(data: &crate::game_data::GameData) -> Vec<String
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CarriedHero(pub(crate) std::sync::Arc<mint_sage_cah::HeroRecord>);
+pub(crate) struct CarriedHero {
+    pub(crate) record: std::sync::Arc<mint_sage_cah::HeroRecord>,
+    pub(crate) stats: std::collections::BTreeMap<String, i32>,
+}
+
+impl CarriedHero {
+    pub(crate) fn new(record: std::sync::Arc<mint_sage_cah::HeroRecord>) -> Self {
+        Self {
+            record,
+            stats: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn with_stats_from(mut self, dir: &std::path::Path) -> Self {
+        if let Some(id) = self.record.id_str() {
+            self.stats = mint_sage_asset::read_stats(dir, &id);
+        }
+        self
+    }
+}
 
 impl std::ops::Deref for CarriedHero {
     type Target = mint_sage_cah::HeroRecord;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.record
     }
 }
 
 impl std::hash::Hash for CarriedHero {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        mint_sage_cah::write(&self.0).hash(state);
+        mint_sage_cah::write(&self.record).hash(state);
+        self.stats.hash(state);
     }
 }
 

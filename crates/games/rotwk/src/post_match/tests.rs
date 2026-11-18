@@ -178,3 +178,11 @@ fn the_y_axis_follows_the_tab() {
     assert_eq!(summary.axis_labels(Series::FinalScore).1[10], "10");
     assert_eq!(Series::named(Some("Score")), Series::FinalScore);
 }
+
+#[test]
+fn a_campaign_timeline_is_victorious_only_after_a_script_victory() {
+    let figures = vec![player(0, 0, 0).figures];
+    let status = |victory| campaign_figures(&figures, victory)[0].status;
+    assert_eq!(status(true), EndStatus::Victorious);
+    assert_eq!(status(false), EndStatus::Defeated);
+}

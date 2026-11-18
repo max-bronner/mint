@@ -48,7 +48,9 @@ pub fn toggle_hidden_special_ability_update_from_fields(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let effect_duration = number(fields, "EffectDuration")?
         .filter(|ms| *ms > 0.0)
-        .map(|ms| LogicFrames::from_milliseconds(ms.min(86_400_000.0) as u32));
+        .map(
+            |ms| crate::special_ability_update::retail_duration_ticks(ms.min(86_400_000.0) as u32),
+        );
     let trigger = ToggleHiddenTrigger {
         effect_duration,
         show_palantir_timer: flag(fields, "ShowPalantirTimer")?.unwrap_or(false),
@@ -152,7 +154,7 @@ mod tests {
         }
         assert_eq!(
             toggles,
-            [(Some(LogicFrames::from_milliseconds(15000)), true)]
+            [(Some(LogicFrames::from_engine_milliseconds(15000)), true)]
         );
     }
 
@@ -221,8 +223,8 @@ mod tests {
         }
         assert_eq!(toggles, 1, "no re-toggle on the second trigger");
         assert_eq!(recharges, 2, "the base machine recharges on both triggers");
-        let one_period = LogicFrames::from_milliseconds(1).get() + 1;
-        let two_periods = one_period + LogicFrames::from_milliseconds(1600).get();
+        let one_period = LogicFrames::from_engine_milliseconds(1).get() + 1;
+        let two_periods = one_period + LogicFrames::from_engine_milliseconds(1600).get();
         assert!(
             packed_at.is_some_and(|frame| frame >= u64::from(two_periods)),
             "must not pack after only the first period ({one_period}): {packed_at:?}"

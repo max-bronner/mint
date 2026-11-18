@@ -93,24 +93,29 @@ pub fn tuning_skip_mask(tuning: &WaterTuning) -> u32 {
     mask
 }
 
-fn apply_map_ini_objects(vfs: &Vfs, map_path: &str, index: &mut ObjectIndex) {
+fn read_map_ini(vfs: &Vfs, map_path: &str) -> Option<mint_sage_ini::Document> {
     let folder = map_path
         .rsplit_once(['/', '\\'])
         .map_or("", |(folder, _)| folder);
     let path = format!("{folder}/map.ini");
-    let Ok(bytes) = vfs.read(&path) else {
-        return;
-    };
+    let bytes = vfs.read(&path).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let table = mint_sage_ini::BlockTable::corpus_path();
     match mint_sage_ini::Document::parse(&path, &text, &table) {
-        Ok(document) => {
-            let patched =
-                index.insert_override_document(&document, &mint_sage_ini::MacroTable::new());
-            println!("object templates: {path} patches {patched} template(s)");
+        Ok(document) => Some(document),
+        Err(error) => {
+            println!("map.ini: {path} FAILED: {error}");
+            None
         }
-        Err(error) => println!("object templates: {path} FAILED: {error}"),
     }
+}
+
+fn apply_map_ini_objects(document: &mint_sage_ini::Document, index: &mut ObjectIndex) {
+    let patched = index.insert_override_document(document, &mint_sage_ini::MacroTable::new());
+    println!(
+        "object templates: {} patches {patched} template(s)",
+        document.name()
+    );
 }
 
 pub fn load_map_scene(
@@ -296,8 +301,11 @@ pub fn load_map_scene(
         }
         index
     });
+    let map_ini = read_map_ini(vfs, &map_label);
     let object_index = object_index.map(|mut index| {
-        apply_map_ini_objects(vfs, &map_label, &mut index);
+        if let Some(document) = &map_ini {
+            apply_map_ini_objects(document, &mut index);
+        }
         index
     });
 
@@ -319,7 +327,8 @@ pub fn load_map_scene(
 
     let (particle_index, particle_lists) = {
         let started = std::time::Instant::now();
-        let (systems, lists, report) = mint_sage_particle::load_particle_index(vfs);
+        let (systems, lists, report) =
+            mint_sage_particle::load_particle_index_over(vfs, map_ini.as_ref());
         println!();
         println!(
             "particle systems: {} of {} document(s) parsed, {} statement(s); {} system(s),              {} FXList(s), {} stray End(s), {} unclosed, in {:.1} ms",

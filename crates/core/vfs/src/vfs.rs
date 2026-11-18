@@ -62,6 +62,13 @@ impl Vfs {
         self.mount_for(&VfsPath::new(path))
     }
 
+    #[must_use]
+    pub fn source(&self, path: &str) -> Option<(Arc<dyn Mount>, VfsPath)> {
+        let path = VfsPath::new(path);
+        let id = *self.index.get(&path)?;
+        self.mounts.get(id).map(|mount| (Arc::clone(mount), path))
+    }
+
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
         self.read_path(&VfsPath::new(path))
     }

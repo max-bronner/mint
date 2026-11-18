@@ -46,11 +46,23 @@ pub(crate) fn skin_bytes(skin: &[SkinVertex]) -> Vec<u8> {
 pub(crate) const BONE_SIZE: usize = 48;
 
 pub(crate) fn write_bone(bone: &Mat4, out: &mut Vec<u8>) {
-    for row in 0..3 {
-        for column in 0..4 {
-            out.extend_from_slice(&bone.get(row, column).to_le_bytes());
+    out.extend_from_slice(&packed_bone(bone));
+}
+
+pub(crate) fn packed_bone(bone: &Mat4) -> [u8; BONE_SIZE] {
+    let cols = bone.to_cols();
+    let mut packed = [0u8; BONE_SIZE];
+    for (row, texels) in packed.chunks_exact_mut(16).enumerate() {
+        for (column, dst) in texels.chunks_exact_mut(4).enumerate() {
+            let value = cols
+                .get(column)
+                .and_then(|col| col.get(row))
+                .copied()
+                .unwrap_or(0.0);
+            dst.copy_from_slice(&value.to_le_bytes());
         }
     }
+    packed
 }
 
 #[must_use]

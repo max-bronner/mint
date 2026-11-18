@@ -336,6 +336,33 @@ fn an_infantry_unit_needs_the_all_health_bars_option() {
 }
 
 #[test]
+fn hovering_one_soldier_draws_that_soldiers_bar_only() {
+    let mut world = mint_sim::World::new();
+    let soldier = |world: &mut mint_sim::World, x: f32| UnitView {
+        selected: false,
+        kind_of: mint_sage_asset::KindOf::SELECTABLE.union(mint_sage_asset::KindOf::INFANTRY),
+        ..bar_view(world, x, 0.0)
+    };
+    let group = [
+        soldier(&mut world, -20.0),
+        soldier(&mut world, 0.0),
+        soldier(&mut world, 20.0),
+    ];
+    let hovered = group[1].entity;
+    let drawn = bars_with(&group, 400.0, Some(hovered), true, HealthBarStyle::Health);
+    assert_eq!(drawn.len(), 6, "one bar is six quads");
+    let selected = group.map(|unit| UnitView {
+        selected: true,
+        ..unit
+    });
+    assert_eq!(
+        bars_with(&selected, 400.0, None, true, HealthBarStyle::Health).len(),
+        18,
+        "a selected group draws every member's bar"
+    );
+}
+
+#[test]
 fn unattackable_never_shows_a_bar() {
     use mint_sage_asset::KindOf;
     let kind_of = KindOf::HERO.union(KindOf::UNATTACKABLE);

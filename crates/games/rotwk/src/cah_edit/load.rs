@@ -32,7 +32,7 @@ pub(crate) fn load_system(
     let thing_stats = documents
         .iter()
         .flat_map(|d| d.roots_named(AWARD_SYSTEM_KEYWORD))
-        .flat_map(read_thing_stats)
+        .flat_map(|block| read_thing_stats(block, &errors))
         .collect();
     let power_buttons = buttons
         .iter()

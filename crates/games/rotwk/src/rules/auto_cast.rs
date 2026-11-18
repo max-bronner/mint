@@ -319,8 +319,8 @@ impl RotwkRules {
         };
         for button in candidates {
             if self.disallowed_by_model_condition(tick, entity, &button.disallowed)
-                || !self.model_conditions_gate(
-                    tick,
+                || !self.model_condition_gate(
+                    tick.state(),
                     entity,
                     &button.enable_on_model_condition,
                     &button.disable_on_model_condition,
@@ -376,9 +376,9 @@ impl RotwkRules {
         Ok(None)
     }
 
-    fn model_conditions_gate(
+    pub(crate) fn model_condition_gate(
         &self,
-        tick: &Tick<'_>,
+        world: &World,
         entity: Entity,
         enable: &[String],
         disable: &[String],
@@ -386,19 +386,18 @@ impl RotwkRules {
         if enable.is_empty() && disable.is_empty() {
             return true;
         }
-        let Some(wiring) = self.modules.as_ref() else {
-            return enable.is_empty();
-        };
-        let Some(state) = tick.state().get(wiring.state, entity) else {
-            return enable.is_empty();
-        };
-        let held = state.model_condition_names();
-        enable
-            .iter()
-            .all(|flag| held.iter().any(|name| name.eq_ignore_ascii_case(flag)))
-            && !disable
+        let held = self
+            .modules
+            .as_ref()
+            .and_then(|wiring| world.get(wiring.state, entity))
+            .map(mint_sage_modules::UpgradeState::model_condition_names)
+            .unwrap_or_default();
+        let holds_any = |flags: &[String]| {
+            flags
                 .iter()
                 .any(|flag| held.iter().any(|name| name.eq_ignore_ascii_case(flag)))
+        };
+        !holds_any(disable) && (enable.is_empty() || holds_any(enable))
     }
 
     fn disallowed_by_model_condition(

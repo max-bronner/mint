@@ -160,7 +160,7 @@ fn ticks(ms: f32) -> LogicFrames {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(3_600_000.0) as u32;
-    LogicFrames::from_milliseconds(whole)
+    mint_sage_modules::retail_duration_ticks(whole)
 }
 
 fn placed(origin: Vec2, facing: Facing, local: Vec2) -> Vec2 {
@@ -993,8 +993,8 @@ impl RotwkRules {
             radius(engine),
             to.0.position,
             radius(target),
-            weapon.minimum_attack_range,
-            weapon.attack_range,
+            weapon.minimum_reach(),
+            weapon.reach(1.0),
         )
     }
 

@@ -3,7 +3,8 @@ use crate::claims::{ClaimLayer, Holder, Registered};
 use crate::diag::diag;
 use mint_sage_passability::claims::{Claim, ClaimGrid, ClaimGround, Claimer, Viewer};
 
-const REVIVAL_COOLDOWN: mint_sim::LogicFrames = mint_sim::LogicFrames::from_milliseconds(4_000);
+const REVIVAL_COOLDOWN: mint_sim::LogicFrames =
+    mint_sim::LogicFrames::from_engine_milliseconds(4_000);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct IncomeView {
@@ -15,6 +16,21 @@ pub(crate) struct IncomeView {
 }
 
 impl RotwkRules {
+    pub(crate) fn brutal_cheats_for(
+        &self,
+        player: PlayerId,
+    ) -> mint_sage_ini::game_data::BrutalCheats {
+        let brutal_ai = self.difficulty.multiplayer
+            && self.ai_power_difficulty.iter().any(|(ai, difficulty)| {
+                *ai == player && *difficulty == crate::lobby::Difficulty::Brutal
+            });
+        if brutal_ai {
+            self.brutal_cheats
+        } else {
+            mint_sage_ini::game_data::BrutalCheats::NONE
+        }
+    }
+
     pub(super) fn cost_modifiers_for_record(
         &self,
         world: &World,
@@ -22,24 +38,35 @@ impl RotwkRules {
         player: PlayerId,
         record: &mint_sage_modules::ObjectRecord,
     ) -> mint_sage_economy::CostModifiers {
-        crate::economy::cost_modifiers_for(
-            world,
-            Self::economy_ids(ids),
-            &self.kinds,
-            &self.upgrade_bits,
-            player,
-            &crate::economy::PriceTarget::Object {
-                kind_of: &record.kind_of,
-                name: &record.name,
-            },
-            self.production_cost_change_percent(player),
-        )
+        mint_sage_economy::CostModifiers {
+            brutal_reduction: self.brutal_cheats_for(player).build_cost_reduction,
+            ..crate::economy::cost_modifiers_for(
+                world,
+                Self::economy_ids(ids),
+                &self.kinds,
+                &self.upgrade_bits,
+                player,
+                &crate::economy::PriceTarget::Object {
+                    kind_of: &record.kind_of,
+                    name: &record.name,
+                },
+                self.production_cost_change_percent(player),
+            )
+        }
     }
 
     pub(crate) fn time_modifiers_for(&self, player: PlayerId) -> mint_sage_economy::TimeModifiers {
         mint_sage_economy::TimeModifiers {
             handicap: self.handicap_of(Some(player)).build_time,
-            production_time_change_percent: 0.0,
+            brutal_reduction: self.brutal_cheats_for(player).build_time_reduction,
+            ..mint_sage_economy::TimeModifiers::default()
+        }
+    }
+
+    pub(crate) fn unit_time_modifiers(&self, player: PlayerId) -> mint_sage_economy::TimeModifiers {
+        mint_sage_economy::TimeModifiers {
+            speed_multiplier: self.multiplay.unit_speed(self.players),
+            ..self.time_modifiers_for(player)
         }
     }
 
@@ -73,16 +100,19 @@ impl RotwkRules {
         target: crate::unit::Kind,
     ) -> Option<i64> {
         let record = &self.kinds.get(target)?.record;
-        let modifiers = crate::economy::cost_modifiers_from_counts(
-            counts,
-            &self.kinds,
-            &self.upgrade_bits,
-            &crate::economy::PriceTarget::Object {
-                kind_of: &record.kind_of,
-                name: &record.name,
-            },
-            self.production_cost_change_percent(player),
-        );
+        let modifiers = mint_sage_economy::CostModifiers {
+            brutal_reduction: self.brutal_cheats_for(player).build_cost_reduction,
+            ..crate::economy::cost_modifiers_from_counts(
+                counts,
+                &self.kinds,
+                &self.upgrade_bits,
+                &crate::economy::PriceTarget::Object {
+                    kind_of: &record.kind_of,
+                    name: &record.name,
+                },
+                self.production_cost_change_percent(player),
+            )
+        };
         crate::construction::price_of(record, &modifiers, &self.time_modifiers_for(player))
             .map(|(cost, _)| cost)
     }
@@ -525,13 +555,14 @@ impl RotwkRules {
                 let buildable = u16::try_from(item)
                     .ok()
                     .and_then(|item| self.buildable_at(item))?;
+                let owner = world.get(ids.owner, structure)?.0;
                 Some(
-                    crate::economy::frames_to_produce(
+                    crate::economy::unit_frames_to_produce(
                         world,
                         economy,
                         structure,
-                        buildable.build_time,
-                        self.multiplay.unit_speed(self.players),
+                        buildable.build_seconds,
+                        &self.unit_time_modifiers(owner),
                     )
                     .get(),
                 )
@@ -661,6 +692,7 @@ impl RotwkRules {
                             entity,
                             template.kind,
                         )?;
+                        self.inherit_army(tick, ids, structure, entity);
                         Ok(Some(entity))
                     }
                     crate::economy::Output::Horde {
@@ -762,6 +794,7 @@ impl RotwkRules {
                             horde,
                             template.kind,
                         )?;
+                        self.inherit_army(tick, ids, structure, horde);
                         Ok(Some(horde))
                     }
                 }
@@ -776,7 +809,6 @@ impl RotwkRules {
                         economy,
                         structure,
                         upgrade.build_time,
-                        self.multiplay.unit_speed(self.players),
                     )
                     .get(),
                 )

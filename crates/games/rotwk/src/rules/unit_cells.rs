@@ -32,6 +32,12 @@ pub(super) enum GoalVerdict {
     Refused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Enemies {
+    Unread,
+    Listed,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Held {
     ally_goals: u32,
@@ -93,6 +99,13 @@ impl UnitCells {
             return None;
         }
         self.cells.get(usize::try_from(dy * self.side + dx).ok()?)
+    }
+
+    fn touches(&self, rect: Option<CellRect>) -> bool {
+        rect.is_some_and(|rect| {
+            let (x0, y0, x1, y1) = rect.span();
+            x0 < self.x0 + self.side && x1 > self.x0 && y0 < self.y0 + self.side && y1 > self.y0
+        })
     }
 
     fn mark(&mut self, rect: CellRect, mut f: impl FnMut(&mut Held)) {
@@ -199,6 +212,20 @@ impl RotwkRules {
         centre: Vec2,
         reach: f32,
     ) -> UnitCells {
+        self.unit_cells_reading(tick, ids, asker, ignored, centre, reach, Enemies::Unread)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn unit_cells_reading(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        asker: Entity,
+        ignored: Option<Entity>,
+        centre: Vec2,
+        reach: f32,
+        enemies: Enemies,
+    ) -> UnitCells {
         let _perf = crate::perf::sub(crate::perf::sub_row!("unit_cells"));
         let world = tick.state();
         let geometry = self.passability.geometry;
@@ -254,7 +281,7 @@ impl RotwkRules {
                 walked.iter().collect()
             }
         };
-        self.fill_unit_cells(tick, ids, &mut map, me, asker, ignored, &near);
+        self.fill_unit_cells(tick, ids, &mut map, me, asker, ignored, enemies, &near);
         map
     }
 
@@ -284,8 +311,11 @@ impl RotwkRules {
         me: DestinationAsker,
         asker: Entity,
         ignored: Option<Entity>,
+        enemies: Enemies,
         near: &[&BodyRecord],
     ) {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("fill_unit_cells"));
+        crate::perf::count(crate::perf::sub_row!("fill_bodies"), near.len());
         let world = tick.state();
         let geometry = self.passability.geometry;
         let size = geometry.cell_size();
@@ -324,6 +354,17 @@ impl RotwkRules {
                     })
                 })
                 .unwrap_or(position);
+            let goal_rect = if goal == position {
+                record.body_rect
+            } else {
+                super::unit_index::square(self, goal, record.footprint)
+            };
+            if enemies == Enemies::Unread
+                && !map.touches(goal_rect)
+                && !map.touches(record.body_rect)
+            {
+                continue;
+            }
             let relation = relation.to_owned_by(entity, record.holder.owner);
             let ally = relation == super::map_scripts::Relation::Allies;
             let at_goal = goal.minus(position).length() <= size;
@@ -337,11 +378,6 @@ impl RotwkRules {
             if enemy {
                 map.enemies.push((position, record.radius));
             }
-            let goal_rect = if goal == position {
-                record.body_rect
-            } else {
-                super::unit_index::square(self, goal, record.footprint)
-            };
             if let Some(rect) = goal_rect {
                 map.mark(rect, |held| {
                     if ally {

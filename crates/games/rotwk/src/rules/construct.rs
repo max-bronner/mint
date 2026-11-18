@@ -350,21 +350,55 @@ impl RotwkRules {
             );
             return Ok(());
         }
-        let facing = mint_movement::Facing::from_radians(angle);
-        let Some(mut spawn) = self.kinds.spawn(&self.combat, kind, centre, facing, player) else {
-            return Ok(());
+        if let Some(entity) =
+            self.place_structure_complete(tick, ids, player, kind, centre, angle)?
+        {
+            diag!(
+                "spawn-buildings: {} at ({x:.0}, {y:.0}) - entity {}",
+                record.name,
+                entity.index()
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn place_structure_complete(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        player: PlayerId,
+        kind: crate::unit::Kind,
+        centre: Vec2,
+        angle: f32,
+    ) -> Result<Option<Entity>> {
+        let Some(entry) = self.kinds.get(kind) else {
+            return Ok(None);
         };
-        spawn.producer = self.kinds.producer(&self.production, kind, centre, facing);
+        let record = entry.record.clone();
+        let footprint = footprint_of(&record);
+        let facing = mint_movement::Facing::from_radians(angle);
+        self.clear_for_construction(tick, ids, kind, centre, angle, None);
+        let Some(spawn) = self.kinds.spawn(&self.combat, kind, centre, facing, player) else {
+            return Ok(None);
+        };
         let entity = tick.state_mut().spawn()?;
         Self::insert_spawn(tick, ids, entity, &spawn, &self.combat)?;
         self.stamp_footprint(tick, ids, entity, centre, angle, footprint)?;
-        self.attach_upgrade_state(tick, ids, entity, Some(kind))?;
-        diag!(
-            "spawn-buildings: {} at ({x:.0}, {y:.0}) - entity {}",
-            record.name,
-            entity.index()
-        );
-        Ok(())
+        let created = tick.frame();
+        tick.state_mut().insert(
+            ids.construction,
+            entity,
+            Construction {
+                builder: None,
+                elapsed: 0,
+                rebuild: None,
+                worker: None,
+                delay: 0,
+                created,
+            },
+        )?;
+        self.complete_construction(tick, ids, entity, kind, &record)?;
+        Ok(Some(entity))
     }
 
     pub(super) fn stamp_footprint(
@@ -690,6 +724,11 @@ impl RotwkRules {
         Ok(())
     }
 
+    pub(crate) const fn with_building_height_variation(mut self, variation: f32) -> Self {
+        self.building_height_variation = variation;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn validate_placement(
         &self,
@@ -786,6 +825,14 @@ impl RotwkRules {
             if flags.intersects(mint_sage_passability::FORD) {
                 return Err(Reason::Ford);
             }
+        }
+        if !record.has_kind("WALL_HUB")
+            && !record.has_kind("WALL_SEGMENT")
+            && crate::construction::height_variation(footprint, centre, angle, |x, y| {
+                self.passability.heights.height_at(x, y)
+            }) > self.building_height_variation
+        {
+            return Err(Reason::NotFlat);
         }
         if self.meets_a_plan(world, ids, player, &cells) {
             return Err(Reason::Planned);
@@ -1208,6 +1255,7 @@ impl RotwkRules {
             .map(|entry| footprint_of(&entry.record))
             .unwrap_or_default();
         let facing = mint_movement::Facing::from_radians(angle);
+        self.clear_for_construction(tick, ids, kind, centre, angle, builder);
         let Some(mut spawn) = self.kinds.spawn(&self.combat, kind, centre, facing, owner) else {
             return Ok(None);
         };
@@ -1231,6 +1279,7 @@ impl RotwkRules {
             .filter(|_| builder.is_none())
             .and_then(|entry| self.getting_built_worker(&entry.record, owner));
         let worker = self.spawn_site_worker(tick, ids, worker_kind, site, owner)?;
+        let created = tick.frame();
         tick.state_mut().insert(
             ids.construction,
             site,
@@ -1240,6 +1289,7 @@ impl RotwkRules {
                 rebuild: None,
                 worker,
                 delay,
+                created,
             },
         )?;
         if let Some((cost, _)) = self
@@ -1271,6 +1321,10 @@ impl RotwkRules {
             .store(ids.build_task)
             .map_or_else(Vec::new, |store| store.entities().to_vec());
         for porter in porters {
+            if Self::builder_dying(tick, ids, porter) {
+                self.cancel_build_order(tick, ids, porter)?;
+                continue;
+            }
             if tick.state().contains(ids.path, porter) {
                 self.try_early_builder_arrival(tick, ids, porter)?;
             }
@@ -1279,6 +1333,15 @@ impl RotwkRules {
             }
         }
         Ok(())
+    }
+
+    fn builder_dying(tick: &Tick<'_>, ids: Ids, porter: Entity) -> bool {
+        let world = tick.state();
+        !world.is_live(porter)
+            || world.contains(ids.doomed, porter)
+            || world
+                .get(ids.health, porter)
+                .is_some_and(|health| health.0.is_dead())
     }
 
     fn try_early_builder_arrival(
@@ -1316,6 +1379,9 @@ impl RotwkRules {
         let Some(task) = tick.state().get(ids.build_task, porter).copied() else {
             return Ok(());
         };
+        if Self::builder_dying(tick, ids, porter) {
+            return self.cancel_build_order(tick, ids, porter);
+        }
         if let Some(body) = tick.state().get(ids.body, porter).copied() {
             if let Some(direction) = task.centre.minus(body.0.position).normalised() {
                 let desired = Facing::from_vector(direction).unwrap_or(body.0.facing);
@@ -1705,12 +1771,16 @@ impl RotwkRules {
         let time = owner.map_or_else(mint_sage_economy::TimeModifiers::default, |owner| {
             self.time_modifiers_for(owner)
         });
+        let time = mint_sage_economy::TimeModifiers {
+            speed_multiplier: self.multiplay.building_speed(self.players),
+            ..time
+        };
         let seconds = record
             .build_time
             .filter(|seconds| (0.0..=crate::templates::MAX_BUILD_SECONDS).contains(seconds))?;
-        let frames = mint_sage_economy::time_to_build(seconds, &time).get();
         Some(
-            crate::experience::scaled_frames(frames, self.multiplay.building_speed(self.players))
+            mint_sage_economy::time_to_build(seconds, &time)
+                .get()
                 .max(1),
         )
     }
@@ -1811,7 +1881,7 @@ impl RotwkRules {
         if !rebuilt {
             self.attach_upgrade_state(tick, ids, site, Some(kind))?;
             self.inherit_castle_upgrades(tick, ids, site)?;
-            self.unpack_castle(tick, ids, site)?;
+            self.castle_build_complete(tick, ids, site, construction.created)?;
         }
         match construction.builder {
             Some(builder) => self.reappear_builder(tick, ids, builder, position, reach),

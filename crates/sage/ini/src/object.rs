@@ -140,6 +140,16 @@ const FOLLOW_BONE_MODIFIER: &str = "FollowBone";
 
 pub const PARTICLES_ATTACHED_TO_ANIMATED_BONES_KEYWORD: &str = "ParticlesAttachedToAnimatedBones";
 
+pub const PARTICLE_BONES_CHECK_DRAWABLE_KEYWORD: &str = "ParticleBonesCheckDrawable";
+
+#[must_use]
+pub fn draw_flag(draw: &Block, keyword: &str) -> bool {
+    draw.field(keyword)
+        .and_then(Field::value)
+        .and_then(crate::value::parse_bool)
+        == Some(true)
+}
+
 pub const ANIMATION_KEYWORD: &str = "Animation";
 
 pub const ANIMATION_FIELDS: [&str; 3] = ["AnimationName", "AnimationMode", "AnimationBlendTime"];
@@ -340,6 +350,7 @@ pub struct ParticleSysBone {
     pub system: String,
     pub follow_bone: bool,
     pub module_flag: bool,
+    pub check_drawable: bool,
     pub persist: Persist,
     pub persist_id: u32,
 }
@@ -604,6 +615,7 @@ pub fn draw_particle_bones(draw: &Block) -> ParticleBones {
         .and_then(Field::value)
         .and_then(crate::value::parse_bool)
         == Some(true);
+    let check_drawable = draw_flag(draw, PARTICLE_BONES_CHECK_DRAWABLE_KEYWORD);
     let mut bones = ParticleBones::default();
     for state in draw.blocks() {
         if state_kind(state) == StateKind::Other {
@@ -626,6 +638,7 @@ pub fn draw_particle_bones(draw: &Block) -> ParticleBones {
             }
             if let Some(mut attachment) = parse_particle_sys_bone(&field.args) {
                 attachment.module_flag = module_flag;
+                attachment.check_drawable = check_drawable;
                 into.push(attachment);
             }
         }
@@ -707,6 +720,7 @@ pub fn parse_particle_sys_bone(args: &[String]) -> Option<ParticleSysBone> {
                 .is_some_and(|word| word.eq_ignore_ascii_case(FOLLOW_BONE_MODIFIER))
         }),
         module_flag: false,
+        check_drawable: false,
         persist: modifier(args, "Persist")
             .and_then(Persist::from_token)
             .unwrap_or_default(),
@@ -737,6 +751,7 @@ pub fn model_naming(draw: &Block) -> ModelNaming {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct DrawFacet {
+    written_tag: Option<String>,
     module: Option<String>,
     model: Option<String>,
     offered_a_model: bool,
@@ -781,6 +796,7 @@ struct ObjectEntry {
     crowd_response_key: Option<String>,
     animation_sound: Option<crate::client_behavior::AnimationSoundBehavior>,
     animation_sound_errors: Vec<crate::client_behavior::AnimationSoundError>,
+    shadow: crate::model_state::DecalFields,
 }
 
 impl ObjectEntry {
@@ -806,6 +822,7 @@ impl ObjectEntry {
         if over.animation_sound.is_some() {
             self.animation_sound = over.animation_sound;
         }
+        self.shadow = over.shadow.overlay(&self.shadow);
     }
 }
 
@@ -888,6 +905,7 @@ const MAX_ANIMATION_SOUND_FAILURES: usize = 64;
 #[derive(Debug, Clone, Copy)]
 pub struct DrawModuleView<'a> {
     pub tag: Option<&'a str>,
+    pub tag_as_written: Option<&'a str>,
     pub module: Option<&'a str>,
     pub model: Option<&'a str>,
     pub is_model_module: bool,
@@ -1120,6 +1138,17 @@ impl ObjectIndex {
     }
 
     #[must_use]
+    pub fn object_decal(&self, name: &str) -> Option<crate::model_state::StateDecal> {
+        self.chain(&name.to_ascii_lowercase())
+            .iter()
+            .rev()
+            .fold(crate::model_state::DecalFields::default(), |base, entry| {
+                entry.shadow.overlay(&base)
+            })
+            .decal()
+    }
+
+    #[must_use]
     pub fn animation_sound_behavior(
         &self,
         name: &str,
@@ -1272,6 +1301,7 @@ impl ObjectIndex {
                     .or_else(|| facets.iter().find(|facet| facet.names_state_model()));
                 DrawModuleView {
                     tag,
+                    tag_as_written: facets.iter().find_map(|facet| facet.written_tag.as_deref()),
                     module: facets.first().and_then(|facet| facet.module.as_deref()),
                     model,
                     is_model_module: own.is_some(),
@@ -1310,6 +1340,26 @@ impl ObjectIndex {
     }
 
     #[must_use]
+    pub fn tree_drawable_body(&self, name: &str) -> Option<DrawModuleView<'_>> {
+        let modules = self.draw_modules(name);
+        let body = modules
+            .iter()
+            .position(|module| module.model.is_some())
+            .or_else(|| modules.iter().position(|module| module.is_model_module))?;
+        let is_tree = |module: &DrawModuleView<'_>| {
+            module
+                .module
+                .is_some_and(|kind| kind.eq_ignore_ascii_case(TREE_DRAW_MODULE))
+        };
+        if !modules.get(body).is_some_and(is_tree) {
+            return None;
+        }
+        modules
+            .into_iter()
+            .find(|module| module.is_model_module && !is_tree(module))
+    }
+
+    #[must_use]
     pub fn model_modules(&self, name: &str) -> Vec<DrawModuleView<'_>> {
         let modules = self.draw_modules(name);
         let body = modules
@@ -1331,6 +1381,23 @@ impl ObjectIndex {
             })
             .map(|(_, module)| module)
             .collect()
+    }
+
+    #[must_use]
+    pub fn model_modules_before_body(&self, name: &str) -> usize {
+        let modules = self.draw_modules(name);
+        let body = modules
+            .iter()
+            .position(|module| module.model.is_some())
+            .or_else(|| modules.iter().position(|module| module.is_model_module));
+        let Some(body) = body else {
+            return 0;
+        };
+        modules
+            .iter()
+            .take(body)
+            .filter(|module| module.is_model_module && !module.start_hidden)
+            .count()
     }
 
     #[must_use]
@@ -1661,6 +1728,7 @@ fn analyse(block: &Block, macros: &crate::value::MacroTable) -> ObjectEntry {
         draws.push((
             tag,
             DrawFacet {
+                written_tag: draw.args.get(1).cloned(),
                 module,
                 model,
                 offered_a_model,
@@ -1717,6 +1785,12 @@ fn analyse(block: &Block, macros: &crate::value::MacroTable) -> ObjectEntry {
             .map(ToOwned::to_owned),
         animation_sound,
         animation_sound_errors,
+        shadow: crate::model_state::DecalFields::read(
+            &crate::model_state::DecalFields::default(),
+            block,
+            macros,
+            &crate::diagnostic::ValueErrors::new(),
+        ),
     }
 }
 
@@ -2837,6 +2911,44 @@ End
             index.animation("tree").map(|a| a.name.as_str()),
             Some("ATree_IDLA")
         );
+    }
+
+    #[test]
+    fn a_tree_objects_drawable_body_is_the_module_beside_the_tree_draw() {
+        let index = index(
+            "Object Tree
+  Draw = W3DTreeDraw Opt
+    ModelName = ATree
+  End
+  Draw = W3DScriptedModelDraw T
+    DefaultModelConditionState
+      Model = ATree
+    End
+    ModelConditionState = PASSENGER CLUB
+      Model = None
+    End
+  End
+End
+Object Rock
+  Draw = W3DScriptedModelDraw T
+    DefaultModelConditionState
+      Model = ARock
+    End
+  End
+End
+",
+        );
+        let body = index
+            .tree_drawable_body("tree")
+            .expect("a body beside the tree");
+        assert_eq!(body.model, Some("ATree"));
+        let club = body
+            .model_states
+            .iter()
+            .find(|state| state.conditions == ["PASSENGER", "CLUB"])
+            .expect("the club state");
+        assert_eq!(club.model, None);
+        assert!(index.tree_drawable_body("rock").is_none());
     }
 
     #[test]

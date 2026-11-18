@@ -140,7 +140,7 @@ pub fn auto_pick_up_update_from_fields(
         .map_or(LogicFrames::ZERO, |ms| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let whole = ms.min(86_400_000.0) as u32;
-            LogicFrames::from_milliseconds(whole)
+            crate::special_ability_update::retail_duration_ticks(whole)
         });
     let scan_distance = fields
         .field_numeric("ScanDistance")

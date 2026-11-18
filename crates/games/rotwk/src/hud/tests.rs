@@ -101,6 +101,7 @@ fn slot(name: &str) -> ResolvedSlot {
         progress: None,
         count: 0,
         auto_cast: false,
+        hero: None,
     }
 }
 
@@ -132,8 +133,13 @@ fn palantir_movie() -> Player {
         Item::Place(place(1, field)),
         Item::Action(placeholder),
     ]]);
+    let faction_icon = s.sprite(vec![
+        vec![Item::Label("_hide"), Item::Action(stop)],
+        vec![Item::Label("_show"), Item::Action(stop)],
+    ]);
     let resource_bar = s.sprite(vec![vec![
         Item::Place(place(1, resources).name("Resources")),
+        Item::Place(place(2, faction_icon).name("PlayerFactionIcon")),
         Item::Action(stop),
     ]]);
     let portrait_type = set_block(&mut s, "_type", "RenderImage");
@@ -194,7 +200,11 @@ fn palantir_movie() -> Player {
             b.get_var("state");
         });
     });
-    root_code.function("SetPlayerFaction", &["faction"], |_| {});
+    root_code.function("SetPlayerFaction", &["faction"], |b| {
+        goto(b, "ResourceBar.PlayerFactionIcon", |b| {
+            b.push_str("_show");
+        });
+    });
     root_code.function("ShowCommandInterface", &[], |b| {
         goto(b, "CommandUI", |b| {
             b.push_str("_show");
@@ -228,6 +238,8 @@ fn evil_hud() -> HudState {
         command_points: (60, 300),
         evil: true,
         selected: true,
+        side: Some("Mordor".to_owned()),
+        faction: "Mordor".to_owned(),
         minimap: Some("maps/test/test_art.tga".to_owned()),
         ..HudState::default()
     };
@@ -269,6 +281,10 @@ fn the_palantir_lands_in_the_live_order() {
     }
     assert!(ex.stats().ready);
     assert!(at_label(&p, "PalantirFrame", "_evil"), "faction art");
+    assert!(
+        at_label(&p, "ResourceBar.PlayerFactionIcon", "_show"),
+        "the faction icon's clip, which holds `RenderFactionIcon`"
+    );
     assert!(at_label(&p, "Radar", "_show"), "the minimap's frame");
     assert!(at_label(&p, "CommandUI", "_show"), "the command interface");
     assert!(
@@ -2164,4 +2180,13 @@ fn stealth_hides_foreign_marks_and_pulses_only_an_own_hidden_hero() {
     assert_eq!(gate(false, false, true, 15), Some(1.0));
     assert_eq!(gate(false, true, false, 15), Some(1.0));
     assert_eq!(gate(false, true, true, 0), Some(64.0 / 255.0));
+}
+
+#[test]
+fn the_faction_icon_is_the_resource_bar_image_the_install_declares() {
+    let data = crate::game::tests::data_from("MappedImage ResourceBar_Mordor\nEnd\n");
+    let icon = |faction| super::resource_bar_icon(faction, &data.mapped_images);
+    assert_eq!(icon("Mordor").as_deref(), Some("ResourceBar_Mordor"));
+    assert_eq!(icon("Men"), None);
+    assert_eq!(icon(""), None);
 }

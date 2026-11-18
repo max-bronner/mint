@@ -1,8 +1,8 @@
 use super::*;
 
 const TOGGLE_DATA: &str = "\
-SpecialPower DisguisePower\n  ReloadTime = 10\nEnd\n\
-SpecialPower MountPower\n  ReloadTime = 10\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
+SpecialPower MountPower\n  ReloadTime = 0\nEnd\n\
 CommandSet HeroSet\n  1 = Fire_Disguise\n  2 = Fire_Mount\nEnd\n\
 CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
 CommandButton Fire_Mount\n  Command = SPECIAL_POWER\n  SpecialPower = MountPower\nEnd\n\
@@ -207,7 +207,7 @@ fn dismounting_without_the_cancel_flag_leaves_the_disguise_alone() {
 }
 
 const DETECT_DATA: &str = "\
-SpecialPower DisguisePower\n  ReloadTime = 10\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
 CommandSet HeroSet\n  1 = Fire_Disguise\nEnd\n\
 CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
 Object Hero\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = HeroSet\n  \
@@ -318,7 +318,7 @@ fn taking_damage_does_not_break_the_disguise() {
 }
 
 const KIND_DATA: &str = "\
-SpecialPower DisguisePower\n  ReloadTime = 10\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
 CommandSet HeroSet\n  1 = Fire_Disguise\nEnd\n\
 CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
 Object Hero\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = HeroSet\n  \

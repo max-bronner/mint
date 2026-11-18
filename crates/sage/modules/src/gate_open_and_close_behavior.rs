@@ -134,7 +134,7 @@ fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<LogicFrames
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(MAX_MILLISECONDS) as u32;
-    Ok(LogicFrames::from_milliseconds(whole))
+    Ok(crate::special_ability_update::retail_duration_ticks(whole))
 }
 
 fn percentage(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<Option<f32>, FieldError> {

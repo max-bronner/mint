@@ -33,7 +33,7 @@ fn object_team(object: &Object) -> Option<&str> {
     }
 }
 
-const CAPTURE_KINDS: [&str; 3] = ["CAPTUREFLAG", "CAPTURABLE", "LINKED_TO_FLAG"];
+const SOUGHT_KINDS: [&str; 4] = ["CAPTUREFLAG", "CAPTURABLE", "LINKED_TO_FLAG", "SALT_LICK"];
 
 const INERT_KIND: &str = "INERT";
 
@@ -73,7 +73,7 @@ impl Relation {
 
 pub(crate) fn is_entity(record: &ObjectRecord) -> bool {
     !decorates(record)
-        && (CAPTURE_KINDS.iter().any(|kind| record.has_kind(kind))
+        && (SOUGHT_KINDS.iter().any(|kind| record.has_kind(kind))
             || acts(record)
             || (!record.has_kind(INERT_KIND) && (record.max_health.is_some() || record.produces)))
 }
@@ -86,11 +86,10 @@ fn decorates(record: &ObjectRecord) -> bool {
 }
 
 fn acts(record: &ObjectRecord) -> bool {
-    !record.has_kind(INERT_KIND)
-        && record.declared_modules.iter().any(|module| {
-            mint_sage_modules::is_ai_module(&module.name)
-                || module.name.eq_ignore_ascii_case("SpawnBehavior")
-        })
+    record.declared_modules.iter().any(|module| {
+        mint_sage_modules::is_ai_module(&module.name)
+            || module.name.eq_ignore_ascii_case("SpawnBehavior")
+    })
 }
 
 const ROAD_OR_BRIDGE_POINT_FLAGS: i32 = 0x36;
@@ -160,6 +159,7 @@ pub(crate) struct ContestantSide {
     pub(crate) player: PlayerId,
     pub(crate) allies: Vec<Relation>,
     pub(crate) enemies: Vec<Relation>,
+    pub(crate) faction_icon: Option<String>,
 }
 
 impl MapCast {
@@ -326,6 +326,10 @@ pub(crate) fn cast(
                 player: *player,
                 allies: resolve("playerAllies", side),
                 enemies: resolve("playerEnemies", side),
+                faction_icon: side
+                    .text("playerFactionIcon")
+                    .filter(|icon| !icon.is_empty())
+                    .map(str::to_owned),
             })
         })
         .collect();
@@ -550,6 +554,12 @@ Object ZMarker
     MaxHealth = 1
   End
 End
+Object ZLick
+  KindOf = SALT_LICK NO_COLLIDE INERT
+  Body = ImmortalBody ModuleTag_ZBody
+    MaxHealth = 1
+  End
+End
 Object ZFern
   KindOf = IMMOBILE OPTIMIZED_PROP
 End
@@ -582,6 +592,7 @@ End
             object("ZRuin", "Wildmen/teamWildmen"),
             object("ZStable", "Kingdom/teamKingdom"),
             object("ZMarker", "/team"),
+            object("ZLick", "/team"),
             object("ZFern", "/team"),
             object("ZFluff", "/team"),
             object("ZFence", "/team"),
@@ -611,8 +622,10 @@ End
             vec![
                 ("ZLair", "Wildmen"),
                 ("ZBrigand", "Wildmen"),
+                ("ZHeron", "Wildmen"),
                 ("ZRuin", "Wildmen"),
                 ("ZStable", "Kingdom"),
+                ("ZLick", "(neutral side)"),
                 ("ZFence", "(neutral side)"),
             ]
         );

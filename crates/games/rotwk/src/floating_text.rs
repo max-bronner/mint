@@ -42,9 +42,7 @@ pub(crate) fn read_timing(
         let hz = mint_sim::SIMULATION_HZ as f32;
         if let Some(ms) = fields.time_out_ms {
             out.timeout = if ms.is_finite() && ms > 0.0 {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let frames = (ms * hz / 1000.0).ceil().min(u32::MAX as f32) as u32;
-                frames
+                mint_sage_modules::retail_duration_ticks_f32(ms).get()
             } else {
                 FloatingTextTiming::default().timeout
             };

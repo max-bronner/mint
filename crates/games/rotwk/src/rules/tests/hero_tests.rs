@@ -48,6 +48,7 @@ Object Scout\n  Side = Men\n  KindOf = HERO INFANTRY SELECTABLE\n  BuildCost = 5
   Body = RespawnBody Tag_01\n    MaxHealth = 800\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 8\n  GeometryHeight = 19\nEnd\n\
 Object Porter\n  Side = Men\n  KindOf = INFANTRY SELECTABLE DOZER\n  BuildCost = 100\n  BuildTime = 1\n  \
+  CommandPoints = 40\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object Elite\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 100\n  BuildTime = 1\n  \
@@ -95,9 +96,10 @@ Object Target\n  Side = Mordor\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10
   Body = ActiveBody Tag_01\n    MaxHealth = 25\n  End\n  \
   ArmorSet\n    Conditions = None\n    Armor = Plain\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Locomotor TrollFeet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\
 Object Troll\n  Side = Mordor\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n  BuildTime = 1\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100000\n  End\n  \
-  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Hammer\n  End\n  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes ATTACK_BUILDINGS\n    MoodAttackCheckRate = 500\n  End\n  VisionRange = 400\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Hammer\n  End\n  LocomotorSet\n    Locomotor = TrollFeet\n    Condition = SET_NORMAL\n    Speed = 40\n  End\n  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes ATTACK_BUILDINGS\n    MoodAttackCheckRate = 500\n  End\n  VisionRange = 400\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Upgrade Upgrade_SelfTrigger\n  Type = OBJECT\nEnd\n\
 Object Deliverer\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n  BuildTime = 1\n  \
@@ -466,6 +468,86 @@ fn a_hero_over_the_command_point_limit_is_refused_before_the_queue() {
 }
 
 #[test]
+fn a_queued_entry_does_not_count_against_a_heros_command_points() {
+    let m = load();
+    let rules =
+        rules(&m, &[("Fortress", 200.0, 200.0, PLAYER)], 10_000).with_command_point_factor(20);
+    let mut simulation = Simulation::new(21, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let fortress = placed(&simulation, ids, &m, "Fortress")[0];
+    let free = |simulation: &Simulation<RotwkRules>| {
+        crate::economy::points_of(simulation.state(), RotwkRules::economy_ids(ids), PLAYER).free()
+    };
+    let before = free(&simulation);
+    assert!((50..90).contains(&before), "precondition: {before} free");
+    press(
+        &mut simulation,
+        PLAYER,
+        fortress,
+        RotwkCommand::QueueUnit { button: 0 },
+    );
+    assert_eq!(free(&simulation), before, "the porter is still queued");
+    let order = simulation
+        .rules()
+        .hero_order(simulation.state(), ids, PLAYER, fortress, HERO);
+    assert!(order.is_ok(), "{order:?}");
+}
+
+#[test]
+fn a_unit_press_is_refused_only_against_living_command_points() {
+    let m = load();
+    let entries = |simulation: &Simulation<RotwkRules>, ids: Ids, fortress: Entity| {
+        simulation
+            .state()
+            .get(ids.producer, fortress)
+            .map_or(0, |producer| producer.queue.entries().len())
+    };
+    let porter = m.kinds.kind("Porter").unwrap();
+    let short =
+        rules(&m, &[("Fortress", 200.0, 200.0, PLAYER)], 10_000).with_command_point_factor(5);
+    let mut simulation = Simulation::new(21, short).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let fortress = placed(&simulation, ids, &m, "Fortress")[0];
+    assert!(!simulation
+        .rules()
+        .unit_command_points_fit(simulation.state(), PLAYER, porter));
+    press(
+        &mut simulation,
+        PLAYER,
+        fortress,
+        RotwkCommand::QueueUnit { button: 0 },
+    );
+    assert_eq!(
+        entries(&simulation, ids, fortress),
+        0,
+        "refused, nothing queued"
+    );
+    assert_eq!(purse(&simulation, ids, PLAYER), 10_000, "nothing charged");
+
+    let room =
+        rules(&m, &[("Fortress", 200.0, 200.0, PLAYER)], 10_000).with_command_point_factor(20);
+    let mut simulation = Simulation::new(21, room).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let fortress = placed(&simulation, ids, &m, "Fortress")[0];
+    let free =
+        crate::economy::points_of(simulation.state(), RotwkRules::economy_ids(ids), PLAYER).free();
+    assert!((40..80).contains(&free), "precondition: {free} free");
+    for _ in 0..2 {
+        press(
+            &mut simulation,
+            PLAYER,
+            fortress,
+            RotwkCommand::QueueUnit { button: 0 },
+        );
+    }
+    assert_eq!(
+        entries(&simulation, ids, fortress),
+        2,
+        "queued entries never count"
+    );
+}
+
+#[test]
 fn cancelling_a_hero_in_production_puts_its_slot_back() {
     let (_m, mut simulation, ids, fortress) = fortress_match(10_000);
     press(
@@ -761,8 +843,8 @@ fn a_dead_hero_is_revived_at_its_respawn_price_with_its_experience() {
     assert_eq!(before - purse(&simulation, ids, PLAYER), 600);
     assert_eq!(
         last_entry(&simulation, ids, fortress),
-        Some((600, 72)),
-        "90 x 0.8"
+        Some((600, 60)),
+        "3 s x 0.8 truncates to 2 s"
     );
     assert!(matches!(
         state(&simulation, ids, 1),
@@ -1209,6 +1291,8 @@ fn an_upgrade_the_object_holds_is_refused_before_any_gate() {
         &rules.upgrade_buildables,
         &open,
         rules.production_cost_change_percent(PLAYER),
+        rules.brutal_cheats_for(PLAYER).build_cost_reduction,
+        &|world, builder, bit| rules.sub_upgrade_counted(world, ids, builder, bit),
     );
     assert_eq!(verdict.err().as_deref(), Some("already holds this upgrade"));
 }
@@ -1536,4 +1620,153 @@ fn a_match_with_a_recruit_a_death_and_a_revive_replays_identically() {
     let recording = simulation.into_recording();
     let verified = recording.verify(rules(&m, &placed_units, 10_000)).unwrap();
     assert_eq!(verified.final_hash, final_hash);
+}
+
+#[test]
+fn an_upgrade_price_takes_brutal_once_and_sums_the_counted_sub_upgrades() {
+    let (_m, simulation, ids, fortress) = fortress_match(10_000);
+    let rules = simulation.rules();
+    let mut upgrade = rules.upgrade_buildables[0].clone();
+    upgrade.cost = 300;
+    upgrade.subs = Vec::new();
+    let price = |upgrade: &crate::economy::UpgradeBuildable, brutal: f32, only: Option<usize>| {
+        let counted = |_: &World, _: Option<Entity>, bit: mint_sim::UpgradeBit| {
+            only.is_none_or(|index| upgrade.subs.get(index).is_some_and(|sub| sub.bit == bit))
+        };
+        crate::economy::upgrade_cost(
+            simulation.state(),
+            RotwkRules::economy_ids(ids),
+            &rules.kinds,
+            &rules.upgrade_bits,
+            PLAYER,
+            upgrade,
+            Some(fortress),
+            0.0,
+            brutal,
+            &counted,
+        )
+    };
+    assert_eq!(price(&upgrade, 0.15, None), 255);
+    assert_eq!(price(&upgrade, 0.0, None), 300);
+    let first = upgrade.bit;
+    let second = rules.upgrade_buildables[1].bit;
+    upgrade.subs = vec![
+        crate::economy::SubUpgrade {
+            bit: first,
+            cost: 100,
+        },
+        crate::economy::SubUpgrade {
+            bit: second,
+            cost: 50,
+        },
+    ];
+    assert_eq!(price(&upgrade, 0.0, None), 150, "every sub-upgrade");
+    assert_eq!(
+        price(&upgrade, 0.0, Some(0)),
+        100,
+        "only the first is taken"
+    );
+}
+
+#[test]
+fn a_revived_hero_keeps_the_army_it_died_with() {
+    use crate::rules::wotr_battle::{WotrSeat, WotrStart, WotrStructure};
+    let m = load();
+    let plot = |template: &str, x: f32, army| WotrStructure {
+        template: template.to_owned(),
+        army,
+        at: Vec2::new(x, x),
+    };
+    let start = WotrStart {
+        seats: vec![WotrSeat {
+            player: PLAYER,
+            armies: Vec::new(),
+            structures: vec![plot("Fortress", 200.0, 5), plot("Camp", 800.0, 9)],
+            modifiers: None,
+            purchase_points: 0,
+            skill_points: 0.0,
+            sciences: Vec::new(),
+            upgrades: Vec::new(),
+            fallen: Vec::new(),
+        }],
+        skill_scalars: Vec::new(),
+        revival_multipliers: (1.0, 1.0),
+    };
+    let rules = rules(&m, &[], 20_000).with_map_scripts(
+        Some(super::wotr_battle_tests::engine(start)),
+        vec![(0, PLAYER)],
+    );
+    let mut simulation = Simulation::new(24, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    run(&mut simulation, 2);
+    let fortress = placed(&simulation, ids, &m, "Fortress")[0];
+    let camp = placed(&simulation, ids, &m, "Camp")[0];
+    let army_of = |simulation: &Simulation<RotwkRules>, entity| {
+        simulation
+            .rules()
+            .wotr_run(simulation.state())
+            .unwrap()
+            .army_of(entity)
+    };
+    assert_eq!(army_of(&simulation, fortress), Some(5));
+    assert_eq!(army_of(&simulation, camp), Some(9));
+    press(
+        &mut simulation,
+        PLAYER,
+        fortress,
+        RotwkCommand::RecruitHero { button: HERO },
+    );
+    run(&mut simulation, 305);
+    let first = placed(&simulation, ids, &m, "Hero")[0];
+    assert_eq!(army_of(&simulation, first), Some(5));
+    press(&mut simulation, PLAYER, first, RotwkCommand::DebugKill);
+    assert!(matches!(state(&simulation, ids, 1), HeroState::Dead { .. }));
+    press(
+        &mut simulation,
+        PLAYER,
+        camp,
+        RotwkCommand::RecruitHero { button: HERO },
+    );
+    run(&mut simulation, 130);
+    let revived = placed(&simulation, ids, &m, "Hero");
+    assert_eq!(revived.len(), 1);
+    assert_eq!(army_of(&simulation, revived[0]), Some(5));
+}
+
+#[test]
+fn a_campaign_fallen_hero_is_offered_for_revival_at_its_seeded_price() {
+    use crate::rules::wotr_battle::{WotrSeat, WotrStart, WotrStructure};
+    let m = load();
+    let start = WotrStart {
+        seats: vec![WotrSeat {
+            player: PLAYER,
+            armies: Vec::new(),
+            structures: vec![WotrStructure {
+                template: "Fortress".to_owned(),
+                army: 5,
+                at: Vec2::new(200.0, 200.0),
+            }],
+            modifiers: None,
+            purchase_points: 0,
+            skill_points: 0.0,
+            sciences: Vec::new(),
+            upgrades: Vec::new(),
+            fallen: vec![("Hero".to_owned(), 2, 7)],
+        }],
+        skill_scalars: Vec::new(),
+        revival_multipliers: (2.0, 3.0),
+    };
+    let rules = rules(&m, &[], 20_000).with_map_scripts(
+        Some(super::wotr_battle_tests::engine(start)),
+        vec![(0, PLAYER)],
+    );
+    let mut simulation = Simulation::new(24, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    run(&mut simulation, 2);
+    assert_eq!(state(&simulation, ids, 1), HeroState::Dead { points: 7 });
+    let fortress = placed(&simulation, ids, &m, "Fortress")[0];
+    let page = simulation
+        .rules()
+        .hero_page(simulation.state(), PLAYER, Some(fortress));
+    assert_eq!(page[1].cost, Some(1500), "750 x 2");
 }

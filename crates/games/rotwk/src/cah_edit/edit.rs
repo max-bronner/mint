@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mint_sage_cah::HeroRecord;
 use mint_sage_ini::BlingType;
 
 use super::powers::PowerPage;
-use super::system::{eq, CahSystem};
+use super::system::{eq, BinderOptions, CahSystem};
 
 const MAX_UI_SLOT: usize = 32;
 
@@ -56,6 +57,7 @@ pub(crate) struct HeroEdit {
     pub(super) page: Option<PowerPage>,
     template: Option<(u32, u32)>,
     examine: ExamineApply,
+    stats: BTreeMap<String, i32>,
 }
 
 fn to_i32(value: u32) -> i32 {
@@ -78,9 +80,22 @@ impl HeroEdit {
                 skip: true,
                 ..ExamineApply::default()
             },
+            stats: BTreeMap::new(),
         };
         edit.build_slots();
         edit
+    }
+
+    pub(crate) fn set_stats(&mut self, stats: BTreeMap<String, i32>) {
+        if self.stats != stats {
+            self.stats = stats;
+            self.build_slots();
+        }
+    }
+
+    fn options(&self, class: usize, subclass: usize, group: &str) -> Option<BinderOptions> {
+        self.sys
+            .binder_options_earned(class, subclass, group, &self.stats)
     }
 
     #[must_use]
@@ -184,13 +199,13 @@ impl HeroEdit {
     }
 
     #[must_use]
-    pub(crate) fn slot_choice(&self, kind: SlotKind, index: usize) -> Option<&str> {
+    pub(crate) fn slot_choice(&self, kind: SlotKind, index: usize) -> Option<String> {
         let slot = self.slot(kind, index)?;
         let group = self.slot_group(kind, index)?;
         let (class, sub) = self.class_subclass();
-        let options = self.sys.binder_options(class, sub, group)?;
+        let options = self.options(class, sub, group)?;
         let at = usize::try_from(slot.cur).ok()?;
-        options.upgrades.get(at).map(String::as_str)
+        options.upgrades.into_iter().nth(at)
     }
 
     #[must_use]
@@ -224,7 +239,7 @@ impl HeroEdit {
             if ui >= MAX_UI_SLOT || self.slot(kind, ui).is_some() {
                 continue;
             }
-            let (min, max, default) = match sys.binder_options(class, subclass, group) {
+            let (min, max, default) = match self.options(class, subclass, group) {
                 Some(options) => {
                     let last = to_i32(
                         u32::try_from(options.upgrades.len().saturating_sub(1)).unwrap_or(0),
@@ -429,11 +444,10 @@ impl HeroEdit {
         for (group, index) in &self.record.blings {
             let group = String::from_utf8_lossy(group);
             let chosen = self
-                .sys
-                .binder_options(class, subclass, &group)
+                .options(class, subclass, &group)
                 .zip(usize::try_from(*index).ok())
-                .and_then(|(options, index)| options.upgrades.get(index));
-            grants.extend(chosen.cloned());
+                .and_then(|(options, index)| options.upgrades.into_iter().nth(index));
+            grants.extend(chosen);
         }
         if let Some(class_def) = self.sys.def().classes.get(class) {
             grants.extend(class_def.upgrade.clone());

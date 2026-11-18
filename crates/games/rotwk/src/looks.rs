@@ -1,5 +1,5 @@
 use mint_sage_modules::UpgradeState;
-use mint_sage_scene::{LookKey, LookTexture, UnitLook, UnitScene};
+use mint_sage_scene::{LookKey, LookSubObject, LookTexture, UnitLook, UnitScene};
 use mint_sim::{ComponentId, Entity, World};
 
 pub(crate) fn unit_look(state: &UpgradeState) -> UnitLook {
@@ -12,7 +12,12 @@ pub(crate) fn unit_look(state: &UpgradeState) -> UnitLook {
         sub_objects: state
             .sub_objects
             .iter()
-            .map(|(name, shown)| (std::sync::Arc::clone(name), *shown))
+            .map(|write| LookSubObject {
+                name: std::sync::Arc::clone(&write.name),
+                shown: write.shown,
+                permanent: write.permanent,
+                rewrites: write.rewrites,
+            })
             .collect(),
         textures: state
             .textures
@@ -61,6 +66,7 @@ mod tests {
         state.apply(&Effect::SubObjects {
             show: names(&["FireArowTip"]),
             hide: names(&[]),
+            permanent: true,
         });
         state.apply(&Effect::Texture {
             swaps: std::sync::Arc::from([("GUArcher.tga".into(), "GUArcher_HA.tga".into())]),
@@ -68,7 +74,8 @@ mod tests {
         });
         let look = unit_look(&state);
         assert_eq!(look.conditions, vec!["WEAPONSET_PLAYER_UPGRADE".into()]);
-        assert_eq!(look.sub_objects, vec![("FireArowTip".into(), true)]);
+        assert_eq!(&*look.sub_objects[0].name, "FireArowTip");
+        assert!(look.sub_objects[0].shown);
         assert_eq!(look.textures.len(), 1);
         assert_eq!(&*look.textures[0].to, "GUArcher_HA.tga");
         assert_eq!(look.textures[0].exclude, vec!["Bow".into()]);
@@ -99,6 +106,7 @@ mod tests {
             Effect::SubObjects {
                 show: names(&["Forged_Blade"]),
                 hide: names(&[]),
+                permanent: true,
             },
         );
         let blade = look_of(&world, Some(id), &mut scene, archer);

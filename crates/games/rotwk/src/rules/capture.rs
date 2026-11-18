@@ -816,6 +816,7 @@ impl RotwkRules {
                 }
                 Ok(())
             }
+            CastEdge::Finish { .. } => Ok(()),
         }
     }
 

@@ -99,7 +99,7 @@ pub(crate) struct MatchLoader {
     scene: Option<MatchScene>,
     scene_step: Option<SceneStep>,
     scene_steps: u8,
-    build: Option<GameBuild>,
+    build: Option<Box<GameBuild>>,
     spent: [Duration; 6],
     started: Instant,
     reported: Option<u8>,
@@ -183,7 +183,8 @@ impl MatchLoader {
             if let Some(mut game) = game {
                 game.set_scale_mode(self.scale_mode);
                 self.report_timings();
-                return Ok(Some(Box::new(game)));
+                crate::startup::mark("match built");
+                return Ok(Some(game));
             }
             if begun.elapsed() >= budget {
                 return Ok(None);
@@ -191,7 +192,7 @@ impl MatchLoader {
         }
     }
 
-    fn step(&mut self, renderer: &mut Renderer) -> Result<Option<Game>, String> {
+    fn step(&mut self, renderer: &mut Renderer) -> Result<Option<Box<Game>>, String> {
         match self.stage {
             Stage::ReadMap => {
                 let bytes = self
@@ -209,55 +210,8 @@ impl MatchLoader {
                 }
                 self.stage = Stage::Scene;
             }
-            Stage::Scene => {
-                self.scene_steps = self.scene_steps.saturating_add(1);
-                let Some(next) = self.scene_step.take() else {
-                    let (Some(map_bytes), Some(data)) = (self.map_bytes.take(), self.data.as_mut())
-                    else {
-                        return Err("load: scene stage without its map and data".to_owned());
-                    };
-                    crate::game_data::compose_for_match(data, &self.vfs, &self.map_label)?;
-                    let object_index = data.object_index.take();
-                    let (skirmish, allow_ring_heroes) = self.config.scene_filter();
-                    self.scene_step = Some(crate::scene::begin_match_scene(
-                        &self.vfs,
-                        &map_bytes,
-                        self.map_label.clone(),
-                        &data.templates,
-                        skirmish,
-                        allow_ring_heroes,
-                        object_index,
-                        Some(crate::scene::game_tuning_file()),
-                    )?);
-                    return Ok(None);
-                };
-                match next(renderer, self.vfs.as_ref())? {
-                    SceneProgress::More(step) => self.scene_step = Some(step),
-                    SceneProgress::Done(scene) => {
-                        self.scene = Some(*scene);
-                        self.stage = Stage::Match;
-                    }
-                }
-            }
-            Stage::Match => {
-                let (Some(scene), Some(data)) = (self.scene.take(), self.data.take()) else {
-                    return Err("load: match stage without its scene and data".to_owned());
-                };
-                let build = GameBuild::begin(
-                    renderer,
-                    scene,
-                    data,
-                    self.viewport,
-                    Arc::clone(&self.vfs),
-                    self.sources,
-                    self.config.clone(),
-                    self.install_roots.clone(),
-                    self.control.clone(),
-                    self.ui.take(),
-                )?;
-                self.build = Some(build);
-                self.stage = Stage::Art;
-            }
+            Stage::Scene => self.step_scene(renderer)?,
+            Stage::Match => self.step_match(renderer)?,
             Stage::Art => {
                 let Some(build) = self.build.as_mut() else {
                     return Err("load: unit art stage without a match".to_owned());
@@ -268,19 +222,73 @@ impl MatchLoader {
                     build.step_art(renderer);
                 }
             }
-            Stage::Finish => {
-                let Some(build) = self.build.take() else {
-                    return Err("load: finish stage without a match".to_owned());
-                };
-                println!("load: first-frame state hash {:#018x}", build.state_hash());
-                let game = build.finish(renderer)?;
-                if let Err(error) = renderer.save_pipeline_cache() {
-                    println!("load: pipeline cache not saved: {error}");
-                }
-                return Ok(Some(game));
-            }
+            Stage::Finish => return self.step_finish(renderer).map(Some),
         }
         Ok(None)
+    }
+
+    fn step_scene(&mut self, renderer: &mut Renderer) -> Result<(), String> {
+        self.scene_steps = self.scene_steps.saturating_add(1);
+        let Some(next) = self.scene_step.take() else {
+            let (Some(map_bytes), Some(data)) = (self.map_bytes.take(), self.data.as_mut()) else {
+                return Err("load: scene stage without its map and data".to_owned());
+            };
+            crate::game_data::compose_for_match(data, &self.vfs, &self.map_label)?;
+            let object_index = data.object_index.take();
+            let (skirmish, allow_ring_heroes) = self.config.scene_filter();
+            self.scene_step = Some(crate::scene::begin_match_scene(
+                &self.vfs,
+                &map_bytes,
+                self.map_label.clone(),
+                &data.templates,
+                skirmish,
+                allow_ring_heroes,
+                object_index,
+                Some(crate::scene::game_tuning_file()),
+            )?);
+            return Ok(());
+        };
+        match next(renderer, self.vfs.as_ref())? {
+            SceneProgress::More(step) => self.scene_step = Some(step),
+            SceneProgress::Done(scene) => {
+                self.scene = Some(*scene);
+                self.stage = Stage::Match;
+            }
+        }
+        Ok(())
+    }
+
+    fn step_match(&mut self, renderer: &mut Renderer) -> Result<(), String> {
+        let (Some(scene), Some(data)) = (self.scene.take(), self.data.take()) else {
+            return Err("load: match stage without its scene and data".to_owned());
+        };
+        let build = GameBuild::begin(
+            renderer,
+            scene,
+            data,
+            self.viewport,
+            Arc::clone(&self.vfs),
+            self.sources,
+            self.config.clone(),
+            self.install_roots.clone(),
+            self.control.clone(),
+            self.ui.take(),
+        )?;
+        self.build = Some(build);
+        self.stage = Stage::Art;
+        Ok(())
+    }
+
+    fn step_finish(&mut self, renderer: &mut Renderer) -> Result<Box<Game>, String> {
+        let Some(build) = self.build.take() else {
+            return Err("load: finish stage without a match".to_owned());
+        };
+        println!("load: first-frame state hash {:#018x}", build.state_hash());
+        let game = build.finish(renderer)?;
+        if let Err(error) = renderer.save_pipeline_cache() {
+            println!("load: pipeline cache not saved: {error}");
+        }
+        Ok(game)
     }
 
     fn report_timings(&self) {

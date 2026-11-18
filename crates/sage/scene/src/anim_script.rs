@@ -98,10 +98,18 @@ pub struct ScriptRun {
     pub transitions: Vec<String>,
     pub label: Option<String>,
     pub sub_objects: Vec<(String, bool, bool)>,
+    pub modules: Vec<(String, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Prev<'a> {
+    pub state: &'a str,
+    pub animation: &'a str,
+    pub fraction: f32,
 }
 
 struct DrawableHost<'a> {
-    prev: &'a str,
+    prev: Prev<'a>,
     conditions: Conditions,
     extras: &'a ExtraTokens,
     id: u32,
@@ -117,10 +125,11 @@ const SUB_OBJECT_CALLS: [(&str, bool, bool); 4] = [
     ("CurDrawableShowSubObjectPermanently", true, true),
 ];
 
-const BOUND_NOOP_CALLS: [&str; 3] = [
-    "CurDrawableAllowToContinue",
-    "CurDrawablePrevAnimation",
-    "CurDrawablePrevAnimFraction",
+const BOUND_NOOP_CALLS: [&str; 2] = ["CurDrawableAllowToContinue", "CurDrawablePlaySound"];
+
+const MODULE_CALLS: [(&str, bool); 2] = [
+    ("CurDrawableHideModule", false),
+    ("CurDrawableShowModule", true),
 ];
 
 const SCRIPT_RANDOM_SALT: u32 = 0x05;
@@ -128,7 +137,13 @@ const SCRIPT_RANDOM_SALT: u32 = 0x05;
 impl Host for DrawableHost<'_> {
     fn call(&mut self, name: &str, args: &[Value]) -> Result<Value, HostError> {
         if name == "CurDrawablePrevAnimationState" {
-            return Ok(Value::string(self.prev));
+            return Ok(Value::string(self.prev.state));
+        }
+        if name == "CurDrawablePrevAnimation" {
+            return Ok(Value::string(self.prev.animation));
+        }
+        if name == "CurDrawablePrevAnimFraction" {
+            return Ok(Value::Number(self.prev.fraction));
         }
         if name == "CurDrawableSetTransitionAnimState" {
             if let Some(name) = args.first().and_then(Value::as_str) {
@@ -144,6 +159,14 @@ impl Host for DrawableHost<'_> {
                     self.run
                         .sub_objects
                         .push((part.to_owned(), *shown, *permanent));
+                }
+            }
+            return Ok(Value::Nil);
+        }
+        if let Some((_, shown)) = MODULE_CALLS.iter().find(|(call, _)| *call == name) {
+            if let Some(tag) = args.first().and_then(Value::as_str).map(str::trim) {
+                if !tag.is_empty() {
+                    self.run.modules.push((tag.to_owned(), *shown));
                 }
             }
             return Ok(Value::Nil);
@@ -174,7 +197,7 @@ impl Host for DrawableHost<'_> {
 
 pub fn run(
     script: &Script,
-    prev: &str,
+    prev: Prev<'_>,
     conditions: Conditions,
     extras: &ExtraTokens,
     id: u32,

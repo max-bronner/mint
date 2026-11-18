@@ -80,6 +80,19 @@ pub(crate) struct ResolvedSlot {
     pub(crate) progress: Option<u8>,
     pub(crate) count: u16,
     pub(crate) auto_cast: bool,
+    pub(crate) hero: Option<SlotHero>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotHero {
+    pub(crate) display_name: Option<String>,
+    pub(crate) literal_name: Option<String>,
+    pub(crate) revive: bool,
+    pub(crate) hotkey: Option<String>,
+    pub(crate) revive_text: Option<String>,
+    pub(crate) recruit_text: Option<String>,
+    pub(crate) level: u16,
+    pub(crate) command_points: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,6 +117,14 @@ pub(crate) struct Hero {
     pub(crate) fielded: bool,
     pub(crate) affordable: bool,
     pub(crate) allowed: bool,
+    pub(crate) display_name: Option<String>,
+    pub(crate) literal_name: Option<String>,
+    pub(crate) revive: bool,
+    pub(crate) hotkey: Option<String>,
+    pub(crate) revive_text: Option<String>,
+    pub(crate) recruit_text: Option<String>,
+    pub(crate) level: u16,
+    pub(crate) command_points: i64,
 }
 
 pub(crate) struct SlotContext<'a> {
@@ -128,6 +149,7 @@ pub(crate) struct SlotContext<'a> {
     pub(crate) power_clock: &'a dyn Fn(&str) -> Option<u8>,
     pub(crate) auto_cast_on: &'a dyn Fn(&str) -> bool,
     pub(crate) weapon_set_raised: &'a dyn Fn(&[String]) -> bool,
+    pub(crate) model_condition_gate: &'a dyn Fn(&[String], &[String]) -> bool,
     pub(crate) passengers: &'a [Option<String>],
     pub(crate) passenger_entities: &'a [mint_sim::Entity],
     pub(crate) capacity: Option<u32>,
@@ -167,6 +189,7 @@ fn under_construction_bar(
         progress: None,
         count: 0,
         auto_cast: false,
+        hero: None,
     };
     if button.radial == Some(true) {
         out.radial.push((1, slot.clone()));
@@ -270,7 +293,12 @@ pub(crate) fn availability(
             .iter()
             .any(|u| u.eq_ignore_ascii_case(upgrade))
     };
-    let state = if is(command, "REVIVE") && hero.is_none() {
+    let state = if !(ctx.model_condition_gate)(
+        &button.enable_on_model_condition,
+        &button.disable_on_model_condition,
+    ) {
+        Availability::Disabled
+    } else if is(command, "REVIVE") && hero.is_none() {
         return Availability::Hidden;
     } else if !button.needs_met(held) {
         Availability::Disabled
@@ -595,6 +623,16 @@ pub(crate) fn resolve_command_bar(
             progress,
             count: 0,
             auto_cast,
+            hero: hero.map(|h| SlotHero {
+                display_name: h.display_name.clone(),
+                literal_name: h.literal_name.clone(),
+                revive: h.revive,
+                hotkey: h.hotkey.clone(),
+                revive_text: h.revive_text.clone(),
+                recruit_text: h.recruit_text.clone(),
+                level: h.level,
+                command_points: h.command_points,
+            }),
         };
         if matches!(slot.action, SlotAction::SetStance(_)) {
             out.stance_flyout.push(slot.clone());

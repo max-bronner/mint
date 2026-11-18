@@ -180,7 +180,7 @@ impl MusicScripts {
             &script.actions_false
         };
         let ran = truth || !script.actions_false.is_empty();
-        for action in actions {
+        for action in actions.iter().filter(|action| action.enabled) {
             self.act(action, world, depth);
         }
         if ran && script.one_shot {
@@ -201,6 +201,10 @@ impl MusicScripts {
     }
 
     fn condition(&mut self, condition: &Condition, world: &dyn MusicWorld) -> bool {
+        self.condition_raw(condition, world) != condition.negates()
+    }
+
+    fn condition_raw(&mut self, condition: &Condition, world: &dyn MusicWorld) -> bool {
         let p = &condition.params;
         match condition.name.as_str() {
             "CONDITION_TRUE" => true,

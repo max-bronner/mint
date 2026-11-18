@@ -3,6 +3,7 @@
 
 pub mod dds;
 pub mod jpeg;
+pub mod png;
 pub mod tga;
 
 #[cfg(test)]
@@ -112,10 +113,28 @@ pub enum Error {
     #[error("jpeg: the decoder returned no frame header")]
     JpegNoFrame,
 
+    #[error("jpeg: the decoder panicked on this input")]
+    JpegDecoderPanicked,
+
     #[error("jpeg: {source}")]
     Jpeg {
         #[source]
-        source: Box<jpeg_decoder::Error>,
+        source: Box<zune_jpeg::errors::DecodeErrors>,
+    },
+
+    #[error("png declares {width}x{height}; mint decodes at most {limit} on either axis")]
+    PngTooLarge { width: u32, height: u32, limit: u32 },
+
+    #[error("png: the decoder returned no usable header")]
+    PngNoHeader,
+
+    #[error("png: the decoder panicked on this input")]
+    PngDecoderPanicked,
+
+    #[error("png: {source}")]
+    Png {
+        #[source]
+        source: Box<zune_png::error::PngDecodeErrors>,
     },
 }
 
@@ -153,6 +172,23 @@ impl RgbaImage {
     #[must_use]
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    #[must_use]
+    pub fn with_alpha_of(mut self, alpha: &RgbaImage) -> Option<Self> {
+        if (self.width, self.height) != (alpha.width, alpha.height) {
+            return None;
+        }
+        for (texel, from) in self
+            .pixels
+            .chunks_exact_mut(RGBA_BYTES)
+            .zip(alpha.pixels.chunks_exact(RGBA_BYTES))
+        {
+            if let (Some(to), Some(&a)) = (texel.get_mut(3), from.get(3)) {
+                *to = a;
+            }
+        }
+        Some(self)
     }
 
     #[must_use]

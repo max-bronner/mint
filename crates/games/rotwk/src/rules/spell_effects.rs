@@ -9,7 +9,9 @@ use crate::combat::{grid_cell, grid_radius_cells, Foe, TargetGrid};
 use crate::defeat::ObjectFilter;
 use crate::diag::diag;
 use crate::powers::PowerEnumEffect;
-use crate::spell_state::{ArrowStormHits, CashBounty, PendingShot, ProductionBonuses, Suppressed};
+use crate::spell_state::{
+    ArrowStormHits, CashBounty, CashBountyPower, PendingShot, ProductionBonuses, Suppressed,
+};
 
 pub(super) fn standing(
     rules: &RotwkRules,
@@ -266,10 +268,11 @@ impl RotwkRules {
         Ok(made)
     }
 
-    pub(super) fn raise_cash_bounty(
+    pub(super) fn set_cash_bounty(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
+        source: Entity,
         owner: PlayerId,
         fraction: f32,
     ) -> Result<()> {
@@ -278,13 +281,11 @@ impl RotwkRules {
         else {
             return Ok(());
         };
-        let held = tick
-            .state()
-            .get(ids.cash_bounty, player)
-            .map_or(0.0, |bounty| bounty.0);
-        if fraction.is_finite() && fraction > held {
+        if fraction.is_finite() {
             tick.state_mut()
                 .insert(ids.cash_bounty, player, CashBounty(fraction))?;
+            tick.state_mut()
+                .insert(ids.cash_bounty_power, source, CashBountyPower(fraction))?;
             diag!(
                 "power: player {} earns {:.0}% of a victim's bounty value per kill",
                 owner.get(),
@@ -292,6 +293,30 @@ impl RotwkRules {
             );
         }
         Ok(())
+    }
+
+    pub(super) fn pause_special_powers(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        disabled: bool,
+    ) -> Result<()> {
+        let Some(owner) = tick.state().get(ids.owner, entity).map(|owner| owner.0) else {
+            return Ok(());
+        };
+        let Some(player) =
+            crate::economy::player_entity(tick.state(), Self::economy_ids(ids), owner)
+        else {
+            return Ok(());
+        };
+        crate::spell_state::pause_bounty(
+            tick.state_mut(),
+            (ids.cash_bounty, ids.cash_bounty_power),
+            entity,
+            player,
+            disabled,
+        )
     }
 
     pub(super) fn capture(
@@ -666,10 +691,12 @@ impl RotwkRules {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn level_grant(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
+        source: Entity,
         owner: PlayerId,
         centre: Vec2,
         radius: f32,
@@ -679,26 +706,39 @@ impl RotwkRules {
         let filter = filter_of(affects);
         let world = tick.state();
         let reach = radius * radius;
-        let mut targets: Vec<Entity> = self
-            .select_everywhere(world, ids, owner, &filter, PowerSides::All)
+        let mut receivers: Vec<Entity> = self
+            .select_everywhere(world, ids, owner, &filter, PowerSides::Friends)
             .into_iter()
+            .filter(|entity| *entity != source)
             .filter(|entity| {
                 world.get(ids.body, *entity).is_some_and(|body| {
                     let (dx, dy) = (body.0.position.x - centre.x, body.0.position.y - centre.y);
                     dx * dx + dy * dy <= reach
                 })
             })
+            .map(|entity| self.sink_of(world, ids, entity))
             .collect();
-        targets.sort_unstable_by_key(|entity| entity.index());
-        targets.dedup();
-        for &entity in &targets {
+        receivers.sort_unstable_by_key(|entity| entity.index());
+        receivers.dedup();
+        let mut granted = Vec::with_capacity(receivers.len());
+        for entity in receivers {
+            if self.experience_of(tick.state(), ids, entity).is_none() {
+                continue;
+            }
+            if tick.state().contains(ids.horde, entity) {
+                if experience > 0 && self.grant_horde_pools(tick, ids, entity, experience)? {
+                    granted.push(entity);
+                }
+                continue;
+            }
             let scalar = self.level_scalar(tick.state(), ids, entity);
             let gain = crate::experience::scaled(experience, scalar);
             if gain > 0 {
                 self.add_experience(tick, ids, entity, gain)?;
+                granted.push(entity);
             }
         }
-        Ok(targets)
+        Ok(granted)
     }
 
     pub(super) fn production_bonus(
@@ -835,6 +875,7 @@ impl RotwkRules {
                     alive_only: false,
                     reload_slot: None,
                     owner_if_gone: None,
+                    victim: None,
                 },
             )?;
         }

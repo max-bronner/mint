@@ -4,6 +4,13 @@ use crate::{Error, Result};
 
 pub const DEFAULT_TEXTURE_EXTENSIONS: [&str; 4] = ["dds", "tga", "jpg", "png"];
 
+#[must_use]
+pub fn alpha_sidecar(path: &VfsPath) -> Option<VfsPath> {
+    let (stem, extension) = path.as_str().rsplit_once('.')?;
+    (extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg"))
+        .then(|| VfsPath::new(&format!("{stem}.png")))
+}
+
 const W3D_DIR: &str = "art/w3d/";
 const MOLDS_DIR: &str = "data/editor/molds/";
 const SHADERS_DIR: &str = "shaders/compiled/";

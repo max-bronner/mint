@@ -13,6 +13,7 @@ const INI_ROOT: &str = "data/ini/";
 const LANGUAGE_COMMAND_MAP: &str = "commandmap.ini";
 
 mod map_ini;
+pub(crate) mod preload;
 pub(crate) use map_ini::compose_map_ini;
 
 pub(crate) fn compose_for_match(
@@ -55,6 +56,7 @@ pub(crate) struct GameData {
     pub(crate) drag_formation: Arc<mint_sage_formation::FormationAssistant>,
     pub(crate) castle_siege_stand_back_distance: f32,
     pub(crate) move_hint_name: String,
+    pub(crate) downwind_angle: f32,
     pub(crate) shell_map: crate::shell_map::ShellMapData,
     pub(crate) tutorials: crate::tutorial::Tutorials,
     pub(crate) selection_flash_saturation: f32,
@@ -66,6 +68,8 @@ pub(crate) struct GameData {
     pub(crate) ai_bases: Arc<Vec<AiBaseDef>>,
     pub(crate) ai_timing: AiTiming,
     pub(crate) ai_power_activation_tuning: [(i64, i64); 4],
+    pub(crate) brutal_cheats: mint_sage_ini::game_data::BrutalCheats,
+    pub(crate) wotr_retreat: Option<mint_sage_ini::game_data::RetreatTuning>,
     pub(crate) combat_chains: Arc<crate::combat::CombatChainTable>,
     pub(crate) order_mode_key: Option<Key>,
     pub(crate) view_last_radar_event_key: Option<Key>,
@@ -75,12 +79,14 @@ pub(crate) struct GameData {
     pub(crate) attack_priorities: Arc<crate::combat::priority::AttackPriorityData>,
     pub(crate) army_definitions: Arc<mint_sage_ini::ArmyDefinitionIndex>,
     pub(crate) multiplayer_colors: Arc<mint_sage_ini::MultiplayerColorIndex>,
+    pub(crate) control_bar_schemes: Arc<mint_sage_ini::ControlBarSchemeIndex>,
     pub(crate) handicaps: Arc<crate::handicap::HandicapTable>,
     pub(crate) create_a_hero: Arc<crate::create_a_hero::CahData>,
     pub(crate) rule_choices: Arc<crate::setup_rules::RuleChoices>,
     pub(crate) hero_subclasses: Arc<Vec<Vec<crate::setup_heroes::SubclassFactions>>>,
     pub(crate) cah_system: Option<Arc<crate::cah_edit::CahSystem>>,
     pub(crate) porter_targets: Arc<Vec<(String, i64)>>,
+    pub(crate) user_data_leaf: Option<String>,
     pub(crate) attack_urgency_values: AttackUrgencyValues,
     pub(crate) object_scripts: Option<ObjectScripts>,
     pub(crate) object_index: Option<mint_sage_model::ObjectIndex>,
@@ -93,6 +99,7 @@ pub(crate) struct GameData {
     pub(crate) camera: CameraDefaults,
     pub(crate) shake: ScreenShake,
     pub(crate) upgrades: Arc<Vec<mint_sage_modules::UpgradeRecord>>,
+    pub(crate) upgrade_costs: Arc<Vec<mint_sage_modules::UpgradeCost>>,
     pub(crate) upgrade_bits: Arc<mint_sage_modules::UpgradeBits>,
     pub(crate) radius_cursors: Arc<mint_sage_ini::RadiusCursorIndex>,
     pub(crate) special_powers: Arc<mint_sage_ini::SpecialPowerIndex>,
@@ -109,6 +116,7 @@ pub(crate) struct GameData {
     pub(crate) terrain_resource_cell_size: Option<f32>,
     pub(crate) supply_boxes_per_tree: f32,
     pub(crate) value_per_supply_box: f32,
+    pub(crate) building_height_variation: f32,
     pub(crate) macros: Arc<MacroTable>,
     pub(crate) locomotors: Arc<mint_sage_ini::LocomotorIndex>,
     pub(crate) emotions: Arc<mint_sage_ini::EmotionIndex>,
@@ -363,6 +371,10 @@ pub(crate) const DEFAULT_SUPPLY_BOXES_PER_TREE: f32 = 90.0;
 
 pub(crate) const DEFAULT_VALUE_PER_SUPPLY_BOX: f32 = 10.0;
 
+pub(crate) const DEFAULT_BUILDING_HEIGHT_VARIATION: f32 = 10.0;
+
+const DEFAULT_DOWNWIND_ANGLE: f32 = -0.785;
+
 fn read_sell_percentage(block: &mint_sage_ini::Block) -> Option<f32> {
     let raw = block
         .field("SellPercentage")
@@ -595,6 +607,7 @@ impl Default for GameData {
             ini_documents: Arc::new(Vec::new()),
             map_ini: None,
             move_hint_name: String::new(),
+            downwind_angle: DEFAULT_DOWNWIND_ANGLE,
             shell_map: crate::shell_map::ShellMapData::default(),
             tutorials: crate::tutorial::Tutorials::default(),
             selection_flash_saturation: SELECTION_FLASH_SATURATION,
@@ -606,6 +619,8 @@ impl Default for GameData {
             ai_bases: Arc::new(Vec::new()),
             ai_timing: AiTiming::default(),
             ai_power_activation_tuning: [(1, 1); 4],
+            brutal_cheats: mint_sage_ini::game_data::BrutalCheats::default(),
+            wotr_retreat: None,
             combat_chains: Arc::new(crate::combat::CombatChainTable::default()),
             order_mode_key: None,
             view_last_radar_event_key: None,
@@ -615,12 +630,14 @@ impl Default for GameData {
             attack_priorities: Arc::default(),
             army_definitions: Arc::new(mint_sage_ini::ArmyDefinitionIndex::new()),
             multiplayer_colors: Arc::new(mint_sage_ini::MultiplayerColorIndex::new()),
+            control_bar_schemes: Arc::default(),
             handicaps: Arc::new(crate::handicap::HandicapTable::default()),
             create_a_hero: Arc::new(crate::create_a_hero::CahData::default()),
             rule_choices: Arc::new(crate::setup_rules::RuleChoices::default()),
             hero_subclasses: Arc::new(Vec::new()),
             cah_system: None,
             porter_targets: Arc::new(Vec::new()),
+            user_data_leaf: None,
             attack_urgency_values: AttackUrgencyValues::default(),
             builder_cycle_timeout_ms: SHIPPED_BUILDER_CYCLE_MS,
             drawable_caption_points: SHIPPED_DRAWABLE_CAPTION_POINTS,
@@ -631,6 +648,7 @@ impl Default for GameData {
             camera: CameraDefaults::SHIPPED,
             shake: ScreenShake::default(),
             upgrades: Arc::new(Vec::new()),
+            upgrade_costs: Arc::new(Vec::new()),
             upgrade_bits: Arc::new(mint_sage_modules::UpgradeBits::default()),
             radius_cursors: Arc::new(mint_sage_ini::RadiusCursorIndex::new()),
             special_powers: Arc::new(mint_sage_ini::SpecialPowerIndex::new()),
@@ -647,6 +665,7 @@ impl Default for GameData {
             terrain_resource_cell_size: None,
             supply_boxes_per_tree: DEFAULT_SUPPLY_BOXES_PER_TREE,
             value_per_supply_box: DEFAULT_VALUE_PER_SUPPLY_BOX,
+            building_height_variation: DEFAULT_BUILDING_HEIGHT_VARIATION,
             macros: Arc::new(MacroTable::new()),
             locomotors: Arc::new(mint_sage_ini::LocomotorIndex::new()),
             emotions: Arc::new(mint_sage_ini::EmotionIndex::new()),
@@ -810,6 +829,8 @@ pub(crate) struct FormationLibrary {
     banners: Vec<Option<BannerDef>>,
     melee: Vec<Option<f32>>,
     rangefinders: Vec<Option<f32>>,
+    rangefinder_weapons: Vec<Option<mint_sage_combat::WeaponId>>,
+    overloaded: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -861,6 +882,8 @@ impl FormationLibrary {
             member,
             banner,
             ranges: (melee, rangefinder),
+            rangefinder_weapon,
+            overloaded,
         } = entry;
         let key = name.to_ascii_lowercase();
         match self.names.iter().position(|found| *found == key) {
@@ -871,6 +894,9 @@ impl FormationLibrary {
                 if let Some(slot) = self.rangefinders.get_mut(at) {
                     *slot = rangefinder;
                 }
+                if let Some(slot) = self.rangefinder_weapons.get_mut(at) {
+                    *slot = rangefinder_weapon;
+                }
                 if let Some(slot) = self.tables.get_mut(at) {
                     *slot = table;
                 }
@@ -880,6 +906,9 @@ impl FormationLibrary {
                 if let Some(slot) = self.banners.get_mut(at) {
                     *slot = banner;
                 }
+                if let Some(slot) = self.overloaded.get_mut(at) {
+                    *slot = overloaded;
+                }
             }
             None => {
                 self.names.push(key);
@@ -888,6 +917,8 @@ impl FormationLibrary {
                 self.banners.push(banner);
                 self.melee.push(melee);
                 self.rangefinders.push(rangefinder);
+                self.rangefinder_weapons.push(rangefinder_weapon);
+                self.overloaded.push(overloaded);
             }
         }
     }
@@ -896,8 +927,16 @@ impl FormationLibrary {
         &self.melee
     }
 
+    pub(crate) fn overloaded(&self) -> &[bool] {
+        &self.overloaded
+    }
+
     pub(crate) fn rangefinders(&self) -> &[Option<f32>] {
         &self.rangefinders
+    }
+
+    pub(crate) fn rangefinder_weapons(&self) -> &[Option<mint_sage_combat::WeaponId>] {
+        &self.rangefinder_weapons
     }
 
     pub(crate) fn member(&self, index: u16) -> Option<&str> {
@@ -910,6 +949,8 @@ pub(crate) struct HordeFormation {
     member: Option<String>,
     banner: Option<BannerDef>,
     ranges: (Option<f32>, Option<f32>),
+    rangefinder_weapon: Option<mint_sage_combat::WeaponId>,
+    overloaded: bool,
 }
 
 pub(crate) fn horde_formation(
@@ -942,7 +983,7 @@ pub(crate) fn horde_formation(
                 .map(str::to_owned)
         });
     let record = templates.get(name);
-    let own_weapon = record
+    let own_weapon_id = record
         .and_then(|record| {
             record
                 .weapon_sets
@@ -951,14 +992,15 @@ pub(crate) fn horde_formation(
                 .value
                 .as_deref()
         })
-        .and_then(|weapon| combat.weapons.get(combat.weapons.id(weapon)?));
+        .and_then(|weapon| combat.weapons.id(weapon));
+    let own_weapon = own_weapon_id.and_then(|id| combat.weapons.get(id));
     let melee = own_weapon
         .filter(|weapon| weapon.melee)
         .filter(|_| {
             record.is_some_and(|record| record.kind_of.iter().any(|flag| flag == "MELEE_HORDE"))
         })
         .map(|weapon| weapon.attack_range);
-    let rangefinder = own_weapon.map(|weapon| weapon.attack_range);
+    let rangefinder = own_weapon.map(|weapon| weapon.reach(1.0));
     Some((
         at > 0,
         Some(HordeFormation {
@@ -966,6 +1008,8 @@ pub(crate) fn horde_formation(
             member,
             banner: BannerDef::of(&def),
             ranges: (melee, rangefinder),
+            rangefinder_weapon: own_weapon_id,
+            overloaded: def.living_world_overload_template.is_some(),
         }),
     ))
 }
@@ -1113,6 +1157,11 @@ pub(crate) fn load_game_data(vfs: &Vfs) -> Result<(GameData, String), LoadRefusa
             })?
             .unwrap_or_default(),
     );
+    data.wotr_retreat =
+        mint_sage_ini::game_data::wotr_retreat_tuning(&documents).map_err(|error| LoadRefusal {
+            errors: vec![error],
+            documents: documents.len(),
+        })?;
     data.fire_logic_system = documents
         .iter()
         .flat_map(mint_sage_ini::Document::roots)
@@ -1125,11 +1174,21 @@ pub(crate) fn load_game_data(vfs: &Vfs) -> Result<(GameData, String), LoadRefusa
             errors: vec![format!("FireLogicSystem: {error}")],
             documents: documents.len(),
         })?;
+    if let Some(system) = &data.cah_system {
+        let errors = system.undefined_names();
+        if !errors.is_empty() {
+            return Err(LoadRefusal {
+                errors,
+                documents: documents.len(),
+            });
+        }
+    }
     let mut systems = mint_sage_ini::ParticleIndex::new();
     let mut lists = mint_sage_ini::FxListIndex::new();
     let mut sounds = mint_sage_ini::AudioIndex::new();
     for document in &documents {
         sounds.insert_defines(document.defines());
+        lists.insert_defines(document.defines());
     }
     for document in &documents {
         systems.insert_document(document);
@@ -1224,12 +1283,21 @@ pub(crate) fn game_data_from_documents(
 
 pub(crate) use mint_sage_modules::RETAIL_LOGIC_HZ;
 
+pub(crate) const RETAIL_HZ: core::num::NonZeroU32 =
+    match core::num::NonZeroU32::new(RETAIL_LOGIC_HZ) {
+        Some(hz) => hz,
+        None => core::num::NonZeroU32::MIN,
+    };
+
+pub(crate) fn rebuild_time_ticks(seconds: f32) -> u32 {
+    let one_frame = mint_sim::LogicFrames::from_authored_frames(1, RETAIL_HZ);
+    mint_sim::LogicFrames::from_authored_seconds_truncated(seconds, RETAIL_HZ)
+        .max(one_frame)
+        .get()
+}
+
 pub(crate) fn retail_duration(ms: f32) -> mint_sim::LogicFrames {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let retail = (ms.max(0.0) * RETAIL_LOGIC_HZ as f32 / 1000.0).ceil() as u32;
-    mint_sim::LogicFrames::from_frames(
-        retail.saturating_mul(mint_sim::SIMULATION_HZ / RETAIL_LOGIC_HZ),
-    )
+    mint_sage_modules::retail_duration_ticks_f32(ms)
 }
 
 const DEFAULT_BASE_CHECK_SECONDS: f32 = 25.0;
@@ -1262,16 +1330,15 @@ fn game_data_from_expanded(
     started: Instant,
 ) -> (GameData, String, Vec<mint_sage_ini::ValueError>) {
     let game_data_block = mint_sage_ini::game_data::merged_game_data(documents);
-    crate::user_data::note_game_data_leaf(
-        game_data_block
-            .field("UserDataLeafName")
-            .and_then(mint_sage_ini::Field::value),
-    );
+    let user_data_leaf = game_data_block
+        .field("UserDataLeafName")
+        .and_then(mint_sage_ini::Field::value)
+        .map(str::to_owned);
     let ai_data_block = mint_sage_ini::game_data::merged_ai_data(documents);
     let side_info = mint_sage_ini::game_data::merged_side_info(documents);
 
     let mut data = CombatData::new();
-    data.authored_logic_hz = core::num::NonZeroU32::new(RETAIL_LOGIC_HZ);
+    data.authored_logic_hz = Some(RETAIL_HZ);
     for document in documents {
         data.load_document(document, &macros);
     }
@@ -1312,6 +1379,7 @@ fn game_data_from_expanded(
     let mut players = mint_sage_ini::PlayerTemplateIndex::new();
     let mut army_definitions = mint_sage_ini::ArmyDefinitionIndex::new();
     let mut multiplayer_colors = mint_sage_ini::MultiplayerColorIndex::new();
+    let mut control_bar_schemes = mint_sage_ini::ControlBarSchemeIndex::new();
     let mut upgrade_index = mint_sage_ini::UpgradeIndex::new();
     let mut special_powers = mint_sage_ini::SpecialPowerIndex::new();
     let mut radius_cursors = mint_sage_ini::RadiusCursorIndex::new();
@@ -1322,11 +1390,13 @@ fn game_data_from_expanded(
         players.insert_document(document);
         army_definitions.insert_document(document);
         multiplayer_colors.insert_document(document);
+        control_bar_schemes.insert_document(document);
         upgrade_index.insert_document(document);
         special_powers.insert_document(document, &macros);
         radius_cursors.insert_document(document);
     }
     let upgrades = mint_sage_modules::build_upgrade_records(&upgrade_index, &macros);
+    let upgrade_costs = mint_sage_modules::build_upgrade_costs(&upgrade_index, &macros);
     let upgrade_bits = mint_sage_modules::UpgradeBits::from_index(&upgrade_index);
 
     let line = format!(
@@ -1449,7 +1519,7 @@ fn game_data_from_expanded(
     ) = read_game_data_block(&game_data_block);
     let line = format!(
         "{line}; victory: {victory_fields} of 3 GameData field(s) read, cancel refund {:.0}%, \
-         unit filter {} (V1: parsed, not consulted for defeat)",
+         unit filter {} (read as data by the skirmish defeat mode)",
         construction_cancel_refund_percent * 100.0,
         if victory_unit_filter == crate::defeat::ObjectFilter::default() {
             "unconfigured"
@@ -1610,6 +1680,12 @@ fn game_data_from_expanded(
         .and_then(mint_sage_ini::value::parse_float)
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(DEFAULT_VALUE_PER_SUPPLY_BOX);
+    let building_height_variation = game_data_block
+        .field("AllowedHeightVariationForBuilding")
+        .and_then(mint_sage_ini::Field::value)
+        .and_then(mint_sage_ini::value::parse_float)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(DEFAULT_BUILDING_HEIGHT_VARIATION);
     let refund_percent_field = read_refund_percent_field(&game_data_block);
     let command_points = read_command_point_table(&game_data_block);
     let multiplay = read_multiplay_multipliers(&game_data_block);
@@ -1732,6 +1808,7 @@ fn game_data_from_expanded(
             combat: data,
             object_scripts: None,
             object_index: None,
+            user_data_leaf,
             formations,
             templates: Arc::new(templates),
             command_sets: Arc::new(command_sets),
@@ -1769,6 +1846,12 @@ fn game_data_from_expanded(
                 .and_then(mint_sage_ini::Field::value)
                 .unwrap_or_default()
                 .to_owned(),
+            downwind_angle: game_data_block
+                .field("DownwindAngle")
+                .and_then(mint_sage_ini::Field::value)
+                .and_then(mint_sage_ini::value::parse_float)
+                .filter(|angle| angle.is_finite())
+                .unwrap_or(DEFAULT_DOWNWIND_ANGLE),
             selection_flash_saturation: game_data_block
                 .field("SelectionFlashSaturationFactor")
                 .and_then(mint_sage_ini::Field::value)
@@ -1809,6 +1892,10 @@ fn game_data_from_expanded(
             ai_timing,
             ai_power_activation_tuning:
                 mint_sage_ini::game_data::skirmish_special_power_activation_tuning(documents),
+            brutal_cheats: mint_sage_ini::game_data::brutal_difficulty_cheats(documents),
+            wotr_retreat: mint_sage_ini::game_data::wotr_retreat_tuning(documents)
+                .ok()
+                .flatten(),
             combat_chains: Arc::new(read_combat_chains(documents)),
             order_mode_key: read_order_mode_key(documents),
             view_last_radar_event_key: read_view_last_radar_event_key(documents),
@@ -1818,6 +1905,7 @@ fn game_data_from_expanded(
             attack_priorities,
             army_definitions: Arc::new(army_definitions),
             multiplayer_colors: Arc::new(multiplayer_colors),
+            control_bar_schemes: Arc::new(control_bar_schemes),
             handicaps: Arc::new(handicaps),
             rule_choices: Arc::new(crate::setup_rules::RuleChoices::read(documents)),
             hero_subclasses: Arc::new(crate::setup_heroes::read_subclasses(documents, &macros)),
@@ -1840,6 +1928,7 @@ fn game_data_from_expanded(
                 &upgrade_index,
             )),
             upgrades: Arc::new(upgrades),
+            upgrade_costs: Arc::new(upgrade_costs),
             upgrade_bits: Arc::new(upgrade_bits),
             radius_cursors: Arc::new(radius_cursors),
             special_powers: Arc::new(special_powers),
@@ -1856,6 +1945,7 @@ fn game_data_from_expanded(
             terrain_resource_cell_size,
             supply_boxes_per_tree,
             value_per_supply_box,
+            building_height_variation,
             macros: Arc::new(macros),
             locomotors: Arc::new(locomotors),
             emotions: Arc::new(emotions),
@@ -1877,6 +1967,184 @@ fn game_data_from_expanded(
         line,
         value_errors,
     )
+}
+
+pub(crate) fn recompose_singletons(
+    data: &mut GameData,
+    globals: &[mint_sage_ini::Document],
+    map: &mint_sage_ini::Document,
+    macros: &mint_sage_ini::MacroTable,
+) -> Result<(), Vec<String>> {
+    let singleton = |block: &mint_sage_ini::Block| {
+        [
+            mint_sage_ini::GAME_DATA_KEYWORD,
+            mint_sage_ini::AI_DATA_KEYWORD,
+            mint_sage_ini::game_data::SKIRMISH_AI_DATA_KEYWORD,
+        ]
+        .contains(&block.keyword.as_str())
+    };
+    let documents: Vec<mint_sage_ini::Document> = globals
+        .iter()
+        .map(|document| {
+            document.retaining_roots(|block| {
+                singleton(block) || block.keyword.eq_ignore_ascii_case("ModifierList")
+            })
+        })
+        .chain(std::iter::once(map.retaining_roots(singleton)))
+        .filter(|document| !document.roots().is_empty())
+        .collect();
+    let (fresh, _, errors) = game_data_from_expanded(&documents, macros.clone(), 0, Instant::now());
+    if !errors.is_empty() {
+        return Err(errors.iter().map(ToString::to_string).collect());
+    }
+    mint_sage_ini::game_data::wotr_retreat_tuning(&documents).map_err(|error| vec![error])?;
+    let GameData {
+        combat,
+        attack_priorities,
+        water_depths,
+        victory_structure_filter,
+        victory_unit_filter,
+        construction_cancel_refund_percent,
+        max_cells_adjust_horde_melee,
+        max_cells_adjust_destination,
+        max_cells_adjust_to_possible_destination,
+        melee_placement,
+        group_formation,
+        castle_siege_stand_back_distance,
+        shell_map,
+        tutorials,
+        move_hint_name,
+        downwind_angle,
+        selection_flash_saturation,
+        selection_flash_house_color,
+        damage_thresholds,
+        movement_penalty_state,
+        engaged_defaults,
+        default_voice_attack_charge_timeout_ms,
+        ai_timing,
+        ai_power_activation_tuning,
+        brutal_cheats,
+        wotr_retreat,
+        combat_chains,
+        guard_ranges,
+        handicaps,
+        porter_targets,
+        armor_bonus_cap,
+        sell_percentage,
+        base_check_frames,
+        gravity,
+        ground_stiffness,
+        terrain_resource_cell_size,
+        supply_boxes_per_tree,
+        value_per_supply_box,
+        building_height_variation,
+        command_points,
+        multiplay,
+        score_weights,
+        objects_that_score,
+        command_points_solo,
+        max_tunnel_capacity,
+        camera,
+        shake,
+        formations: _,
+        templates: _,
+        command_sets: _,
+        command_buttons: _,
+        mapped_images: _,
+        players: _,
+        footprints: _,
+        user_data_leaf: _,
+        drag_formation: _,
+        ai_bases: _,
+        order_mode_key: _,
+        view_last_radar_event_key: _,
+        diplomacy_key: _,
+        spell_store_key: _,
+        army_definitions: _,
+        multiplayer_colors: _,
+        control_bar_schemes: _,
+        create_a_hero: _,
+        rule_choices: _,
+        hero_subclasses: _,
+        cah_system: _,
+        attack_urgency_values: _,
+        object_scripts: _,
+        object_index: _,
+        builder_cycle_timeout_ms: _,
+        drawable_caption_points: _,
+        floating_text: _,
+        military_caption: _,
+        named_timer: _,
+        notification_box: _,
+        upgrades: _,
+        upgrade_costs: _,
+        upgrade_bits: _,
+        radius_cursors: _,
+        special_powers: _,
+        experience: _,
+        experience_scalars: _,
+        sciences: _,
+        ranks: _,
+        ocls: _,
+        macros: _,
+        locomotors: _,
+        emotions: _,
+        stances: _,
+        fire_logic_system: _,
+        ini_documents: _,
+        map_ini: _,
+    } = fresh;
+    let mut priorities =
+        Arc::try_unwrap(attack_priorities).unwrap_or_else(|shared| (*shared).clone());
+    priorities.defined_templates = data.attack_priorities.defined_templates.clone();
+    data.attack_priorities = Arc::new(priorities);
+    data.combat.weapon_bonus = combat.weapon_bonus;
+    data.water_depths = water_depths;
+    data.victory_structure_filter = victory_structure_filter;
+    data.victory_unit_filter = victory_unit_filter;
+    data.construction_cancel_refund_percent = construction_cancel_refund_percent;
+    data.max_cells_adjust_horde_melee = max_cells_adjust_horde_melee;
+    data.max_cells_adjust_destination = max_cells_adjust_destination;
+    data.max_cells_adjust_to_possible_destination = max_cells_adjust_to_possible_destination;
+    data.melee_placement = melee_placement;
+    data.group_formation = group_formation;
+    data.castle_siege_stand_back_distance = castle_siege_stand_back_distance;
+    data.shell_map = shell_map;
+    data.tutorials = tutorials;
+    data.move_hint_name = move_hint_name;
+    data.downwind_angle = downwind_angle;
+    data.selection_flash_saturation = selection_flash_saturation;
+    data.selection_flash_house_color = selection_flash_house_color;
+    data.damage_thresholds = damage_thresholds;
+    data.movement_penalty_state = movement_penalty_state;
+    data.engaged_defaults = engaged_defaults;
+    data.default_voice_attack_charge_timeout_ms = default_voice_attack_charge_timeout_ms;
+    data.ai_timing = ai_timing;
+    data.ai_power_activation_tuning = ai_power_activation_tuning;
+    data.brutal_cheats = brutal_cheats;
+    data.wotr_retreat = wotr_retreat;
+    data.combat_chains = combat_chains;
+    data.guard_ranges = guard_ranges;
+    data.handicaps = handicaps;
+    data.porter_targets = porter_targets;
+    data.armor_bonus_cap = armor_bonus_cap;
+    data.sell_percentage = sell_percentage;
+    data.base_check_frames = base_check_frames;
+    data.gravity = gravity;
+    data.ground_stiffness = ground_stiffness;
+    data.terrain_resource_cell_size = terrain_resource_cell_size;
+    data.supply_boxes_per_tree = supply_boxes_per_tree;
+    data.value_per_supply_box = value_per_supply_box;
+    data.building_height_variation = building_height_variation;
+    data.command_points = command_points;
+    data.multiplay = multiplay;
+    data.score_weights = score_weights;
+    data.objects_that_score = objects_that_score;
+    data.command_points_solo = command_points_solo;
+    data.max_tunnel_capacity = max_tunnel_capacity;
+    data.camera = camera;
+    data.shake = shake;
+    Ok(())
 }
 
 fn check_stance_references(

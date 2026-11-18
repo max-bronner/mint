@@ -290,20 +290,97 @@ impl CahSystem {
         stats: &BTreeMap<String, i32>,
     ) -> Option<bool> {
         let name = self.subclass(class, subclass)?.awards.get(i)?;
-        let award = self
-            .awards
+        Some(self.award(name)?.earned(stats))
+    }
+
+    #[must_use]
+    pub(crate) fn award(&self, name: &str) -> Option<&AwardDef> {
+        self.awards
             .iter()
-            .find(|a| a.name.as_deref().is_some_and(|n| eq(n, name)))?;
-        Some(
-            !award.triggers.is_empty()
-                && award.triggers.iter().all(|t| {
-                    let sum: i64 = t
-                        .stats
-                        .iter()
-                        .map(|s| i64::from(stats.get(s).copied().unwrap_or(0)))
-                        .sum();
-                    sum >= t.threshold.unwrap_or(0)
-                }),
-        )
+            .find(|a| a.name.as_deref().is_some_and(|n| eq(n, name)))
+    }
+
+    #[must_use]
+    pub(crate) fn earned_awards(
+        &self,
+        class: usize,
+        subclass: usize,
+        stats: &BTreeMap<String, i32>,
+    ) -> Vec<String> {
+        self.subclass(class, subclass)
+            .map(|sub| {
+                sub.awards
+                    .iter()
+                    .filter(|name| self.award(name).is_some_and(|award| award.earned(stats)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub(crate) fn award_blings(
+        &self,
+        class: usize,
+        subclass: usize,
+        stats: &BTreeMap<String, i32>,
+    ) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        for name in self.earned_awards(class, subclass, stats) {
+            let Some(award) = self.award(&name) else {
+                continue;
+            };
+            for upgrade in &award.upgrade_awards {
+                let Some(group) = find_bling(&self.def, upgrade)
+                    .and_then(|bling| find_binder(&self.def, bling))
+                    .and_then(|binder| binder.group.clone())
+                else {
+                    continue;
+                };
+                pairs.push((group, upgrade.clone()));
+            }
+        }
+        pairs
+    }
+
+    #[must_use]
+    pub(crate) fn binder_options_earned(
+        &self,
+        class: usize,
+        subclass: usize,
+        group: &str,
+        stats: &BTreeMap<String, i32>,
+    ) -> Option<BinderOptions> {
+        let mut options = self.binder_options(class, subclass, group)?.clone();
+        for (binder, upgrade) in self.award_blings(class, subclass, stats) {
+            if eq(&binder, group) && !options.upgrades.iter().any(|u| eq(u, &upgrade)) {
+                options.upgrades.push(upgrade);
+            }
+        }
+        Some(options)
+    }
+
+    #[must_use]
+    pub(crate) fn undefined_names(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for class in &self.def.classes {
+            for sub in &class.subclasses {
+                for name in &sub.awards {
+                    if self.award(name).is_none() {
+                        errors.push(format!(
+                            "The Award {name} does not exist in the AwardSystemManager."
+                        ));
+                    }
+                }
+                for name in &sub.stats {
+                    if self.thing_stat(name).is_none() {
+                        errors.push(format!(
+                            "The Stat {name} does not exist in the AwardSystemManager."
+                        ));
+                    }
+                }
+            }
+        }
+        errors
     }
 }

@@ -9,6 +9,7 @@ pub(crate) const LOW_LOD_SHELL_MUSIC: &str = "LowLODShellMusic";
 pub(crate) const HIGH_LOD_SHELL_MUSIC: &str = "HighLODShellMusic";
 pub(crate) const FULL_SCREEN_SUB_MENU_MUSIC: &str = "FullScreenSubMenuMusic";
 pub(crate) const SCORE_SCREEN_MUSIC: &str = "ScoreScreenMusic";
+const CREDITS_MUSIC: &str = "CreditsMusic";
 pub(crate) const COMBO_BOX_CLICK: &str = "ComboBoxClick";
 
 const NO_SOUND: &str = "NoSound";
@@ -27,7 +28,7 @@ impl UiAudio {
                 AudioLibrary::default()
             }
         };
-        let audio = SageAudio::open(library);
+        let audio = SageAudio::open_named(library, "shell");
         println!("ui sound: shell audio open - {}", audio.readout());
         Self { audio, vfs }
     }
@@ -91,6 +92,17 @@ impl UiAudio {
         let vfs = Arc::clone(&self.vfs);
         self.audio.music_replace(&vfs, request);
         diag!("music: submenu - {FULL_SCREEN_SUB_MENU_MUSIC} = {event}");
+    }
+
+    pub(crate) fn credits(&mut self) {
+        let Some(event) = self.misc(CREDITS_MUSIC) else {
+            return;
+        };
+        let vfs = Arc::clone(&self.vfs);
+        self.audio.music_stop(true);
+        self.audio
+            .music_replace(&vfs, MusicRequest::forever(&event));
+        diag!("music: credits - {CREDITS_MUSIC} = {event}");
     }
 
     pub(crate) fn score_screen(&mut self) {

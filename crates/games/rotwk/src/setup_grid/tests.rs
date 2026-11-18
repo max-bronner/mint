@@ -60,6 +60,8 @@ fn setup() -> SkirmishSetup {
         spawn_buildings: None,
         dummies: None,
         dummies_attack: false,
+        drive_templates: Vec::new(),
+        wotr: None,
         cah_hero: None,
         random_seed: crate::skirmish::SKIRMISH_SEED,
         resolved: None,
@@ -78,6 +80,15 @@ fn a_cell_is_its_row_clips_path() {
     );
     assert_eq!(cell_path("L", 0, Column::Colour), "L.~0.Color");
     assert_eq!(connection_icon(7), "ConnectionIcon~7");
+}
+
+#[test]
+fn the_player_list_is_under_the_clip_the_hub_loaded_the_setup_into() {
+    assert_eq!(list_path("OpenPlay"), "OpenPlay.#1.PlayerList");
+    assert_eq!(
+        cell_path(&list_path("Strategic"), 1, Column::Player),
+        "Strategic.#1.PlayerList.~1.Player"
+    );
 }
 
 #[test]
@@ -154,7 +165,10 @@ fn an_occupied_rows_columns_offer_their_choices() {
     assert_eq!(handicap.items[19].text, "-95%");
     assert_eq!(handicap.selected, Some(19));
     let (hero, _) = cell(&s, &c, &l, 1, Column::Hero);
-    assert_eq!(texts(&hero), vec!["Random", "Mine", "SysB *", "SysA *"]);
+    assert_eq!(
+        texts(&hero),
+        vec!["-", "Random", "Mine", "SysB *", "SysA *"]
+    );
     assert!(hero.enabled);
     s.slots[1].faction = Some("FactionA".to_owned());
     let (hero, choices) = cell(&s, &c, &l, 1, Column::Hero);
@@ -163,9 +177,10 @@ fn an_occupied_rows_columns_offer_their_choices() {
         .iter()
         .map(|i| i.colour == Some(UNUSABLE_HERO))
         .collect();
-    assert_eq!(greyed, [false, false, true, false]);
-    assert_eq!(choices[0], Choice::Hero(HeroPick::Random));
-    assert_eq!(choices[2], Choice::Hero(HeroPick::Stored(1)));
+    assert_eq!(greyed, [false, false, false, true, false]);
+    assert_eq!(choices[0], Choice::Hero(HeroPick::None));
+    assert_eq!(choices[1], Choice::Hero(HeroPick::Random));
+    assert_eq!(choices[3], Choice::Hero(HeroPick::Stored(1)));
     s.rules.allow_custom_heroes = false;
     let (hero, choices) = cell(&s, &c, &l, 1, Column::Hero);
     assert_eq!(
@@ -232,4 +247,24 @@ fn the_preview_numbers_each_held_start_with_its_slot() {
         preview(&none, &lobby, &labels(), "Back").extent,
         [0, 0, 1, 1]
     );
+}
+
+#[test]
+fn a_strategic_setup_publishes_no_visible_cell_in_rows_six_and_seven() {
+    let (setup, catalogue, labels) = (setup(), catalogue(8), labels());
+    let visible_rows = |map_type| -> Vec<usize> {
+        (0..MAX_SLOTS)
+            .filter(|row| {
+                Column::ALL.iter().all(|column| {
+                    let (spec, _) = cell(&setup, &catalogue, &labels, *row, *column);
+                    matches!(
+                        cell_source(map_type, *row, Arc::new(spec)),
+                        ImageSource::Combo(_)
+                    )
+                })
+            })
+            .collect()
+    };
+    assert_eq!(visible_rows(MapType::Strategic), [0, 1, 2, 3, 4, 5]);
+    assert_eq!(visible_rows(MapType::OpenPlay), [0, 1, 2, 3, 4, 5, 6, 7]);
 }

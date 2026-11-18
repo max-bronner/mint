@@ -1,5 +1,5 @@
 use crate::hud::ImageSource;
-use crate::lobby::{Occupant, ResolvedPlayer, SkirmishSetup};
+use crate::lobby::{ResolvedPlayer, SkirmishSetup};
 use crate::setup_grid::GridLabels;
 use mint_sage_apt_player::{Exposure, ImageKey, Value};
 
@@ -60,13 +60,9 @@ pub(crate) fn rows(
     army_name: &dyn Fn(&str) -> String,
     image_exists: &dyn Fn(&str) -> bool,
 ) -> Vec<Row> {
-    let local_slot = setup
-        .slots
-        .iter()
-        .position(|slot| slot.occupant == Occupant::Human);
-    let local_team = local_slot
-        .and_then(|slot| setup.slots.get(slot))
-        .and_then(|slot| slot.team);
+    let local = players.iter().find(|player| player.ai.is_none());
+    let local_slot = local.map(|player| player.slot);
+    let local_team = local.and_then(|player| player.team);
     players
         .iter()
         .map(|player| {

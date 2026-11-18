@@ -898,23 +898,50 @@ End
     assert_eq!(world.live_systems(), 0, "and the system is reaped");
 }
 
+fn burst_world(extra: &str) -> (ParticleWorld, TemplateHandle) {
+    world(&format!(
+        "FXParticleSystem Pop\n  System\n    Lifetime = 1000 1000\n    BurstCount = 4 4\n{extra}  End\nEnd\n"
+    ))
+}
+
 #[test]
-fn a_one_shot_system_fires_once() {
-    let (mut world, handle) = world(
-        "FXParticleSystem Pop
-  System
-    Lifetime = 10 10
-    BurstCount = 4 4
-                 IsOneShot = Yes
-  End
-End
-",
-    );
+fn a_one_shot_with_no_delay_bursts_every_update_for_its_system_lifetime() {
+    let (mut world, handle) = burst_world("    IsOneShot = Yes\n    SystemLifetime = 5\n");
     world.spawn(handle, Vec3::ZERO);
-    world.warm_up(0.2, &NoGround);
+    for _ in 0..10 {
+        world.warm_up(1.0 / 30.0, &NoGround);
+    }
+    assert_eq!(world.live_particles(), 20, "five bursts of four");
+}
+
+#[test]
+fn a_one_shot_with_a_delay_bursts_once_and_stays_alive() {
+    let (mut world, handle) = burst_world("    IsOneShot = Yes\n    BurstDelay = 5 5\n");
+    world.spawn(handle, Vec3::ZERO);
+    for _ in 0..40 {
+        world.warm_up(1.0 / 30.0, &NoGround);
+    }
     assert_eq!(world.live_particles(), 4);
-    world.warm_up(1.0, &NoGround);
-    assert_eq!(world.live_systems(), 0);
+    assert_eq!(world.live_systems(), 1);
+}
+
+#[test]
+fn a_fractional_burst_delay_is_truncated_to_zero() {
+    for (extra, updates, expected) in [
+        (
+            "    IsOneShot = Yes\n    SystemLifetime = 5\n    BurstDelay = 0 1\n",
+            10,
+            20,
+        ),
+        ("    BurstDelay = 0.8 0.8\n", 4, 16),
+    ] {
+        let (mut world, handle) = burst_world(extra);
+        world.spawn(handle, Vec3::ZERO);
+        for _ in 0..updates {
+            world.warm_up(1.0 / 30.0, &NoGround);
+        }
+        assert_eq!(world.live_particles(), expected, "{extra}");
+    }
 }
 
 #[test]
@@ -1432,6 +1459,8 @@ fn the_compound_rung_off_starts_none_of_step_fourteen() {
             fires: vec![plain_nugget(slave_handle)],
             height_offset: 0.0,
             kill_after: true,
+            follow_up: None,
+            orient: false,
         }),
     );
     world.set_compound(false);
@@ -1460,6 +1489,8 @@ fn a_particle_that_reaches_the_ground_fires_its_event_once() {
             fires: vec![plain_nugget(fired)],
             height_offset: 0.0,
             kill_after: true,
+            follow_up: None,
+            orient: false,
         }),
     );
     world.spawn(handle, Vec3::new(0.0, 0.0, 5.0)).unwrap();
@@ -1483,6 +1514,8 @@ fn a_particle_that_reaches_the_ground_fires_its_event_once() {
             fires: vec![plain_nugget(fired)],
             height_offset: 4.0,
             kill_after: true,
+            follow_up: None,
+            orient: false,
         }),
     );
     high.spawn(handle, Vec3::new(0.0, 0.0, 5.0)).unwrap();
@@ -1491,6 +1524,41 @@ fn a_particle_that_reaches_the_ground_fires_its_event_once() {
         high.refusals().collisions > 0,
         "the offset raised the plane"
     );
+}
+
+#[test]
+fn a_collision_reports_its_follow_up_to_the_caller() {
+    let falling = compound_source("master", 60, "").replace(
+        "  EmissionVelocity = OrthoEmissionVelocity\n  End",
+        "  EmissionVelocity = OrthoEmissionVelocity\n    X = 2 2\n    Z = -1 -1\n  End",
+    );
+    let (master, _) = two(&falling, &compound_source("slave", 30, ""));
+    let mut world = ParticleWorld::new(9);
+    let handle = world.register(&master, None);
+    world.link(
+        handle,
+        None,
+        None,
+        Some(CollisionEvent {
+            fires: Vec::new(),
+            height_offset: 0.0,
+            kill_after: false,
+            follow_up: Some(7),
+            orient: true,
+        }),
+    );
+    world.spawn(handle, Vec3::new(0.0, 0.0, 5.0)).unwrap();
+    world.warm_up(8.0 / 30.0, &FlatGround(0.0));
+    let mut taken = Vec::new();
+    world.take_collisions(&mut taken);
+    let first = taken.first().expect("the ground was reached");
+    assert_eq!(first.follow_up, 7);
+    assert!(first.at.z <= 0.0);
+    let [x, y] = first.heading.expect("oriented to the terrain");
+    assert!(x > 0.0 && y.abs() < 1e-6, "heading along +x, got {x},{y}");
+    let count = taken.len();
+    world.take_collisions(&mut taken);
+    assert_eq!(taken.len(), count, "taken once");
 }
 
 #[test]
@@ -1508,6 +1576,8 @@ fn a_particle_that_survives_its_event_does_not_fire_it_again() {
             fires: vec![plain_nugget(fired)],
             height_offset: 0.0,
             kill_after: false,
+            follow_up: None,
+            orient: false,
         }),
     );
     world.spawn(handle, Vec3::ZERO).unwrap();
@@ -1525,7 +1595,7 @@ fn a_particle_that_survives_its_event_does_not_fire_it_again() {
 
 #[test]
 fn the_slot_map_survives_a_system_ending_under_another_one() {
-    let one_shot = compound_source("master", 1, "    IsOneShot = Yes\n");
+    let one_shot = compound_source("master", 1, "    IsOneShot = Yes\n    SystemLifetime = 1\n");
     let (short, long) = two(&one_shot, &compound_source("slave", 400, ""));
     let mut world = ParticleWorld::new(13);
     let short_handle = world.register(&short, None);
@@ -2544,4 +2614,101 @@ End
     let swirled = run("Swirly = Yes");
     assert_eq!((swirled.x, swirled.y, swirled.z), (0.0, -4.0, 1.0));
     assert_eq!(run("Swirly = No"), Vec3::new(0.0, 0.0, 1.0));
+}
+
+fn ring_system(radius: f32, rate: f32, extra: &str) -> (ParticleWorld, TemplateHandle) {
+    world(&format!(
+        "FXParticleSystem Ring\n\
+         \x20 System\n    Lifetime = 1000 1000\n    BurstCount = 1 1\n    BurstDelay = 0 0\n{extra}  End\n\
+         \x20 EmissionVolume = CylinderEmissionVolume\n\
+         \x20   Radius = {radius}\n    RadiusRate = {rate}\n    IsHollow = Yes\n  End\n\
+         End\n"
+    ))
+}
+
+fn reach(world: &ParticleWorld, particle: usize) -> f32 {
+    let at = world.systems[0].particles[particle].position;
+    (at.x * at.x + at.y * at.y).sqrt()
+}
+
+#[test]
+fn a_cylinder_burst_uses_the_radius_as_it_stood_before_that_steps_update() {
+    let (mut world, handle) = ring_system(50.0, 10.0, "");
+    world.spawn(handle, Vec3::ZERO).unwrap();
+    world.warm_up(1.0 / 30.0, &NoGround);
+    assert!(
+        (reach(&world, 0) - 50.0).abs() < 1e-3,
+        "{}",
+        reach(&world, 0)
+    );
+    world.warm_up(1.0 / 30.0, &NoGround);
+    assert!(
+        (reach(&world, 1) - 60.0).abs() < 1e-3,
+        "{}",
+        reach(&world, 1)
+    );
+}
+
+#[test]
+fn a_shrinking_cylinder_stops_at_the_floor() {
+    let (mut world, handle) = ring_system(1.0, -5.0, "");
+    world.spawn(handle, Vec3::ZERO).unwrap();
+    for _ in 0..3 {
+        world.warm_up(1.0 / 30.0, &NoGround);
+    }
+    assert!(
+        (reach(&world, 2) - 0.1).abs() < 1e-5,
+        "{}",
+        reach(&world, 2)
+    );
+    let (mut world, handle) = ring_system(-1.0, 0.0, "");
+    world.spawn(handle, Vec3::ZERO).unwrap();
+    for _ in 0..2 {
+        world.warm_up(1.0 / 30.0, &NoGround);
+    }
+    assert!(
+        (reach(&world, 1) - 0.1).abs() < 1e-5,
+        "{}",
+        reach(&world, 1)
+    );
+}
+
+#[test]
+fn a_delayed_cylinder_does_not_grow_until_its_delay_ends() {
+    let (mut world, handle) = ring_system(50.0, 10.0, "    InitialDelay = 3 3\n");
+    world.spawn(handle, Vec3::ZERO).unwrap();
+    for _ in 0..3 {
+        world.warm_up(1.0 / 30.0, &NoGround);
+    }
+    assert_eq!(world.systems[0].radius, 50.0);
+    world.warm_up(1.0 / 30.0, &NoGround);
+    assert!((reach(&world, 0) - 50.0).abs() < 1e-3);
+    assert_eq!(world.systems[0].radius, 60.0);
+}
+
+#[test]
+fn a_radiusless_cylinder_with_a_rate_gives_every_particle_its_own_angle() {
+    let (mut world, handle) = world(
+        "FXParticleSystem FireFlies\n\
+         \x20 System\n    Lifetime = 1000 1000\n    BurstCount = 1 1\n    BurstDelay = 0 0\n    IsParticleUpTowardsEmitter = Yes\n  End\n\
+         \x20 EmissionVolume = CylinderEmissionVolume\n    Length = 75\n    RadiusRate = 0.001\n  End\n\
+         End\n",
+    );
+    world.spawn(handle, Vec3::ZERO).unwrap();
+    for _ in 0..39 {
+        world.warm_up(1.0 / 30.0, &NoGround);
+    }
+    let mut angles: Vec<u32> = world.systems[0]
+        .particles
+        .iter()
+        .map(|particle| particle.angle.to_bits())
+        .collect();
+    let live = angles.len();
+    angles.sort_unstable();
+    angles.dedup();
+    println!(
+        "birth angles: {} distinct over {live} particles",
+        angles.len()
+    );
+    assert_eq!(angles.len(), live);
 }

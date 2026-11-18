@@ -11,6 +11,7 @@ pub mod cloud_effect;
 pub mod command_button;
 pub mod command_map;
 pub mod command_set;
+pub mod control_bar_scheme;
 #[cfg(feature = "coverage")]
 pub mod coverage;
 pub mod create_a_hero;
@@ -24,6 +25,7 @@ mod glow_effect;
 pub mod house_color;
 pub mod lex;
 pub mod linear_campaign;
+pub mod living_world;
 pub mod locomotor;
 pub mod mapped_image;
 pub mod melee_behavior;
@@ -78,6 +80,10 @@ pub use client_behavior::{
 pub use cloud_effect::{cloud_darkening, CloudDarkeningSetting, CLOUD_EFFECT_KEYWORD};
 pub use command_button::{read_command_button, ButtonFace, CommandButtonDef, CommandButtonIndex};
 pub use command_set::{read_command_set, CommandSetDef, CommandSetIndex};
+pub use control_bar_scheme::{
+    read_control_bar_scheme, Argb8, ControlBarSchemeDef, ControlBarSchemeIndex,
+    CONTROL_BAR_SCHEME_KEYWORD,
+};
 pub use create_a_hero::{
     read_create_a_hero_system, AttributeDef, BlingBinderDef, BlingChoices, BlingDef, BlingType,
     ClassDef, CreateAHeroSystemDef, SubClassDef, ViewInfoDef, ViewPreset,
@@ -106,8 +112,8 @@ pub use melee_behavior::{
     MELEE_BEHAVIOR_KEYWORD,
 };
 pub use model_state::{
-    draw_model_states, draw_model_states_collecting, DecalBlend, ModelStateDef, StateDecal,
-    WEAPON_SLOT_COUNT,
+    draw_model_states, draw_model_states_collecting, DecalBlend, DecalOpacity, ModelStateDef,
+    StateDecal, WEAPON_SLOT_COUNT,
 };
 pub use mouse_cursor::{cursor_file, read_mouse_cursor, MouseCursorDef, MouseCursorIndex};
 pub use multiplayer_color::{
@@ -126,14 +132,16 @@ pub use object::{
 };
 pub use object_creation_list::{
     read_object_creation_list, CreationEntry, ObjectCreationListDef, ObjectCreationListIndex,
+    DEFAULT_DISPOSITION,
 };
 pub use particle::{
-    water_gate_admits, weather_gate_admits, AlphaKey, CameraShakerVolume, ColorKey, DefinitionForm,
-    EmissionVelocity, EmissionVolume, Flipbook, FxAtBonePos, FxEvaEvent, FxList, FxListIndex,
-    FxNugget, FxParticleNugget, LightningWave, NuggetConditions, NuggetWeather, ParticleIndex,
-    ParticleKind, ParticlePriority, ParticleRotation, ParticleShader, ParticleSystemDef,
-    RandomRange, TerrainCollisionEvent, Wind, WindMotion, DEFAULT_FULL_STRENGTH_DIST,
-    DEFAULT_ZERO_STRENGTH_DIST, FX_DELAY_HZ, PARTICLE_DOCUMENTS,
+    water_gate_admits, weather_gate_admits, AlphaKey, CameraShakerVolume, ColorKey, DecalShader,
+    DefinitionForm, EmissionVelocity, EmissionVolume, Flipbook, FxAtBonePos, FxDynamicDecal,
+    FxEvaEvent, FxList, FxListIndex, FxNugget, FxParticleNugget, LightningWave, NuggetConditions,
+    NuggetWeather, ParticleIndex, ParticleKind, ParticlePriority, ParticleRotation, ParticleShader,
+    ParticleSystemDef, RandomRange, TerrainCollisionEvent, Wind, WindMotion,
+    DEFAULT_FULL_STRENGTH_DIST, DEFAULT_ZERO_STRENGTH_DIST, DEFINE_DOCUMENTS,
+    FX_DELAY_FRAMES_PER_MS, PARTICLE_DOCUMENTS,
 };
 pub use player_template::{
     read_player_template, PlayerTemplateDef, PlayerTemplateIndex, StartingUnit, MAX_STARTING_UNITS,

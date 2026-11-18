@@ -1,3 +1,4 @@
+use mint_sage_ini::game_data::BrutalCheats;
 use mint_sage_modules::{ProductionModifierDef, RespawnEntry, RespawnRule};
 use mint_sim::{Component, Entity, LogicFrames, StateHasher};
 
@@ -131,6 +132,35 @@ pub(crate) fn respawn_rule(
     })
 }
 
+pub(crate) fn campaign_revive_price(
+    rules: &[RespawnRule],
+    entries: &[RespawnEntry],
+    level: u32,
+    (cost_mult, time_mult): (f32, f32),
+) -> (i64, f32) {
+    let declared = |l: u16| {
+        (l == 1 && !rules.is_empty())
+            || rules.iter().any(|rule| rule.level == Some(l))
+            || entries.iter().any(|entry| entry.level == Some(l))
+    };
+    let level = u16::try_from(level).unwrap_or(u16::MAX);
+    let rule = [level, 1]
+        .into_iter()
+        .find(|l| declared(*l))
+        .and_then(|l| respawn_rule(rules, entries, l));
+    let cost = rule
+        .and_then(|rule| rule.cost)
+        .and_then(crate::templates::whole)
+        .unwrap_or(1000);
+    let seconds = rule
+        .and_then(|rule| rule.time_ms)
+        .and_then(crate::templates::whole)
+        .map_or(150, |ms| ms / 1000);
+    #[allow(clippy::cast_precision_loss)]
+    let (cost, seconds) = (cost as f32 * cost_mult, seconds as f32 * time_mult);
+    (crate::templates::whole(cost).unwrap_or(0), seconds.trunc())
+}
+
 pub(crate) fn hero_discount(
     modifiers: &[ProductionModifierDef],
     revive: bool,
@@ -162,22 +192,82 @@ pub(crate) fn discounted(
     cost: i64,
     seconds: f32,
     (cost_mult, time_mult): (f32, f32),
+    brutal: BrutalCheats,
 ) -> (i64, LogicFrames) {
     (
         mint_sage_economy::cost_to_build(
             cost,
             &mint_sage_economy::CostModifiers {
                 kind_of_modifier: cost_mult,
+                brutal_reduction: brutal.build_cost_reduction,
                 ..mint_sage_economy::CostModifiers::default()
             },
         ),
         mint_sage_economy::time_to_build(
             seconds,
             &mint_sage_economy::TimeModifiers {
-                production_time_change_percent: time_mult - 1.0,
+                builder_modifier: time_mult,
+                brutal_reduction: brutal.build_time_reduction,
                 ..mint_sage_economy::TimeModifiers::default()
             },
         ),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeldRevive {
+    pub(crate) sum: i64,
+    pub(crate) discount_percent: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReviveTerms {
+    pub(crate) player: mint_sage_economy::CostModifiers,
+    pub(crate) slot: (f32, f32),
+    pub(crate) brutal: BrutalCheats,
+    pub(crate) held: Option<HeldRevive>,
+}
+
+pub(crate) fn revive_price(cost: i64, seconds: f32, terms: &ReviveTerms) -> (i64, LogicFrames) {
+    let player = mint_sage_economy::CostModifiers {
+        brutal_reduction: terms.brutal.build_cost_reduction,
+        ..terms.player
+    };
+    let priced = match terms.held {
+        None => mint_sage_economy::cost_to_build(cost, &player),
+        Some(held) => {
+            let stored = mint_sage_economy::cost_to_build(cost.saturating_add(held.sum), &player)
+                .saturating_mul(i64::from(held.discount_percent))
+                / 100;
+            let sum_again = if stored == cost { held.sum } else { 0 };
+            mint_sage_economy::cost_to_build(stored.saturating_add(sum_again), &player)
+        }
+    };
+    let slotted = mint_sage_economy::cost_to_build(
+        priced,
+        &mint_sage_economy::CostModifiers {
+            kind_of_modifier: terms.slot.0,
+            ..mint_sage_economy::CostModifiers::default()
+        },
+    );
+    let paid = mint_sage_economy::cost_to_build(
+        slotted,
+        &mint_sage_economy::CostModifiers {
+            brutal_reduction: terms.brutal.build_cost_reduction,
+            ..mint_sage_economy::CostModifiers::default()
+        },
+    );
+    let time = mint_sage_economy::time_to_build(
+        seconds,
+        &mint_sage_economy::TimeModifiers {
+            builder_modifier: terms.slot.1,
+            brutal_reduction: terms.brutal.build_time_reduction,
+            ..mint_sage_economy::TimeModifiers::default()
+        },
+    );
+    (
+        paid,
+        mint_sage_economy::reduce_frames(time, terms.brutal.build_time_reduction),
     )
 }
 
@@ -187,6 +277,8 @@ pub(crate) struct HeroAvailability {
     pub(crate) affordable: bool,
     pub(crate) allowed: bool,
     pub(crate) cost: Option<i64>,
+    pub(crate) revive: bool,
+    pub(crate) level: u16,
 }
 
 const ENGINE_HERO_PAGE_IMAGES: [(&str, &str, &str); 1] = [(
@@ -335,10 +427,63 @@ mod tests {
 
     #[test]
     fn a_discounted_price_truncates_as_ea_does() {
-        let (cost, time) = discounted(625, 60.0, (0.8, 0.8));
+        let (cost, time) = discounted(625, 60.0, (0.8, 0.8), BrutalCheats::NONE);
         assert_eq!(cost, 500);
         assert_eq!(time.get(), 1_440, "60 s at 30 Hz is 1800, less 20%");
-        let (cost, time) = discounted(1500, 60.0, (1.0, 1.0));
+        let (cost, time) = discounted(1500, 60.0, (1.0, 1.0), BrutalCheats::NONE);
         assert_eq!((cost, time.get()), (1500, 1800));
+    }
+
+    fn terms(kind_of: f32, brutal: BrutalCheats, held: Option<HeldRevive>) -> ReviveTerms {
+        ReviveTerms {
+            player: mint_sage_economy::CostModifiers {
+                kind_of_modifier: kind_of,
+                ..mint_sage_economy::CostModifiers::default()
+            },
+            slot: (1.0, 1.0),
+            brutal,
+            held,
+        }
+    }
+
+    #[test]
+    fn a_brutal_revive_goes_through_the_reduction_twice() {
+        let brutal = BrutalCheats {
+            build_cost_reduction: f32::from_bits(0x3E19_9999),
+            build_time_reduction: f32::from_bits(0x3E19_9999),
+        };
+        let (cost, time) = revive_price(1_000, 20.0, &terms(1.0, brutal, None));
+        assert_eq!(cost, 722);
+        assert_eq!(time.get(), 72 * 6, "100 retail frames, then 85, then 72");
+        let (cost, _) = revive_price(1_000, 20.0, &terms(1.0, BrutalCheats::NONE, None));
+        assert_eq!(cost, 1_000);
+    }
+
+    #[test]
+    fn a_held_hero_revive_takes_the_player_modifier_a_second_time() {
+        let held = HeldRevive {
+            sum: 0,
+            discount_percent: 75,
+        };
+        let (cost, _) = revive_price(1_000, 20.0, &terms(0.5, BrutalCheats::NONE, Some(held)));
+        assert_eq!(cost, 187);
+    }
+
+    #[test]
+    fn a_campaign_revive_is_priced_from_its_level_then_level_one_then_the_defaults() {
+        let rules = [rule(None, 600.0)];
+        let entries = [entry(2, Some(700.0), Some(90_500.0))];
+        assert_eq!(
+            campaign_revive_price(&rules, &entries, 2, (2.0, 1.5)),
+            (1400, 135.0)
+        );
+        assert_eq!(
+            campaign_revive_price(&rules, &entries, 7, (2.0, 1.0)),
+            (1200, 60.0)
+        );
+        assert_eq!(
+            campaign_revive_price(&[], &[], 3, (1.25, 1.0)),
+            (1250, 150.0)
+        );
     }
 }

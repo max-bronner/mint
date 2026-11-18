@@ -185,9 +185,9 @@ pub fn attribute_modifier_aura_update_from_fields(
         Some(ms) if ms.is_finite() && ms >= 1.0 => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let whole = ms.min(86_400_000.0) as u32;
-            LogicFrames::from_milliseconds(whole)
+            crate::special_ability_update::retail_duration_ticks(whole)
         }
-        _ => LogicFrames::from_milliseconds(1000),
+        _ => LogicFrames::from_engine_milliseconds(1000),
     };
     let refresh = if refresh.is_zero() {
         LogicFrames::ONE

@@ -7,6 +7,7 @@ pub(crate) const CATEGORIES: &[&str] = &[
     "allies",
     "ambient",
     "amphibious",
+    "animal",
     "approach",
     "apt",
     "attach",
@@ -27,6 +28,7 @@ pub(crate) const CATEGORIES: &[&str] = &[
     "contact",
     "contain",
     "crate",
+    "critter",
     "crush",
     "crush notice",
     "damage-creation",
@@ -44,7 +46,9 @@ pub(crate) const CATEGORIES: &[&str] = &[
     "fade",
     "fire",
     "flank",
+    "flood",
     "forest",
+    "forfeit",
     "formation",
     "foundation",
     "gadget",
@@ -105,6 +109,7 @@ pub(crate) const CATEGORIES: &[&str] = &[
     "wall",
     "weapon",
     "weather",
+    "wotr",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

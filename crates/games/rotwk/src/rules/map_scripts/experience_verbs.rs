@@ -156,7 +156,11 @@ impl RotwkRules {
         };
         let wanted = u32::try_from(points).unwrap_or(0);
         state.rank_cap = (1..=u16::MAX)
-            .map_while(|rank| self.ranks.needed(rank).map(|needed| (rank, needed)))
+            .map_while(|rank| {
+                self.ranks_of(player)
+                    .needed(rank)
+                    .map(|needed| (rank, needed))
+            })
             .find(|&(_, needed)| needed >= wanted)
             .map_or(0, |(rank, _)| rank);
         tick.state_mut().insert(ids.player_science, entity, state)?;

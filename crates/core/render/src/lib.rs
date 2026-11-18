@@ -14,6 +14,7 @@ mod modulate;
 mod pipeline_cache;
 mod post;
 mod renderer;
+mod ribbon;
 mod shadow;
 mod skin;
 mod texture;
@@ -40,6 +41,7 @@ pub use renderer::{
     RenderTargetHandle, Renderer, Scene, SurfaceTarget, TextureHandle, VisibilityMask, LIGHT_SETS,
     MAX_ANISOTROPY, MAX_DIRECTIONAL_LIGHTS,
 };
+pub use ribbon::{ribbon_mesh, RibbonStyle, Ribbons};
 pub use shadow::{
     directional_light_view_proj, fit_directional_light_to_view, ContactHardening, ContactShadows,
     FittedShadow, ShadowCascade, ShadowEdge, ShadowFit, ShadowMapHandle, ShadowSample,

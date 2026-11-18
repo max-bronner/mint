@@ -179,6 +179,26 @@ fn inline_arithmetic_over_a_macro_is_evaluated() {
 }
 
 #[test]
+fn an_emotion_duration_is_whole_seconds_in_authored_frames() {
+    let document = parse(
+        "Weapon Scare\n\
+         \tEmotionWeaponNugget\n\
+         \t\tEmotionType = FEAR\n\
+         \t\tDuration = 2.5\n\
+         \tEnd\n\
+         End\n",
+    );
+    let mut data = CombatData::new();
+    data.authored_logic_hz = core::num::NonZeroU32::new(5);
+    data.load_document(&document, &MacroTable::new());
+    let id = data.weapons.id("Scare").unwrap();
+    let Some(EffectNugget::EmotionWeapon(nugget)) = data.effects.get(id.index(), 0) else {
+        panic!("expected an emotion nugget");
+    };
+    assert_eq!(nugget.duration, LogicFrames::from_frames(60));
+}
+
+#[test]
 fn a_nugget_flag_that_is_neither_yes_nor_no_is_counted() {
     let data = load(
         "Weapon Blast\n\
@@ -567,7 +587,7 @@ fn hostile_numbers_load_without_panicking_and_without_absurd_durations() {
     assert_eq!(weapon.clip_size, 0);
     assert_eq!(
         weapon.pre_attack_delay,
-        LogicFrames::from_milliseconds(86_400_000)
+        LogicFrames::from_engine_milliseconds(86_400_000)
     );
     assert!(weapon.attack_range.is_finite());
     assert!(weapon.weapon_speed.is_finite());

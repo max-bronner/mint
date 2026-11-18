@@ -408,8 +408,10 @@ struct Placed {
     movie: Movie,
     instance: InstanceId,
     action: SlotAction,
+    enabled: bool,
     hover: (HoverKey, String, Option<i64>),
     face: Option<mint_sage_ini::Stance>,
+    hero: Option<crate::command_bar::SlotHero>,
 }
 
 fn readiness(ready_event: &str) -> Readiness {
@@ -423,6 +425,14 @@ fn readiness(ready_event: &str) -> Readiness {
 fn hero_number(name: &str) -> Option<u8> {
     name.get(..4).filter(|p| p.eq_ignore_ascii_case("hero"))?;
     name.get(4..)?
+        .parse::<u8>()
+        .ok()
+        .filter(|n| (1..=16).contains(n))
+}
+
+fn spell_number(name: &str) -> Option<u8> {
+    name.get(..5).filter(|p| p.eq_ignore_ascii_case("spell"))?;
+    name.get(5..)?
         .parse::<u8>()
         .ok()
         .filter(|n| (1..=16).contains(n))
@@ -454,7 +464,7 @@ fn help_box_state(prepared: Option<&PreparedHelp>, shown: Option<HoverKey>) -> H
 }
 
 pub(crate) struct Hosted {
-    pub(crate) view: MovieView,
+    pub(crate) view: Box<MovieView>,
     pub(crate) expose: Exposure<ImageSource>,
     name: &'static str,
     ready_event: &'static str,
@@ -463,7 +473,7 @@ pub(crate) struct Hosted {
 impl Hosted {
     pub(crate) fn new(view: MovieView, name: &'static str, ready_event: &'static str) -> Self {
         Self {
-            view,
+            view: Box::new(view),
             expose: Exposure::new(readiness(ready_event)),
             name,
             ready_event,
@@ -567,6 +577,19 @@ pub(crate) struct ImageResolver {
     vfs: Arc<Vfs>,
     files: HashMap<String, Option<(TextureHandle, u32, u32)>>,
     unresolved: std::collections::HashSet<ImageSource>,
+    evil_side: bool,
+}
+
+const PORTRAIT_BUTTON: &str = "PortraitBackground";
+
+const CLOCK_FILL_IMAGE: &str = "RadialClockOverlay1";
+const CLOCK_RING_IMAGE: &str = "RadialClockOverlay2";
+const CLOCK_RIM_GOOD: u32 = 0xFF0B_5EF2;
+const CLOCK_RIM_EVIL: u32 = 0xFFD9_2102;
+
+fn argb_unit(argb: u32) -> [f32; 4] {
+    let [a, r, g, b] = argb.to_be_bytes();
+    [r, g, b, a].map(|channel| f32::from(channel) / 255.0)
 }
 
 impl ImageResolver {
@@ -581,6 +604,7 @@ impl ImageResolver {
             vfs,
             files: HashMap::new(),
             unresolved: std::collections::HashSet::new(),
+            evil_side: false,
         }
     }
 
@@ -839,6 +863,7 @@ impl ImageResolver {
             selected: spec.selected,
             scroll_bar: spec.scroll_bar,
             text_inset: f32::from(spec.text_inset_percent) / 100.0,
+            scroll_to_top: spec.scroll_to_top,
         }
     }
 
@@ -870,9 +895,22 @@ impl ImageResolver {
     ) -> Option<SurfaceContent> {
         let icon = match source {
             ImageSource::Hidden => return Some(SurfaceContent::Hidden),
-            ImageSource::Progress(percent) => {
-                let covered = 1.0 - f32::from(*percent).clamp(0.0, 100.0) / 100.0;
-                return Some(SurfaceContent::Progress(covered));
+            ImageSource::Progress(clock) => {
+                let covered = 1.0 - f32::from(clock.percent).clamp(0.0, 100.0) / 100.0;
+                let rim = if self.evil_side {
+                    CLOCK_RIM_EVIL
+                } else {
+                    CLOCK_RIM_GOOD
+                };
+                return Some(SurfaceContent::Progress(
+                    mint_sage_apt_viewer::host::TimerClock {
+                        covered,
+                        tint: argb_unit(clock.tint),
+                        rim: argb_unit(rim),
+                        fill: self.icons.icon_by_image(renderer, CLOCK_FILL_IMAGE),
+                        ring: self.icons.icon_by_image(renderer, CLOCK_RING_IMAGE),
+                    },
+                ));
             }
             ImageSource::List(spec) => {
                 return Some(SurfaceContent::List(Arc::new(
@@ -1010,6 +1048,7 @@ pub(crate) struct AptOverlay {
     help_shown: Option<HoverKey>,
     command_buttons: Arc<CommandButtonIndex>,
     world_hover: Option<(mint_sim::Entity, help_box::ObjectHelp, Option<f32>)>,
+    portrait_hover: Option<(mint_sim::Entity, help_box::ObjectHelp, Option<f32>)>,
     spell_store: Option<Hosted>,
     spell_session: Option<SpellStoreSession>,
     spell_store_requested: bool,
@@ -1018,6 +1057,7 @@ pub(crate) struct AptOverlay {
     pointer_held: Option<PointerTarget>,
     spell_data: SpellBookData,
     spell_view: SpellBookView,
+    spell_rows: Vec<String>,
     spell_purchases: Vec<String>,
     view3d: crate::view3d::View3d,
     spell_store_cost: (Duration, u32),
@@ -1034,6 +1074,7 @@ pub(crate) struct AptOverlay {
     objectives: Option<ObjectivesHost>,
     objectives_feed: objectives_host::Feed,
     campaign: bool,
+    skirmish_or_multiplayer: bool,
     top_held: Option<TopTarget>,
     objectives_flash: ObjectivesFlash,
 }
@@ -1181,6 +1222,7 @@ impl AptOverlay {
             help_shown: None,
             command_buttons,
             world_hover: None,
+            portrait_hover: None,
             spell_store,
             spell_session: None,
             spell_store_requested: false,
@@ -1189,6 +1231,7 @@ impl AptOverlay {
             pointer_held: None,
             spell_data,
             spell_view: SpellBookView::default(),
+            spell_rows: Vec::new(),
             spell_purchases: Vec::new(),
             view3d,
             spell_store_cost: (Duration::ZERO, 0),
@@ -1211,6 +1254,7 @@ impl AptOverlay {
             objectives,
             objectives_feed: objectives_host::Feed::default(),
             campaign: false,
+            skirmish_or_multiplayer: true,
             top_held: None,
             objectives_flash: ObjectivesFlash::default(),
         })
@@ -1231,8 +1275,10 @@ impl AptOverlay {
             &self.command_buttons,
             &self.strings,
             hud.template.as_deref(),
+            self.skirmish_or_multiplayer,
             &hud.spell_book,
         );
+        self.images.evil_side = hud.evil;
         declare_palantir(&mut self.palantir.expose, hud);
         let spell_store_enabled = true;
         declare_player_magic(&mut self.palantir.expose, spell_store_enabled);
@@ -1261,12 +1307,18 @@ impl AptOverlay {
         );
         let effects = self.hero_row.effects(hud);
         crate::hud::declare_hero_effects(&mut self.palantir.expose, HERO_SELECT_CLIP, &effects);
+        self.spell_rows = hud
+            .spell_bar
+            .iter()
+            .map(|slot| slot.command_button.clone())
+            .collect();
         if self.spell_book_ready {
             declare_spell_row(&mut self.palantir.expose, hud, SPELL_BOOK_CLIP);
         }
         if self.menus.is_open() {
             self.help_hover = None;
             self.world_hover = None;
+            self.portrait_hover = None;
         }
         self.help_box_frame();
         self.palantir.frame(dt);
@@ -1337,9 +1389,13 @@ impl AptOverlay {
     }
 
     fn help_box_frame(&mut self) {
-        let shown =
-            self.help_timer
-                .update(self.help_hover, self.since_load, self.help_config.delay);
+        let delay = match self.help_hover {
+            Some(HoverKey::Portrait) => Duration::ZERO,
+            _ => self.help_config.delay,
+        };
+        let shown = self
+            .help_timer
+            .update(self.help_hover, self.since_load, delay);
         if shown != self.help_shown {
             self.help_shown = shown;
             match (shown, shown.and_then(|key| self.build_help_text(key))) {
@@ -1372,9 +1428,25 @@ impl AptOverlay {
             HoverKey::Native(name) => help_box::native_help(name, &self.strings),
             HoverKey::Hero(1) => help_box::native_help("SelectNearestBuilder", &self.strings),
             HoverKey::Hero(_) => None,
+            HoverKey::Spell(n) => {
+                let def = self
+                    .spell_rows
+                    .get(usize::from(n).checked_sub(1)?)
+                    .and_then(|name| self.command_buttons.get(name))?;
+                Some(help_box::button_help(
+                    def.text_label.as_deref(),
+                    def.descript_label.as_deref(),
+                    None,
+                    None,
+                    &self.strings,
+                ))
+            }
             HoverKey::Ring(_) | HoverKey::Bar(_) | HoverKey::Radial(_) | HoverKey::Flyout(_) => {
                 let placed = self.placed.iter().find(|p| p.hover.0 == key)?;
                 let (_, command_button, cost) = &placed.hover;
+                if let Some(hero) = &placed.hero {
+                    return Some(help_box::hero_help(hero, *cost, &self.strings));
+                }
                 let def = self.command_buttons.get(command_button);
                 let face = def.zip(placed.face).and_then(|(d, s)| d.stance_face(s));
                 Some(help_box::command_button_help(
@@ -1392,6 +1464,10 @@ impl AptOverlay {
                     .world_hover
                     .as_ref()
                     .filter(|(hovered, ..)| *hovered == entity)?;
+                Some(help_box::world_help(help, *max_health, &self.strings))
+            }
+            HoverKey::Portrait => {
+                let (_, help, max_health) = self.portrait_hover.as_ref()?;
                 Some(help_box::world_help(help, *max_health, &self.strings))
             }
         }
@@ -1736,12 +1812,14 @@ impl AptOverlay {
                     movie: Movie::Palantir,
                     instance,
                     action: slot.action.clone(),
+                    enabled: slot.enabled,
                     hover: (
                         HoverKey::Ring(ring_pos(p)),
                         slot.command_button.clone(),
                         slot.cost,
                     ),
                     face: face_of(slot),
+                    hero: slot.hero.clone(),
                 });
             }
         }
@@ -1754,12 +1832,14 @@ impl AptOverlay {
                     movie: Movie::Palantir,
                     instance,
                     action: slot.action.clone(),
+                    enabled: slot.enabled,
                     hover: (
                         HoverKey::Bar(ring_pos(i)),
                         slot.command_button.clone(),
                         slot.cost,
                     ),
                     face: face_of(slot),
+                    hero: slot.hero.clone(),
                 });
             }
         }
@@ -1775,12 +1855,14 @@ impl AptOverlay {
                     movie: Movie::Palantir,
                     instance,
                     action: slot.action.clone(),
+                    enabled: slot.enabled,
                     hover: (
                         HoverKey::Flyout(ring_pos(i)),
                         slot.command_button.clone(),
                         slot.cost,
                     ),
                     face: face_of(slot),
+                    hero: slot.hero.clone(),
                 });
             }
         }
@@ -1790,12 +1872,14 @@ impl AptOverlay {
                     movie: Movie::Radial,
                     instance,
                     action: slot.action.clone(),
+                    enabled: slot.enabled,
                     hover: (
                         HoverKey::Radial(ring_pos(i)),
                         slot.command_button.clone(),
                         slot.cost,
                     ),
                     face: face_of(slot),
+                    hero: slot.hero.clone(),
                 });
             }
         }
@@ -1950,7 +2034,9 @@ impl AptOverlay {
     pub(crate) fn set_world_hover(
         &mut self,
         hover: Option<(mint_sim::Entity, help_box::ObjectHelp, Option<f32>)>,
+        portrait: Option<(mint_sim::Entity, help_box::ObjectHelp, Option<f32>)>,
     ) {
+        self.portrait_hover = portrait;
         self.world_hover = hover;
         if self.help_hover.is_none() && self.spell_session.is_none() {
             self.help_hover = self.world_hover.as_ref().map(|(e, ..)| HoverKey::World(*e));
@@ -1969,6 +2055,9 @@ impl AptOverlay {
             if let Some(n) = hero_number(&name) {
                 return Some(HoverKey::Hero(n));
             }
+            if let Some(n) = spell_number(&name) {
+                return Some(HoverKey::Spell(n));
+            }
             let key: Option<&'static str> = if name.eq_ignore_ascii_case("Options") {
                 Some("Options")
             } else if name.eq_ignore_ascii_case("PlayerMagic") {
@@ -1977,6 +2066,8 @@ impl AptOverlay {
                 Some("Objectives")
             } else if name.eq_ignore_ascii_case("Players") {
                 Some("Players")
+            } else if name.eq_ignore_ascii_case(PORTRAIT_BUTTON) {
+                return Some(HoverKey::Portrait);
             } else {
                 None
             };
@@ -2065,6 +2156,13 @@ impl AptOverlay {
     pub(crate) fn action_for(&self, id: WidgetId) -> Option<SlotAction> {
         let index = usize::try_from(id.0).ok()?;
         self.placed.get(index).map(|slot| slot.action.clone())
+    }
+
+    pub(crate) fn enabled_for(&self, id: WidgetId) -> bool {
+        usize::try_from(id.0)
+            .ok()
+            .and_then(|index| self.placed.get(index))
+            .is_some_and(|slot| slot.enabled)
     }
 
     pub(crate) fn button_for(&self, id: WidgetId) -> Option<String> {
@@ -2159,6 +2257,7 @@ impl AptOverlay {
         self.radial_cost.0 = self.radial_cost.0.saturating_add(started.elapsed());
         let started = std::time::Instant::now();
         if !hud_hidden {
+            self.view3d.draw(renderer, &mut self.palantir.view);
             self.palantir.view.build(renderer);
         }
         self.palantir_cost.0 = self.palantir_cost.0.saturating_add(started.elapsed());

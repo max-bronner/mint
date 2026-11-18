@@ -178,7 +178,7 @@ pub(super) fn frames_of_ms(milliseconds: f32) -> LogicFrames {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = milliseconds.min(86_400_000.0) as u32;
-    LogicFrames::from_milliseconds(whole)
+    mint_sage_modules::retail_duration_ticks(whole)
 }
 
 fn bearing_to(world: &World, ids: Ids, entity: Entity, killer: Entity) -> Option<f32> {
@@ -312,6 +312,7 @@ impl RotwkRules {
                 alive_only: false,
                 reload_slot: None,
                 owner_if_gone: owner,
+                victim: None,
             },
         )
     }

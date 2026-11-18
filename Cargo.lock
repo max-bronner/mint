@@ -630,12 +630,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg-decoder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
-
-[[package]]
 name = "js-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -735,7 +729,7 @@ dependencies = [
  "mint-math",
  "mint-render",
  "mint-sim",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
  "winit",
 ]
@@ -745,7 +739,7 @@ name = "mint-audio"
 version = "0.0.0"
 dependencies = [
  "mint-audio-format",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "windows",
 ]
 
@@ -754,7 +748,7 @@ name = "mint-audio-format"
 version = "0.0.0"
 dependencies = [
  "mint-bytes",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -766,14 +760,14 @@ name = "mint-cursor"
 version = "0.0.0"
 dependencies = [
  "mint-bytes",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mint-ecs"
 version = "0.0.0"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -798,6 +792,7 @@ dependencies = [
  "mint-sage-apt-viewer",
  "mint-sage-asset",
  "mint-sage-audio",
+ "mint-sage-autoresolve",
  "mint-sage-big",
  "mint-sage-cah",
  "mint-sage-campaign",
@@ -806,6 +801,7 @@ dependencies = [
  "mint-sage-formation",
  "mint-sage-ini",
  "mint-sage-ini-coverage",
+ "mint-sage-livingworld",
  "mint-sage-map",
  "mint-sage-model",
  "mint-sage-modules",
@@ -819,19 +815,21 @@ dependencies = [
  "mint-sage-terrain",
  "mint-sage-w3d",
  "mint-sage-wnd",
+ "mint-sage-worldmap",
  "mint-sim",
  "mint-ui",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mint-image"
 version = "0.0.0"
 dependencies = [
- "jpeg-decoder",
  "mint-bytes",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
+ "zune-jpeg",
+ "zune-png",
 ]
 
 [[package]]
@@ -846,7 +844,7 @@ name = "mint-movement"
 version = "0.0.0"
 dependencies = [
  "mint-math",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -854,7 +852,7 @@ name = "mint-movie"
 version = "0.0.0"
 dependencies = [
  "mint-render",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -870,7 +868,7 @@ version = "0.0.0"
 dependencies = [
  "mint-math",
  "mint-pool",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "wgpu",
 ]
 
@@ -880,7 +878,7 @@ version = "0.0.0"
 dependencies = [
  "mint-bytes",
  "mint-sage-big",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -890,7 +888,7 @@ dependencies = [
  "mint-math",
  "mint-sage-apt",
  "mint-sage-big",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -910,7 +908,7 @@ dependencies = [
  "mint-sage-wnd",
  "mint-ui",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -923,7 +921,7 @@ dependencies = [
  "mint-sage-cah",
  "mint-sage-w3d",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -935,7 +933,16 @@ dependencies = [
  "mint-sage-big",
  "mint-sage-ini",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "mint-sage-autoresolve"
+version = "0.0.0"
+dependencies = [
+ "mint-math",
+ "mint-sage-big",
+ "mint-sage-ini",
 ]
 
 [[package]]
@@ -943,7 +950,7 @@ name = "mint-sage-big"
 version = "0.0.0"
 dependencies = [
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -952,7 +959,7 @@ version = "0.0.0"
 dependencies = [
  "mint-bytes",
  "mint-sage-big",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -980,7 +987,7 @@ name = "mint-sage-economy"
 version = "0.0.0"
 dependencies = [
  "mint-sim",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1002,7 +1009,7 @@ dependencies = [
  "mint-math",
  "mint-sage-big",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1021,7 +1028,7 @@ dependencies = [
  "mint-sage-scene",
  "mint-ui",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1030,7 +1037,7 @@ version = "0.0.0"
 dependencies = [
  "mint-sage-big",
  "mint-sage-map",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1041,6 +1048,18 @@ dependencies = [
  "mint-sage-ini",
  "mint-sage-modules",
  "mint-sim",
+]
+
+[[package]]
+name = "mint-sage-livingworld"
+version = "0.0.0"
+dependencies = [
+ "mint-ecs",
+ "mint-math",
+ "mint-sage-big",
+ "mint-sage-ini",
+ "mint-sage-save",
+ "mint-sage-str",
 ]
 
 [[package]]
@@ -1055,7 +1074,7 @@ dependencies = [
  "mint-math",
  "mint-sage-big",
  "mint-sage-refpack",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1070,7 +1089,7 @@ dependencies = [
  "mint-sage-ini",
  "mint-sage-w3d",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -1096,7 +1115,7 @@ dependencies = [
  "mint-sage-vp6",
  "mint-vfs",
  "mint-vp6",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1127,7 +1146,7 @@ name = "mint-sage-refpack"
 version = "0.0.0"
 dependencies = [
  "mint-sage-big",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1135,7 +1154,7 @@ name = "mint-sage-save"
 version = "0.0.0"
 dependencies = [
  "mint-bytes",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1160,7 +1179,7 @@ dependencies = [
  "mint-sage-w3d",
  "mint-sim",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1168,7 +1187,7 @@ name = "mint-sage-shroud"
 version = "0.0.0"
 dependencies = [
  "mint-sim",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1177,7 +1196,7 @@ version = "0.0.0"
 dependencies = [
  "mint-bytes",
  "mint-sage-big",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1198,7 +1217,7 @@ dependencies = [
  "mint-sage-w3d",
  "mint-ui",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1213,7 +1232,7 @@ dependencies = [
  "mint-sage-model",
  "mint-sage-w3d",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1221,7 +1240,7 @@ name = "mint-sage-vp6"
 version = "0.0.0"
 dependencies = [
  "mint-bytes",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1232,7 +1251,7 @@ dependencies = [
  "mint-math",
  "mint-sage-big",
  "mint-vfs",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1240,7 +1259,19 @@ name = "mint-sage-wnd"
 version = "0.0.0"
 dependencies = [
  "mint-sage-big",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "mint-sage-worldmap"
+version = "0.0.0"
+dependencies = [
+ "mint-math",
+ "mint-render",
+ "mint-sage-ini",
+ "mint-sage-livingworld",
+ "mint-sage-model",
+ "mint-vfs",
 ]
 
 [[package]]
@@ -1249,7 +1280,7 @@ version = "0.0.0"
 dependencies = [
  "mint-ecs",
  "mint-math",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1259,21 +1290,21 @@ dependencies = [
  "mint-pool",
  "mint-render",
  "skrifa",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mint-vfs"
 version = "0.0.0"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mint-vp6"
 version = "0.0.0"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2047,6 +2078,12 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simd_cesu8"
@@ -3025,4 +3062,38 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
+
+[[package]]
+name = "zune-inflate"
+version = "0.2.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
+name = "zune-jpeg"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+dependencies = [
+ "zune-core",
+]
+
+[[package]]
+name = "zune-png"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a321146329f7617ba0a5b26982cba45b7ce78163135aba78be25850aefcea80"
+dependencies = [
+ "zune-core",
+ "zune-inflate",
 ]

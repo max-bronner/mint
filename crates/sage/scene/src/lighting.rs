@@ -8,9 +8,10 @@ use mint_vfs::Vfs;
 #[derive(Debug, Clone, Copy)]
 pub struct TerrainRig {
     pub lights: [DirectionalLight; mint_render::MAX_DIRECTIONAL_LIGHTS],
+    pub effect_lights: [DirectionalLight; mint_render::MAX_DIRECTIONAL_LIGHTS],
     pub ambient: [f32; 3],
     pub ceiling: Option<f32>,
-    pub models: [Option<LightSet>; 2],
+    pub models: [Option<LightSet>; mint_render::LIGHT_SETS as usize],
     pub modulate2x: bool,
 }
 
@@ -25,15 +26,27 @@ pub fn terrain_rig(lighting: &GlobalLighting, time: TimeOfDay) -> TerrainRig {
         }
     }
     let mut lights = [DirectionalLight::default(); mint_render::MAX_DIRECTIONAL_LIGHTS];
-    for (index, (out, light)) in lights.iter_mut().zip(config.terrain).enumerate() {
+    let mut effect_lights = lights;
+    for (index, ((out, effect), light)) in lights
+        .iter_mut()
+        .zip(effect_lights.iter_mut())
+        .zip(config.terrain)
+        .enumerate()
+    {
+        let direction = Vec3::new(light.direction[0], light.direction[1], light.direction[2]);
         let scale = if index == 0 { 1.0 } else { gain };
         *out = DirectionalLight {
-            direction: Vec3::new(light.direction[0], light.direction[1], light.direction[2]),
+            direction,
             color: light.color.map(|c| c * scale),
+        };
+        *effect = DirectionalLight {
+            direction,
+            color: light.color.map(|c| c * gain),
         };
     }
     TerrainRig {
         lights,
+        effect_lights,
         ambient,
         ceiling: None,
         models: model_light_sets(lighting, time),
@@ -42,10 +55,12 @@ pub fn terrain_rig(lighting: &GlobalLighting, time: TimeOfDay) -> TerrainRig {
 }
 
 #[must_use]
-pub fn model_light_sets(lighting: &GlobalLighting, time: TimeOfDay) -> [Option<LightSet>; 2] {
+pub fn model_light_sets(
+    lighting: &GlobalLighting,
+    time: TimeOfDay,
+) -> [Option<LightSet>; mint_render::LIGHT_SETS as usize] {
     let config = lighting.config(time);
-    let gain = lighting.overbright;
-    let set = |rig: &[mint_sage_map::MapLight; 3]| {
+    let set = |rig: &[mint_sage_map::MapLight; 3], gain: f32| {
         let mut ambient = [0.0f32; 3];
         let mut lights = [DirectionalLight::default(); mint_render::MAX_DIRECTIONAL_LIGHTS];
         for (out, light) in lights.iter_mut().zip(rig) {
@@ -63,7 +78,13 @@ pub fn model_light_sets(lighting: &GlobalLighting, time: TimeOfDay) -> [Option<L
             cookie: true,
         })
     };
-    [set(&config.object), set(&config.infantry)]
+    let gain = lighting.overbright;
+    [
+        set(&config.object, gain),
+        set(&config.infantry, gain),
+        set(&config.object, 1.0),
+        set(&config.infantry, 1.0),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +118,7 @@ impl TerrainRig {
             light.direction = Vec3::new(-light.direction.x, -light.direction.y, light.direction.z);
         };
         self.lights.iter_mut().for_each(mirror);
+        self.effect_lights.iter_mut().for_each(mirror);
         for set in self.models.iter_mut().flatten() {
             set.lights.iter_mut().for_each(mirror);
         }
@@ -171,7 +193,7 @@ impl ModelLights {
         match self {
             Self::Retail => scene.light_cookie = cloud,
             Self::TerrainRig => {
-                scene.light_sets = [None; 2];
+                scene.light_sets = [None; mint_render::LIGHT_SETS as usize];
                 scene.light_cookie = None;
             }
         }
@@ -335,7 +357,11 @@ impl CloudDarkening {
                 *channel *= factor;
             }
         };
-        for light in &mut darkened.lights {
+        for light in darkened
+            .lights
+            .iter_mut()
+            .chain(&mut darkened.effect_lights)
+        {
             darken(&mut light.color);
         }
         for set in darkened.models.iter_mut().flatten() {
@@ -418,6 +444,7 @@ mod cloud_darkening_tests {
                 direction: Vec3::new(0.0, 0.0, -1.0),
                 color: [1.0, 1.0, 1.0],
             }; mint_render::MAX_DIRECTIONAL_LIGHTS],
+            effect_lights: [DirectionalLight::default(); mint_render::MAX_DIRECTIONAL_LIGHTS],
             ambient: [1.0, 1.0, 1.0],
             ceiling: None,
             modulate2x: false,
@@ -430,6 +457,8 @@ mod cloud_darkening_tests {
                     ambient_color: [1.0, 1.0, 1.0],
                     cookie: true,
                 }),
+                None,
+                None,
                 None,
             ],
         };

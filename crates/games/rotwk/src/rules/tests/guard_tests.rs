@@ -1,7 +1,7 @@
 use super::super::guard::{GuardDecision, GuardState};
 use super::*;
 
-const DATA: &str = "\
+pub(super) const DATA: &str = "\
 AIData\n  GuardChaseUnitsDuration = 2000\n  GuardEnemyScanRate = 500\n  \
   GuardEnemyReturnScanRate = 1000\nEnd\n\
 Locomotor Feet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\

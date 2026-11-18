@@ -15,6 +15,7 @@ mod cah;
 pub(crate) mod message_box;
 mod saves;
 mod update_gate;
+pub(crate) mod wotr;
 
 use crate::apt_overlay::{Hosted, ImageResolver};
 use crate::game::PassabilitySources;
@@ -27,7 +28,6 @@ use crate::setup_grid::{Choice, Column, GridLabels};
 const MAIN_MENU_MOVIE: &str = "mainmenu";
 const SKIRMISH_HUB_MOVIE: &str = "skirmish";
 const GAME_MAP_TYPE: (&str, &str) = ("AptMapPreview::GameMapType", "OpenPlay");
-const SETUP_CLIP: &str = "OpenPlay";
 const CAH_MOVIE: &str = "createahero";
 const LOAD_SCREEN_MOVIE: &str = "loadscreen";
 const TIME_LINE_MOVIE: &str = "TimeLine";
@@ -167,8 +167,6 @@ pub(crate) struct CampaignMenuData {
     pub(crate) victorious: bool,
 }
 
-const PLAYER_LIST: &str = "OpenPlay.#1.PlayerList";
-
 struct GridCell {
     row: usize,
     path: String,
@@ -206,6 +204,8 @@ pub(crate) struct ShellApp {
     campaign_menu_data: Option<CampaignMenuData>,
     front_end: Hosted,
     view3d: crate::view3d::View3d,
+    bink: crate::bink_surface::BinkSurfaces,
+    credits: Option<(crate::credits::CreditsRoll, f32)>,
     front_end_mode: FrontEndMode,
     images: ImageResolver,
     shell_map: Option<Option<SurfaceContent>>,
@@ -217,6 +217,7 @@ pub(crate) struct ShellApp {
     map_sort: crate::list_sort::ColumnSort,
     lobby: SkirmishSetup,
     catalogue: Catalogue,
+    player_templates: Vec<String>,
     grid_labels: GridLabels,
     rule_choices: Arc<crate::setup_rules::RuleChoices>,
     rule_labels: crate::setup_rules::RuleLabels,
@@ -234,6 +235,7 @@ pub(crate) struct ShellApp {
     army_names: Vec<(String, String)>,
     mapped_images: Arc<mint_sage_ini::MappedImageIndex>,
     score: Option<Score>,
+    wotr: wotr::WotrShell,
     bonus_unlocked: bool,
 }
 
@@ -285,6 +287,12 @@ impl MovieCost {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ShellCache {
+    ui: crate::ui_resources::UiResources,
+    data: crate::game_data::GameData,
+}
+
 impl ShellApp {
     pub(crate) fn load(
         vfs: Arc<Vfs>,
@@ -292,16 +300,24 @@ impl ShellApp {
         window_size: (f32, f32),
         scale_mode: ScaleMode,
         renderer: &mut Renderer,
-    ) -> Result<Self, String> {
-        let ui = crate::ui_resources::UiResources::load(&install_roots);
-        println!(
-            "shell: {} movie(s) decoded, {} localisation label(s) from {} .str file(s) \
-             ({} failed)",
-            ui.movies,
-            ui.strings.len(),
-            ui.string_files,
-            ui.string_failures,
-        );
+        cache: Option<ShellCache>,
+    ) -> Result<Box<Self>, String> {
+        let (ui, cached_data) = match cache {
+            Some(ShellCache { ui, data }) => (ui, Some(data)),
+            None => {
+                let ui = crate::ui_resources::UiResources::load(&install_roots);
+                println!(
+                    "shell: {} movie(s) decoded, {} localisation label(s) from {} .str file(s) \
+                     ({} failed)",
+                    ui.movies,
+                    ui.strings.len(),
+                    ui.string_files,
+                    ui.string_failures,
+                );
+                (ui, None)
+            }
+        };
+        crate::startup::mark("shell resources");
         let (library, fonts, strings) = (
             Arc::clone(&ui.library),
             Arc::clone(&ui.fonts),
@@ -386,10 +402,14 @@ impl ShellApp {
              waypoints)",
             maps.len()
         );
-        let (data, _line) = crate::load_game_data_or_exit(&vfs);
+        crate::startup::mark("shell movies and maps");
+        let audio = crate::ui_audio::UiAudio::open(Arc::clone(&vfs));
+        crate::startup::mark("shell audio");
+        let data = cached_data.unwrap_or_else(|| crate::load_game_data_or_exit(&vfs).0);
+        crate::startup::mark("shell game data");
         let factions = crate::lobby::playable_factions(&data);
         let grid_labels = grid_labels(&data, &factions, &strings);
-        let catalogue = Catalogue {
+        let mut catalogue = Catalogue {
             random_pool: crate::lobby::random_pool(&data),
             factions,
             colours: u8::try_from(data.multiplayer_colors.len()).unwrap_or(u8::MAX),
@@ -403,6 +423,31 @@ impl ShellApp {
         lobby.fit_to_map(catalogue.starts);
         let rule_choices = Arc::clone(&data.rule_choices);
         lobby.rules = rule_choices.defaults();
+        let player_templates: Vec<String> = data.players.iter().map(|p| p.name.clone()).collect();
+        let mut map_index = 0;
+        if let Some(preset) = crate::skirmish_preset::load(
+            &crate::user_options::UserOptions::load_skirmish(),
+            &player_templates,
+            catalogue.heroes.len(),
+        ) {
+            let saved = preset
+                .map
+                .as_deref()
+                .map(crate::skirmish_preset::same_map_key);
+            if let Some((at, map)) = maps.iter().enumerate().find(|(_, m)| {
+                saved.as_deref() == Some(crate::skirmish_preset::same_map_key(&m.map_path).as_str())
+            }) {
+                map_index = at;
+                catalogue.starts = u8::try_from(map.players).unwrap_or(u8::MAX);
+                lobby.map_label.clone_from(&map.map_path);
+            }
+            crate::skirmish_preset::apply(&preset, &mut lobby, &catalogue);
+            lobby.fit_to_map(catalogue.starts);
+            println!(
+                "shell: skirmish setup restored from Skirmish.ini - {}",
+                lobby.map_label
+            );
+        }
         let rule_labels = rule_labels(&strings);
         let mut images = ImageResolver::new(
             Arc::clone(&vfs),
@@ -410,6 +455,7 @@ impl ShellApp {
             Arc::clone(&data.command_buttons),
         );
         report_gadget_templates(&mut images, renderer);
+        crate::startup::mark("shell gadgets");
         let load_screen_music = data
             .players
             .iter()
@@ -417,8 +463,7 @@ impl ShellApp {
             .collect();
         let army_names = army_names(&data, &strings);
         let mapped_images = Arc::clone(&data.mapped_images);
-        let audio = crate::ui_audio::UiAudio::open(Arc::clone(&vfs));
-        Ok(Self {
+        Ok(Box::new(Self {
             window_size,
             scale_mode,
             screen: Screen::MainMenu,
@@ -448,17 +493,20 @@ impl ShellApp {
             campaign_menu_data: None,
             front_end,
             view3d: crate::view3d::View3d::new(Arc::clone(&vfs)),
+            bink: crate::bink_surface::BinkSurfaces::new(Arc::clone(&vfs), &install_roots),
+            credits: None,
             front_end_mode: FrontEndMode::default(),
             images,
             shell_map: None,
             shell_map_running: false,
             pointer: (0.0, 0.0),
             maps,
-            map_index: 0,
+            map_index,
             map_lists: None,
             map_sort: crate::mapcache::DEFAULT_SORT,
             lobby,
             catalogue,
+            player_templates,
             grid_labels,
             rule_choices,
             rule_labels,
@@ -477,10 +525,14 @@ impl ShellApp {
             mapped_images,
             score: None,
             bonus_unlocked,
-        })
+            wotr: wotr::WotrShell::default(),
+        }))
     }
 
     fn enter(&mut self, screen: Screen) {
+        if screen == Screen::MainMenu {
+            self.leave_strategic();
+        }
         let bonus_unlocked = self.bonus_unlocked;
         let hosted = self.hosted_mut(screen);
         match hosted.restart() {
@@ -518,7 +570,10 @@ impl ShellApp {
     }
 
     pub(crate) fn show_score(&mut self, figures: &[PlayerFigures], setup: SkirmishSetup) {
-        if let Some(index) = self.maps.iter().position(|m| m.map_path == setup.map_label) {
+        if let Some(index) = self.maps.iter().position(|m| {
+            crate::skirmish_preset::same_map_key(&m.map_path)
+                == crate::skirmish_preset::same_map_key(&setup.map_label)
+        }) {
             if let Some(map) = self.maps.get(index) {
                 self.map_index = index;
                 self.catalogue.starts = u8::try_from(map.players).unwrap_or(u8::MAX);
@@ -741,7 +796,11 @@ impl ShellApp {
             },
             &|image| mapped_images.get(image).is_some(),
         );
-        let map = self.maps.iter().find(|m| m.map_path == setup.map_label);
+        let wanted = crate::skirmish_preset::same_map_key(&setup.map_label);
+        let map = self
+            .maps
+            .iter()
+            .find(|m| crate::skirmish_preset::same_map_key(&m.map_path) == wanted);
         self.load_local_row = rows.iter().position(|r| r.local);
         let expose = &mut self.load_screen.expose;
         expose.set_extern("GameLoadingType", Value::str("_skirmish"));
@@ -936,10 +995,209 @@ impl ShellApp {
         self.campaign_action.take()
     }
 
+    pub(crate) fn screen_name(&self) -> String {
+        if self.in_campaign_menu {
+            "CampaignMenu".to_owned()
+        } else {
+            format!("{:?}", self.screen)
+        }
+    }
+
+    pub(crate) fn act_for_script(&mut self, action: &str) -> Result<String, String> {
+        if let Some(answer) = self.act_wotr(action) {
+            return answer;
+        }
+        if let Some(answer) = self.act_movie(action) {
+            return answer;
+        }
+        let on_menu = self.screen == Screen::TimeLine && self.in_campaign_menu;
+        let (action, said) = match action {
+            "continue" if self.screen == Screen::TimeLine && self.campaign_score() => {
+                let said = self
+                    .score
+                    .as_ref()
+                    .and_then(|score| score.summary.players.first())
+                    .map(|player| score_line(&player.figures))
+                    .unwrap_or_default();
+                (CampaignAction::TimeLineContinue, said)
+            }
+            "next-mission" if on_menu => (CampaignAction::NextMission, String::new()),
+            "last-mission" if on_menu => (CampaignAction::LastMission, String::new()),
+            "main-menu" if on_menu => (CampaignAction::MainMenu, String::new()),
+            _ => return Err(format!("{action}: not offered on {}", self.screen_name())),
+        };
+        self.campaign_action = Some(action);
+        Ok(format!("{action:?} {said}"))
+    }
+
+    fn start_credits(&mut self) {
+        let strings = Arc::clone(&self.strings);
+        let roll = crate::credits::Fonts::load(&self.vfs).and_then(|fonts| {
+            crate::credits::CreditsRoll::load(&self.vfs, fonts, |label| strings.fetch(label))
+        });
+        match roll {
+            Ok(roll) => {
+                println!(
+                    "shell: MainMenu -> Credits (AptMainMenu::Credits): {} line(s)",
+                    roll.counts().0
+                );
+                self.credits = Some((roll, 0.0));
+            }
+            Err(error) => println!("shell: MainMenu -> Credits: no roll ({error})"),
+        }
+        self.audio.credits();
+    }
+
+    fn draw_credits(&mut self) {
+        let Some((roll, clock)) = self.credits.as_mut() else {
+            return;
+        };
+        let view = &mut self.main_menu.view;
+        let Some(id) = mint_sage_apt_viewer::scene_surface::surfaces_of_type(view, |t| {
+            t == crate::credits::RENDER_CREDITS
+        })
+        .first()
+        .copied() else {
+            return;
+        };
+        let Some([left, top, right, bottom]) = view.slot_rect(id) else {
+            return;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let (width, height) = ((right - left) as i32, (bottom - top) as i32);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let steps = (*clock * crate::credits::UPDATES_PER_SECOND)
+            .clamp(0.0, crate::credits::UPDATES_PER_SECOND) as u32;
+        #[allow(clippy::cast_precision_loss)]
+        let spent = steps as f32 / crate::credits::UPDATES_PER_SECOND;
+        *clock = (*clock - spent).clamp(0.0, 1.0 / crate::credits::UPDATES_PER_SECOND);
+        let was_finished = roll.is_finished();
+        for _ in 0..steps {
+            roll.update(width, height, |text, (font, points)| {
+                #[allow(clippy::cast_possible_truncation)]
+                let [w, h] = view
+                    .measure_native_text(text, font, *points)
+                    .map(|v| v.round() as i32);
+                [w, h]
+            });
+        }
+        let rows = roll.rows(width, height);
+        view.set_surface(id, Some(SurfaceContent::Placed(Arc::new(rows))));
+        if roll.is_finished() && !was_finished {
+            println!("shell: credits roll finished - HideCredits");
+            let root = view.player.root();
+            let _ = view
+                .player
+                .call(root, crate::credits::HIDE_CREDITS, Vec::new());
+        }
+    }
+
+    pub(crate) fn main_menu_command(&mut self, command: Option<&str>, args: &str) {
+        match command {
+            Some("Skirmish") => {
+                println!(
+                    "shell: MainMenu -> Skirmish (GameCode(\"Skirmish\"); the hub \
+                     loads SkirmishOpenPlay itself)"
+                );
+                self.enter(Screen::SkirmishSetup);
+            }
+            Some("WarOfTheRing") => {
+                println!(
+                    "shell: MainMenu -> WarOfTheRing (GameCode(\"WarOfTheRing\"); \
+                     the hub opens with GameMapType Strategic)"
+                );
+                if !self.enter_strategic() {
+                    self.enter(Screen::MainMenu);
+                }
+            }
+            Some("CreateAHero") => {
+                println!("shell: MainMenu -> CreateAHero (AptMainMenu::CreateAHero)");
+                self.enter_create_a_hero();
+            }
+            Some("ExitGame") => {
+                println!("shell: MainMenu QUIT (AptMainMenu::ExitGame) - exiting");
+                crate::startup::mark("quit requested");
+                self.exit_requested = true;
+            }
+            Some("Credits") => self.start_credits(),
+            Some("CreditsExit") => {
+                println!("shell: MainMenu CreditsExit (AptMainMenu::CreditsExit)");
+                self.credits = None;
+                self.audio.main_menu(self.shell_map_running);
+            }
+            Some("LoadCampaign") => {
+                self.open_save_load(crate::save_load::Mode::Load, CAMPAIGN_TAB);
+            }
+            Some("LoadGame") => {
+                self.open_save_load(crate::save_load::Mode::Load, LOAD_TABS);
+            }
+            Some("LoadReplay") => {
+                println!("shell: MainMenu LoadReplay: replays are not built");
+            }
+            Some("ContinueCampaign") => {
+                println!("shell: MainMenu ContinueCampaign: not built yet");
+            }
+            Some(command) => match crate::title::current().menu_action(command) {
+                Some(crate::title::MenuAction::Tutorial) => {
+                    println!("shell: MainMenu -> {command}({args:?})");
+                    self.tutorial_request = Some(crate::tutorial::OnTutorial::from_arg(args));
+                }
+                Some(crate::title::MenuAction::Campaign { key, .. }) => {
+                    let difficulty = crate::campaign::difficulty_from_level(args);
+                    println!(
+                        "shell: MainMenu -> campaign {key} at {difficulty:?} \
+                         (AptMainMenu::{command}, level {args:?})"
+                    );
+                    self.campaign_request = Some((key.to_owned(), difficulty));
+                }
+                None => {}
+            },
+            None => {}
+        }
+    }
+
+    fn act_movie(&mut self, action: &str) -> Option<Result<String, String>> {
+        let (verb, rest) = action.split_once(' ').unwrap_or((action, ""));
+        if ![
+            "tree", "texts", "children", "var", "press", "click", "trace", "traces",
+        ]
+        .contains(&verb)
+        {
+            return None;
+        }
+        let screen = self.screen;
+        let player = &mut self.hosted_mut(screen).view.player;
+        Some(match verb {
+            "trace" => {
+                player.set_trace_log(true);
+                Ok("script trace output is kept".to_owned())
+            }
+            "traces" => Ok(player.take_traces().join("\n  ")),
+            "tree" => Ok(crate::wotr_movies::tree_of(player, rest.trim()).join("\n  ")),
+            "texts" => Ok(crate::wotr_movies::texts_of(player, rest.trim()).join("\n  ")),
+            "children" => crate::wotr_movies::children_of(player, rest.trim()),
+            "var" => crate::wotr_movies::var_of(player, rest.trim()),
+            "click" => crate::wotr_movies::click_button(player, rest.trim()),
+            _ => crate::wotr_movies::press_button(player, rest.trim()),
+        })
+    }
+
     fn campaign_score(&self) -> bool {
         self.score
             .as_ref()
             .is_some_and(|score| score.mode == crate::game_mode::GameMode::SinglePlayer)
+    }
+
+    pub(crate) fn start_wotr_battle(&mut self, setup: SkirmishSetup) {
+        self.score = None;
+        self.pending = Some(PendingMatch {
+            setup,
+            passability_sources: PassabilitySources::default(),
+            campaign: None,
+        });
+        self.campaign_still = None;
+        self.set_front_end(FrontEnd::FadeOut);
+        self.enter(Screen::Loading);
     }
 
     pub(crate) fn start_campaign_mission(&mut self, plan: &crate::campaign::MissionPlan) {
@@ -968,7 +1226,7 @@ impl ShellApp {
         self.enter(Screen::Loading);
     }
 
-    pub(crate) fn show_campaign_score(&mut self, figures: &[PlayerFigures]) {
+    pub(crate) fn show_campaign_score(&mut self, figures: &[PlayerFigures], victory: bool) {
         self.leave_campaign_menu();
         let rgb = self
             .grid_labels
@@ -976,13 +1234,12 @@ impl ShellApp {
             .first()
             .copied()
             .unwrap_or([255; 3]);
-        let players: Vec<SummaryPlayer> = figures
-            .iter()
-            .filter(|f| f.player == crate::game::LOCAL_PLAYER)
+        let players: Vec<SummaryPlayer> = crate::post_match::campaign_figures(figures, victory)
+            .into_iter()
             .map(|figures| SummaryPlayer {
                 name: self.grid_labels.human.clone(),
                 rgb,
-                figures: figures.clone(),
+                figures,
             })
             .collect();
         let summary = MatchSummary { players };
@@ -1059,6 +1316,28 @@ impl ShellApp {
         self.ui.clone()
     }
 
+    pub(crate) fn cache(&self) -> Option<ShellCache> {
+        Some(ShellCache {
+            ui: self.ui.clone(),
+            data: self.game_data.clone()?,
+        })
+    }
+
+    pub(crate) fn is_evil_template(&self, name: &str) -> bool {
+        self.game_data
+            .as_ref()
+            .and_then(|d| d.players.get(name))
+            .and_then(|p| p.evil)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn template_side(&self, name: &str) -> Option<String> {
+        self.game_data
+            .as_ref()
+            .and_then(|d| d.players.get(name))
+            .and_then(|p| p.side.clone())
+    }
+
     pub(crate) fn game_data_clone(&self) -> Option<crate::game_data::GameData> {
         self.game_data.clone()
     }
@@ -1104,6 +1383,9 @@ impl ShellApp {
                     .gadget_pointer_moved([x, y], self.gadget_held)
                 {
                     self.gadget_changed(&event);
+                }
+                if self.screen == Screen::SkirmishSetup && !self.gadget_held {
+                    let _ = self.preview_pointer_moved([x, y]);
                 }
                 if let Some(pos) = self.gadget_hosted().view.gadget_thumb_drag_diag() {
                     crate::diag::diag!("gadget: thumb drag display_pos {pos:.1}");
@@ -1154,7 +1436,7 @@ impl ShellApp {
             }
             Screen::SkirmishSetup | Screen::CreateAHero => {
                 let at = [self.pointer.0, self.pointer.1];
-                if button == PointerButton::Secondary && !pressed {
+                if button == PointerButton::Secondary && !pressed && !self.wotr.setup_shown() {
                     if let GadgetClick::Changed(event) =
                         self.gadget_hosted().view.gadget_right_released(at)
                     {
@@ -1175,6 +1457,10 @@ impl ShellApp {
                 }
                 if pressed && self.gadget_hosted().view.gadget_pressed(at) {
                     self.gadget_held = true;
+                    return;
+                }
+                if self.screen == Screen::SkirmishSetup && self.preview_pointer_button(at, pressed)
+                {
                     return;
                 }
                 let stage = self.gadget_hosted().view.resolve_stage_point(at);
@@ -1212,6 +1498,9 @@ impl ShellApp {
             self.cah_gadget_changed(event);
             return;
         }
+        if self.strategic_gadget_changed(event) {
+            return;
+        }
         let map_list = gadget_key(MAP_LIST.0, MAP_LIST.1);
         if self.rule_changed(event) {
             return;
@@ -1246,8 +1535,7 @@ impl ShellApp {
                     return;
                 };
                 self.audio.play_misc(crate::ui_audio::COMBO_BOX_CLICK);
-                let applied =
-                    crate::setup_grid::apply(&mut self.lobby, &self.catalogue, row, &choice);
+                let applied = self.apply_grid_choice(row, &choice);
                 println!(
                     "shell: grid row {row} - {choice:?} {}",
                     if applied { "set" } else { "refused" }
@@ -1279,6 +1567,7 @@ impl ShellApp {
 
     fn grid(&mut self) -> &[GridCell] {
         let (lobby, catalogue, labels) = (&self.lobby, &self.catalogue, &self.grid_labels);
+        let list = crate::setup_grid::list_path(self.setup_clip());
         self.grid.get_or_insert_with(|| {
             let mut cells = Vec::with_capacity(MAX_SLOTS * Column::ALL.len());
             for row in 0..MAX_SLOTS {
@@ -1287,7 +1576,7 @@ impl ShellApp {
                         crate::setup_grid::cell(lobby, catalogue, labels, row, column);
                     cells.push(GridCell {
                         row,
-                        path: crate::setup_grid::cell_path(PLAYER_LIST, row, column),
+                        path: crate::setup_grid::cell_path(&list, row, column),
                         spec: Arc::new(spec),
                         choices,
                     });
@@ -1325,6 +1614,17 @@ impl ShellApp {
         }
     }
 
+    fn save_skirmish_preset(&self) {
+        let mut options = crate::user_options::UserOptions::load_skirmish();
+        if !crate::skirmish_preset::store(&mut options, &self.lobby, &self.player_templates) {
+            return;
+        }
+        match options.save_skirmish() {
+            Ok(path) => println!("shell: skirmish setup saved to {}", path.display()),
+            Err(error) => println!("shell: could not write Skirmish.ini ({error})"),
+        }
+    }
+
     fn start_clicked(&mut self) {
         if self.maps.get(self.map_index).is_none() {
             println!(
@@ -1333,15 +1633,19 @@ impl ShellApp {
             );
             return;
         }
-        if let Err(error) = self.lobby.validate(&self.catalogue) {
+        if let Err(error) = self.lobby.validate_play(&self.catalogue) {
             println!("shell: PLAY refused - {error}");
             return;
+        }
+        if self.lobby.is_sandbox() {
+            println!("shell: PLAY - one side only: GUI:SandboxMode");
         }
         println!(
             "shell: PLAY - {}, {} player(s)",
             self.lobby.map_label,
             self.lobby.players()
         );
+        self.save_skirmish_preset();
         let mut setup = self.lobby.clone();
         setup.random_seed = crate::lobby::fresh_seed(setup.random_seed);
         let starts = self
@@ -1494,62 +1798,24 @@ impl ShellApp {
                     if self.played(&event) {
                         continue;
                     }
-                    match event.command() {
-                        Some("Skirmish") => {
-                            println!(
-                                "shell: MainMenu -> Skirmish (GameCode(\"Skirmish\"); the hub \
-                                 loads SkirmishOpenPlay itself)"
-                            );
-                            self.enter(Screen::SkirmishSetup);
-                        }
-                        Some("CreateAHero") => {
-                            println!("shell: MainMenu -> CreateAHero (AptMainMenu::CreateAHero)");
-                            self.enter_create_a_hero();
-                        }
-                        Some("ExitGame") => {
-                            println!("shell: MainMenu QUIT (AptMainMenu::ExitGame) - exiting");
-                            self.exit_requested = true;
-                        }
-                        Some("LoadCampaign") => {
-                            self.open_save_load(crate::save_load::Mode::Load, CAMPAIGN_TAB);
-                        }
-                        Some("LoadGame") => {
-                            self.open_save_load(crate::save_load::Mode::Load, LOAD_TABS);
-                        }
-                        Some("LoadReplay") => {
-                            println!("shell: MainMenu LoadReplay: replays are not built");
-                        }
-                        Some("ContinueCampaign") => {
-                            println!("shell: MainMenu ContinueCampaign: not built yet");
-                        }
-                        Some(command) => match crate::title::current().menu_action(command) {
-                            Some(crate::title::MenuAction::Tutorial) => {
-                                let arg = event.args().unwrap_or_default();
-                                println!("shell: MainMenu -> {command}({arg:?})");
-                                self.tutorial_request =
-                                    Some(crate::tutorial::OnTutorial::from_arg(arg));
-                            }
-                            Some(crate::title::MenuAction::Campaign { key, .. }) => {
-                                let level = event.args().unwrap_or_default();
-                                let difficulty = crate::campaign::difficulty_from_level(level);
-                                println!(
-                                    "shell: MainMenu -> campaign {key} at {difficulty:?} \
-                                     (AptMainMenu::{command}, level {level:?})"
-                                );
-                                self.campaign_request = Some((key.to_owned(), difficulty));
-                            }
-                            None => {}
-                        },
-                        _ => {}
-                    }
+                    let args = event.args().unwrap_or_default().to_owned();
+                    self.main_menu_command(event.command(), &args);
                 }
             }
             Screen::SkirmishSetup => {
-                self.setup.expose.call(
-                    "map_tab",
-                    &format!("{SETUP_CLIP}.MpMapAndSettings.gotoAndStop"),
-                    vec![Value::str("_MapTabSelected")],
-                );
+                if self.wotr.setup_shown() {
+                    self.publish_strategic();
+                }
+                if self.message_box.is_up() {
+                    self.message_box_frame(elapsed);
+                }
+                if !self.wotr.setup_shown() {
+                    self.setup.expose.call(
+                        "map_tab",
+                        &format!("{}.MpMapAndSettings.gotoAndStop", self.setup_clip()),
+                        vec![Value::str("_MapTabSelected")],
+                    );
+                }
                 let (list, info) = self.map_lists();
                 self.setup.expose.image(
                     ImageKey::Name(gadget_key(MAP_LIST.0, MAP_LIST.1)),
@@ -1559,7 +1825,8 @@ impl ShellApp {
                     ImageKey::Name(gadget_key(MAP_INFO.0, MAP_INFO.1)),
                     Some(ImageSource::List(info)),
                 );
-                if let Some(map) = self.maps.get(self.map_index) {
+                let strategic = self.wotr.setup_shown();
+                if let Some(map) = self.maps.get(self.map_index).filter(|_| !strategic) {
                     let preview = crate::setup_grid::preview(
                         map,
                         &self.lobby,
@@ -1571,19 +1838,26 @@ impl ShellApp {
                         Some(ImageSource::MapWindow(Arc::new(preview))),
                     );
                 }
-                let name = self
-                    .maps
-                    .get(self.map_index)
-                    .map(|m| m.display_name.clone());
-                self.setup.expose.string(CURRENT_MAP_NAME, name);
+                if !strategic {
+                    let name = self
+                        .maps
+                        .get(self.map_index)
+                        .map(|m| m.display_name.clone());
+                    self.setup.expose.string(CURRENT_MAP_NAME, name);
+                }
                 self.declare_grid();
-                self.declare_rules();
+                if !strategic {
+                    self.declare_rules();
+                }
                 self.setup.frame(elapsed);
                 for event in self.setup.expose.take_events() {
                     if self.played(&event) {
                         continue;
                     }
                     match event.command() {
+                        Some("StartGame") if self.wotr.setup_shown() => {
+                            self.strategic_start_clicked();
+                        }
                         Some("StartGame") => self.start_clicked(),
                         Some("Reset") => {
                             self.lobby.rules = self.rule_choices.defaults();
@@ -1621,6 +1895,11 @@ impl ShellApp {
                             if let Some(focus) = focus {
                                 self.set_score_focus(focus);
                             }
+                        }
+                        Some(CONTINUE) if self.wotr.ending() => {
+                            println!("shell: TimeLine CONTINUE - back to the main menu");
+                            self.wotr.end_done();
+                            self.enter(Screen::MainMenu);
                         }
                         Some(CONTINUE) if self.campaign_score() => {
                             println!("shell: TimeLine CONTINUE - campaign");
@@ -1669,6 +1948,10 @@ impl ShellApp {
             self.view3d.advance(elapsed);
             self.costs[BACKGROUND].add(started.elapsed());
         }
+        self.advance_living_world(elapsed);
+        if let Some((_, clock)) = self.credits.as_mut() {
+            *clock += dt.max(0.0);
+        }
         self.audio.frame(dt);
     }
 
@@ -1715,6 +1998,7 @@ impl ShellApp {
         );
         self.front_end.apply_images(&mut self.images, renderer);
         self.front_end.view.build(renderer);
+        self.draw_living_world(renderer);
         match self.screen {
             Screen::MainMenu => self.main_menu.apply_images(&mut self.images, renderer),
             Screen::SkirmishSetup => self.setup.apply_images(&mut self.images, renderer),
@@ -1762,11 +2046,26 @@ impl ShellApp {
                 &mut self.time_line,
             ),
         );
+        self.bink.draw(
+            renderer,
+            active_view(
+                &self.screen,
+                &mut self.main_menu,
+                &mut self.setup,
+                &mut self.cah,
+                &mut self.load_screen,
+                &mut self.time_line,
+            ),
+        );
+        if self.screen == Screen::MainMenu {
+            self.draw_credits();
+        }
         self.costs[ACTIVE].add(started.elapsed());
         let started = std::time::Instant::now();
         if self.screen == Screen::CreateAHero {
             self.scan_cah_surfaces();
         }
+        self.draw_living_world(renderer);
         let movie = match self.screen {
             Screen::MainMenu => {
                 self.main_menu.apply_images(&mut self.images, renderer);
@@ -1986,15 +2285,18 @@ impl ShellApp {
     }
 
     fn declare_grid(&mut self) {
-        let cells: Vec<(String, Arc<ComboSpec>)> = self
+        let map_type = self.setup_map_type();
+        let cells: Vec<(String, ImageSource)> = self
             .grid()
             .iter()
-            .map(|cell| (cell.path.clone(), Arc::clone(&cell.spec)))
+            .map(|cell| {
+                let source =
+                    crate::setup_grid::cell_source(map_type, cell.row, Arc::clone(&cell.spec));
+                (cell.path.clone(), source)
+            })
             .collect();
-        for (path, spec) in cells {
-            self.setup
-                .expose
-                .image(ImageKey::Path(path), Some(ImageSource::Combo(spec)));
+        for (path, source) in cells {
+            self.setup.expose.image(ImageKey::Path(path), Some(source));
         }
         for row in 0..MAX_SLOTS {
             self.setup.expose.image(
@@ -2042,7 +2344,27 @@ fn map_list(maps: &[crate::mapcache::SkirmishMap], selected: usize) -> ListSpec 
         selected: (selected < maps.len()).then_some(selected),
         scroll_bar: None,
         text_inset_percent: 0,
+        scroll_to_top: false,
     }
+}
+
+fn score_line(figures: &PlayerFigures) -> String {
+    format!(
+        "{:?} at tick {}: units built/lost/killed {}/{}/{}, structures built/lost/destroyed \
+         {}/{}/{}, heroes built/lost {}/{}, earned {} spent {}",
+        figures.status,
+        figures.end_tick,
+        figures.units_built,
+        figures.units_lost,
+        figures.units_killed,
+        figures.structures_built,
+        figures.structures_lost,
+        figures.structures_destroyed,
+        figures.heroes_built,
+        figures.heroes_lost,
+        figures.earned,
+        figures.spent
+    )
 }
 
 fn map_info(map: Option<&crate::mapcache::SkirmishMap>) -> ListSpec {
@@ -2053,8 +2375,9 @@ fn map_info(map: Option<&crate::mapcache::SkirmishMap>) -> ListSpec {
             .map(|map| vec![vec![CellSpec::Text(map.description.clone())]])
             .unwrap_or_default(),
         selected: None,
-        scroll_bar: Some(false),
+        scroll_bar: None,
         text_inset_percent: 0,
+        scroll_to_top: true,
     }
 }
 
@@ -2144,6 +2467,8 @@ fn default_lobby(map_label: Option<String>) -> SkirmishSetup {
         spawn_buildings: None,
         dummies: None,
         dummies_attack: false,
+        drive_templates: Vec::new(),
+        wotr: None,
         cah_hero: None,
         random_seed: crate::skirmish::SKIRMISH_SEED,
         resolved: None,
@@ -2276,14 +2601,13 @@ mod map_list_tests {
     }
 
     #[test]
-    fn the_description_is_one_row_without_a_scroll_bar() {
+    fn the_description_is_one_row() {
         let arnor = map("Arnor", 4, "This was once the realm.");
         let info = map_info(Some(&arnor));
         assert_eq!(
             info.rows,
             vec![vec![CellSpec::Text("This was once the realm.".to_owned())]]
         );
-        assert_eq!(info.scroll_bar, Some(false));
         assert!(map_info(Some(&map("Umbar", 2, ""))).rows.is_empty());
         assert!(map_info(None).rows.is_empty());
     }

@@ -254,7 +254,7 @@ impl RotwkRules {
         &self,
         kind: crate::unit::Kind,
         data: &str,
-    ) -> Option<Vec<(String, bool)>> {
+    ) -> Option<Vec<(String, bool, bool)>> {
         let scripts = self.object_scripts.as_ref()?;
         let list = self.kinds.get(kind)?.record.lua_events.as_deref()?;
         let run = scripts.run(
@@ -270,11 +270,19 @@ impl RotwkRules {
         }
         let mut parts = Vec::new();
         for effect in &run.effects {
-            let Effect::SubObjects { show, hide } = effect else {
+            let Effect::SubObjects {
+                show,
+                hide,
+                permanent,
+            } = effect
+            else {
                 return None;
             };
-            parts.extend(show.iter().map(|name| (name.to_string(), true)));
-            parts.extend(hide.iter().map(|name| (name.to_string(), false)));
+            parts.extend(show.iter().map(|name| (name.to_string(), true, *permanent)));
+            parts.extend(
+                hide.iter()
+                    .map(|name| (name.to_string(), false, *permanent)),
+            );
         }
         Some(parts)
     }

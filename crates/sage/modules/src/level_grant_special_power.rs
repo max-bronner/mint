@@ -17,14 +17,17 @@ pub struct LevelGrantTrigger {
 }
 
 impl Trigger for LevelGrantTrigger {
-    fn fire(&self, entity: Entity, _target: AbilityTarget, ctx: &mut UpdateContext<'_>) {
+    fn fire(&self, entity: Entity, target: AbilityTarget, ctx: &mut UpdateContext<'_>) {
         let Some(log) = ctx.effects.get::<EffectLog>() else {
             return;
         };
         log.push(
             entity,
             Effect::AreaLevelUp {
-                at: PowerPlace::Source,
+                at: match target {
+                    AbilityTarget::Position(x, y) => PowerPlace::At(x, y),
+                    _ => PowerPlace::At(0.0, 0.0),
+                },
                 radius: self.radius,
                 experience: self.experience,
                 affects: Names::clone(&self.affects),
@@ -128,7 +131,7 @@ mod tests {
         let activation = Activation {
             power: "SpecialAbilityKingsFavor",
             target: None,
-            at: None,
+            at: Some((300.0, 400.0)),
         };
         assert!(registry.activate(
             &mut world,
@@ -138,6 +141,8 @@ mod tests {
             Effects::into_sink(&mut log)
         ));
 
+        let positions =
+            crate::world_reads::Positions::from_pairs([(holder, (250.0, 400.0, 0.0, 0.0))]);
         let mut rng = Pcg32::new(1);
         let mut destroy = DestroyRequests::new();
         let mut granted = None;
@@ -149,21 +154,23 @@ mod tests {
                 &mut rng,
                 &mut destroy,
                 Effects::into_sink(&mut log),
-                Reads::none(),
+                Reads::from_snapshot(&positions),
             );
             for (_, effect) in log.drain() {
                 if let Effect::AreaLevelUp {
+                    at,
                     radius,
                     experience,
                     fx,
                     ..
                 } = effect
                 {
-                    granted = Some((radius, experience, fx));
+                    granted = Some((at, radius, experience, fx));
                 }
             }
         }
-        let (radius, experience, fx) = granted.expect("the trigger must report an area grant");
+        let (at, radius, experience, fx) = granted.expect("the trigger must report an area grant");
+        assert_eq!(at, PowerPlace::At(300.0, 400.0));
         assert_eq!((radius, experience), (150.0, 50));
         assert_eq!(fx.as_deref(), Some("FX_LevelUp"));
     }

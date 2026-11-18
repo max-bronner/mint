@@ -10,7 +10,8 @@ use crate::animation_state::{phase_offset, pick_clip, rate_scale, speed_factor, 
 use super::blend::{blend_seconds, Blend, Blending, Slot};
 use super::fx::{crossed, queue_fx_events, MAX_FX_EVENTS_QUEUED};
 use super::{
-    is_drawable_for, model_part_overrides, LookKey, Scratch, UnitDrawable, UnitPose, UnitTemplate,
+    is_drawable_for, model_part_overrides, FloorFlags, LookKey, LookSubObject, Scratch,
+    UnitDrawable, UnitPose, UnitTemplate,
 };
 
 #[cfg(test)]
@@ -141,79 +142,37 @@ pub(super) fn pose_all(
         counts.entries = scratch.entries;
         (counts, scratch.refused)
     };
+    let size = chunk_len(threads, drawables.len(), PARALLEL_POSE_MIN);
     let used = PoseCounts {
-        threads: chunk_threads(threads, drawables.len(), PARALLEL_POSE_MIN),
+        threads: if size < drawables.len() {
+            mint_pool::threads()
+        } else {
+            1
+        },
         ..PoseCounts::default()
     };
-    run_chunked(drawables, paired, threads, PARALLEL_POSE_MIN, run)
-        .into_iter()
-        .fold(
-            (used, crate::anim_script::Refusals::default()),
-            |(counts, mut refused), (chunk_counts, chunk_refused)| {
-                refused.add(&chunk_refused);
-                (counts.add(chunk_counts), refused)
-            },
-        )
-}
-
-pub(super) fn chunk_threads(threads: usize, len: usize, min: usize) -> usize {
-    if len < min {
-        return 1;
-    }
-    if threads == 0 {
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
-    } else {
-        threads
-    }
+    mint_pool::map_chunks_mut(drawables, size, |offset, chunk| {
+        run(chunk, paired.get(offset..).unwrap_or_default())
+    })
+    .into_iter()
+    .fold(
+        (used, crate::anim_script::Refusals::default()),
+        |(counts, mut refused), (chunk_counts, chunk_refused)| {
+            refused.add(&chunk_refused);
+            (counts.add(chunk_counts), refused)
+        },
+    )
 }
 
 const CHUNKS_PER_THREAD: usize = 8;
 
-pub(super) fn run_chunked<T, P, R, F>(
-    items: &mut [T],
-    pairs: &[P],
-    threads: usize,
-    min: usize,
-    run: F,
-) -> Vec<R>
-where
-    T: Send,
-    P: Sync,
-    R: Send,
-    F: Fn(&mut [T], &[P]) -> R + Sync,
-{
-    let threads = chunk_threads(threads, items.len(), min);
-    if threads <= 1 {
-        return vec![run(items, pairs)];
+pub(super) fn chunk_len(threads: usize, len: usize, min: usize) -> usize {
+    let workers = mint_pool::threads();
+    if len < min || threads == 1 || workers == 0 {
+        return len.max(1);
     }
-    let size = items
-        .len()
-        .div_ceil(threads.saturating_mul(CHUNKS_PER_THREAD))
-        .max(1);
-    let queue: std::sync::Mutex<Vec<(&mut [T], &[P])>> =
-        std::sync::Mutex::new(items.chunks_mut(size).zip(pairs.chunks(size)).collect());
-    let run = &run;
-    let queue = &queue;
-    let take = || {
-        let mut results = Vec::new();
-        loop {
-            let next = queue.lock().ok().and_then(|mut queue| queue.pop());
-            let Some((chunk, pairs)) = next else { break };
-            results.push(run(chunk, pairs));
-        }
-        results
-    };
-    let take = &take;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (1..threads).map(|_| scope.spawn(take)).collect();
-        let mut results = take();
-        for handle in handles {
-            if let Ok(mut theirs) = handle.join() {
-                results.append(&mut theirs);
-            }
-        }
-        results
-    })
+    len.div_ceil(workers.saturating_mul(CHUNKS_PER_THREAD))
+        .max(1)
 }
 
 #[must_use]
@@ -381,25 +340,40 @@ pub(super) fn pose_drawable(
             model_state.and_then(|state| art.skins.get(&(drawable.body, state)).cloned());
     }
     drawable.hidden = drawable.body_missing || conditions.intersects(art.hide_if);
+    let mut parts_written = false;
     let look_at = (drawable.body, pose.look);
     if look_at != drawable.look_at {
         drawable.look = art.looks.get(&look_at).cloned();
         if drawable.look.is_some() || pose.look == LookKey::PLAIN {
             drawable.look_at = look_at;
         }
+        if let Some(writes) = drawable.look.as_ref().map(|look| Arc::clone(&look.writes)) {
+            parts_written |= take_look_writes(drawable, art, writes);
+        }
     }
     drawable.ghost = pose.ghost;
     drawable.casts_shadow = pose.casts_shadow;
     if drawable.hidden {
         drawable.drawn = false;
+        if selected != drawable.script_state {
+            drawable.script_state = selected;
+            run_state_script_parts(art, selected, drawable, conditions, scratch);
+            parts_written = true;
+        }
+        if parts_written {
+            drawable.parts_body = drawable.body;
+            drawable.state_parts = resolve_sub_objects(drawable);
+        }
         return Posed::Held;
     }
-    let entered = selected != drawable.script_state;
-    if entered {
-        drawable.script_state = selected;
+    let script_edge = selected != drawable.script_state;
+    drawable.script_state = selected;
+    let scripts_on_entry = transitions_enabled && drawable.state.is_some();
+    if script_edge && (pose.ghost.is_some() || !scripts_on_entry) {
         run_state_script_parts(art, selected, drawable, conditions, scratch);
+        parts_written = true;
     }
-    if entered || rebuilt || drawable.body != drawable.parts_body {
+    if parts_written || rebuilt || drawable.body != drawable.parts_body {
         drawable.parts_body = drawable.body;
         drawable.state_parts = resolve_sub_objects(drawable);
     }
@@ -594,7 +568,7 @@ pub(super) fn pose_drawable(
     {
         #[allow(clippy::cast_precision_loss)]
         let last = (animation.frames.max(1) - 1) as f32;
-        let writes: Vec<(String, bool)> = events
+        let writes: Vec<(String, bool, bool)> = events
             .iter()
             .filter(|event| {
                 #[allow(clippy::cast_precision_loss)]
@@ -606,7 +580,7 @@ pub(super) fn pose_drawable(
             .cloned()
             .collect();
         if !writes.is_empty() {
-            write_permanent_parts(drawable, writes);
+            write_parts(drawable, writes);
         }
     }
     drawable.fx_frame = Some(frame);
@@ -820,9 +794,10 @@ fn enter(
     drawable.transition_target = destination;
     scratch.entries = scratch.entries.saturating_add(1);
     let outgoing = shown(drawable);
-    let mut left = art.identity_of(drawable.state);
+    let (mut left, mut left_animation, mut left_fraction) = left_behind(drawable, art);
     let mut current = target;
     let mut label: Option<String> = None;
+    let mut parts_written = false;
     if run_scripts {
         let mut steps = 0u32;
         while let Some(t) = current {
@@ -833,7 +808,11 @@ fn enter(
             let run = art.script_of(t).map(|script| {
                 anim_script::run(
                     script,
-                    &left,
+                    anim_script::Prev {
+                        state: &left,
+                        animation: &left_animation,
+                        fraction: left_fraction,
+                    },
                     conditions,
                     &art.extras,
                     pose_id,
@@ -842,7 +821,19 @@ fn enter(
                     &mut scratch.refused,
                 )
             });
-            let Some(run) = run else { break };
+            let Some(mut run) = run else { break };
+            let calls = route_script_writes(
+                drawable,
+                art,
+                std::mem::take(&mut run.sub_objects),
+                &run.modules,
+            );
+            parts_written |= !calls.is_empty();
+            record_sub_object_writes(
+                &mut drawable.plain_parts,
+                &mut drawable.permanent_parts,
+                calls,
+            );
             let resolved: Vec<usize> = run
                 .transitions
                 .iter()
@@ -854,8 +845,13 @@ fn enter(
             };
             drawable.queue.splice(0..0, rest.iter().copied());
             left = art.identity_of(Some(t));
+            left_animation.clear();
+            left_fraction = 1.0;
             current = Some(*first);
         }
+    }
+    if parts_written {
+        drawable.state_parts = resolve_sub_objects(drawable);
     }
     commit(
         drawable,
@@ -1122,18 +1118,23 @@ fn run_state_script_parts(
     let (Some(state), Some(script)) = (selected, selected.and_then(|at| art.script_of(at))) else {
         return;
     };
-    let prev = art.identity_of(drawable.state);
-    let calls = anim_script::run(
+    let (state_name, animation, fraction) = left_behind(drawable, art);
+    let prev = anim_script::Prev {
+        state: &state_name,
+        animation: &animation,
+        fraction,
+    };
+    let run = anim_script::run(
         script,
-        &prev,
+        prev,
         conditions,
         &art.extras,
         drawable.id,
         u32::try_from(state).unwrap_or(u32::MAX),
         &mut scratch.script_env,
         &mut scratch.refused,
-    )
-    .sub_objects;
+    );
+    let calls = route_script_writes(drawable, art, run.sub_objects, &run.modules);
     record_sub_object_writes(
         &mut drawable.plain_parts,
         &mut drawable.permanent_parts,
@@ -1141,17 +1142,137 @@ fn run_state_script_parts(
     );
 }
 
-pub(super) fn write_permanent_parts(drawable: &mut UnitDrawable, writes: Vec<(String, bool)>) {
-    let calls = writes
-        .into_iter()
-        .map(|(name, shown)| (name, shown, true))
-        .collect();
+fn left_behind(drawable: &UnitDrawable, art: &UnitTemplate) -> (String, String, f32) {
+    let label = drawable
+        .state
+        .and_then(|state| art.states.get(state))
+        .and_then(|def| def.clips.get(drawable.clip))
+        .and_then(|clip| clip.label.clone())
+        .unwrap_or_default();
+    let fraction = drawable
+        .state
+        .and_then(|state| art.clip(drawable.body, state, drawable.clip))
+        .zip(drawable.phase)
+        .map_or(1.0, |(clip, phase)| {
+            (phase / natural_seconds(clip.frames, clip.rate)).clamp(0.0, 1.0)
+        });
+    (art.identity_of(drawable.state), label, fraction)
+}
+
+pub(super) fn write_parts(drawable: &mut UnitDrawable, calls: Vec<(String, bool, bool)>) {
     record_sub_object_writes(
         &mut drawable.plain_parts,
         &mut drawable.permanent_parts,
         calls,
     );
     drawable.state_parts = resolve_sub_objects(drawable);
+}
+
+pub(super) fn take_look_writes(
+    drawable: &mut UnitDrawable,
+    art: &UnitTemplate,
+    writes: Arc<[LookSubObject]>,
+) -> bool {
+    let mut calls: Vec<(String, bool, bool)> = Vec::new();
+    let fresh: Vec<&LookSubObject> = writes
+        .iter()
+        .filter(|write| !drawable.look_writes.contains(write))
+        .collect();
+    for write in fresh {
+        let name = write.name.to_string();
+        let keep = if !write.permanent {
+            true
+        } else if write.shown {
+            set_module_by_name(drawable, art, &name, true, false);
+            true
+        } else {
+            !set_module_by_name(drawable, art, &name, false, true)
+        };
+        if keep {
+            calls.push((name, write.shown, write.permanent));
+        }
+    }
+    drawable.look_writes = writes;
+    let any = !calls.is_empty();
+    record_sub_object_writes(
+        &mut drawable.plain_parts,
+        &mut drawable.permanent_parts,
+        calls,
+    );
+    any
+}
+
+fn set_module_by_name(
+    drawable: &mut UnitDrawable,
+    art: &UnitTemplate,
+    name: &str,
+    show: bool,
+    lock: bool,
+) -> bool {
+    if set_floor_by_name(drawable, art, name, show, lock) {
+        return true;
+    }
+    let Some(at) = art
+        .module_tags
+        .iter()
+        .position(|tag| tag.as_deref() == Some(name))
+    else {
+        return false;
+    };
+    if drawable.module_hidden.len() < art.module_tags.len() {
+        drawable.module_hidden.resize(art.module_tags.len(), false);
+    }
+    if let Some(hidden) = drawable.module_hidden.get_mut(at) {
+        *hidden = !show;
+    }
+    true
+}
+
+fn set_floor_by_name(
+    drawable: &mut UnitDrawable,
+    art: &UnitTemplate,
+    name: &str,
+    show: bool,
+    lock: bool,
+) -> bool {
+    let Some(at) = art
+        .floors
+        .iter()
+        .position(|floor| floor.tag.as_deref() == Some(name))
+    else {
+        return false;
+    };
+    if drawable.floor_flags.len() < art.floors.len() {
+        drawable
+            .floor_flags
+            .resize(art.floors.len(), FloorFlags::default());
+    }
+    if let Some(flags) = drawable.floor_flags.get_mut(at) {
+        if flags.hidden == show || flags.lock != lock {
+            flags.changed = true;
+        }
+        flags.hidden = !show;
+        flags.lock = lock;
+    }
+    true
+}
+
+pub(super) fn route_script_writes(
+    drawable: &mut UnitDrawable,
+    art: &UnitTemplate,
+    calls: Vec<(String, bool, bool)>,
+    modules: &[(String, bool)],
+) -> Vec<(String, bool, bool)> {
+    let rest = calls
+        .into_iter()
+        .filter(|(name, shown, permanent)| {
+            *permanent || !set_module_by_name(drawable, art, name, *shown, false)
+        })
+        .collect();
+    for (tag, shown) in modules {
+        set_module_by_name(drawable, art, tag, *shown, false);
+    }
+    rest
 }
 
 pub(super) fn record_sub_object_writes(

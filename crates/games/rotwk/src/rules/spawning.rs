@@ -475,7 +475,7 @@ impl RotwkRules {
                     planned: false,
                     horde: None,
                     guard: false,
-                    forced: false,
+                    relation_free: false,
                     order_owner: None,
                 },
             )?;
@@ -661,7 +661,7 @@ impl RotwkRules {
                             planned: false,
                             horde: None,
                             guard: false,
-                            forced: false,
+                            relation_free: false,
                             order_owner: None,
                         },
                     )?;

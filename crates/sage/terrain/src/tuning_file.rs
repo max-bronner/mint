@@ -1,12 +1,21 @@
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use crate::water_tuning::ParsedTuning;
 use crate::WaterTuning;
+
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+type Reread = Result<ParsedTuning, String>;
 
 pub struct TuningFile {
     path: PathBuf,
-    stamp: Option<SystemTime>,
     tuning: WaterTuning,
+    rereads: Option<mpsc::Receiver<Reread>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl TuningFile {
@@ -24,17 +33,15 @@ impl TuningFile {
                 Err(error) => println!("  tuning: could not write {}: {error}", path.display()),
             }
         }
-        let mut file = Self {
-            path,
-            stamp: None,
-            tuning: defaults,
-        };
-        println!("  tuning: {}", file.path.display());
+        println!("  tuning: {}", path.display());
         println!("    edit it while this runs - it is re-read whenever it changes");
-        match file.read() {
-            Some(parsed) => {
-                let changes = defaults.differences(&parsed);
-                file.tuning = parsed;
+        let stamp = stamp_of(&path);
+        let mut tuning = defaults;
+        match read(&path) {
+            Ok(parsed) => {
+                report_warnings(&parsed.warnings);
+                let changes = defaults.differences(&parsed.tuning);
+                tuning = parsed.tuning;
                 if changes.is_empty() {
                     println!("    every value is the default, so nothing is changed");
                 } else {
@@ -44,9 +51,19 @@ impl TuningFile {
                     }
                 }
             }
-            None => println!("    could not be read; the built-in defaults are in force"),
+            Err(error) => {
+                println!("  tuning: {}: {error}", path.display());
+                println!("    could not be read; the built-in defaults are in force");
+            }
         }
-        file
+        let stop = Arc::new(AtomicBool::new(false));
+        let rereads = watch(path.clone(), stamp, Arc::clone(&stop));
+        Self {
+            path,
+            tuning,
+            rereads,
+            stop,
+        }
     }
 
     #[must_use]
@@ -55,35 +72,73 @@ impl TuningFile {
     }
 
     pub fn poll(&mut self) -> Option<Vec<String>> {
-        let stamp = std::fs::metadata(&self.path)
-            .and_then(|meta| meta.modified())
-            .ok();
-        if stamp == self.stamp {
-            return None;
-        }
-        self.stamp = stamp;
-        let parsed = self.read()?;
-        let changes = self.tuning.differences(&parsed);
-        self.tuning = parsed;
-        Some(changes)
-    }
-
-    fn read(&mut self) -> Option<WaterTuning> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
+        let newest = self.rereads.as_ref()?.try_iter().last()?;
+        match newest {
+            Ok(parsed) => {
+                report_warnings(&parsed.warnings);
+                let changes = self.tuning.differences(&parsed.tuning);
+                self.tuning = parsed.tuning;
+                Some(changes)
+            }
             Err(error) => {
                 println!("  tuning: {}: {error}", self.path.display());
-                return None;
+                None
             }
-        };
-        self.stamp = std::fs::metadata(&self.path)
-            .and_then(|meta| meta.modified())
-            .ok();
-        let parsed = WaterTuning::parse(&text);
-        for warning in &parsed.warnings {
-            println!("  tuning: {warning}");
         }
-        Some(parsed.tuning)
+    }
+}
+
+impl Drop for TuningFile {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn watch(
+    path: PathBuf,
+    mut stamp: Option<SystemTime>,
+    stop: Arc<AtomicBool>,
+) -> Option<mpsc::Receiver<Reread>> {
+    let (tx, rx) = mpsc::channel();
+    let started = std::thread::Builder::new()
+        .name("mint-tuning-watch".to_string())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(POLL_INTERVAL);
+                let now = stamp_of(&path);
+                if now == stamp {
+                    continue;
+                }
+                stamp = now;
+                if tx.send(read(&path)).is_err() {
+                    break;
+                }
+            }
+        });
+    match started {
+        Ok(_) => Some(rx),
+        Err(error) => {
+            println!("  tuning: could not start the watcher ({error}); edits are not picked up");
+            None
+        }
+    }
+}
+
+fn stamp_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+fn read(path: &Path) -> Reread {
+    std::fs::read_to_string(path)
+        .map(|text| WaterTuning::parse(&text))
+        .map_err(|error| error.to_string())
+}
+
+fn report_warnings(warnings: &[String]) {
+    for warning in warnings {
+        println!("  tuning: {warning}");
     }
 }
 

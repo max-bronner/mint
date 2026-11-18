@@ -362,6 +362,97 @@ impl RotwkRules {
         )
     }
 
+    pub(super) fn clear_for_construction(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        kind: Kind,
+        centre: Vec2,
+        angle: f32,
+        constructor: Option<Entity>,
+    ) {
+        let Some(entry) = self.kinds.get(kind) else {
+            return;
+        };
+        if entry.record.has_kind("NO_COLLIDE") || entry.record.has_kind("DO_NOT_CLASSIFY") {
+            return;
+        }
+        if constructor.is_some_and(|who| self.has_kind_bit(tick.state(), ids, who, "DOZER")) {
+            return;
+        }
+        let placed = Placed {
+            records: footprint_of(&entry.record),
+            centre,
+            angle,
+        };
+        self.clear_placed(tick, ids, &placed);
+    }
+
+    pub(super) fn clear_for_conversion(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        template: &str,
+        attendants: &Names,
+    ) {
+        for (kind, placed) in self.conversion_poses(tick.state(), ids, entity, template, attendants)
+        {
+            let skipped = self.kinds.get(kind).is_some_and(|entry| {
+                entry.record.has_kind("NO_COLLIDE") || entry.record.has_kind("DO_NOT_CLASSIFY")
+            });
+            if !skipped {
+                self.clear_placed(tick, ids, &placed);
+            }
+        }
+    }
+
+    fn clear_placed(&self, tick: &mut Tick<'_>, ids: Ids, placed: &Placed) {
+        let reach = 1.1 * placed.bounding_radius();
+        let now = tick.frame();
+        let world = tick.state();
+        let Some(bodies) = world.store(ids.body) else {
+            return;
+        };
+        let removable: Vec<Entity> = bodies
+            .entities()
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                let Some((_, other)) = self.placed_now(world, ids, candidate) else {
+                    return false;
+                };
+                let blocked = ["INERT", "TAINT", "ALWAYS_SELECTABLE"]
+                    .iter()
+                    .any(|bit| self.has_kind_bit(world, ids, candidate, bit));
+                let removable = world
+                    .get(ids.health, candidate)
+                    .is_some_and(|health| health.0.is_dead())
+                    || world
+                        .get(ids.lifetime, candidate)
+                        .is_some_and(|lifetime| lifetime.dies_at <= now)
+                    || ["SHRUBBERY", "CLEARED_BY_BUILD"]
+                        .iter()
+                        .any(|bit| self.has_kind_bit(world, ids, candidate, bit));
+                !blocked
+                    && removable
+                    && !world.contains(ids.contained, candidate)
+                    && other.centre.minus(placed.centre).length() <= reach
+                    && placed.overlaps(&other)
+            })
+            .collect();
+        if removable.is_empty() {
+            return;
+        }
+        diag!(
+            "construct: {} object(s) cleared for construction",
+            removable.len()
+        );
+        for entity in removable {
+            tick.state_mut().despawn(entity);
+        }
+    }
+
     pub(super) fn cancel_unaffected_object_upgrades(
         &self,
         tick: &mut Tick<'_>,

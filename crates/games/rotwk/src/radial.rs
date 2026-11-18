@@ -141,6 +141,7 @@ mod tests {
             progress: None,
             count: 0,
             auto_cast: false,
+            hero: None,
         }
     }
 

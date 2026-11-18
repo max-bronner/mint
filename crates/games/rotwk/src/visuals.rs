@@ -70,6 +70,8 @@ pub(crate) struct UnitVisuals {
     ),
     claim_disc: Option<FadedDisc>,
     pub(crate) selection_claims: usize,
+    pub(crate) fading_decals: crate::game::decals::FadingDecals,
+    pub(crate) shadow_decals: Option<bool>,
     pub(crate) claim_share: Option<ClaimShareLabel>,
     label_atlas: Option<mint_ui::GlyphAtlas>,
     label_texture: Option<TextureHandle>,
@@ -331,6 +333,10 @@ pub(crate) fn placement_look(scene: &mut mint_sage_scene::UnitScene) -> mint_sag
     })
 }
 
+pub(crate) const RALLY_MARKER_TEMPLATE: &str = "RallyPointMarker";
+
+pub(crate) const RALLY_FLAG_ID: u32 = u32::MAX - (2 << 20);
+
 pub(crate) const PLACEMENT_GHOST_ID: u32 = u32::MAX;
 
 pub(crate) const PLANTED_TREE_ID: u32 = u32::MAX - (1 << 20);
@@ -366,6 +372,8 @@ impl UnitVisuals {
             claim_outline: (Vec::new(), Vec::new()),
             claim_disc: None,
             selection_claims: 0,
+            fading_decals: crate::game::decals::FadingDecals::default(),
+            shadow_decals: None,
             claim_share: None,
             label_atlas: mint_ui::GlyphAtlas::new(mint_ui::GlyphAtlasConfig::default_config()).ok(),
             label_texture: mint_render::TextureData::rgba8(1, 1, vec![255, 255, 255, 255])

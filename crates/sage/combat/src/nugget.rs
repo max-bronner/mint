@@ -514,6 +514,7 @@ pub struct ProjectileNugget {
     pub projectile_template: Option<String>,
     pub warhead: String,
     pub requires_upgrade: bool,
+    pub launch_slot: Option<crate::weapon_slots::WeaponSlot>,
 }
 
 impl ProjectileNugget {
@@ -527,6 +528,10 @@ impl ProjectileNugget {
         }
         hasher.write_bytes(self.warhead.as_bytes());
         hasher.write_bool(self.requires_upgrade);
+        if let Some(slot) = self.launch_slot {
+            hasher.write_u8(1);
+            hasher.write_usize(slot.index());
+        }
     }
 }
 
@@ -673,11 +678,13 @@ mod tests {
             projectile_template: None,
             warhead: "W".to_owned(),
             requires_upgrade: false,
+            launch_slot: None,
         });
         let fire = Nugget::Projectile(ProjectileNugget {
             projectile_template: None,
             warhead: "W".to_owned(),
             requires_upgrade: true,
+            launch_slot: None,
         });
         assert!(!plain.is_gated());
         assert!(fire.is_gated());
@@ -722,6 +729,7 @@ mod tests {
                 projectile_template: None,
                 warhead: String::new(),
                 requires_upgrade: false,
+                launch_slot: None,
             }),
             Nugget::MetaImpact(MetaImpactNugget::default()),
             Nugget::Unmodelled(String::new()),

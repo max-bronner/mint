@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::diagnostic::ValueError;
 use crate::tables::field_table::{self, Context, Titles};
 use crate::tree::{Block, Diagnostic, Document, Node};
 use crate::value::MacroDiagnostic;
@@ -23,7 +24,15 @@ pub enum StrictError {
     Structural(Diagnostic),
     #[error("{0}")]
     Macro(MacroDiagnostic),
+    #[error("{0}")]
+    Value(ValueError),
 }
+
+pub const TYPED_READER_BLOCKS: &[&str] = &[
+    "StrategicHUD",
+    "LivingWorldRegionEffects",
+    "AutoResolveReinforcementSchedule",
+];
 
 pub const UNBOUND_LEGEND_BLOCKS: &[&str] = &[
     "AerialPathfindNoFlyZone",
@@ -35,7 +44,6 @@ pub const UNBOUND_LEGEND_BLOCKS: &[&str] = &[
     "ParticleSystem",
     "ReallyLowMHz",
     "StanceTemplate",
-    "StrategicHUD",
 ];
 
 pub const UNIMPLEMENTED_SUBSYSTEM_FILES: &[&str] = &["data/ini/credits.ini"];
@@ -81,6 +89,14 @@ pub fn check(
         report.errors.push(StrictError::Macro(diagnostic.clone()));
     }
     for root in document.roots() {
+        if TYPED_READER_BLOCKS.contains(&root.keyword.as_str()) {
+            report.errors.extend(
+                crate::living_world::check_block(root, macros)
+                    .into_iter()
+                    .map(StrictError::Value),
+            );
+            continue;
+        }
         match field_table::file_scope(&root.keyword) {
             Some(context) => walk(root, context, &root.keyword, title, &mut report),
             None if UNBOUND_LEGEND_BLOCKS.contains(&root.keyword.as_str()) => {
@@ -96,16 +112,7 @@ pub fn check(
     report
 }
 
-const UNKNOWN_NOT_INVALID: &[(&str, &str)] = &[
-    ("LivingWorldRegionEffects", "BordersEffect"),
-    ("LivingWorldRegionEffects", "FilledOwnershipEffect"),
-    ("LivingWorldRegionEffects", "HomeRegionHighlight"),
-    ("LivingWorldRegionEffects", "MouseoverEffectFlareup"),
-    ("LivingWorldRegionEffects", "RegionSelectionEffect"),
-    ("LivingWorldRegionEffects", "UnifiedEffect"),
-    ("AutoResolveReinforcementSchedule", "EachRemaining"),
-    ("ButtonSet", "Mode"),
-];
+const UNKNOWN_NOT_INVALID: &[(&str, &str)] = &[("ButtonSet", "Mode")];
 
 fn walk(block: &Block, context: &Context, label: &str, title: Titles, report: &mut StrictReport) {
     for node in &block.children {
@@ -218,20 +225,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unbound_registered_block_is_unchecked_not_refused() {
-        let doc = parse("StrategicHUD\n  Whatever = 1\nEnd\n");
-        let report = check(&doc, &MacroTable::new(), Titles::BOTH);
-        assert!(report.is_clean(), "{:?}", report.errors);
-        assert_eq!(report.unchecked, 1);
-    }
-
-    #[test]
-    fn a_registry_dispatched_child_u3_names_unknown_is_unchecked_not_refused() {
-        let doc =
-            parse("LivingWorldRegionEffects Foo\n  BordersEffect\n    Time = 1\n  End\nEnd\n");
-        let report = check(&doc, &MacroTable::new(), Titles::BOTH);
-        assert!(report.is_clean(), "{:?}", report.errors);
-        assert!(report.unchecked > 0);
+    fn a_block_with_a_load_time_field_table_is_checked_by_its_typed_reader() {
+        for (text, bad) in [
+            ("StrategicHUD\n  Whatever = 1\nEnd\n", 1),
+            (
+                "LivingWorldRegionEffects Foo\n  BordersEffect\n    Time = 1\n  End\nEnd\n",
+                1,
+            ),
+            (
+                "AutoResolveReinforcementSchedule Attacker\n  #1 = 0\nEnd\n",
+                1,
+            ),
+            (
+                "StrategicHUD\n  OptionsButton\n    Title = T\n  End\nEnd\n\
+                 LivingWorldRegionEffects Foo\n  BordersEffect\n    Opacity = 1\n  End\nEnd\n\
+                 AutoResolveReinforcementSchedule Attacker\n  1 = 0\n  EachRemaining = +1\nEnd\n",
+                0,
+            ),
+        ] {
+            let report = check(&parse(text), &MacroTable::new(), Titles::BOTH);
+            assert_eq!(report.errors.len(), bad, "{text}: {:?}", report.errors);
+        }
     }
 
     #[test]

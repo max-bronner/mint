@@ -14,12 +14,14 @@ const COMMAND_SET_INI: &str = "data/ini/commandset.ini";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ScienceDef {
+    pub(crate) cost_mp: Option<u32>,
     pub(crate) cost: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SpellStoreTemplate {
     pub(crate) command_set: Option<String>,
+    pub(crate) command_set_sp: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,30 +58,29 @@ impl SpellBookData {
             data.command_sets.insert_document(document);
         }
         for (name, block) in named_blocks(documents, "Science") {
-            let cost = whole(
-                block
-                    .field("SciencePurchasePointCostMP")
-                    .and_then(mint_sage_ini::Field::value),
-            )
-            .or_else(|| {
-                whole(
-                    block
-                        .field("SciencePurchasePointCost")
-                        .and_then(mint_sage_ini::Field::value),
-                )
-            });
-            data.sciences
-                .insert(name.to_ascii_lowercase(), ScienceDef { cost });
+            let read =
+                |field: &str| whole(block.field(field).and_then(mint_sage_ini::Field::value));
+            data.sciences.insert(
+                name.to_ascii_lowercase(),
+                ScienceDef {
+                    cost_mp: read("SciencePurchasePointCostMP"),
+                    cost: read("SciencePurchasePointCost"),
+                },
+            );
         }
         for (name, block) in named_blocks(documents, "PlayerTemplate") {
+            let command_set_field = |field: &str| {
+                block
+                    .field(field)
+                    .and_then(mint_sage_ini::Field::value)
+                    .filter(|v| !mint_sage_ini::value::is_none(v))
+                    .map(str::to_owned)
+            };
             data.templates.insert(
                 name.to_ascii_lowercase(),
                 SpellStoreTemplate {
-                    command_set: block
-                        .field("PurchaseScienceCommandSetMP")
-                        .and_then(mint_sage_ini::Field::value)
-                        .filter(|v| !mint_sage_ini::value::is_none(v))
-                        .map(str::to_owned),
+                    command_set: command_set_field("PurchaseScienceCommandSetMP"),
+                    command_set_sp: command_set_field("PurchaseScienceCommandSet"),
                 },
             );
         }
@@ -193,11 +194,18 @@ pub(crate) fn spell_book_view(
     command_buttons: &mint_sage_ini::CommandButtonIndex,
     strings: &StringTable,
     template: Option<&str>,
+    multiplayer: bool,
     holdings: &SpellBookHoldings,
 ) -> SpellBookView {
     let store = template.and_then(|t| data.template(t));
     let set = store
-        .and_then(|t| t.command_set.as_deref())
+        .and_then(|t| {
+            if multiplayer {
+                t.command_set.as_deref()
+            } else {
+                t.command_set_sp.as_deref()
+            }
+        })
         .and_then(|name| data.command_sets.get(name));
     let last = set
         .and_then(mint_sage_ini::CommandSetDef::max_slot)
@@ -220,7 +228,9 @@ pub(crate) fn spell_book_view(
                 image: button.button_image.clone(),
                 name: text(button.text_label.as_deref()),
                 description: text(button.descript_label.as_deref()),
-                cost: def.and_then(|d| d.cost).unwrap_or(0),
+                cost: def
+                    .and_then(|d| if multiplayer { d.cost_mp } else { d.cost })
+                    .unwrap_or(0),
                 state: spell_state(science, holdings),
             })
         })

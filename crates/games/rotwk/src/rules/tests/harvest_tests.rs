@@ -101,17 +101,17 @@ fn purse_of(simulation: &Simulation<RotwkRules>, ids: Ids, player: PlayerId) -> 
 #[test]
 fn an_idle_harvester_chops_a_tree_and_banks_a_box_with_no_order() {
     let (mut simulation, ids, _mill, _worker) = scene(90);
-    run(&mut simulation, 12);
+    run(&mut simulation, 24);
     assert!(
         purse_of(&simulation, ids, PLAYER) > 0,
-        "a load should have been banked within 12 frames"
+        "a load should have been banked within 24 frames"
     );
 }
 
 #[test]
 fn harvesting_an_almost_empty_tree_sinks_it_and_still_banks_what_it_held() {
     let (mut simulation, ids, _mill, _worker) = scene(1);
-    run(&mut simulation, 12);
+    run(&mut simulation, 24);
     let forest_entity =
         crate::forest::singleton_of(simulation.state(), ids.forest).expect("forest singleton");
     let forest = simulation.state().get(ids.forest, forest_entity).unwrap();
@@ -127,7 +127,7 @@ fn value_multiplier_scales_the_deposit() {
          Behavior = SupplyCenterDockUpdate Tag_Dock\n    ValueMultiplier = 150%\n  End\n",
     );
     let (mut simulation, ids, _mill, _worker) = scene_with(&data, Vec2::new(310.0, 300.0), 90);
-    run(&mut simulation, 12);
+    run(&mut simulation, 24);
     assert_eq!(purse_of(&simulation, ids, PLAYER), 30);
 }
 

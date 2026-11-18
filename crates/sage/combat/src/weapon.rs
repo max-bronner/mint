@@ -233,6 +233,7 @@ pub struct WeaponTemplate {
     pub aim_direction: f32,
     pub continue_attack_range: f32,
     pub projectile_filter_in_container: Vec<String>,
+    pub projectile_self: bool,
     pub fx_trigger: FxTrigger,
     pub bonus: crate::weapon_bonus::WeaponBonusSet,
 }
@@ -285,6 +286,7 @@ impl Default for WeaponTemplate {
             aim_direction: 0.0,
             continue_attack_range: 0.0,
             projectile_filter_in_container: Vec::new(),
+            projectile_self: false,
             fx_trigger: FxTrigger::None,
             bonus: crate::weapon_bonus::WeaponBonusSet::default(),
         }
@@ -317,6 +319,8 @@ pub fn scatter_landing(rng: &mut Pcg32, radius: f32) -> ShotOutcome {
 
 const PATHFIND_CELL_SIZE: f32 = 10.0;
 
+pub const RANGE_TRIM: f32 = PATHFIND_CELL_SIZE * 0.25;
+
 const MIN_AIM_TOLERANCE: f32 = 0.035;
 
 impl WeaponTemplate {
@@ -329,6 +333,25 @@ impl WeaponTemplate {
     #[must_use]
     pub fn is_contact(&self) -> bool {
         self.attack_range - PATHFIND_CELL_SIZE * 0.25 < PATHFIND_CELL_SIZE
+    }
+
+    #[must_use]
+    pub fn reach(&self, bonus: f32) -> f32 {
+        let scaled = self.attack_range * bonus;
+        if self.melee {
+            scaled
+        } else {
+            (scaled - RANGE_TRIM).max(0.0)
+        }
+    }
+
+    #[must_use]
+    pub fn minimum_reach(&self) -> f32 {
+        if self.melee {
+            self.minimum_attack_range
+        } else {
+            (self.minimum_attack_range - RANGE_TRIM).max(0.0)
+        }
     }
 
     #[must_use]
@@ -520,6 +543,7 @@ impl WeaponTemplate {
         for token in &self.projectile_filter_in_container {
             hasher.write_bytes(token.as_bytes());
         }
+        hasher.write_bool(self.projectile_self);
         hasher.write_u8(self.fx_trigger.code());
         self.bonus.hash_into(hasher);
     }
@@ -803,6 +827,11 @@ impl WeaponState {
         rng: &mut Pcg32,
     ) -> bool {
         self.last_shot = Some(now);
+        if template.leech_range {
+            self.leech_until = now
+                .checked_add(template.firing_duration.max(LogicFrames::from_frames(1)))
+                .unwrap_or(Frame::FOREVER);
+        }
         self.forced_reload_at = (template.auto_reload_when_idle > LogicFrames::ZERO)
             .then(|| now.checked_add(template.auto_reload_when_idle))
             .flatten();
@@ -1016,6 +1045,27 @@ mod tests {
                 "{rate}"
             );
         }
+    }
+
+    #[test]
+    fn a_leech_weapon_with_no_wind_up_is_armed_at_the_shot() {
+        let t = WeaponTemplate {
+            leech_range: true,
+            firing_duration: LogicFrames::from_frames(6),
+            ..WeaponTemplate::default()
+        };
+        let mut state = WeaponState::new(&t);
+        state.fire(&t, Frame::new(100), &mut rng());
+        assert!(state.leeching(Frame::new(105)));
+        assert!(!state.leeching(Frame::new(106)));
+        let bare = WeaponTemplate {
+            leech_range: true,
+            ..WeaponTemplate::default()
+        };
+        let mut state = WeaponState::new(&bare);
+        state.fire(&bare, Frame::new(100), &mut rng());
+        assert!(state.leeching(Frame::new(100)));
+        assert!(!state.leeching(Frame::new(101)));
     }
 
     #[test]

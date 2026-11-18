@@ -1956,18 +1956,18 @@ impl RotwkRules {
         if held_by == Some(grabber) || (held_by.is_some() && !remove_from_other) {
             return Ok(false);
         }
-        let grab = self
+        let grabs_structures = self
             .modules
             .as_ref()
             .and_then(|wiring| wiring.transport_view(tick.state(), grabber))
             .and_then(|module| module.grab())
-            .map(|grab| (grab.weapon.clone(), grab.structures, grab.on_victim));
+            .is_some_and(|grab| grab.structures);
         let is_structure = tick
             .state()
             .get(ids.kind, victim)
             .and_then(|kind| self.kinds.get(*kind))
             .is_some_and(|entry| entry.record.has_kind("STRUCTURE"));
-        if is_structure && !grab.as_ref().is_some_and(|(_, structures, _)| *structures) {
+        if is_structure && !grabs_structures {
             return Ok(false);
         }
         let Some(owner) = tick.state().get(ids.owner, victim).map(|held| held.0) else {
@@ -1979,7 +1979,31 @@ impl RotwkRules {
         {
             return Ok(false);
         }
-        if let Some(container) = held_by {
+        self.take_into(tick, ids, grabber, victim)?;
+        Ok(true)
+    }
+
+    pub(super) fn take_into(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        grabber: Entity,
+        victim: Entity,
+    ) -> Result<()> {
+        let Some(owner) = tick.state().get(ids.owner, victim).map(|held| held.0) else {
+            return Ok(());
+        };
+        let grab = self
+            .modules
+            .as_ref()
+            .and_then(|wiring| wiring.transport_view(tick.state(), grabber))
+            .and_then(|module| module.grab())
+            .map(|grab| (grab.weapon.clone(), grab.on_victim));
+        if let Some(container) = tick
+            .state()
+            .get(ids.contained, victim)
+            .map(|held| held.container)
+        {
             self.release_one(tick, ids, container, victim)?;
         }
         self.leave_horde(tick, ids, victim)?;
@@ -2002,7 +2026,7 @@ impl RotwkRules {
             grab.as_ref()
                 .map_or_else(String::new, |(weapon, ..)| format!(" and fires {weapon}"))
         );
-        if let Some((weapon, _, on_victim)) = grab {
+        if let Some((weapon, on_victim)) = grab {
             let at = if on_victim {
                 mint_sage_modules::effects::PowerPlace::Object(victim)
             } else {
@@ -2020,8 +2044,7 @@ impl RotwkRules {
                 },
             ));
         }
-        self.apply_effects(tick, ids, effects)?;
-        Ok(true)
+        self.apply_effects(tick, ids, effects)
     }
 
     fn leave_horde(&self, tick: &mut Tick<'_>, ids: Ids, member: Entity) -> Result<()> {

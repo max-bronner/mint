@@ -84,6 +84,19 @@ fn add_and_remove_module_edit_the_overridden_templates_modules() {
 }
 
 #[test]
+fn a_map_game_data_block_merges_over_the_global_fields_it_does_not_write() {
+    let table = BlockTable::corpus_path();
+    let global = "GameData\n  Gravity = -30\n  GroundStiffness = 0.5\nEnd\n";
+    let document = Document::parse("global.ini", global, &table).unwrap();
+    let mut data = game_data_from_documents(&[document], 0, std::time::Instant::now()).0;
+    let map = Document::parse("map.ini", "GameData\n  Gravity = -10\nEnd\n", &table).unwrap();
+    compose_document(&mut data, map)
+        .map_err(|r| r.errors)
+        .unwrap();
+    assert_eq!((data.gravity, data.ground_stiffness), (Some(-10.0), 0.5));
+}
+
+#[test]
 fn a_science_override_clears_its_prerequisites_and_keeps_its_cost() {
     let data = composed("Science SCIENCE_Leaf\n  PrerequisiteSciences = None\nEnd\n").unwrap();
     let leaf = data.sciences.get("SCIENCE_Leaf").unwrap();

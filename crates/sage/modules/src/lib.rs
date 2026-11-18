@@ -43,6 +43,7 @@ mod fields;
 mod fire_weapon_update;
 pub mod flammable;
 mod fling_passenger_special_ability_update;
+mod flood_update;
 mod fx_list_die;
 mod gate_open_and_close_behavior;
 mod geometry_upgrade;
@@ -81,6 +82,7 @@ mod replace_object_update;
 mod replace_self_upgrade;
 mod salvage_crate_collide;
 pub mod script_events;
+mod set_conditions;
 pub mod slave_watcher_behavior;
 pub mod slaved_update;
 mod slow_death_behavior;
@@ -210,6 +212,7 @@ pub use fire_weapon_update::{
 pub use fling_passenger_special_ability_update::{
     fling_passenger_special_ability_update_from_fields, FlingPassengerSpecialAbilityUpdate,
 };
+pub use flood_update::{flood_update_from_fields, FloodMember, FloodSpec, FloodUpdate};
 pub use fx_list_die::{fx_list_die_from_fields, FxListDie};
 pub use gate_open_and_close_behavior::{
     gate_open_and_close_behavior_from_fields, GateOpenAndCloseBehavior,
@@ -266,12 +269,13 @@ pub use record::{
     player_upgrades, purchase_science_buttons, revive_buttons, special_power_buttons,
     spell_book_buttons, unit_builds, weapon_toggle_buttons, AiKindOf, AiTable, AnimalWander,
     AodCrush, AutoAcquire, BackAway, BuildCompletion, BuildableStatus, Castle, ConditionedSet,
-    ContactLabels, ContactPoint, ContactTags, Crush, CrushResistance, DeadCollideSize,
-    DeployStyleDef, FormationPreviewDecal, Foundation, Geometry, GeometryPiece, HarvestDef,
-    LocomotorSlot, ObjectRecord, PieceShape, PowerButton, PowerSlot, ProductionModifierDef,
-    RadarPriority, RespawnEntry, RespawnRule, SiegeDeployDef, SiegeRecord, SupplyCenterDockDef,
-    TemplateRecords, ToggleDeployDef, TurretDef, UnitBuild, UpgradeButton, VisionBonus,
-    DOZER_CONSTRUCT, FOUNDATION_CONSTRUCT, OBJECT_UPGRADE, PLAYER_UPGRADE, REVIVE, UNCRUSHABLE,
+    ContactLabels, ContactPoint, ContactTags, CritterEmitter, Crush, CrushResistance,
+    DeadCollideSize, DeployStyleDef, FormationPreviewDecal, Foundation, Geometry, GeometryPiece,
+    HarvestDef, LocomotorSlot, ObjectRecord, PieceShape, PowerButton, PowerSlot,
+    ProductionModifierDef, RadarPriority, RespawnEntry, RespawnRule, SiegeDeployDef, SiegeRecord,
+    SupplyCenterDockDef, TemplateRecords, ToggleDeployDef, TurretDef, UnitBuild, UpgradeButton,
+    VisionBonus, DOZER_CONSTRUCT, FOUNDATION_CONSTRUCT, OBJECT_UPGRADE, PLAYER_UPGRADE, REVIVE,
+    UNCRUSHABLE,
 };
 pub use refund_die::{refund_die_from_fields, RefundDie};
 pub use register_effects::{
@@ -296,8 +300,8 @@ pub use spawn_point_production_exit_update::{
     MAX_SPAWN_POINTS,
 };
 pub use special_ability_update::{
-    grab_passenger_eat, retail_duration_ticks, special_ability_update_from_fields,
-    GrabPassengerEat, SpecialAbilityUpdate, RETAIL_LOGIC_HZ,
+    grab_passenger_eat, retail_duration_ticks, retail_duration_ticks_f32,
+    special_ability_update_from_fields, GrabPassengerEat, SpecialAbilityUpdate, RETAIL_LOGIC_HZ,
 };
 pub use special_disguise_update::{
     special_disguise_update_from_fields, SpecialDisguiseUpdate, DISGUISED,
@@ -336,7 +340,7 @@ pub use unpause_special_power_upgrade::{
 };
 pub use upgrade_bits::UpgradeBits;
 pub use upgrade_mux::{attempt_upgrade_via_mux, UpgradeEffect, UpgradeMuxData};
-pub use upgrade_record::{build_upgrade_records, UpgradeRecord};
+pub use upgrade_record::{build_upgrade_costs, build_upgrade_records, UpgradeCost, UpgradeRecord};
 pub use wall_hub_behavior::{
     wall_hub_behavior_from_fields, ModuleOption, WallHubBehavior, BUILDER_RADIUS_USES_HUB,
 };
@@ -563,6 +567,7 @@ pub fn register_spell_family(registry: &mut ModuleRegistry, world: &mut World) {
     );
     registry.register_loadable(world, "FireWeaponUpdate", fire_weapon_update_from_fields);
     registry.register_loadable(world, "DeletionUpdate", deletion_update_from_fields);
+    registry.register_loadable(world, "FloodUpdate", flood_update_from_fields);
     registry.register_loadable(
         world,
         "AttributeModifierAuraUpdate",
@@ -1311,6 +1316,7 @@ mod tests {
                 Effect::SubObjects {
                     show: vec![effects::Name::from("Sub_Flag")].into(),
                     hide: Vec::new().into(),
+                    permanent: true,
                 },
             ],
             "declaration order"

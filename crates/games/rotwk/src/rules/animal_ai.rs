@@ -63,10 +63,15 @@ impl RotwkRules {
         else {
             return Ok(());
         };
+        let ticks_per_frame = u64::from(super::emotions::TICKS_PER_FRAME.max(1));
+        if tick.frame().get() % ticks_per_frame != 0 {
+            return Ok(());
+        }
+        let retail_frame = tick.frame().get() / ticks_per_frame;
         let owner = tick.state().get(ids.owner, animal).map(|o| o.0);
         if wander.update_timer > 0 {
             let period = u64::from(u32::try_from(wander.update_timer).unwrap_or(1).max(1));
-            if tick.frame().get() % period == 0 {
+            if retail_frame % period == 0 {
                 if let Some(enemy) = self.animal_flee_target(
                     tick,
                     ids,
@@ -229,6 +234,13 @@ impl RotwkRules {
 
     fn walk_animal(&self, tick: &mut Tick<'_>, ids: Ids, animal: Entity, to: Vec2) -> Result<()> {
         let to = self.adjust_to_possible_destination(tick, ids, animal, to);
+        diag!(
+            "animal: frame {} entity {} walks to ({:.0}, {:.0})",
+            tick.frame().get(),
+            animal.index(),
+            to.x,
+            to.y
+        );
         crate::unit::give_path(
             tick.state_mut(),
             (ids.body, ids.path),

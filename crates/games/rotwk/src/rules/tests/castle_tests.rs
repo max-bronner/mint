@@ -6,14 +6,14 @@ Object DefaultThingTemplate\n  Behavior = DestroyDie Tag_DefaultDie\n  End\nEnd\
 Object Site\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE BASE_SITE\n  \
   Body = StructureBody Tag_Body\n    MaxHealth = 5000\n  End\n  \
   Behavior = CastleBehavior Tag_Castle\n    KeepDeathKillsEverything = Yes\n  End\n  \
-  Behavior = SlowDeathBehavior Tag_Death\n    DestructionDelay = 1500\n  End\nEnd\n\
+  Behavior = SlowDeathBehavior Tag_Death\n    DestructionDelay = 1400\n  End\nEnd\n\
 Object MapSite\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
   Body = StructureBody Tag_Body\n    MaxHealth = 5000\n  End\n  \
   Behavior = CastleBehavior Tag_Castle\n  End\nEnd\n\
 Object Keep\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE CASTLE_KEEP\n  \
   Body = StructureBody Tag_Body\n    MaxHealth = 5000\n  End\n  \
   Geometry = BOX\n  GeometryMajorRadius = 30\n  GeometryMinorRadius = 30\n  GeometryHeight = 40\n  \
-  Behavior = SlowDeathBehavior Tag_Death\n    DestructionDelay = 1500\n  End\nEnd\n\
+  Behavior = SlowDeathBehavior Tag_Death\n    DestructionDelay = 1400\n  End\nEnd\n\
 Object Pad\n  Side = Men\n  \
   KindOf = STRUCTURE SELECTABLE IMMOBILE BASE_FOUNDATION UNATTACKABLE NO_COLLIDE EXPANSION_PAD\n  \
   CommandSet = PadSet\n  \
@@ -679,8 +679,30 @@ fn a_castle_finished_in_play_unpacks_owned_and_neutral_members() {
         pad,
         RotwkCommand::FoundationConstruct { button: 0 },
     );
-    run(&mut simulation, 80);
-    let site = of_kind(&b, &simulation, ids, "FieldSite")[0];
+    let site = loop {
+        run(&mut simulation, 1);
+        let sites = of_kind(&b, &simulation, ids, "FieldSite");
+        if let Some(&site) = sites.first() {
+            if simulation.state().get(ids.construction, site).is_none() {
+                break site;
+            }
+        }
+        assert!(simulation.frame().get() < 400, "never finished");
+    };
+    assert!(
+        of_kind(&b, &simulation, ids, "Tower").is_empty(),
+        "not unpacked at completion"
+    );
+    run(&mut simulation, 1);
+    assert!(
+        of_kind(&b, &simulation, ids, "Tower").is_empty(),
+        "not unpacked a tick later"
+    );
+    run(&mut simulation, 30);
+    assert!(
+        !of_kind(&b, &simulation, ids, "Tower").is_empty(),
+        "unpacked within a retail second"
+    );
     let world = simulation.state();
     let held = |name: &str| {
         let entity = of_kind(&b, &simulation, ids, name)[0];
@@ -692,6 +714,10 @@ fn a_castle_finished_in_play_unpacks_owned_and_neutral_members() {
     assert_eq!(
         [held("Tower"), held("Rock")],
         [(PLAYER, site), (neutral, site)]
+    );
+    assert!(
+        simulation.rules().is_unattackable(world, ids, site),
+        "onBuildComplete leaves the castle site UNATTACKABLE"
     );
 }
 

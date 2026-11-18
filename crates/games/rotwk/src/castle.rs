@@ -3,7 +3,11 @@ use std::collections::BTreeMap;
 use mint_movement::{Facing, Vec2};
 use mint_sage_map::BaseLayout;
 use mint_sage_modules::Castle;
-use mint_sim::{Component, ComponentId, Entity, StateHasher, UpgradeMask, World};
+use mint_sim::{
+    Component, ComponentId, Entity, Frame, LogicFrames, StateHasher, UpgradeMask, World,
+};
+
+use crate::game_data::RETAIL_HZ;
 
 use crate::combat::Doomed;
 use crate::templates::KindTable;
@@ -65,6 +69,39 @@ impl Component for CastleMember {
     fn hash_into(&self, hasher: &mut StateHasher) {
         self.castle.hash_into(hasher);
         self.castle_kind.hash_into(hasher);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingUnpack {
+    pub(crate) first_update: Frame,
+    pub(crate) completed: Frame,
+}
+
+impl Component for PendingUnpack {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        self.first_update.hash_into(hasher);
+        self.completed.hash_into(hasher);
+    }
+}
+
+impl PendingUnpack {
+    pub(crate) fn after_creation(created: Frame, completed: Frame) -> Self {
+        let one_frame = LogicFrames::from_authored_frames(1, RETAIL_HZ);
+        Self {
+            first_update: Frame::new(created.get().saturating_add(u64::from(one_frame.get()))),
+            completed,
+        }
+    }
+
+    pub(crate) fn due(self, now: Frame) -> bool {
+        let period = u64::from(LogicFrames::from_authored_frames(RETAIL_HZ.get(), RETAIL_HZ).get());
+        now > self.completed
+            && now
+                .get()
+                .checked_sub(self.first_update.get())
+                .and_then(|since| since.checked_rem(period))
+                == Some(0)
     }
 }
 

@@ -122,6 +122,8 @@ fn two_slots(first: SlotSetup) -> SkirmishSetup {
         spawn_buildings: None,
         dummies: None,
         dummies_attack: false,
+        drive_templates: Vec::new(),
+        wotr: None,
         cah_hero: None,
         random_seed: 0,
         resolved: None,

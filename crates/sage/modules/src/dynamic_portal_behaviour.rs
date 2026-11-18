@@ -230,7 +230,10 @@ fn seconds(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<LogicFrames,
         .field_numeric(keyword)
         .filter(|v| v.is_finite())
         .ok_or_else(|| FieldError::new(format!("{keyword} '{raw}' is not a number of seconds")))?;
-    Ok(LogicFrames::from_seconds(value))
+    Ok(LogicFrames::from_authored_seconds_truncated(
+        value,
+        crate::special_ability_update::RETAIL_LOGIC_NONZERO,
+    ))
 }
 
 fn non_negative(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<Option<f32>, FieldError> {

@@ -76,6 +76,7 @@ pub struct UiGeometry<'a> {
     pub texture: Option<TextureHandle>,
     pub texture_transform: [[f32; 2]; 2],
     pub texture_translation: [f32; 2],
+    pub retain_key: Option<u64>,
 }
 
 impl<'a> UiGeometry<'a> {
@@ -92,6 +93,7 @@ impl<'a> UiGeometry<'a> {
             texture: None,
             texture_transform: [[1.0, 0.0], [0.0, 1.0]],
             texture_translation: [0.0, 0.0],
+            retain_key: None,
         }
     }
 
@@ -129,6 +131,12 @@ impl<'a> UiGeometry<'a> {
     #[must_use]
     pub fn with_clip(mut self, clip: [f32; 4]) -> Self {
         self.clip = clip;
+        self
+    }
+
+    #[must_use]
+    pub fn with_retention(mut self, key: u64) -> Self {
+        self.retain_key = Some(key);
         self
     }
 

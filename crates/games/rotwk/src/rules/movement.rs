@@ -1346,7 +1346,7 @@ impl RotwkRules {
                 planned: false,
                 horde: None,
                 guard: false,
-                forced: false,
+                relation_free: false,
                 order_owner: None,
             },
         )?;
@@ -3170,7 +3170,13 @@ impl RotwkRules {
         if pipeline.config() != config {
             *pipeline = Pipeline::new(config);
         }
-        pipeline.plan(grid, geometry, request, budget)
+        let spent = budget.spent();
+        let outcome = pipeline.plan(grid, geometry, request, budget);
+        crate::perf::count(
+            crate::perf::sub_row!("path_expanded"),
+            usize::try_from(budget.spent().saturating_sub(spent)).unwrap_or(usize::MAX),
+        );
+        outcome
     }
 
     pub(super) fn replan_if_due(
@@ -3240,6 +3246,7 @@ impl RotwkRules {
                 entity.index()
             ),
         };
+        let site = crate::perf::sub(crate::perf::sub_row!("path_site_move"));
         let outcome = if exact_goal.is_some() {
             self.plan_path(modes.config(), &view, &request, budget)
                 .map_err(planning_error)?
@@ -3249,6 +3256,7 @@ impl RotwkRules {
                 .plan_closest(&view, self.passability.geometry, &request, &mut whole)
                 .map_err(planning_error)?
         };
+        drop(site);
         match outcome {
             PlanOutcome::Ready(plan) => {
                 Self::clear_path_retry(tick, ids, entity);
@@ -3671,6 +3679,7 @@ impl RotwkRules {
                     corner_radius: self.mover_limits(tick, ids, straggler.member).corner_radius,
                     departure: self.departure(tick, ids, straggler.member),
                 };
+                let _site = crate::perf::sub(crate::perf::sub_row!("path_site_rescue"));
                 let outcome = self
                     .plan_path(config, &view, &request, budget)
                     .map_err(|e| mint_sim::Error::Rules {

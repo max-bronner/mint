@@ -45,7 +45,7 @@ impl RotwkRules {
                 .filter(|ms| *ms > 0)
                 .map_or(Frame::FOREVER, |ms| {
                     tick.frame()
-                        .checked_add(LogicFrames::from_milliseconds(ms))
+                        .checked_add(mint_sage_modules::retail_duration_ticks(ms))
                         .unwrap_or(Frame::FOREVER)
                 });
             self.give_timed_list(tick, ids, entity, id, until)?;

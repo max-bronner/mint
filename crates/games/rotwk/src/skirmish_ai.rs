@@ -59,7 +59,7 @@ pub(crate) fn sorted_tasks(mut tasks: Vec<AiTask>) -> Vec<AiTask> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AiTaskState {
     Pending,
-    Ordered(Entity),
+    Ordered(Entity, [u32; 2]),
     Underway(Entity),
     Built(Entity),
     Destroyed(Frame),
@@ -77,8 +77,10 @@ impl Component for AiProgress {
         for state in &self.tasks {
             match state {
                 AiTaskState::Pending => hasher.write_u8(0),
-                AiTaskState::Ordered(entity) => {
+                AiTaskState::Ordered(entity, spot) => {
                     hasher.write_u8(1);
+                    hasher.write_u32(spot[0]);
+                    hasher.write_u32(spot[1]);
                     entity.hash_into(hasher);
                 }
                 AiTaskState::Underway(entity) => {
@@ -150,12 +152,15 @@ pub(crate) fn structure_timer_frames(
     } else {
         1.0
     };
-    let seconds = if base_seconds > 0.0 {
-        base_seconds / rate
-    } else {
-        0.0
-    };
-    mint_sim::LogicFrames::from_seconds(seconds.max(0.0)).get()
+    let frames =
+        mint_sim::LogicFrames::authored_frames_truncated(base_seconds, crate::game_data::RETAIL_HZ);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let scaled = (frames as f32 / rate) as u32;
+    mint_sim::LogicFrames::from_authored_frames(scaled, crate::game_data::RETAIL_HZ).get()
 }
 
 #[must_use]
@@ -502,6 +507,7 @@ pub(crate) struct AiAttackProgress {
     pub(crate) enemies: Option<EnemyManager>,
     pub(crate) wave: Option<AttackWave>,
     pub(crate) launches: u32,
+    pub(crate) forfeit: Option<forfeit::ForfeitProgress>,
 }
 
 impl AiAttackProgress {
@@ -518,6 +524,7 @@ impl AiAttackProgress {
             enemies,
             wave: None,
             launches: 0,
+            forfeit: None,
         }
     }
 }
@@ -569,8 +576,13 @@ impl Component for AiAttackProgress {
             }
         }
         hasher.write_u32(self.launches);
+        if let Some(forfeit) = &self.forfeit {
+            forfeit.hash_into(hasher);
+        }
     }
 }
+
+pub(crate) mod forfeit;
 
 #[cfg(test)]
 mod tests;

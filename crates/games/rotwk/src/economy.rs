@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use mint_movement::Vec2;
 use mint_sage_economy::{
     Alignment, AutoDeposit, CommandPointPool, CostModifierStacking, CostModifiers, EntryKind,
-    ItemId, Money, ProductionId, ProductionQueue, Progress, QueueRequest,
+    ItemId, ItemTable, Money, ProductionId, ProductionQueue, Progress, QueueRequest,
 };
 use mint_sim::{
     Component, ComponentId, Entity, PlayerId, Result, StateHasher, Tick, UpgradeBit, UpgradeMask,
@@ -177,6 +177,12 @@ impl Component for ObjectUpgrades {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SubUpgrade {
+    pub(crate) bit: UpgradeBit,
+    pub(crate) cost: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UpgradeBuildable {
     pub(crate) name: String,
@@ -184,6 +190,7 @@ pub(crate) struct UpgradeBuildable {
     pub(crate) bit: UpgradeBit,
     pub(crate) is_player: bool,
     pub(crate) cost: i64,
+    pub(crate) subs: Vec<SubUpgrade>,
     pub(crate) build_time: mint_sim::LogicFrames,
     pub(crate) command_button: String,
 }
@@ -242,7 +249,7 @@ pub(crate) struct Buildable {
     pub(crate) output: Output,
     pub(crate) kind: Kind,
     pub(crate) cost: i64,
-    pub(crate) build_time: mint_sim::LogicFrames,
+    pub(crate) build_seconds: f32,
     pub(crate) command_points: i32,
     pub(crate) label: String,
     pub(crate) builder: bool,
@@ -379,6 +386,7 @@ pub(crate) fn cost_modifiers_from_counts(
         production_cost_change_percent,
         kind_of_modifier,
         handicap: 1.0,
+        brutal_reduction: 0.0,
     }
 }
 
@@ -663,17 +671,27 @@ pub(crate) fn exit_point(rally: Vec2, production_id: u32) -> Vec2 {
 
 const EXIT_SPACING: f32 = 25.0;
 
+pub(crate) fn unit_frames_to_produce(
+    world: &World,
+    ids: EconomyIds,
+    structure: Entity,
+    seconds: f32,
+    time: &mint_sage_economy::TimeModifiers,
+) -> mint_sim::LogicFrames {
+    frames_to_produce(
+        world,
+        ids,
+        structure,
+        mint_sage_economy::time_to_build(seconds, time),
+    )
+}
+
 pub(crate) fn frames_to_produce(
     world: &World,
     ids: EconomyIds,
     structure: Entity,
     base: mint_sim::LogicFrames,
-    speed_mult: f32,
 ) -> mint_sim::LogicFrames {
-    let base = mint_sim::LogicFrames::from_frames(crate::experience::scaled_frames(
-        base.get(),
-        speed_mult,
-    ));
     world.get(ids.bonuses, structure).map_or(base, |bonuses| {
         crate::experience::production_time(base, bonuses.0.production)
     })
@@ -710,7 +728,7 @@ fn simultaneous_count(
                 .queue
                 .entries()
                 .iter()
-                .filter(|entry| entry.item == item)
+                .filter(|entry| entry.makes(ItemTable::Objects, item))
                 .count();
             count = count.saturating_add(u32::try_from(queued).unwrap_or(u32::MAX));
         }
@@ -726,6 +744,7 @@ pub(crate) struct QueueRules<'a> {
     pub(crate) gate: Gate<'a>,
     pub(crate) kinds: &'a KindTable,
     pub(crate) upgrade_bits: &'a mint_sage_modules::UpgradeBits,
+    pub(crate) brutal_cost_reduction: f32,
 }
 
 pub(crate) fn queue_at(
@@ -735,7 +754,7 @@ pub(crate) fn queue_at(
     selected: &[Entity],
     button: u8,
     rules: QueueRules<'_>,
-    unit_speed_mult: f32,
+    unit_time: &mint_sage_economy::TimeModifiers,
     production_cost_change_percent: f32,
 ) -> Result<Vec<String>> {
     let QueueRules {
@@ -744,6 +763,7 @@ pub(crate) fn queue_at(
         gate,
         kinds,
         upgrade_bits,
+        brutal_cost_reduction,
     } = rules;
     let mut lines = Vec::new();
     let Some(player_entity) = player_entity(tick.state(), ids, player) else {
@@ -816,34 +836,52 @@ pub(crate) fn queue_at(
             .state()
             .get(ids.purse, player_entity)
             .map_or(Money::new(0), |held| held.0);
-        let points = tick
-            .state()
-            .get(ids.points, player_entity)
-            .map_or(CommandPointPool::new(0), |held| held.0);
-        let build_time = frames_to_produce(
+        let build_time = unit_frames_to_produce(
             tick.state(),
             ids,
             *structure,
-            buildable.build_time,
-            unit_speed_mult,
+            buildable.build_seconds,
+            unit_time,
         );
         let cost = kinds.get(buildable.kind).map_or(buildable.cost, |entry| {
+            if entry.record.has_kind("BUILD_FOR_FREE") {
+                return 0;
+            }
             mint_sage_economy::cost_to_build(
                 buildable.cost,
-                &cost_modifiers_for(
-                    tick.state(),
-                    ids,
-                    kinds,
-                    upgrade_bits,
-                    player,
-                    &PriceTarget::Object {
-                        kind_of: &entry.record.kind_of,
-                        name: &entry.record.name,
-                    },
-                    production_cost_change_percent,
-                ),
+                &CostModifiers {
+                    brutal_reduction: brutal_cost_reduction,
+                    ..cost_modifiers_for(
+                        tick.state(),
+                        ids,
+                        kinds,
+                        upgrade_bits,
+                        player,
+                        &PriceTarget::Object {
+                            kind_of: &entry.record.kind_of,
+                            name: &entry.record.name,
+                        },
+                        production_cost_change_percent,
+                    )
+                },
             )
         });
+        if purse.can_afford(cost) {
+            let free = points_of(tick.state(), ids, player).free();
+            let army_of_dead = kinds
+                .get(buildable.kind)
+                .is_some_and(|entry| entry.record.has_kind("ARMY_OF_DEAD"));
+            if !crate::heroes::command_points_fit(buildable.command_points, free, army_of_dead) {
+                lines.push(format!(
+                    "production: {} refused at entity {} - GUI:ErrorNoMoreCommandPoints \
+                     (needs {}, {free} free)",
+                    buildable.label,
+                    structure.index(),
+                    buildable.command_points
+                ));
+                continue;
+            }
+        }
         let request = QueueRequest {
             item: ItemId::new(u32::from(index)),
             cost,
@@ -857,7 +895,7 @@ pub(crate) fn queue_at(
         let Some(producer) = tick.state_mut().get_mut(ids.producer, *structure) else {
             continue;
         };
-        match producer.queue.queue(request, &mut purse, &points) {
+        match producer.queue.queue(request, &mut purse) {
             Ok(id) => {
                 let depth = producer.queue.entries().len();
                 tick.state_mut()
@@ -945,6 +983,8 @@ pub(crate) fn cancel_at(
     Ok((lines, cancelled_items))
 }
 
+pub(crate) type SubCounted<'a> = &'a dyn Fn(&World, Option<Entity>, UpgradeBit) -> bool;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upgrade_check<'u>(
     world: &World,
@@ -959,6 +999,8 @@ pub(crate) fn upgrade_check<'u>(
     upgrades: &'u [UpgradeBuildable],
     gate: Gate<'_>,
     production_cost_change_percent: f32,
+    brutal_cost_reduction: f32,
+    sub_counted: SubCounted<'_>,
 ) -> core::result::Result<(u16, i64, &'u UpgradeBuildable), String> {
     let player_entity = player_entity(world, ids, player).ok_or("no player")?;
     let owned = world
@@ -1031,7 +1073,10 @@ pub(crate) fn upgrade_check<'u>(
         upgrade_bits,
         player,
         upgrade,
+        Some(structure),
         production_cost_change_percent,
+        brutal_cost_reduction,
+        sub_counted,
     );
     let purse = world
         .get(ids.purse, player_entity)
@@ -1042,6 +1087,7 @@ pub(crate) fn upgrade_check<'u>(
     Ok((index, cost, upgrade))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn upgrade_cost(
     world: &World,
     ids: EconomyIds,
@@ -1049,7 +1095,10 @@ pub(crate) fn upgrade_cost(
     upgrade_bits: &mint_sage_modules::UpgradeBits,
     player: PlayerId,
     upgrade: &UpgradeBuildable,
+    builder: Option<Entity>,
     production_cost_change_percent: f32,
+    brutal_cost_reduction: f32,
+    sub_counted: SubCounted<'_>,
 ) -> i64 {
     let cost_discount_template = upgrade
         .cost_discount_template
@@ -1057,20 +1106,32 @@ pub(crate) fn upgrade_cost(
         .and_then(|name| kinds.kind(name))
         .and_then(|kind| kinds.get(kind))
         .map(|entry| (entry.record.kind_of.as_slice(), entry.record.name.as_str()));
+    let own_cost = if upgrade.subs.is_empty() {
+        upgrade.cost
+    } else {
+        upgrade
+            .subs
+            .iter()
+            .filter(|sub| sub_counted(world, builder, sub.bit))
+            .fold(0_i64, |sum, sub| sum.saturating_add(sub.cost))
+    };
     mint_sage_economy::cost_to_build(
-        upgrade.cost,
-        &cost_modifiers_for(
-            world,
-            ids,
-            kinds,
-            upgrade_bits,
-            player,
-            &PriceTarget::Upgrade {
-                name: &upgrade.name,
-                cost_discount_template,
-            },
-            production_cost_change_percent,
-        ),
+        own_cost,
+        &CostModifiers {
+            brutal_reduction: brutal_cost_reduction,
+            ..cost_modifiers_for(
+                world,
+                ids,
+                kinds,
+                upgrade_bits,
+                player,
+                &PriceTarget::Upgrade {
+                    name: &upgrade.name,
+                    cost_discount_template,
+                },
+                production_cost_change_percent,
+            )
+        },
     )
 }
 
@@ -1088,6 +1149,8 @@ pub(crate) fn queue_upgrade_at(
     upgrades: &[UpgradeBuildable],
     gate: Gate<'_>,
     production_cost_change_percent: f32,
+    brutal_cost_reduction: f32,
+    sub_counted: SubCounted<'_>,
 ) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     let Some(player_entity) = player_entity(tick.state(), ids, player) else {
@@ -1124,6 +1187,8 @@ pub(crate) fn queue_upgrade_at(
             upgrades,
             gate,
             production_cost_change_percent,
+            brutal_cost_reduction,
+            sub_counted,
         ) {
             Ok((index, cost, upgrade)) => (index, cost, upgrade.clone()),
             Err(reason) => {
@@ -1149,10 +1214,7 @@ pub(crate) fn queue_upgrade_at(
         let Some(producer) = tick.state_mut().get_mut(ids.producer, *structure) else {
             continue;
         };
-        match producer
-            .queue
-            .queue(request, &mut purse, &CommandPointPool::new(0))
-        {
+        match producer.queue.queue(request, &mut purse) {
             Ok(id) => {
                 tick.state_mut()
                     .insert(ids.purse, player_entity, Purse(purse))?;

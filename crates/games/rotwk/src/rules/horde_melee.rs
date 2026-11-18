@@ -100,7 +100,7 @@ impl RotwkRules {
     }
 
     pub(super) fn after(now: Frame, ms: u32) -> Frame {
-        now.checked_add(LogicFrames::from_milliseconds(ms))
+        now.checked_add(mint_sage_modules::retail_duration_ticks(ms))
             .unwrap_or(now)
     }
 
@@ -239,6 +239,7 @@ impl RotwkRules {
         goal: Entity,
         now: Frame,
     ) -> bool {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("member_contact"));
         let world = tick.state();
         let body_of = |entity: Entity| -> Option<(Vec2, f32)> {
             if world
@@ -306,6 +307,7 @@ impl RotwkRules {
     }
 
     pub(super) fn fleeing(&self, tick: &Tick<'_>, ids: Ids, from: Vec2, goal: Entity) -> bool {
+        let goal = tick.state().get(ids.member, goal).map_or(goal, |m| m.horde);
         let Some(body) = tick.state().get(ids.body, goal).map(|b| b.0) else {
             return false;
         };
@@ -918,13 +920,15 @@ impl RotwkRules {
         only: Option<&[Foe]>,
         snapshot: &Snapshot<'_>,
     ) -> Option<Foe> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("adjacent_enemy"));
         let armed = tick.state().get(ids.armed, member.entity)?;
         let template = self.combat.weapons.get(armed.weapon).filter(|t| t.melee)?;
         let range = self.attack_range_of(tick.state(), ids, member.entity, template);
+        let footprint = self.footprint_of(tick, ids, member.entity);
         let reaches = |foe: &Foe| {
             (foe.z - member.z).abs() <= ADJACENT_HEIGHT
                 && !foe.unattackable
-                && self.melee_in_reach(tick, ids, member, foe, range)
+                && self.melee_in_reach_from(tick, ids, member, footprint, foe, range)
         };
         let gap = |foe: &Foe| foe.position.minus(member.position).length() - foe.radius;
         let best = |foes: &mut dyn Iterator<Item = Foe>| {
@@ -953,10 +957,11 @@ impl RotwkRules {
             &mut found,
         );
         found.sort_unstable();
+        let relation = self.relation_from(tick.state(), member.entity);
         let mut candidates = found.into_iter().filter_map(|at| {
             #[allow(clippy::cast_possible_truncation)]
             let (foe, _) = snapshot.living.get(at as usize).copied()?;
-            (self.object_hostile(tick.state(), member.entity, foe.entity)
+            (relation.to(foe.entity) == super::map_scripts::Relation::Enemies
                 && tick.state().get(ids.horde, foe.entity).is_none())
             .then_some(foe)
         });
@@ -1317,7 +1322,9 @@ impl RotwkRules {
             tick.state_mut().remove(ids.member_attack, member.entity);
             return Ok(None);
         };
+        let part = crate::perf::sub(crate::perf::sub_row!("member_reach"));
         let reached = self.melee_in_reach(tick, ids, member, &victim, range);
+        drop(part);
         let since = if reached {
             None
         } else {
@@ -1340,6 +1347,7 @@ impl RotwkRules {
                         && super::movement::goal_moved(member.position, seen, victim.position)
                 }));
         if due {
+            let _part = crate::perf::sub(crate::perf::sub_row!("member_replan"));
             let keep = !standing
                 && attack.spot.is_some_and(|spot| {
                     let there = Foe {

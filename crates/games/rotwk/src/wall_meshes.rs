@@ -154,6 +154,7 @@ fn bone_binding(model: &Model<'_>, mesh_name: &str, bones: &[Mat4]) -> Mat4 {
             let Ok(index) = usize::try_from(sub.bone_index) else {
                 return Mat4::IDENTITY;
             };
+            let index = if index < bones.len() { index } else { 0 };
             return bones.get(index).copied().unwrap_or(Mat4::IDENTITY);
         }
     }

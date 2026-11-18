@@ -263,7 +263,7 @@ fn a_landed_object_lies_stunned_for_its_own_shock_times_before_it_takes_an_order
         }
     }
     let (landed, up) = (landed.expect("never landed"), up.expect("never got up"));
-    assert_eq!(up - landed, 45, "landed on {landed}, up on {up}");
+    assert_eq!(up - landed, 48, "landed on {landed}, up on {up}");
 }
 
 #[test]

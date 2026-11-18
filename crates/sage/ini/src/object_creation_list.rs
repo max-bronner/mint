@@ -48,6 +48,80 @@ fn flag(block: &Block, keyword: &str, context: &str, errors: &ValueErrors) -> bo
     read.unwrap_or(false)
 }
 
+pub const DEFAULT_DISPOSITION: &str = "ON_GROUND_ALIGNED";
+
+const DISPOSITION_FLAGS: [&str; 19] = [
+    "LIKE_EXISTING",
+    "ON_GROUND_ALIGNED",
+    "SEND_IT_FLYING",
+    "SEND_IT_UP",
+    "SEND_IT_OUT",
+    "RANDOM_FORCE",
+    "FLOATING",
+    "INHERIT_VELOCITY",
+    "FORWARD_IMPACT",
+    "REVERSE_IMPACT",
+    "BUILDING_CHUNKS",
+    "FADE_AND_DIE_ORNAMENT",
+    "ANIMATED",
+    "ABSOLUTE_ANGLE",
+    "SPAWN_AROUND",
+    "RELATIVE_ANGLE",
+    "SPAWNED_MODELCONDITION_TRIGGER",
+    "USE_WATER_SURFACE",
+    "USE_CLIFF",
+];
+
+fn resolve_disposition(block: &Block, context: &str, errors: &ValueErrors) -> Vec<String> {
+    let mut flags = vec![DEFAULT_DISPOSITION.to_owned()];
+    let Some(field) = block.field("Disposition") else {
+        return flags;
+    };
+    let (mut bare, mut edited) = (false, false);
+    for (index, token) in field.args.iter().enumerate() {
+        if token.eq_ignore_ascii_case("NONE") {
+            if index != 0 {
+                errors.field(context, field, "NONE only as the first flag");
+                return flags;
+            }
+            flags.clear();
+            continue;
+        }
+        let (name, add) = match (token.strip_prefix('+'), token.strip_prefix('-')) {
+            (Some(name), _) => (name, Some(true)),
+            (_, Some(name)) => (name, Some(false)),
+            _ => (token.as_str(), None),
+        };
+        if !DISPOSITION_FLAGS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(name))
+        {
+            errors.field(context, field, "a Disposition flag name");
+            return flags;
+        }
+        let mixed = match add {
+            Some(_) => bare,
+            None => edited,
+        };
+        if mixed {
+            errors.field(context, field, "names, or +/- edits, not both");
+            return flags;
+        }
+        if add.is_none() && !bare {
+            flags.clear();
+            bare = true;
+        }
+        flags.retain(|held| !held.eq_ignore_ascii_case(name));
+        if add.is_some() {
+            edited = true;
+        }
+        if add != Some(false) {
+            flags.push(name.to_owned());
+        }
+    }
+    flags
+}
+
 fn read_entry(
     block: &Block,
     names_keyword: &str,
@@ -85,10 +159,7 @@ fn read_entry(
             .field("Count")
             .and_then(crate::tree::Field::value)
             .and_then(parse_int),
-        disposition: block
-            .field("Disposition")
-            .map(|f| f.args.clone())
-            .unwrap_or_default(),
+        disposition: resolve_disposition(block, context, errors),
         disposition_angle: block
             .field("DispositionAngle")
             .and_then(crate::tree::Field::value)
@@ -295,5 +366,30 @@ mod tests {
         let (def, errors) = one_create_object("ClearRemovables = Sideways");
         assert!(!def.create_object[0].clear_removables);
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn disposition_reads_as_a_bit_string_over_on_ground_aligned() {
+        let read = |line: &str| {
+            let (def, errors) = one_create_object(line);
+            (def.create_object[0].disposition.clone(), errors.len())
+        };
+        assert_eq!(read(""), (vec!["ON_GROUND_ALIGNED".to_owned()], 0));
+        assert_eq!(
+            read("Disposition = ABSOLUTE_ANGLE"),
+            (vec!["ABSOLUTE_ANGLE".to_owned()], 0)
+        );
+        assert_eq!(
+            read("Disposition = +RELATIVE_ANGLE -ON_GROUND_ALIGNED"),
+            (vec!["RELATIVE_ANGLE".to_owned()], 0)
+        );
+        assert_eq!(read("Disposition = NONE"), (Vec::new(), 0));
+        assert_eq!(read("Disposition = LIKE_EXISTING +ANIMATED").1, 1);
+        assert_eq!(read("Disposition = ABSOLUTE_ANGLE NONE").1, 1);
+        assert_eq!(read("Disposition = SEND_IT_SIDEWAYS").1, 1);
+        assert_eq!(
+            read("Disposition = +ANIMATED").0,
+            ["ON_GROUND_ALIGNED", "ANIMATED"]
+        );
     }
 }

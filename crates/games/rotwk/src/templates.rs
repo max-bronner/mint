@@ -8,7 +8,7 @@ use mint_sage_modules::{ObjectRecord, UpgradeBits};
 use mint_sim::{LogicFrames, PlayerId, UpgradeMask};
 
 use crate::defeat::ObjectFilter;
-use crate::economy::{Buildable, Output, UpgradeBuildable};
+use crate::economy::{Buildable, Output, SubUpgrade, UpgradeBuildable};
 use crate::game_data::GameData;
 use crate::unit::{Kind, Kinematics, ProducerSpawn, Shape, Spawn};
 
@@ -789,6 +789,7 @@ impl KindTable {
             health: record
                 .max_health
                 .filter(|health| *health > 0.0 && *health <= MAX_HEALTH),
+            initial_health: record.initial_health,
             weapon: record
                 .weapon
                 .as_deref()
@@ -975,10 +976,8 @@ impl KindTable {
                     cost,
                     &mint_sage_economy::CostModifiers::default(),
                 ),
-                build_time: mint_sage_economy::time_to_build(
-                    record.build_time_seconds,
-                    &mint_sage_economy::TimeModifiers::default(),
-                ),
+                subs: sub_upgrades_of(data, &record.sub_upgrade_template_names, 0),
+                build_time: mint_sage_economy::upgrade_time_to_build(record.build_time_seconds),
                 command_button: command_button.to_owned(),
             });
             upgrade_of.insert(key, index);
@@ -1175,10 +1174,7 @@ impl KindTable {
                 cost,
                 &mint_sage_economy::CostModifiers::default(),
             ),
-            build_time: mint_sage_economy::time_to_build(
-                seconds,
-                &mint_sage_economy::TimeModifiers::default(),
-            ),
+            build_seconds: seconds,
             command_points: points,
             label: record.name.clone(),
             builder: KindOf::parse(&record.kind_of.join(" "))
@@ -1338,7 +1334,10 @@ pub(crate) fn income(record: &ObjectRecord) -> Option<(LogicFrames, i64)> {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let timing = timing as u32;
-    Some((LogicFrames::from_milliseconds(timing), whole(amount)?))
+    Some((
+        mint_sage_modules::retail_duration_ticks(timing),
+        whole(amount)?,
+    ))
 }
 
 pub(crate) fn claimant(record: &ObjectRecord) -> Option<crate::claims::Claimant> {
@@ -1429,6 +1428,38 @@ const DEFAULT_FAST_TURN_RADIUS: f32 = 20.0;
 
 #[allow(clippy::cast_precision_loss)]
 pub(crate) const RETAIL_FRAME_SECONDS: f32 = 1.0 / crate::game_data::RETAIL_LOGIC_HZ as f32;
+
+const MAX_SUB_UPGRADE_DEPTH: u8 = 4;
+
+fn sub_upgrades_of(data: &GameData, names: &[String], depth: u8) -> Vec<SubUpgrade> {
+    if depth >= MAX_SUB_UPGRADE_DEPTH {
+        return Vec::new();
+    }
+    names
+        .iter()
+        .filter_map(|name| {
+            let bit = data.upgrade_bits.bit(name)?;
+            let record = data
+                .upgrade_costs
+                .iter()
+                .find(|u| u.name.eq_ignore_ascii_case(name));
+            let cost = record.map_or(0, |record| {
+                let own = sub_upgrades_of(
+                    data,
+                    &record.sub_upgrade_template_names,
+                    depth.saturating_add(1),
+                );
+                if own.is_empty() {
+                    whole(record.cost).unwrap_or(0)
+                } else {
+                    own.iter()
+                        .fold(0_i64, |sum, sub| sum.saturating_add(sub.cost))
+                }
+            });
+            Some(SubUpgrade { bit, cost })
+        })
+        .collect()
+}
 
 fn whole_frames(ms: f32) -> f32 {
     (ms / (RATE_UNIT_MS * RETAIL_FRAME_SECONDS)).ceil().max(1.0) * RETAIL_FRAME_SECONDS

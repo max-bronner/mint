@@ -41,6 +41,9 @@ pub fn rgb_field(block: &Block, keyword: &str) -> Option<Rgb8> {
 pub struct MultiplayerColorDef {
     pub rgb: Option<Rgb8>,
     pub rgb_night: Option<Rgb8>,
+    pub living_world: Option<Rgb8>,
+    pub living_world_banner: Option<Rgb8>,
+    pub available_in_wotr: Option<bool>,
 }
 
 #[must_use]
@@ -48,6 +51,12 @@ pub fn read_multiplayer_color(block: &Block) -> MultiplayerColorDef {
     MultiplayerColorDef {
         rgb: rgb_field(block, "RGBColor"),
         rgb_night: rgb_field(block, "RGBNightColor"),
+        living_world: rgb_field(block, "LivingWorldColor"),
+        living_world_banner: rgb_field(block, "LivingWorldBannerColor"),
+        available_in_wotr: block
+            .field("AvailableInWotR")
+            .and_then(|field| field.args.first())
+            .and_then(|token| crate::value::parse_bool(token)),
     }
 }
 

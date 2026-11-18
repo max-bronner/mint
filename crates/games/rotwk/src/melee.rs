@@ -313,7 +313,7 @@ impl AmoebaTuning {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let frames = |ms: f32| {
             (ms / 1000.0 * crate::game_data::RETAIL_LOGIC_HZ as f32)
-                .round()
+                .ceil()
                 .clamp(0.0, 1.0e6) as u32
         };
         Self {

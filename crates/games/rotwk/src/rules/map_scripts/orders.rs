@@ -80,7 +80,7 @@ impl Hunters {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum ScriptOrder {
+pub(in crate::rules) enum ScriptOrder {
     Move(Vec2, bool),
     AttackMove(Vec2, bool),
     Attack(Entity),
@@ -172,7 +172,7 @@ impl RotwkRules {
         self.issue_order_to(tick, ids, &awake, order)
     }
 
-    pub(super) fn issue_order_to(
+    pub(in crate::rules) fn issue_order_to(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
@@ -187,7 +187,7 @@ impl RotwkRules {
                 rules.issue_order(tick, ids, actor, HeldOrder::AttackMove(to, queue))
             }
             ScriptOrder::Attack(target) => {
-                rules.issue_order(tick, ids, actor, HeldOrder::AttackObject(target))
+                rules.issue_order(tick, ids, actor, HeldOrder::ScriptAttackObject(target))
             }
             ScriptOrder::Enter(container) => rules.enter_container(tick, ids, actor, container),
             ScriptOrder::Stop => rules.stop(tick, ids, actor),

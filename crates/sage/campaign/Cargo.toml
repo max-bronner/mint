@@ -1,0 +1,18 @@
+[package]
+name = "mint-sage-campaign"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 2
+tier = "sage"
+
+[lints]
+workspace = true
+
+[dependencies]
+mint-sage-save = { path = "../save" }
+mint-math = { path = "../../core/math" }

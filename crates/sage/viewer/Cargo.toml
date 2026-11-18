@@ -1,0 +1,24 @@
+[package]
+name = "mint-sage-viewer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 4
+
+[dependencies]
+mint-app = { path = "../../core/app" }
+mint-render = { path = "../../core/render" }
+mint-vfs = { path = "../../core/vfs" }
+mint-image = { path = "../../core/image" }
+mint-sage-big = { path = "../big" }
+mint-sage-model = { path = "../model" }
+mint-sage-w3d = { path = "../w3d" }
+mint-sage-asset = { path = "../asset" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "mint-sage-fx"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 0
+kind = "format"
+
+[dependencies]
+mint-math = { path = "../../core/math" }
+thiserror.workspace = true
+mint-bytes = { path = "../../core/bytes" }
+
+[dev-dependencies]
+mint-sage-big = { path = "../big" }
+mint-vfs = { path = "../../core/vfs" }
+
+[lints]
+workspace = true

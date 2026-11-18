@@ -1,0 +1,18 @@
+[package]
+name = "mint-sage-save"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 0
+kind = "format"
+
+[dependencies]
+thiserror.workspace = true
+mint-bytes = { path = "../../core/bytes" }
+
+[lints]
+workspace = true

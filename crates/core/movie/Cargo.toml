@@ -1,0 +1,17 @@
+[package]
+name = "mint-movie"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 3
+
+[dependencies]
+mint-render = { path = "../render" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

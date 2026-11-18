@@ -1,0 +1,19 @@
+[package]
+name = "mint-sim"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 2
+tier = "core"
+
+[dependencies]
+mint-ecs = { path = "../ecs" }
+mint-math = { path = "../math" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

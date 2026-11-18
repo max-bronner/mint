@@ -1,0 +1,23 @@
+[package]
+name = "mint-sage-map"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 0
+kind = "format"
+
+[dependencies]
+thiserror.workspace = true
+mint-bytes = { path = "../../core/bytes" }
+mint-sage-refpack = { path = "../refpack" }
+
+[dev-dependencies]
+mint-sage-big = { path = "../big" }
+mint-math = { path = "../../core/math" }
+
+[lints]
+workspace = true

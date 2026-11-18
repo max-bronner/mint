@@ -1,0 +1,20 @@
+[package]
+name = "mint-game-bfme2"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 4
+
+[[bin]]
+name = "mint-bfme2"
+path = "src/main.rs"
+
+[dependencies]
+mint-game-rotwk = { path = "../rotwk" }
+
+[lints]
+workspace = true

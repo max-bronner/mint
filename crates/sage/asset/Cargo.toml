@@ -1,0 +1,24 @@
+[package]
+name = "mint-sage-asset"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 1
+
+[dependencies]
+thiserror.workspace = true
+mint-bytes = { path = "../../core/bytes" }
+mint-vfs = { path = "../../core/vfs" }
+mint-sage-w3d = { path = "../w3d" }
+mint-math = { path = "../../core/math" }
+mint-sage-cah = { path = "../cah" }
+
+[dev-dependencies]
+mint-sage-big = { path = "../big" }
+
+[lints]
+workspace = true

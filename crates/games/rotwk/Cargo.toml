@@ -1,0 +1,64 @@
+[package]
+name = "mint-game-rotwk"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 4
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mint-rotwk"
+path = "src/main.rs"
+
+[dependencies]
+mint-app = { path = "../../core/app" }
+mint-cursor = { path = "../../core/cursor" }
+mint-render = { path = "../../core/render" }
+mint-sim = { path = "../../core/sim" }
+mint-movement = { path = "../../core/movement" }
+mint-vfs = { path = "../../core/vfs" }
+mint-pool = { path = "../../core/pool" }
+mint-sage-big = { path = "../../sage/big" }
+mint-sage-particle = { path = "../../sage/particle" }
+mint-sage-map = { path = "../../sage/map" }
+mint-sage-scene = { path = "../../sage/scene" }
+mint-sage-terrain = { path = "../../sage/terrain" }
+mint-sage-model = { path = "../../sage/model" }
+mint-sage-w3d = { path = "../../sage/w3d" }
+mint-sage-asset = { path = "../../sage/asset" }
+mint-sage-cah = { path = "../../sage/cah" }
+mint-sage-audio = { path = "../../sage/audio" }
+mint-sage-passability = { path = "../../sage/passability" }
+mint-sage-combat = { path = "../../sage/combat" }
+mint-sage-formation = { path = "../../sage/formation" }
+mint-sage-economy = { path = "../../sage/economy" }
+mint-sage-shroud = { path = "../../sage/shroud" }
+mint-sage-ini = { path = "../../sage/ini" }
+mint-movie = { path = "../../core/movie" }
+mint-sage-movie = { path = "../../sage/movie" }
+mint-sage-campaign = { path = "../../sage/campaign" }
+mint-sage-save = { path = "../../sage/save" }
+mint-sage-modules = { path = "../../sage/modules" }
+mint-ui = { path = "../../core/ui" }
+mint-sage-apt-viewer = { path = "../../sage/apt-viewer" }
+mint-sage-apt-player = { path = "../../sage/apt-player" }
+mint-sage-wnd = { path = "../../sage/wnd" }
+mint-math = { path = "../../core/math" }
+thiserror.workspace = true
+mint-sage-str = { path = "../../sage/str" }
+mint-sage-ini-coverage = { path = "../../sage/ini-coverage", optional = true }
+
+[features]
+ini-census = ["dep:mint-sage-ini-coverage", "mint-sage-ini/coverage"]
+
+[dev-dependencies]
+mint-sage-apt-player = { path = "../../sage/apt-player", features = ["synth-testing"] }
+
+[lints]
+workspace = true

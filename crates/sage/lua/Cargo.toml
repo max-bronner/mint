@@ -1,0 +1,16 @@
+[package]
+name = "mint-sage-lua"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 0
+kind = "format"
+
+[dependencies]
+
+[lints]
+workspace = true

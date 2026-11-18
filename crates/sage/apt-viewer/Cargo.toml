@@ -1,0 +1,32 @@
+[package]
+name = "mint-sage-apt-viewer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 4
+
+[dependencies]
+mint-app = { path = "../../core/app" }
+mint-render = { path = "../../core/render" }
+mint-ui = { path = "../../core/ui" }
+mint-sage-apt = { path = "../apt" }
+mint-sage-apt-player = { path = "../apt-player" }
+mint-sage-big = { path = "../big" }
+mint-image = { path = "../../core/image" }
+mint-sage-str = { path = "../str" }
+mint-sage-ini = { path = "../ini" }
+mint-vfs = { path = "../../core/vfs" }
+mint-sage-asset = { path = "../asset" }
+mint-sage-wnd = { path = "../wnd" }
+mint-pool = { path = "../../core/pool" }
+thiserror.workspace = true
+
+[dev-dependencies]
+mint-sage-apt-player = { path = "../apt-player", features = ["synth-testing"] }
+
+[lints]
+workspace = true

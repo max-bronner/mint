@@ -1,0 +1,23 @@
+[package]
+name = "mint-sage-ini-coverage"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 4
+
+[[bin]]
+name = "ini-coverage"
+path = "src/main.rs"
+
+[dependencies]
+mint-sage-ini = { path = "../ini", features = ["coverage"] }
+mint-sage-big = { path = "../big" }
+mint-sage-modules = { path = "../modules" }
+mint-sim = { path = "../../core/sim" }
+
+[lints]
+workspace = true

@@ -1,0 +1,126 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/games/rotwk",
+    "crates/games/bfme2",
+    "crates/core/app",
+    "crates/core/audio",
+    "crates/core/audio-format",
+    "crates/core/bytes",
+    "crates/core/cursor",
+    "crates/core/ecs",
+    "crates/core/image",
+    "crates/core/math",
+    "crates/core/movement",
+    "crates/core/movie",
+    "crates/core/pool",
+    "crates/core/render",
+    "crates/core/sim",
+    "crates/core/ui",
+    "crates/core/vfs",
+    "crates/core/vp6",
+    "crates/sage/asset",
+    "crates/sage/audio",
+    "crates/sage/apt",
+    "crates/sage/apt-player",
+    "crates/sage/apt-viewer",
+    "crates/sage/big",
+    "crates/sage/campaign",
+    "crates/sage/combat",
+    "crates/sage/economy",
+    "crates/sage/formation",
+    "crates/sage/fx",
+    "crates/sage/fx-viewer",
+    "crates/sage/ini",
+    "crates/sage/ini-coverage",
+    "crates/sage/lua",
+    "crates/sage/map",
+    "crates/sage/model",
+    "crates/sage/modules",
+    "crates/sage/movie",
+    "crates/sage/particle",
+    "crates/sage/passability",
+    "crates/sage/cah",
+    "crates/sage/refpack",
+    "crates/sage/save",
+    "crates/sage/scene",
+    "crates/sage/str",
+    "crates/sage/shroud",
+    "crates/sage/terrain",
+    "crates/sage/viewer",
+    "crates/sage/vp6",
+    "crates/sage/w3d",
+    "crates/sage/wnd",
+]
+
+[workspace.dependencies]
+thiserror = "1"
+byteorder = "1"
+tracing = "0.1"
+jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
+libm = { version = "=0.2.16", default-features = false, features = ["force-soft-floats"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
+skrifa = { version = "0.46", default-features = false, features = ["std"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+] }
+
+rayon = "1.12"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unknown_lints = "deny"
+renamed_and_removed_lints = "deny"
+missing_docs = "allow"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+collapsible_match = "allow"
+if_same_then_else = "allow"
+manual_map = "allow"
+match_like_matches_macro = "allow"
+needless_return = "allow"
+question_mark = "allow"
+single_match = "allow"
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+arithmetic_side_effects = "allow"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.play]
+inherits = "release"
+codegen-units = 16
+lto = false
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

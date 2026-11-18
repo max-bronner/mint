@@ -1,0 +1,24 @@
+[package]
+name = "mint-sage-ini"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 0
+kind = "format"
+
+[features]
+coverage = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+mint-sage-big = { path = "../big" }
+mint-sage-map = { path = "../map" }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "mint-render"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 3
+
+[dependencies]
+wgpu.workspace = true
+thiserror.workspace = true
+mint-math = { path = "../math" }
+mint-pool = { path = "../pool" }
+
+[lints]
+workspace = true

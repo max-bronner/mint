@@ -1,0 +1,26 @@
+[package]
+name = "mint-sage-model"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 3
+
+[dependencies]
+mint-pool = { path = "../../core/pool" }
+mint-render = { path = "../../core/render" }
+mint-sage-w3d = { path = "../w3d" }
+mint-sage-asset = { path = "../asset" }
+mint-sage-ini = { path = "../ini" }
+mint-image = { path = "../../core/image" }
+mint-vfs = { path = "../../core/vfs" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mint-sage-big = { path = "../big" }
+[lints]
+workspace = true

@@ -1,0 +1,961 @@
+use std::collections::BTreeSet;
+
+use super::*;
+
+use mint_movement::{CellFlags, GridExtent, Passability};
+use mint_sage_formation::{GroupMember, GroupSpacing, NO_FORMATION};
+use mint_sage_passability::PINCHED;
+
+use crate::goal_cells::{self, Footprint};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GroupFormation {
+    pub(crate) spacing: GroupSpacing,
+    pub(crate) use_formations: bool,
+    pub(crate) attack_move_uses_formations: bool,
+    pub(crate) hordes_wait_for_hordes: bool,
+    pub(crate) click_to_gather_area_factor: f32,
+    pub(crate) narrow_passage_scale: f32,
+}
+
+impl Default for GroupFormation {
+    fn default() -> Self {
+        Self {
+            spacing: GroupSpacing {
+                column_width: 60.0,
+                row_depth: 55.0,
+                squad_spacing: 30.0,
+                columns: 2,
+            },
+            use_formations: true,
+            attack_move_uses_formations: true,
+            hordes_wait_for_hordes: true,
+            click_to_gather_area_factor: 0.5,
+            narrow_passage_scale: 0.4,
+        }
+    }
+}
+
+const RECENT_DAMAGE_TICKS: u64 = 4 * SIMULATION_HZ as u64;
+
+pub(super) struct FormationOrder {
+    pub(super) points: BTreeMap<Entity, Vec<Vec2>>,
+    pub(super) facing: Facing,
+}
+
+impl FormationOrder {
+    pub(super) fn destinations(&self) -> BTreeMap<Entity, Vec2> {
+        self.points
+            .iter()
+            .filter_map(|(entity, points)| Some((*entity, *points.last()?)))
+            .collect()
+    }
+
+    pub(super) fn via(&self, entity: Entity) -> &[Vec2] {
+        self.points
+            .get(&entity)
+            .and_then(|points| points.split_last())
+            .map_or(&[], |(_, via)| via)
+    }
+}
+
+impl RotwkRules {
+    pub(super) fn group_move_tightens(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        movers: &[Entity],
+        goal: Vec2,
+    ) -> bool {
+        let factor = self.group_formation.click_to_gather_area_factor;
+        if factor <= 0.0 || movers.len() < 2 {
+            return false;
+        }
+        let mut positions = movers
+            .iter()
+            .filter_map(|entity| tick.state().get(ids.body, *entity).map(|b| b.0.position));
+        let Some(first) = positions.next() else {
+            return false;
+        };
+        let (mut min, mut max) = (first, first);
+        for p in positions {
+            min = Vec2::new(min.x.min(p.x), min.y.min(p.y));
+            max = Vec2::new(max.x.max(p.x), max.y.max(p.y));
+        }
+        let centre = min.plus(max).scale(0.5);
+        let half = max.minus(min).scale(0.5 * factor);
+        let (scaled_min, scaled_max) = (centre.minus(half), centre.plus(half));
+        let inside = goal.x >= scaled_min.x
+            && goal.x <= scaled_max.x
+            && goal.y >= scaled_min.y
+            && goal.y <= scaled_max.y;
+        if !inside {
+            return false;
+        }
+        if movers
+            .iter()
+            .any(|entity| self.flies_itself(tick.state(), ids, *entity))
+        {
+            return false;
+        }
+        let cell_size = self.passability.geometry.cell_size();
+        let width_cells = (max.x - min.x) / cell_size;
+        let height_cells = (max.y - min.y) / cell_size;
+        width_cells * height_cells < 2000.0
+    }
+
+    pub(super) fn formation_order(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        movers: &[Entity],
+        goal: Vec2,
+        pipeline: &mut Pipeline,
+    ) -> Result<Option<FormationOrder>> {
+        if movers.len() < 2 || !self.group_formation.use_formations {
+            return Ok(None);
+        }
+        let members: Vec<(Entity, GroupMember)> = movers
+            .iter()
+            .filter_map(|entity| Some((*entity, self.group_member(tick, ids, *entity)?)))
+            .collect();
+        if !members
+            .iter()
+            .any(|(_, m)| m.priority.is_some_and(|p| p != NO_FORMATION))
+        {
+            return Ok(None);
+        }
+        let Some(nodes) = self.group_path(tick, ids, &members, goal, pipeline)? else {
+            return Ok(None);
+        };
+        if nodes.iter().any(|node| self.narrow_at(*node)) {
+            return Ok(None);
+        }
+        let (Some(&from), Some(&to), Some(&end)) = (nodes.first(), nodes.get(1), nodes.last())
+        else {
+            return Ok(None);
+        };
+        let group: Vec<GroupMember> = members.iter().map(|(_, m)| *m).collect();
+        let spacing = self.group_formation.spacing;
+        let slots = mint_sage_formation::lay_out(&group, from, to, spacing);
+
+        let row_depth = spacing.row_depth;
+        #[allow(clippy::cast_precision_loss)]
+        let reach = members
+            .iter()
+            .zip(&slots)
+            .map(|((_, m), slot)| m.depth as f32 * row_depth - slot.x)
+            .fold(0.0, f32::max);
+        let now = tick.frame().get();
+        let recently_damaged = members.iter().any(|(entity, _)| {
+            tick.state()
+                .get(
+                    ids.last_attacker,
+                    Self::commanded_unit(tick.state(), ids, *entity),
+                )
+                .is_some_and(|last| now.saturating_sub(last.at.get()) < RECENT_DAMAGE_TICKS)
+        });
+        let form_up = form_up_distance(row_depth, reach, recently_damaged);
+        let walk = Walk::along(&nodes, form_up, 2.0 * row_depth);
+        let own: Vec<Entity> = members.iter().map(|(entity, _)| *entity).collect();
+        let idle = self.idle_unit_cells(tick, ids, &own);
+        let ground_view = self.dynamic_view(tick, ids);
+        let adjust = |anchor: Vec2, p: Vec2| {
+            self.adjust_ground_path_position(&ground_view, &idle, anchor, p)
+        };
+        let start = walk.start;
+        let facing_from = walk
+            .end_node
+            .and_then(|i| nodes.get(i))
+            .copied()
+            .unwrap_or(from);
+        let facing = Facing::from_vector(end.minus(facing_from))
+            .or_else(|| Facing::from_vector(end.minus(from)))
+            .unwrap_or(Facing::from_radians(0.0));
+
+        let mut points = BTreeMap::new();
+        for ((entity, member), slot) in members.iter().zip(&slots) {
+            let Some(position) = tick.state().get(ids.body, *entity).map(|b| b.0.position) else {
+                continue;
+            };
+            let mover = self.mover_class(tick, ids, *entity);
+            let use_form_point = walk.form_point.is_some_and(|f| {
+                self.line_clear(tick, ids, mover, position, start)
+                    || self.line_clear(tick, ids, mover, position, f)
+            });
+            let narrow_scale = |point: Vec2| {
+                if self.narrow_at(point) {
+                    self.group_formation.narrow_passage_scale
+                } else {
+                    1.0
+                }
+            };
+            let (mut list, previous) =
+                walk.member_points(&nodes, *slot, use_form_point, &narrow_scale, &adjust);
+            let destination = if member.priority == Some(NO_FORMATION) {
+                end
+            } else {
+                let slot = slot.scale(narrow_scale(end));
+                let raw = end.plus(mint_sage_formation::rotate_offset(previous, end, slot));
+                adjust(end, raw)
+            };
+            list.push(if self.passability.cell_at(destination).is_some() {
+                destination
+            } else {
+                end
+            });
+            points.insert(*entity, list);
+        }
+        crate::diag::diag!(
+            "formation: {} movers, path {nodes:?}, final facing {:.1} deg",
+            members.len(),
+            facing.radians().to_degrees()
+        );
+        for ((entity, member), slot) in members.iter().zip(&slots) {
+            crate::diag::diag!(
+                "formation: entity {} class {:?} width {} depth {} slot ({:.2}, {:.2}) points {:?}",
+                entity.index(),
+                member.priority,
+                member.width,
+                member.depth,
+                slot.x,
+                slot.y,
+                points.get(entity)
+            );
+        }
+        Ok(Some(FormationOrder { points, facing }))
+    }
+
+    fn group_member(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> Option<GroupMember> {
+        let position = tick.state().get(ids.body, entity)?.0.position;
+        let kind = tick.state().get(ids.kind, entity).copied();
+        let entry = kind.and_then(|kind| self.kinds.get(kind));
+        let units = |value: Option<f32>| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            value
+                .filter(|v| v.is_finite())
+                .map_or(1, |v| v.round().clamp(0.0, 64.0) as u32)
+        };
+        Some(GroupMember {
+            position,
+            priority: entry
+                .and_then(|entry| entry.flight)
+                .map(|flight| flight.formation_priority),
+            width: units(entry.and_then(|entry| entry.record.formation_width)),
+            depth: units(entry.and_then(|entry| entry.record.formation_depth)),
+        })
+    }
+
+    fn group_path(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        members: &[(Entity, GroupMember)],
+        goal: Vec2,
+        pipeline: &mut Pipeline,
+    ) -> Result<Option<Vec<Vec2>>> {
+        let world = tick.state();
+        #[allow(clippy::cast_precision_loss)]
+        let count = members.len() as f32;
+        let mut centre = members
+            .iter()
+            .fold(Vec2::ZERO, |sum, (_, m)| sum.plus(m.position))
+            .scale(1.0 / count);
+        let grounded: Vec<&(Entity, GroupMember)> = members
+            .iter()
+            .filter(|(entity, _)| !self.has_kind_bit(world, ids, *entity, "AIRCRAFT"))
+            .collect();
+        let nearest = grounded.iter().min_by(|(a, ma), (b, mb)| {
+            let d = |m: &GroupMember| m.position.minus(centre).length_squared();
+            d(ma).total_cmp(&d(mb)).then(a.index().cmp(&b.index()))
+        });
+        if let Some((entity, member)) = nearest {
+            let mover = self.mover_class(tick, ids, *entity);
+            if !self.line_clear(tick, ids, mover, member.position, centre) {
+                centre = member.position;
+            }
+        }
+        let has = |entity: Entity, bit: &str| self.has_kind_bit(world, ids, entity, bit);
+        let representative = grounded
+            .iter()
+            .find(|(e, _)| has(*e, "MONSTER"))
+            .or_else(|| {
+                grounded
+                    .iter()
+                    .find(|(e, _)| has(*e, "CAVALRY") || has(*e, "MACHINE"))
+            })
+            .or_else(|| grounded.iter().find(|(e, _)| has(*e, "INFANTRY")));
+        let Some((representative, _)) = representative else {
+            return Ok(None);
+        };
+        let mover = self.mover_class(tick, ids, *representative);
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        let (Some(start), Some(raw_goal_cell)) = (
+            self.start_cell_toward(tick, ids, centre, goal, mover),
+            self.passable_cell_for(tick, ids, goal, mover),
+        ) else {
+            return Ok(None);
+        };
+        let own: Vec<Entity> = members.iter().map(|(entity, _)| *entity).collect();
+        let idle = self.idle_unit_cells(tick, ids, &own);
+        let base_view = self.dynamic_view(tick, ids);
+        let cost_view =
+            self.unit_cost_view_for(tick, ids, *representative, &base_view, Footprint::EIGHT);
+        let view = GroundPathView {
+            inner: &cost_view,
+            extent,
+            idle: &idle,
+        };
+        let goal_cell = if clear_diameter(&view, extent, &idle, raw_goal_cell, 4) {
+            raw_goal_cell
+        } else {
+            goal_probe(&view, extent, &idle, raw_goal_cell).unwrap_or(raw_goal_cell)
+        };
+        let request = PathRequest {
+            start,
+            goal: goal_cell,
+            mover,
+            goal_id: GoalId(u64::from(representative.index())),
+            origin: Some(centre),
+            corner_radius: 0.0,
+            departure: None,
+        };
+        let mut budget = NodeBudget::new(super::movement::PATH_NODE_BUDGET);
+        let outcome = pipeline
+            .plan(&view, geometry, &request, &mut budget)
+            .map_err(|e| mint_sim::Error::Rules {
+                frame: tick.frame().get(),
+                reason: format!("planning a group path: {e}"),
+            })?;
+        let PlanOutcome::Ready(plan) = outcome else {
+            return Ok(None);
+        };
+        let straightened = straighten_group_path(&view, mover, &plan.cells.cells);
+        let inner = straightened.len().saturating_sub(1);
+        let mut nodes = vec![centre];
+        nodes.extend(
+            straightened
+                .iter()
+                .take(inner)
+                .skip(1)
+                .map(|cell| geometry.centre_of(*cell)),
+        );
+        nodes.push(goal);
+        Ok(Some(nodes))
+    }
+
+    fn idle_unit_cells(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        exclude: &[Entity],
+    ) -> BTreeSet<(i32, i32)> {
+        let world = tick.state();
+        let mut cells = BTreeSet::new();
+        let Some(store) = world.store(ids.shape) else {
+            return cells;
+        };
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        for (entity, shape) in store.iter() {
+            if exclude.contains(&entity)
+                || world.contains(ids.horde, entity)
+                || world.contains(ids.member, entity)
+                || shape.kind_of.contains(super::KindOf::IMMOBILE)
+                || world.contains(ids.flight, entity)
+                || world.contains(ids.doomed, entity)
+                || world.contains(ids.concealed, entity)
+                || world.contains(ids.path, entity)
+            {
+                continue;
+            }
+            let Some(body) = world.get(ids.body, entity) else {
+                continue;
+            };
+            let footprint = self.footprint_of(tick, ids, entity);
+            let Some(rect) = goal_cells::rect(
+                extent,
+                goal_cells::anchor(geometry, body.0.position, footprint),
+                footprint,
+            ) else {
+                continue;
+            };
+            let (x0, y0, x1, y1) = rect.span();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    cells.insert((x, y));
+                }
+            }
+        }
+        cells
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_via(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        pipeline: &mut Pipeline,
+        entity: Entity,
+        mover: MoverClass,
+        from: (Cell, Vec2),
+        via: &[Vec2],
+    ) -> Result<(Cell, Vec2, Vec<Vec2>)> {
+        let (mut cell, mut origin) = from;
+        let mut points: Vec<Vec2> = Vec::new();
+        for point in via {
+            let Some(goal) = self.passable_cell_for(tick, ids, *point, mover) else {
+                continue;
+            };
+            let request = PathRequest {
+                start: cell,
+                goal,
+                mover,
+                goal_id: GoalId(u64::from(entity.index())),
+                origin: Some(origin),
+                corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
+                departure: self.departure(tick, ids, entity),
+            };
+            let mut budget = NodeBudget::new(super::movement::PATH_NODE_BUDGET);
+            let view = self.dynamic_view(tick, ids);
+            let view = self
+                .unit_cost_view(tick, ids, entity, &view)
+                .exempting(&[goal]);
+            let outcome = pipeline
+                .plan_closest(&view, self.passability.geometry, &request, &mut budget)
+                .map_err(|e| mint_sim::Error::Rules {
+                    frame: tick.frame().get(),
+                    reason: format!(
+                        "planning a formation leg for entity {}: {e}",
+                        entity.index()
+                    ),
+                })?;
+            let (plan, exact) = match outcome {
+                PlanOutcome::Ready(plan) => (plan, true),
+                PlanOutcome::Closest(plan) => (plan, false),
+                _ => continue,
+            };
+            let mut leg = plan.route.points;
+            if exact && self.passability.cell_at(*point) == Some(goal) {
+                if let Some(last) = leg.last_mut() {
+                    *last = *point;
+                }
+            }
+            let (Some(&end), Some(&end_cell)) = (leg.last(), plan.cells.cells.last()) else {
+                continue;
+            };
+            let skip = usize::from(!points.is_empty());
+            points.extend(leg.into_iter().skip(skip));
+            cell = end_cell;
+            origin = end;
+        }
+        Ok((cell, origin, points))
+    }
+
+    pub(super) fn narrow_at(&self, point: Vec2) -> bool {
+        self.passability.cell_at(point).is_some_and(|cell| {
+            self.passability
+                .grid
+                .flags(cell)
+                .intersects(mint_sage_passability::NARROW_PASSAGE)
+        })
+    }
+
+    pub(super) fn line_clear(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        mover: MoverClass,
+        from: Vec2,
+        to: Vec2,
+    ) -> bool {
+        let (Some(a), Some(b)) = (self.passability.cell_at(from), self.passability.cell_at(to))
+        else {
+            return false;
+        };
+        let view = self.dynamic_view(tick, ids);
+        mint_movement::smoothing::line_is_passable(&view, mover, a, b)
+    }
+
+    pub(super) fn adjust_ground_path_position(
+        &self,
+        view: &dyn Passability,
+        idle: &BTreeSet<(i32, i32)>,
+        anchor: Vec2,
+        p: Vec2,
+    ) -> Vec2 {
+        adjust_ground_path_position(
+            view,
+            self.passability.geometry,
+            self.passability.grid.extent(),
+            idle,
+            anchor,
+            p,
+        )
+    }
+}
+
+fn adjust_ground_path_position(
+    view: &dyn Passability,
+    geometry: mint_movement::CellGeometry,
+    extent: GridExtent,
+    idle: &BTreeSet<(i32, i32)>,
+    anchor: Vec2,
+    p: Vec2,
+) -> Vec2 {
+    let (Some(from), Some(to)) = (
+        geometry.cell_at(anchor, 0, extent),
+        geometry.cell_at(p, 0, extent),
+    ) else {
+        return p;
+    };
+    if from == to {
+        return p;
+    }
+    let cells = bresenham_cells(from, to);
+    let mut last_clear: Option<Cell> = None;
+    for cell in &cells {
+        if clear_diameter(view, extent, idle, *cell, 4) {
+            last_clear = Some(*cell);
+        } else {
+            break;
+        }
+    }
+    match last_clear {
+        None => anchor,
+        Some(cell) if cells.last() == Some(&cell) => p,
+        Some(cell) => geometry.centre_of(cell),
+    }
+}
+
+fn clear_diameter(
+    view: &dyn Passability,
+    extent: GridExtent,
+    idle: &BTreeSet<(i32, i32)>,
+    cell: Cell,
+    d: u16,
+) -> bool {
+    let r = i32::from(d / 2);
+    let (lo, hi) = if r == 0 {
+        (0, 0)
+    } else {
+        (-r, r.saturating_sub(1))
+    };
+    let cx = i32::from(cell.x);
+    let cy = i32::from(cell.y);
+    for dy in lo..=hi {
+        for dx in lo..=hi {
+            if r > 1 && (dx == lo || dx == hi) && (dy == lo || dy == hi) {
+                continue;
+            }
+            let (Ok(nx), Ok(ny)) = (
+                u16::try_from(cx.saturating_add(dx)),
+                u16::try_from(cy.saturating_add(dy)),
+            ) else {
+                return false;
+            };
+            let n = Cell::new(nx, ny);
+            if !extent.contains(n) {
+                return false;
+            }
+            if view.flags(n).intersects(GROUND.blocked_by) {
+                return false;
+            }
+            if d >= 2 && idle.contains(&(i32::from(n.x), i32::from(n.y))) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn clear_width(
+    view: &dyn Passability,
+    extent: GridExtent,
+    idle: &BTreeSet<(i32, i32)>,
+    cell: Cell,
+) -> u16 {
+    if clear_diameter(view, extent, idle, cell, 4) {
+        4
+    } else if clear_diameter(view, extent, idle, cell, 2) {
+        2
+    } else {
+        0
+    }
+}
+
+struct GroundPathView<'a> {
+    inner: &'a dyn Passability,
+    extent: GridExtent,
+    idle: &'a BTreeSet<(i32, i32)>,
+}
+
+impl Passability for GroundPathView<'_> {
+    fn extent(&self) -> GridExtent {
+        self.inner.extent()
+    }
+
+    fn flags(&self, cell: Cell) -> CellFlags {
+        self.inner.flags(cell)
+    }
+
+    fn extra_cost(&self, cell: Cell) -> u32 {
+        let clear = u32::from(clear_width(self.inner, self.extent, self.idle, cell));
+        self.inner
+            .extra_cost(cell)
+            .saturating_add(6u32.saturating_mul(4u32.saturating_sub(clear)))
+    }
+
+    fn admits(&self, cell: Cell, asker: mint_movement::Asker) -> bool {
+        self.inner.admits(cell, asker)
+    }
+
+    fn is_passable(&self, cell: Cell, mover: MoverClass) -> bool {
+        self.inner.is_passable(cell, mover) && !self.inner.flags(cell).intersects(PINCHED)
+    }
+
+    fn line_clear(&self, cell: Cell, _mover: MoverClass) -> bool {
+        clear_diameter(self.inner, self.extent, self.idle, cell, 4)
+            && !self.inner.flags(cell).intersects(PINCHED)
+    }
+
+    fn portal_at(&self, cell: Cell) -> Option<mint_movement::Portal> {
+        self.inner.portal_at(cell)
+    }
+
+    fn admits_step(&self, from: Cell, to: Cell, mover: MoverClass) -> bool {
+        self.inner.admits_step(from, to, mover)
+    }
+}
+
+fn goal_probe(
+    view: &dyn Passability,
+    extent: GridExtent,
+    idle: &BTreeSet<(i32, i32)>,
+    cell: Cell,
+) -> Option<Cell> {
+    const OFFSETS: [(i32, i32); 8] = [
+        (0, -1),
+        (0, 1),
+        (-1, 0),
+        (1, 0),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+    ];
+    OFFSETS.iter().find_map(|(dx, dy)| {
+        let (Ok(nx), Ok(ny)) = (
+            u16::try_from(i32::from(cell.x).saturating_add(*dx)),
+            u16::try_from(i32::from(cell.y).saturating_add(*dy)),
+        ) else {
+            return None;
+        };
+        let n = Cell::new(nx, ny);
+        (extent.contains(n) && clear_diameter(view, extent, idle, n, 4)).then_some(n)
+    })
+}
+
+fn bresenham_cells(from: Cell, to: Cell) -> Vec<Cell> {
+    if from.layer != to.layer {
+        return vec![from];
+    }
+    let mut x = i32::from(from.x);
+    let mut y = i32::from(from.y);
+    let target_x = i32::from(to.x);
+    let target_y = i32::from(to.y);
+    let dx = target_x.saturating_sub(x).abs();
+    let dy = target_y.saturating_sub(y).abs();
+    let step_x = if target_x > x { 1 } else { -1 };
+    let step_y = if target_y > y { 1 } else { -1 };
+    let mut error = dx.saturating_sub(dy);
+    let cap = dx.saturating_add(dy).saturating_add(1);
+    let mut cells = Vec::new();
+    for _ in 0..=cap {
+        let (Ok(cx), Ok(cy)) = (u16::try_from(x), u16::try_from(y)) else {
+            break;
+        };
+        cells.push(Cell::on_layer(cx, cy, from.layer));
+        if x == target_x && y == target_y {
+            break;
+        }
+        let doubled = error.saturating_mul(2);
+        if doubled > dy.saturating_neg() {
+            error = error.saturating_sub(dy);
+            x = x.saturating_add(step_x);
+        }
+        if doubled < dx {
+            error = error.saturating_add(dx);
+            y = y.saturating_add(step_y);
+        }
+    }
+    cells
+}
+
+fn straighten_group_path(view: &dyn Passability, mover: MoverClass, cells: &[Cell]) -> Vec<Cell> {
+    let Some(&first) = cells.first() else {
+        return Vec::new();
+    };
+    if cells.len() <= 2 {
+        return cells.to_vec();
+    }
+    let Some(&last) = cells.last() else {
+        return cells.to_vec();
+    };
+    let mut kept = vec![first];
+    let mut anchor = first;
+    for (i, &cell) in cells.iter().enumerate().skip(1) {
+        if cell == last {
+            break;
+        }
+        let Some(&next) = cells.get(i.saturating_add(1)) else {
+            break;
+        };
+        if !mint_movement::smoothing::line_is_passable(view, mover, anchor, next) {
+            kept.push(cell);
+            anchor = cell;
+        }
+    }
+    kept.push(last);
+    kept
+}
+
+fn form_up_distance(row_depth: f32, reach: f32, recently_damaged: bool) -> f32 {
+    let l = (4.0 * row_depth).max(reach + row_depth * 0.5);
+    if recently_damaged {
+        l * 2.0
+    } else {
+        l
+    }
+}
+
+struct Walk {
+    start: Vec2,
+    form_point: Option<Vec2>,
+    interior: Option<(usize, usize)>,
+    end_node: Option<usize>,
+}
+
+impl Walk {
+    fn member_points(
+        &self,
+        nodes: &[Vec2],
+        slot: Vec2,
+        use_form_point: bool,
+        narrow_scale: &dyn Fn(Vec2) -> f32,
+        adjust: &dyn Fn(Vec2, Vec2) -> Vec2,
+    ) -> (Vec<Vec2>, Vec2) {
+        let mut list = Vec::new();
+        let mut previous = self.start;
+        if let (true, Some(f)) = (use_form_point, self.form_point) {
+            let point = adjust(
+                f,
+                f.plus(mint_sage_formation::rotate_offset(self.start, f, slot)),
+            );
+            list.push(point);
+            previous = f;
+            if let Some((first, last)) = self.interior {
+                for node in nodes.iter().take(last.saturating_add(1)).skip(first) {
+                    let scaled = slot.scale(narrow_scale(*node));
+                    let raw =
+                        node.plus(mint_sage_formation::rotate_offset(previous, *node, scaled));
+                    let point = adjust(*node, raw);
+                    list.push(point);
+                    previous = point;
+                }
+            }
+        }
+        (list, previous)
+    }
+
+    fn along(nodes: &[Vec2], form_up: f32, near_end: f32) -> Self {
+        let start = nodes.first().copied().unwrap_or(Vec2::ZERO);
+        let end = nodes.last().copied().unwrap_or(start);
+        let total: f32 = nodes
+            .windows(2)
+            .filter_map(|pair| Some(pair.get(1)?.minus(*pair.first()?).length()))
+            .sum();
+        let mut form = None;
+        let mut walked = 0.0f32;
+        for (index, pair) in nodes.windows(2).enumerate() {
+            let (Some(&a), Some(&b)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let leg = b.minus(a).length();
+            if walked + leg >= form_up && leg > 0.0 {
+                let point = a.plus(b.minus(a).scale((form_up - walked) / leg));
+                form = Some((point, index.saturating_add(1)));
+                break;
+            }
+            walked += leg;
+        }
+        let form = form.filter(|_| total - form_up > near_end);
+        let last = nodes.len().saturating_sub(1);
+        let end_node = nodes
+            .iter()
+            .take(last)
+            .rposition(|node| node.minus(end).length() > near_end);
+        let interior = match (form, end_node) {
+            (Some((_, first)), Some(last)) if last > first => Some((first, last)),
+            _ => None,
+        };
+        Self {
+            start,
+            form_point: form.map(|(point, _)| point),
+            interior,
+            end_node,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mint_movement::CostGrid;
+    use mint_sage_passability::OBSTACLE;
+
+    #[test]
+    fn the_first_leg_after_the_form_point_turns_from_the_unoffset_form_point() {
+        let nodes = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(100.0, 40.0),
+            Vec2::new(100.0, 400.0),
+        ];
+        let walk = Walk {
+            start: Vec2::new(0.0, 0.0),
+            form_point: Some(Vec2::new(50.0, 0.0)),
+            interior: Some((1, 1)),
+            end_node: Some(1),
+        };
+        let slot = Vec2::new(0.0, 30.0);
+        let (points, _) = walk.member_points(&nodes, slot, true, &|_| 1.0, &|_, p| p);
+        let node = Vec2::new(100.0, 40.0);
+        let expected = node.plus(mint_sage_formation::rotate_offset(
+            Vec2::new(50.0, 0.0),
+            node,
+            slot,
+        ));
+        let got = points[1];
+        assert!(
+            got.minus(expected).length() < 1e-3,
+            "{got:?} against {expected:?}"
+        );
+    }
+
+    #[test]
+    fn form_up_distance_is_four_rows_at_least_and_doubles_when_recently_hit() {
+        assert!((form_up_distance(55.0, 0.0, false) - 220.0).abs() < 1e-3);
+        let deep = form_up_distance(55.0, 500.0, false);
+        assert!((deep - 527.5).abs() < 1e-3, "{deep}");
+        assert!((form_up_distance(55.0, 500.0, true) - deep * 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_narrow_node_scales_the_members_slot() {
+        let nodes = [Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)];
+        let walk = Walk {
+            start: Vec2::new(0.0, 0.0),
+            form_point: Some(Vec2::new(0.0, 0.0)),
+            interior: Some((1, 1)),
+            end_node: Some(1),
+        };
+        let slot = Vec2::new(0.0, 30.0);
+        let (points, _) = walk.member_points(&nodes, slot, true, &|_| 0.4, &|_, p| p);
+        let node = Vec2::new(100.0, 0.0);
+        let expected = node.plus(mint_sage_formation::rotate_offset(
+            Vec2::new(0.0, 0.0),
+            node,
+            slot.scale(0.4),
+        ));
+        let got = points[1];
+        assert!(
+            got.minus(expected).length() < 1e-3,
+            "{got:?} against {expected:?}"
+        );
+    }
+
+    fn half_blocked_grid() -> (CostGrid, mint_movement::CellGeometry, GridExtent) {
+        let extent = GridExtent::new(10, 10).unwrap();
+        let geometry = mint_movement::CellGeometry::new(10.0, Vec2::new(0.0, 0.0)).unwrap();
+        let mut grid = CostGrid::new(extent);
+        for y in 0..10u16 {
+            for x in 5..10u16 {
+                grid.add_flags(Cell::new(x, y), OBSTACLE).unwrap();
+            }
+        }
+        (grid, geometry, extent)
+    }
+
+    #[test]
+    fn adjust_ground_path_position_into_a_block_returns_the_last_4_clear_cell() {
+        let (grid, geometry, extent) = half_blocked_grid();
+        let idle = BTreeSet::new();
+        let anchor = geometry.centre_of(Cell::new(2, 4));
+        let p = geometry.centre_of(Cell::new(9, 4));
+        let got = adjust_ground_path_position(&grid, geometry, extent, &idle, anchor, p);
+        let expected = geometry.centre_of(Cell::new(3, 4));
+        assert!(
+            got.minus(expected).length() < 1e-3,
+            "{got:?} against {expected:?}"
+        );
+    }
+
+    #[test]
+    fn adjust_ground_path_position_whose_first_cell_fails_returns_the_anchor() {
+        let (grid, geometry, extent) = half_blocked_grid();
+        let idle = BTreeSet::new();
+        let anchor = geometry.centre_of(Cell::new(4, 4));
+        let p = geometry.centre_of(Cell::new(9, 4));
+        let got = adjust_ground_path_position(&grid, geometry, extent, &idle, anchor, p);
+        assert!(
+            got.minus(anchor).length() < 1e-3,
+            "{got:?} against anchor {anchor:?}"
+        );
+    }
+
+    #[test]
+    fn adjust_ground_path_position_over_a_clear_line_keeps_p() {
+        let (grid, geometry, extent) = half_blocked_grid();
+        let idle = BTreeSet::new();
+        let anchor = geometry.centre_of(Cell::new(2, 4));
+        let p = geometry.centre_of(Cell::new(3, 4));
+        let got = adjust_ground_path_position(&grid, geometry, extent, &idle, anchor, p);
+        assert!(got.minus(p).length() < 1e-3, "{got:?} against {p:?}");
+    }
+
+    #[test]
+    fn ground_path_view_refuses_a_pinched_cell() {
+        let extent = GridExtent::new(10, 10).unwrap();
+        let mut grid = CostGrid::new(extent);
+        let cell = Cell::new(5, 5);
+        grid.add_flags(cell, mint_sage_passability::PINCHED)
+            .unwrap();
+        let idle = BTreeSet::new();
+        let view = GroundPathView {
+            inner: &grid,
+            extent,
+            idle: &idle,
+        };
+        assert!(!view.is_passable(cell, GROUND));
+        assert!(view.is_passable(Cell::new(4, 4), GROUND));
+    }
+
+    #[test]
+    fn ground_path_view_charges_six_per_missing_clear_cell() {
+        let extent = GridExtent::new(10, 10).unwrap();
+        let mut grid = CostGrid::new(extent);
+        grid.add_flags(Cell::new(3, 5), OBSTACLE).unwrap();
+        grid.add_flags(Cell::new(7, 5), OBSTACLE).unwrap();
+        let idle = BTreeSet::new();
+        let view = GroundPathView {
+            inner: &grid,
+            extent,
+            idle: &idle,
+        };
+        let cell = Cell::new(5, 5);
+        assert!(!clear_diameter(&grid, extent, &idle, cell, 4));
+        assert!(clear_diameter(&grid, extent, &idle, cell, 2));
+        assert_eq!(view.extra_cost(cell), 12);
+    }
+}

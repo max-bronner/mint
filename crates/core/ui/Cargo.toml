@@ -1,0 +1,20 @@
+[package]
+name = "mint-ui"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 3
+tier = "core"
+
+[dependencies]
+mint-render = { path = "../render" }
+skrifa.workspace = true
+mint-pool = { path = "../pool" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

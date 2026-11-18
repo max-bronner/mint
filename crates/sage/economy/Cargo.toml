@@ -1,0 +1,18 @@
+[package]
+name = "mint-sage-economy"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 2
+tier = "sage"
+
+[dependencies]
+mint-sim = { path = "../../core/sim" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

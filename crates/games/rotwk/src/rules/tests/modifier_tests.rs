@@ -186,6 +186,15 @@ fn simulation_with(
     placed: &[(&str, f32, f32, PlayerId)],
     factor: u32,
 ) -> (Simulation<RotwkRules>, Ids) {
+    simulation_capped(m, placed, factor, Vec::new())
+}
+
+fn simulation_capped(
+    m: &Match,
+    placed: &[(&str, f32, f32, PlayerId)],
+    factor: u32,
+    caps: Vec<Option<u32>>,
+) -> (Simulation<RotwkRules>, Ids) {
     let production = m.kinds.production(&m.data);
     let power_names = crate::powers::PowerNames::build(m.kinds.power_names().map(str::to_owned));
     let power_reload = power_names.reload_table(&m.data.special_powers);
@@ -200,7 +209,13 @@ fn simulation_with(
             ai_base_candidates: Vec::new(),
         })
         .collect();
-    let (sciences, ranks, plans) = crate::skirmish::spell_setup(&m.data, &m.kinds, &starts);
+    let (sciences, ranks, plans) = crate::skirmish::spell_setup(
+        &m.data,
+        &m.kinds,
+        &starts,
+        crate::game_mode::GameMode::Skirmish,
+        false,
+    );
     let power_sciences = power_names.required_sciences(&m.data.special_powers, &sciences);
     let spawns: Vec<Spawn> = placed
         .iter()
@@ -219,7 +234,19 @@ fn simulation_with(
         .collect();
     let map = flat_map(96, 96);
     let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
+    let footprints = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (name, ..))| {
+            let entry = m.kinds.get(m.kinds.kind(name)?)?;
+            entry
+                .record
+                .has_kind("STRUCTURE")
+                .then(|| (at, crate::construction::footprint_of(&entry.record)))
+        })
+        .collect();
     let rules = RotwkRules::new(passability, spawns)
+        .with_structure_footprints(footprints)
         .with_players(2)
         .with_hordes(m.data.formations.tables().to_vec(), Vec::new())
         .with_combat(m.data.combat.clone())
@@ -232,7 +259,8 @@ fn simulation_with(
         .with_spell_books(sciences, ranks, plans, power_sciences)
         .with_creation_lists(Arc::clone(&m.data.ocls))
         .with_command_point_factor(factor)
-        .with_command_point_table(m.data.command_points);
+        .with_command_point_table(m.data.command_points)
+        .with_command_point_overrides(caps);
     let simulation = Simulation::new(5, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
     (simulation, ids)
@@ -690,6 +718,41 @@ fn the_command_point_limit_is_the_start_plus_standing_bonuses_up_to_the_maximum(
         limit(&doubled, ids, OTHER),
         350,
         "its sum now clears the unscaled cap"
+    );
+}
+
+#[test]
+fn a_battle_cap_replaces_the_rows_maximum_and_keeps_its_start() {
+    let m = load();
+    let layout = [
+        ("Fortress", 100.0, 100.0, PLAYER),
+        ("Farm", 300.0, 100.0, PLAYER),
+        ("Fortress", 600.0, 600.0, OTHER),
+        ("Farm", 700.0, 600.0, OTHER),
+    ];
+    let (mut simulation, ids) = simulation_capped(&m, &layout, 100, vec![Some(150), Some(40)]);
+    run(&mut simulation, 2);
+    assert_eq!(
+        limit(&simulation, ids, PLAYER),
+        150,
+        "100 + 100 + 50 capped at 150"
+    );
+    assert_eq!(
+        limit(&simulation, ids, OTHER),
+        40,
+        "the cap is below the row's start"
+    );
+
+    let bare = [
+        ("Soldier", 100.0, 100.0, PLAYER),
+        ("Soldier", 600.0, 600.0, OTHER),
+    ];
+    let (mut simulation, ids) = simulation_capped(&m, &bare, 100, vec![Some(150), None]);
+    run(&mut simulation, 2);
+    assert_eq!(
+        limit(&simulation, ids, PLAYER),
+        100,
+        "the row's start, not the cap"
     );
 }
 

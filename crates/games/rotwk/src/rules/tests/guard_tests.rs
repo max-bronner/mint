@@ -1,14 +1,14 @@
 use super::super::guard::{GuardDecision, GuardState};
 use super::*;
 
-const DATA: &str = "\
+pub(super) const DATA: &str = "\
 AIData\n  GuardChaseUnitsDuration = 2000\n  GuardEnemyScanRate = 500\n  \
   GuardEnemyReturnScanRate = 1000\nEnd\n\
 Locomotor Feet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\
 Weapon Spear\n  AttackRange = 50\n  DelayBetweenShots = 500\n  \
   DamageNugget\n    Damage = 5\n    DamageType = PIERCE\n  End\nEnd\n\
 Weapon OneArrow\n  AttackRange = 600\n  DelayBetweenShots = 500\n  ClipSize = 1\n  \
-  ClipReloadTime = 999999\n  \
+  ClipReloadTime = 999999\n  InstantLoadClipOnActivate = Yes\n  \
   DamageNugget\n    Damage = 5\n    DamageType = PIERCE\n  End\nEnd\n\
 ModifierList StanceBlind\n  Category = LEADERSHIP\n  Modifier = VISION -90%\nEnd\n\
 StanceTemplate PikeTemplate\n  Stance HoldGround\n    AttributeModifier StanceBlind\n  End\n  \

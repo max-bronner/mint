@@ -92,7 +92,7 @@ fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<LogicFrames
         .ok_or_else(|| FieldError::new(format!("{keyword} '{raw}' is not milliseconds")))?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(MAX_MILLISECONDS) as u32;
-    Ok(LogicFrames::from_milliseconds(whole))
+    Ok(crate::special_ability_update::retail_duration_ticks(whole))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

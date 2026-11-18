@@ -9,17 +9,52 @@ enum AsideClear<'a> {
 }
 
 impl AsideClear<'_> {
-    fn clears(&self, point: Vec2, clearance: f32) -> bool {
+    fn clears(&self, anchor: Vec2, half: f32, pushed: Vec2) -> bool {
+        let inside = |p: Vec2| (p.x - anchor.x).abs() < half && (p.y - anchor.y).abs() < half;
+        let pusher = match self {
+            AsideClear::Route(route) => route.first().copied(),
+            AsideClear::Point(p) => Some(*p),
+        };
+        if inside(pushed) || pusher.is_some_and(inside) {
+            return false;
+        }
         match self {
             AsideClear::Route(route) => {
                 route.windows(2).all(|leg| match (leg.first(), leg.get(1)) {
-                    (Some(a), Some(b)) => distance_to_segment(point, *a, *b) > clearance,
+                    (Some(a), Some(b)) => !segment_touches_box(*a, *b, anchor, half),
                     _ => true,
                 })
             }
-            AsideClear::Point(p) => point.minus(*p).length() > clearance,
+            AsideClear::Point(p) => {
+                !((p.x - anchor.x).abs() <= half && (p.y - anchor.y).abs() <= half)
+            }
         }
     }
+}
+
+fn segment_touches_box(a: Vec2, b: Vec2, centre: Vec2, half: f32) -> bool {
+    let (mut near, mut far) = (0.0f32, 1.0f32);
+    for (from, delta, lo, hi) in [
+        (a.x, b.x - a.x, centre.x - half, centre.x + half),
+        (a.y, b.y - a.y, centre.y - half, centre.y + half),
+    ] {
+        if delta == 0.0 {
+            if from < lo || from > hi {
+                return false;
+            }
+            continue;
+        }
+        let (mut t0, mut t1) = ((lo - from) / delta, (hi - from) / delta);
+        if t0 > t1 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        near = near.max(t0);
+        far = far.min(t1);
+        if near > far {
+            return false;
+        }
+    }
+    true
 }
 
 impl RotwkRules {
@@ -45,7 +80,9 @@ impl RotwkRules {
         let crush = self
             .record_of(tick, ids, mover)
             .map(|record| record.crush.clone());
-        let force = crush.as_ref().is_some_and(|crush| crush.crusher_level >= 4);
+        let big = self
+            .crushable_level(tick, ids, mover)
+            .is_some_and(|level| level >= 4);
         let geometry = self.passability.geometry;
         let line = swept_cells(geometry, route, 1);
         let corridor = swept_cells(geometry, route, self.sweep_cells(tick, ids, mover));
@@ -87,20 +124,28 @@ impl RotwkRules {
                 || target == mover
                 || Some(target) == own_horde
                 || (horde_mover && world.contains(ids.horde, target))
+                || world
+                    .get(ids.ignored_obstacle, mover)
+                    .is_some_and(|ignored| ignored.0 == entity)
                 || has(entity, "MOVE_FOR_NOONE")
                 || (has(entity, "PATH_THROUGH_EACH_OTHER") && has(mover, "PATH_THROUGH_EACH_OTHER"))
-                || world.contains(ids.ignored_obstacle, target)
+                || self.holds_condition_in(world, entity, "THROWN_PROJECTILE")
+                || self.carries_object_status(world, entity, "IS_LEAVING_FACTORY")
             {
                 continue;
             }
-            let target_moving = world.contains(ids.path, target);
+            let moving = world.contains(ids.path, target);
             let attacking = self.charge_state(tick, ids, target).attacking;
             let goes = if through_infantry && !has(entity, "PATH_THROUGH_INFANTRY") {
-                (!attacking && !target_moving) || force
+                !(attacking || moving) || big
+            } else if !self.has_ai(world, ids, entity) || moving {
+                false
             } else {
-                !target_moving && (!attacking || force)
+                (self.regular_state_idle(world, ids, target)
+                    && !Self::ai_busy(world, ids, target, tick.frame()))
+                    || big
             };
-            let goes = goes && !world.contains(ids.in_formation_template, target);
+            let goes = goes && !self.refuses_by_formation_status(world, ids, target);
             if goes {
                 pushed.push(target);
             }
@@ -113,7 +158,11 @@ impl RotwkRules {
         if !wants || !(pusher || blocked) {
             return Ok(());
         }
-        let mover_radius = Self::mover_radius(tick, ids, mover);
+        let pusher_cells = f32::from(self.path_footprint(tick, ids, mover).side());
+        let pusher_radius = self.pusher_radius(tick.state(), ids, mover);
+        let Some(destination) = route.last().copied() else {
+            return Ok(());
+        };
         for target in pushed {
             self.move_aside(
                 tick,
@@ -121,7 +170,8 @@ impl RotwkRules {
                 pipeline,
                 target,
                 AsideClear::Route(route),
-                mover_radius,
+                (pusher_cells, pusher_radius),
+                destination,
             )?;
         }
         Ok(())
@@ -145,7 +195,9 @@ impl RotwkRules {
         };
         let geometry = self.passability.geometry;
         let line = swept_cells(geometry, &[from, destination], 1);
+        let pusher_cells = f32::from(self.path_footprint(tick, ids, mover).side());
         let mover_radius = Self::mover_radius(tick, ids, mover);
+        let pusher_radius = self.pusher_radius(tick.state(), ids, mover);
         let world = tick.state();
         let mut pushed: Vec<Entity> = Vec::new();
         for (entity, at) in self.ally_candidates(tick, ids, mover, owner) {
@@ -162,7 +214,7 @@ impl RotwkRules {
             if pushed.contains(&target)
                 || Some(target) == own_horde
                 || elsewhere
-                || world.contains(ids.in_formation_template, target)
+                || self.refuses_by_formation_status(world, ids, target)
             {
                 continue;
             }
@@ -181,7 +233,15 @@ impl RotwkRules {
             AsideClear::Point(from)
         };
         for target in pushed {
-            self.move_aside(tick, ids, &mut pipeline, target, avoid, mover_radius)?;
+            self.move_aside(
+                tick,
+                ids,
+                &mut pipeline,
+                target,
+                avoid,
+                (pusher_cells, pusher_radius),
+                destination,
+            )?;
         }
         Ok(())
     }
@@ -193,7 +253,98 @@ impl RotwkRules {
         pipeline: &mut Pipeline,
         target: Entity,
         avoid: AsideClear<'_>,
-        mover_radius: f32,
+        (pusher_cells, pusher_radius): (f32, f32),
+        destination: Vec2,
+    ) -> Result<()> {
+        let now = tick.frame();
+        if self.weapon_busy(tick.state(), ids, target, now)
+            || Self::mid_portal(tick.state(), ids, target)
+        {
+            let (avoid, from_point) = match avoid {
+                AsideClear::Route(route) => (route.to_vec(), false),
+                AsideClear::Point(point) => (vec![point], true),
+            };
+            tick.state_mut().remove(ids.deferred_order, target);
+            tick.state_mut().insert(
+                ids.held_aside,
+                target,
+                super::busy::HeldAside {
+                    avoid,
+                    from_point,
+                    radii: (pusher_cells, pusher_radius),
+                    destination,
+                },
+            )?;
+            return Ok(());
+        }
+        self.move_aside_now(
+            tick,
+            ids,
+            pipeline,
+            target,
+            avoid,
+            (pusher_cells, pusher_radius),
+            destination,
+        )
+    }
+
+    pub(super) fn replay_held_asides(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
+        let now = tick.frame();
+        let held: Vec<Entity> = tick
+            .state()
+            .store(ids.held_aside)
+            .map(|store| store.entities().to_vec())
+            .unwrap_or_default();
+        for target in held {
+            if self.weapon_busy(tick.state(), ids, target, now)
+                || Self::mid_portal(tick.state(), ids, target)
+            {
+                continue;
+            }
+            let Some(slot) = tick.state_mut().remove(ids.held_aside, target) else {
+                continue;
+            };
+            if !tick.state().is_live(target) || tick.state().contains(ids.doomed, target) {
+                continue;
+            }
+            let avoid = if slot.from_point {
+                match slot.avoid.first() {
+                    Some(point) => AsideClear::Point(*point),
+                    None => continue,
+                }
+            } else {
+                AsideClear::Route(&slot.avoid)
+            };
+            let mut pipeline = Pipeline::new(self.modes(tick, ids).config());
+            self.move_aside_now(
+                tick,
+                ids,
+                &mut pipeline,
+                target,
+                avoid,
+                slot.radii,
+                slot.destination,
+            )?;
+            let points = tick
+                .state()
+                .get(ids.path, target)
+                .map(|path| path.route.points.clone());
+            if let Some(points) = points {
+                self.move_allies(tick, ids, &mut pipeline, target, &points)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_aside_now(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        pipeline: &mut Pipeline,
+        target: Entity,
+        avoid: AsideClear<'_>,
+        (pusher_cells, pusher_radius): (f32, f32),
+        destination: Vec2,
     ) -> Result<()> {
         if self.move_refused(tick, ids, target).is_some() {
             return Ok(());
@@ -201,15 +352,17 @@ impl RotwkRules {
         let Some(from) = tick.state().get(ids.body, target).map(|b| b.0.position) else {
             return Ok(());
         };
-        let class = self.mover_class(tick, ids, target);
+        let class = self
+            .mover_class(tick, ids, target)
+            .passing(self.portal_pass_aside(tick.state(), ids, target));
         let Some(start) = self.passable_cell_for(tick, ids, from, class) else {
             return Ok(());
         };
-        let clearance = mover_radius + Self::mover_radius(tick, ids, target);
         let geometry = self.passability.geometry;
         let view = self.dynamic_view(tick, ids);
         let extent = view.extent();
         let footprint = self.path_footprint(tick, ids, target);
+        let half = 5.0 * (f32::from(footprint.side()) + pusher_cells) - 2.5;
         #[allow(clippy::cast_precision_loss)]
         let reach = ((ASIDE_SEARCH_CELLS as f32).sqrt() + f32::from(footprint.side()) + 1.0)
             * geometry.cell_size();
@@ -236,14 +389,22 @@ impl RotwkRules {
                     return None;
                 }
                 let point = crate::goal_cells::anchor_point(geometry, (x, y), footprint);
-                let clear = avoid.clears(point, clearance);
+                let clear = avoid.clears(point, half, from);
                 (clear && fits((x, y)) && self.reachable(class, start, cell)).then_some(point)
             });
         let Some(aside) = aside else {
             return Ok(());
         };
-        let (_, end, points) =
-            self.plan_via(tick, ids, pipeline, target, class, (start, from), &[aside])?;
+        let (_, end, points) = self.plan_via(
+            tick,
+            ids,
+            pipeline,
+            target,
+            class,
+            (start, from),
+            &[aside],
+            false,
+        )?;
         if points.len() < 2 {
             return Ok(());
         }
@@ -258,6 +419,11 @@ impl RotwkRules {
             state.waypoint = 0;
             tick.state_mut().insert(ids.body, target, Body(state))?;
         }
+        let old = tick.state().get(ids.path, target).cloned();
+        let for_good = self
+            .pushed_goal(tick.state(), ids, target)
+            .is_some_and(|goal| self.within_radius_3d(goal, destination, pusher_radius));
+        self.note_order_origin(tick, ids, target)?;
         tick.state_mut().insert(
             ids.path,
             target,
@@ -265,6 +431,7 @@ impl RotwkRules {
                 route: Route {
                     points,
                     extra_distance: 0.0,
+                    unsearched: false,
                     portals: Vec::new(),
                 },
                 goal: end,
@@ -272,7 +439,28 @@ impl RotwkRules {
                 facing: None,
             },
         )?;
-        Ok(())
+        Self::start_move_aside_state(tick, ids, target, old, for_good)
+    }
+
+    pub(super) fn pusher_radius(&self, world: &World, ids: Ids, mover: Entity) -> f32 {
+        crate::construction::object_bounding_radius(
+            world,
+            &self.kinds,
+            (ids.kind, self.modules.as_ref().map(|wiring| wiring.state)),
+            mover,
+        )
+    }
+
+    pub(super) fn pushed_goal(&self, world: &World, ids: Ids, target: Entity) -> Option<Vec2> {
+        world
+            .get(ids.path, target)
+            .map(|path| path.route.points.last().copied().unwrap_or(path.goal))
+            .or_else(|| world.get(ids.order_goal, target).map(|goal| goal.0))
+    }
+
+    pub(super) fn within_radius_3d(&self, a: Vec2, b: Vec2, radius: f32) -> bool {
+        let dz = self.ground_height(a.x, a.y) - self.ground_height(b.x, b.y);
+        a.minus(b).length_squared() + dz * dz < radius * radius
     }
 
     fn sweep_cells(&self, tick: &Tick<'_>, ids: Ids, mover: Entity) -> u32 {
@@ -392,13 +580,18 @@ pub(super) fn swept_cells(
     cells
 }
 
-fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
-    let ab = b.minus(a);
-    let squared = ab.length_squared();
-    let t = if squared > 0.0 {
-        (p.minus(a).dot(ab) / squared).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    p.minus(a.plus(ab.scale(t))).length()
+impl RotwkRules {
+    pub(super) fn refuses_by_formation_status(
+        &self,
+        world: &World,
+        ids: Ids,
+        target: Entity,
+    ) -> bool {
+        world.contains(ids.in_formation_template, target)
+            && self.regular_state_idle(world, ids, target)
+            && !(world.contains(ids.guard, target)
+                || world
+                    .get(ids.emotion, target)
+                    .is_some_and(|emotion| emotion.state.is_some()))
+    }
 }

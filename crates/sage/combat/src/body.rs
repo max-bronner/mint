@@ -46,9 +46,11 @@ impl BodyKind {
 pub struct HealthPool {
     current: f32,
     max: f32,
+    initial: f32,
     kind: BodyKind,
     dead: bool,
     indestructible: bool,
+    kill_scored: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -88,10 +90,25 @@ impl HealthPool {
         Some(Self {
             current: max_health,
             max: max_health,
+            initial: max_health,
             kind,
             dead: false,
             indestructible: false,
+            kill_scored: false,
         })
+    }
+
+    #[must_use]
+    pub fn with_initial(mut self, initial: f32) -> Self {
+        if initial.is_finite() && initial >= 0.0 {
+            self.initial = initial;
+            self.current = initial.min(self.max);
+        }
+        self
+    }
+
+    pub fn score_kill(&mut self) -> bool {
+        std::mem::replace(&mut self.kill_scored, true)
     }
 
     pub fn set_indestructible(&mut self, indestructible: bool) {
@@ -149,10 +166,10 @@ impl HealthPool {
         if !percent.is_finite() || self.dead {
             return;
         }
-        let initial = self.max;
+        let initial = self.initial;
         let factor = percent / 100.0;
         if percent > 100.0 {
-            let scaled = initial * factor;
+            let scaled = self.max * factor;
             if !scaled.is_finite() || scaled <= 0.0 {
                 return;
             }
@@ -171,6 +188,7 @@ impl HealthPool {
             return;
         }
         self.max = max;
+        self.initial = max;
         self.current = current.clamp(0.0, max);
     }
 
@@ -239,10 +257,16 @@ impl HealthPool {
     pub fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_f32(self.current);
         hasher.write_f32(self.max);
+        if self.initial.to_bits() != self.max.to_bits() {
+            hasher.write_f32(self.initial);
+        }
         hasher.write_u8(self.kind.code());
         hasher.write_bool(self.dead);
         if self.indestructible {
             hasher.write_bool(true);
+        }
+        if self.kill_scored {
+            hasher.write_u8(2);
         }
     }
 }
@@ -490,5 +514,24 @@ mod tests {
         assert!(dead.kill());
         dead.apply_health_modifier(20.0, 1.0);
         assert_eq!(dead.max(), 100.0);
+    }
+
+    #[test]
+    fn a_kill_is_scored_once() {
+        let mut body = HealthPool::new(100.0, BodyKind::Active).unwrap();
+        assert!(!body.score_kill());
+        assert!(body.score_kill());
+    }
+
+    #[test]
+    fn set_initial_percent_takes_its_share_of_the_initial_health() {
+        let mut body = HealthPool::new(100.0, BodyKind::Active).unwrap();
+        body.set_initial_percent(400.0);
+        assert_eq!(body.max(), 400.0);
+        body.set_initial_percent(50.0);
+        assert_eq!(body.current(), 50.0);
+        body.apply_health_modifier(50.0, 1.0);
+        body.set_initial_percent(25.0);
+        assert_eq!(body.current(), 112.5);
     }
 }

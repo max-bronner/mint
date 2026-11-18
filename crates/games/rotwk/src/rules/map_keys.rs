@@ -91,7 +91,7 @@ impl RotwkRules {
                     entity,
                     ScriptStatusBit::NotRecruitable,
                     true,
-                );
+                )?;
                 applied.unrecruitable = applied.unrecruitable.saturating_add(1);
             }
             if let Some(on) = keys.selectable {
@@ -110,7 +110,7 @@ impl RotwkRules {
                 (ScriptStatusBit::Targetable, keys.targetable.then_some(true)),
             ] {
                 let Some(on) = on else { continue };
-                self.set_placed_status(tick, ids, anchor, entity, bit, on);
+                self.set_placed_status(tick, ids, anchor, entity, bit, on)?;
                 if bit == ScriptStatusBit::Targetable {
                     applied.targetable = applied.targetable.saturating_add(1);
                 } else {
@@ -170,10 +170,15 @@ impl RotwkRules {
         entity: Entity,
         bit: ScriptStatusBit,
         on: bool,
-    ) {
-        if let Some(state) = tick.state_mut().get_mut(ids.map_script_state, anchor) {
-            state.rt.statuses.set(entity, bit, on);
+    ) -> Result<()> {
+        let changed = tick
+            .state_mut()
+            .get_mut(ids.map_script_state, anchor)
+            .is_some_and(|state| state.rt.statuses.set(entity, bit, on));
+        if changed && bit == ScriptStatusBit::Disabled {
+            self.pause_special_powers(tick, ids, entity, on)?;
         }
+        Ok(())
     }
 
     fn apply_initial_health(

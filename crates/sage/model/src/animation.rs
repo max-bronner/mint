@@ -99,17 +99,12 @@ pub fn start_frame(mode: AnimationMode, flags: AnimationFlags, num_frames: u32) 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindRefusal {
     NoHierarchy,
-    HierarchyMismatch { model: String, animation: String },
 }
 
 impl core::fmt::Display for BindRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             BindRefusal::NoHierarchy => write!(f, "the model has no hierarchy to pose"),
-            BindRefusal::HierarchyMismatch { model, animation } => write!(
-                f,
-                "the model's hierarchy is {model:?}, the animation names {animation:?}"
-            ),
         }
     }
 }
@@ -158,17 +153,6 @@ impl ModelAnimation {
         let Some(hierarchy) = model.hierarchy.clone() else {
             return Err(BindRefusal::NoHierarchy);
         };
-        if !hierarchy
-            .header
-            .name
-            .eq_ignore_ascii_case(&loaded.animation.hierarchy_name)
-            && !same_skeleton(&hierarchy, &loaded.hierarchy)
-        {
-            return Err(BindRefusal::HierarchyMismatch {
-                model: hierarchy.header.name.clone(),
-                animation: loaded.animation.hierarchy_name.clone(),
-            });
-        }
 
         let mut driven: Vec<u32> = loaded
             .animation
@@ -445,14 +429,6 @@ fn pivots_that_move(hierarchy: &Hierarchy, driven: &[u32]) -> Vec<bool> {
         moves.push(own || inherited);
     }
     moves
-}
-
-fn same_skeleton(a: &Hierarchy, b: &Hierarchy) -> bool {
-    a.pivots.len() == b.pivots.len()
-        && a.pivots
-            .iter()
-            .zip(&b.pivots)
-            .all(|(x, y)| x.parent == y.parent && x.name.eq_ignore_ascii_case(&y.name))
 }
 
 #[cfg(test)]

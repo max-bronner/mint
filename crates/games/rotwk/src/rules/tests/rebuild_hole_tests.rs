@@ -115,6 +115,13 @@ Object Ruin\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  KeepSelec
   Behavior = KeepObjectDie Tag_Rubble\n  End\n  \
   Geometry = BOX\n  GeometryMajorRadius = 20\n  GeometryMinorRadius = 20\n  \
   GeometryHeight = 30\nEnd\n\
+Object BookendRuin\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  KeepSelectableWhenDead = Yes\n  BuildTime = 10\n  \
+  Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = KeepObjectDie Tag_Rubble\n  End\n  \
+  Geometry = BOX\n  GeometryMajorRadius = 20\n  GeometryMinorRadius = 20\n  \
+  GeometryHeight = 30\n  \
+  AdditionalGeometry = BOX\n  GeometryName = Bookend\n  GeometryMajorRadius = 3\n  \
+  GeometryMinorRadius = 3\n  GeometryHeight = 53\nEnd\n\
 Object RuinPriced\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  KeepSelectableWhenDead = Yes\n  \
   BuildCost = 4000\n  BuildTime = 10\n  Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
   Behavior = GettingBuiltBehavior Tag_Built\n    RebuildTimeSeconds = 2\n    \
@@ -148,6 +155,7 @@ fn load() -> Base {
         "Den",
         "Hoard",
         "Ruin",
+        "BookendRuin",
         "RuinPriced",
         "RuinDear",
     ]
@@ -634,6 +642,31 @@ fn kept_rubble_turns_its_cells_to_rubble_until_rebuilt() {
         !rebuilt.intersects(mint_sage_passability::RUBBLE),
         "the footprint is obstacle again, not left marked as rubble"
     );
+}
+
+#[test]
+fn a_rubbled_structure_keeps_only_its_bookend_part() {
+    let b = load();
+    let (mut simulation, ids) = start(&b, &[("BookendRuin", 400.0, 400.0, PLAYER)]);
+    let ruin = of_kind(&b, &simulation, ids, "BookendRuin")[0];
+    let at = |simulation: &Simulation<RotwkRules>, point: Vec2| {
+        let rules = simulation.rules();
+        let cell = rules.passability().cell_at(point).unwrap();
+        let index =
+            usize::try_from(rules.passability().grid.extent().index(cell).unwrap()).unwrap();
+        let world = simulation.state();
+        (
+            crate::obstacles::counts_of(world, ids.obstacles)[index],
+            crate::obstacles::rubble_of(world, ids.obstacles)[index],
+        )
+    };
+    let (centre, corner) = (Vec2::new(400.0, 400.0), Vec2::new(418.0, 418.0));
+    assert!(at(&simulation, corner).0 > 0, "standing, the box blocks");
+    press(&mut simulation, PLAYER, ruin, RotwkCommand::DebugKill);
+    run(&mut simulation, 2);
+    assert!(simulation.state().is_live(ruin), "kept as rubble");
+    assert!(at(&simulation, centre).0 > 0, "the Bookend blocks");
+    assert_eq!(at(&simulation, corner), (0, 0), "nothing else stands");
 }
 
 #[test]

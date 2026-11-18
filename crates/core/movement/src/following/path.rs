@@ -1,6 +1,6 @@
 use super::Route;
 use crate::geom::Vec2;
-use crate::grid::Portal;
+use crate::grid::{Leg, Portal};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct OnPath {
@@ -23,6 +23,28 @@ pub(super) fn at_portal(route: &Route, waypoint: u32) -> bool {
         .any(|&i| route.portals.get(i).copied().flatten().is_some())
 }
 
+pub(super) fn crossing(route: &Route, waypoint: u32) -> Option<Portal> {
+    route
+        .portals
+        .get(index(waypoint))
+        .copied()
+        .flatten()
+        .filter(|tag| tag.leg != Leg::Through)
+}
+
+fn climb_factor(run: f32, rise: f32) -> f32 {
+    let factor = (run / (rise.abs() + 1.0)).min(1.0);
+    if factor < 0.5 {
+        factor * 0.85
+    } else {
+        factor
+    }
+}
+
+pub(super) fn steep(run: f32, rise: f32) -> Option<bool> {
+    (3.0 * rise * rise > run * run).then_some(rise > 0.0)
+}
+
 pub(super) fn walk(route: &Route, from: Vec2, waypoint: u32, distance: f32) -> OnPath {
     let mut at = from;
     let mut left = if distance.is_finite() {
@@ -33,7 +55,21 @@ pub(super) fn walk(route: &Route, from: Vec2, waypoint: u32, distance: f32) -> O
     let first = index(waypoint);
     for (i, point) in route.points.iter().enumerate().skip(first) {
         let leg = point.minus(at);
-        let length = leg.length();
+        let mut length = leg.length();
+        let raw = length;
+        if let Some(tag) = route.portals.get(i).copied().flatten() {
+            if tag.leg == Leg::Climb && tag.rise != 0.0 {
+                let start = i
+                    .checked_sub(1)
+                    .and_then(|before| route.points.get(before))
+                    .copied()
+                    .unwrap_or(at);
+                let factor = climb_factor(point.minus(start).length(), tag.rise);
+                if factor > 0.0 {
+                    length = raw / factor;
+                }
+            }
+        }
         if length >= left && length > 0.0 {
             return OnPath {
                 point: at.plus(leg.scale(left / length)),
@@ -189,24 +225,44 @@ pub struct Departure {
     pub heading: crate::geom::Facing,
     pub radius: f32,
     pub max_turn: f32,
+    pub pass_first: bool,
+    pub backing: Option<f32>,
 }
 
 const DEPART_STRAIGHT_BELOW: f32 = core::f32::consts::PI / 16.0;
 
 const DEPART_RETRY_RADIUS: f32 = 5.0;
 
-pub fn depart(route: &mut Route, departure: Departure, clear: impl Fn(Vec2) -> bool) {
+pub fn depart(
+    route: &mut Route,
+    departure: Departure,
+    clear: impl Fn(Vec2) -> bool,
+    line_clear: impl Fn(Vec2, Vec2) -> bool,
+) {
     let (Some(&start), Some(&first)) = (route.points.first(), route.points.get(1)) else {
         return;
     };
-    if !departure.radius.is_finite() || departure.radius <= 0.0 {
-        return;
-    }
     let leg = first.minus(start);
     let Some(dir) = leg.normalised() else {
         return;
     };
-    let heading = departure.heading.to_vector();
+    let mut heading = departure.heading.to_vector();
+    let radius = departure.radius;
+    if let Some(backing) = departure.backing.filter(|_| leg.dot(heading) < 0.0) {
+        heading = Vec2::new(-heading.x, -heading.y);
+        if backing.is_finite() && leg.length() > 3.0 * backing {
+            let arcs = backing_arcs(start, first, heading, dir, backing);
+            let at = 1.min(route.portals.len());
+            route
+                .portals
+                .splice(at..at, std::iter::repeat_n(None, arcs.len()));
+            route.points.splice(1..1, arcs);
+            return;
+        }
+    }
+    if !radius.is_finite() || radius <= 0.0 {
+        return;
+    }
     let angle = mint_math::f32::acos(heading.dot(dir).clamp(-1.0, 1.0));
     if !angle.is_finite() || angle < DEPART_STRAIGHT_BELOW || angle > departure.max_turn {
         return;
@@ -217,19 +273,67 @@ pub fn depart(route: &mut Route, departure: Departure, clear: impl Fn(Vec2) -> b
         -1.0
     };
     let half_leg = 0.5 * leg.length();
-    for radius in [departure.radius, DEPART_RETRY_RADIUS] {
-        let r = radius.min(half_leg);
-        if let Some(arc) = departure_arc(start, heading, side, r, first) {
-            if arc.iter().all(|point| clear(*point)) {
-                let at = 1.min(route.portals.len());
-                route
-                    .portals
-                    .splice(at..at, std::iter::repeat_n(None, arc.len()));
-                route.points.splice(1..1, arc);
-                return;
-            }
-        }
+    let radius = radius.min(half_leg);
+    let passes = |arc: &Vec<Vec2>| {
+        arc.iter().all(|point| clear(*point))
+            && arc.last().is_none_or(|last| line_clear(*last, first))
+    };
+    let arc = departure_arc(start, heading, side, radius, first)
+        .filter(|arc| departure.pass_first || passes(arc))
+        .or_else(|| {
+            (angle >= core::f32::consts::FRAC_PI_2)
+                .then(|| departure_arc(start, heading, -side, radius, first))
+                .flatten()
+                .filter(passes)
+        })
+        .or_else(|| {
+            departure_arc(
+                start,
+                heading,
+                side,
+                DEPART_RETRY_RADIUS.min(half_leg),
+                first,
+            )
+        });
+    if let Some(arc) = arc {
+        let at = 1.min(route.portals.len());
+        route
+            .portals
+            .splice(at..at, std::iter::repeat_n(None, arc.len()));
+        route.points.splice(1..1, arc);
     }
+}
+
+fn backing_arcs(start: Vec2, first: Vec2, reversed: Vec2, dir: Vec2, r: f32) -> Vec<Vec2> {
+    let sum = dir.plus(reversed);
+    let Some(mut n) = Vec2::new(-sum.y, sum.x).normalised() else {
+        return Vec::new();
+    };
+    if dir.y * reversed.x - reversed.y * dir.x > 0.0 {
+        n = Vec2::new(-n.x, -n.y);
+    }
+    let shifted = start.plus(n.scale(2.0 * r)).plus(sum.scale(0.5 * r));
+    let mut points = committed_arc(start, reversed, shifted, r);
+    let from = points.last().copied().unwrap_or(start);
+    points.extend(committed_arc(from, Vec2::new(-n.x, -n.y), first, r));
+    points
+}
+
+fn committed_arc(start: Vec2, heading: Vec2, to: Vec2, r: f32) -> Vec<Vec2> {
+    let leg = to.minus(start);
+    let Some(dir) = leg.normalised() else {
+        return Vec::new();
+    };
+    let angle = mint_math::f32::acos(heading.dot(dir).clamp(-1.0, 1.0));
+    if !angle.is_finite() || angle < DEPART_STRAIGHT_BELOW {
+        return Vec::new();
+    }
+    let side = if heading.x * dir.y - heading.y * dir.x > 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    departure_arc(start, heading, side, r.min(0.5 * leg.length()), to).unwrap_or_default()
 }
 
 fn departure_arc(start: Vec2, heading: Vec2, side: f32, r: f32, first: Vec2) -> Option<Vec<Vec2>> {

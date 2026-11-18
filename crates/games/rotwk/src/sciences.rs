@@ -29,7 +29,6 @@ pub(crate) struct ScienceReport {
     pub(crate) purchasable: usize,
     pub(crate) alternatives: usize,
     pub(crate) alternatives_dropped: usize,
-    pub(crate) campaign_priced: usize,
     pub(crate) unresolved_costs: usize,
 }
 
@@ -41,7 +40,7 @@ pub(crate) struct ScienceTable {
 }
 
 impl ScienceTable {
-    pub(crate) fn build(index: &mint_sage_ini::ScienceIndex) -> Self {
+    pub(crate) fn build(index: &mint_sage_ini::ScienceIndex, multiplayer: bool) -> Self {
         let mut table = Self::default();
         for (at, def) in index.iter().enumerate() {
             let Ok(id) = u16::try_from(at) else {
@@ -73,18 +72,8 @@ impl ScienceTable {
                     }
                 }
             }
-            let cost = match (def.cost_mp, def.cost) {
-                (Some(mp), _) => mp,
-                (None, Some(campaign)) => {
-                    if campaign != 0 {
-                        table.report.campaign_priced =
-                            table.report.campaign_priced.saturating_add(1);
-                    }
-                    campaign
-                }
-                (None, None) => 0,
-            };
-            let cost = u32::try_from(cost.max(0)).unwrap_or(0);
+            let cost = if multiplayer { def.cost_mp } else { def.cost };
+            let cost = u32::try_from(cost.unwrap_or(0).max(0)).unwrap_or(0);
             table.report.unresolved_costs = table
                 .report
                 .unresolved_costs
@@ -122,18 +111,13 @@ impl ScienceTable {
         let r = self.report;
         format!(
             "sciences: {} read, {} purchasable, {} prerequisite alternative(s) ({} dropped), \
-             {} priced at their campaign cost, {} cost field(s) unresolved",
-            r.sciences,
-            r.purchasable,
-            r.alternatives,
-            r.alternatives_dropped,
-            r.campaign_priced,
-            r.unresolved_costs
+             {} cost field(s) unresolved",
+            r.sciences, r.purchasable, r.alternatives, r.alternatives_dropped, r.unresolved_costs
         )
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Ranks {
     needed: Vec<u32>,
     granted: Vec<u32>,
@@ -141,12 +125,19 @@ pub(crate) struct Ranks {
 }
 
 impl Ranks {
-    pub(crate) fn build(ranks: &mint_sage_ini::RankTable, sciences: &ScienceTable) -> Self {
+    pub(crate) fn build(
+        ranks: &mint_sage_ini::RankTable,
+        sciences: &ScienceTable,
+        campaign: bool,
+        side: Option<&str>,
+    ) -> Self {
         let mut out = Self::default();
         let mut last = 0u32;
+        let column = if campaign { Some("Campaign") } else { side };
         for def in ranks.iter() {
-            let needed = def
-                .skill_points("Default")
+            let needed = column
+                .and_then(|column| def.skill_points(column))
+                .or_else(|| def.skill_points("Default"))
                 .or_else(|| def.skill_points(""))
                 .unwrap_or(last)
                 .max(last);
@@ -183,6 +174,10 @@ impl Ranks {
 
     pub(crate) fn needed(&self, rank: u16) -> Option<u32> {
         self.needed.get(Self::index(rank)?).copied()
+    }
+
+    pub(crate) fn granted_through(&self, rank: u16) -> u32 {
+        (1..=rank).fold(0u32, |sum, r| sum.saturating_add(self.granted(r)))
     }
 
     fn granted(&self, rank: u16) -> u32 {
@@ -419,6 +414,7 @@ pub(crate) struct SpellPlan {
     pub(crate) store: Vec<(String, ScienceId)>,
     pub(crate) intrinsic: Vec<ScienceId>,
     pub(crate) rank_cap: Option<u32>,
+    pub(crate) ranks: Option<std::sync::Arc<Ranks>>,
     pub(crate) intrinsic_purchase_points: u32,
 }
 
@@ -484,11 +480,15 @@ Science SCIENCE_Summon\n  PrerequisiteSciences = SCIENCE_GOOD SCIENCE_Heal OR SC
 Science SCIENCE_Old\n  PrerequisiteSciences = SCIENCE_MEN\n  SciencePurchasePointCost = 7\nEnd\n\
 Science SCIENCE_Broken\n  PrerequisiteSciences = SCIENCE_NOWHERE\n  SciencePurchasePointCostMP = 1\nEnd\n";
 
-    fn table() -> ScienceTable {
+    fn table_for(multiplayer: bool) -> ScienceTable {
         let doc = Document::parse("science.ini", SCIENCES, &BlockTable::corpus_path()).unwrap();
         let mut index = ScienceIndex::new();
         index.insert_document(&doc, &MacroTable::new());
-        ScienceTable::build(&index)
+        ScienceTable::build(&index, multiplayer)
+    }
+
+    fn table() -> ScienceTable {
+        table_for(true)
     }
 
     fn id(table: &ScienceTable, name: &str) -> ScienceId {
@@ -504,20 +504,40 @@ Science SCIENCE_Broken\n  PrerequisiteSciences = SCIENCE_NOWHERE\n  SciencePurch
     }
 
     #[test]
-    fn ids_are_alphabetical_and_the_skirmish_price_is_the_mp_one() {
+    fn ids_are_alphabetical_and_the_price_is_the_modes_own_column_with_no_fallback() {
         let t = table();
         assert!(id(&t, "science_good") < id(&t, "SCIENCE_Heal"));
-        assert_eq!(t.get(id(&t, "SCIENCE_Summon")).unwrap().cost, 10);
-        assert_eq!(
-            t.get(id(&t, "SCIENCE_Old")).unwrap().cost,
-            7,
-            "no MP cost: the campaign price"
-        );
-        assert_eq!(
-            t.report.campaign_priced, 1,
-            "Old; the zero-cost roots do not count"
-        );
+        let cost = |t: &ScienceTable, name: &str| t.get(id(t, name)).unwrap().cost;
+        assert_eq!(cost(&t, "SCIENCE_Summon"), 10);
+        assert_eq!(cost(&t, "SCIENCE_Old"), 0, "no MP cost: not purchasable");
+        let campaign = table_for(false);
+        assert_eq!(cost(&campaign, "SCIENCE_Summon"), 3);
+        assert_eq!(cost(&campaign, "SCIENCE_Old"), 7);
+        assert_eq!(cost(&campaign, "SCIENCE_Rally"), 0, "no campaign cost");
         assert_eq!(t.report.alternatives_dropped, 1, "Broken's only branch");
+    }
+
+    #[test]
+    fn rank_thresholds_read_the_campaign_column_then_the_sides_then_default() {
+        let doc = Document::parse(
+            "rank.ini",
+            "Rank 1\n  SkillPointsNeededDefault = 0\nEnd\n\
+             Rank 2\n  SkillPointsNeededDefault = 60\n  SkillPointsNeededCampaign = 100\n  \
+               SkillPointsNeededElves = 80\nEnd\n",
+            &BlockTable::corpus_path(),
+        )
+        .unwrap();
+        let ranks = mint_sage_ini::RankTable::build(&[doc], &MacroTable::new());
+        let t = table();
+        let needed = |campaign, side| Ranks::build(&ranks, &t, campaign, side).needed(2);
+        assert_eq!(needed(true, Some("Elves")), Some(100));
+        assert_eq!(needed(false, Some("Elves")), Some(80));
+        assert_eq!(
+            needed(false, Some("Men")),
+            Some(60),
+            "unset column: Default"
+        );
+        assert_eq!(needed(false, None), Some(60));
     }
 
     #[test]

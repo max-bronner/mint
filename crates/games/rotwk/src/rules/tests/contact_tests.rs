@@ -50,6 +50,7 @@ fn start(
     spawns: &[(&str, f32, f32, PlayerId)],
 ) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let production = m.kinds.production(&m.data);
+    let placed = spawns;
     let spawns: Vec<Spawn> = spawns
         .iter()
         .map(|(name, x, y, owner)| {
@@ -67,7 +68,19 @@ fn start(
         .collect();
     let map = flat_map(96, 96);
     let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
+    let footprints = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (name, ..))| {
+            let entry = m.kinds.get(m.kinds.kind(name)?)?;
+            entry
+                .record
+                .has_kind("STRUCTURE")
+                .then(|| (at, crate::construction::footprint_of(&entry.record)))
+        })
+        .collect();
     let rules = RotwkRules::new(passability, spawns)
+        .with_structure_footprints(footprints)
         .with_players(2)
         .with_combat(m.data.combat.clone())
         .with_construction(Arc::clone(&m.kinds), production.clone())

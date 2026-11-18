@@ -102,7 +102,7 @@ impl AutoHealBehavior {
         let pulse = data.delay.map_or(Sleep::Forever, Sleep::Frames);
         if !self.active {
             return data.delay.map_or(
-                Sleep::Frames(LogicFrames::from_milliseconds(1000)),
+                Sleep::Frames(LogicFrames::from_engine_milliseconds(1000)),
                 Sleep::Frames,
             );
         }

@@ -16,6 +16,7 @@ pub struct FormationSlot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HordeSettings {
+    pub slots: u32,
     pub melee_attack_leash_distance: f32,
     pub use_slow_horde_movement: bool,
     pub ranks_that_stop_advance: Vec<u32>,
@@ -35,6 +36,7 @@ pub const DEFAULT_MELEE_ATTACK_LEASH_DISTANCE: f32 = 60.0;
 impl Default for HordeSettings {
     fn default() -> Self {
         Self {
+            slots: 0,
             melee_attack_leash_distance: DEFAULT_MELEE_ATTACK_LEASH_DISTANCE,
             use_slow_horde_movement: false,
             ranks_that_stop_advance: Vec::new(),
@@ -55,6 +57,7 @@ impl HordeSettings {
     #[must_use]
     pub fn from_contain(def: &HordeContainDef) -> Self {
         Self {
+            slots: def.slots.unwrap_or(0),
             melee_attack_leash_distance: def
                 .melee_attack_leash_distance
                 .filter(|leash| leash.is_finite() && *leash >= 0.0)

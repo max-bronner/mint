@@ -455,6 +455,74 @@ fn a_regrown_member_takes_the_rank_the_horde_reached() {
     }
 }
 
+fn regrow_with_swap(swap_at: Option<u32>) -> (u32, [Option<u16>; 2]) {
+    let b = load();
+    let (mut simulation, ids) = start(
+        &b,
+        &[
+            ("Barracks", 100.0, 100.0, PLAYER),
+            ("Killer", 400.0, 300.0, OTHER),
+        ],
+    );
+    let horde = spawn_horde(&mut simulation, ids, 300.0, 300.0);
+    run(&mut simulation, 60);
+    remove(&b, &mut simulation, ids, "Killer");
+    let state = simulation.state().get(ids.horde, horde).unwrap().clone();
+    let survivors: Vec<Entity> = state
+        .members
+        .iter()
+        .copied()
+        .filter(|member| {
+            simulation
+                .state()
+                .get(ids.member, *member)
+                .and_then(|m| m.slot)
+                != state.banner_slot
+        })
+        .take(2)
+        .collect();
+    let slots = |simulation: &Simulation<RotwkRules>| {
+        [0, 1].map(|i| {
+            simulation
+                .state()
+                .get(ids.member, survivors[i])
+                .and_then(|m| m.slot)
+        })
+    };
+    for t in 0..600 {
+        if swap_at == Some(t) {
+            simulation
+                .submit(
+                    PLAYER,
+                    RotwkCommand::SetSelection {
+                        replace: true,
+                        units: survivors.clone(),
+                    },
+                )
+                .unwrap();
+            simulation
+                .submit(
+                    PLAYER,
+                    RotwkCommand::Debug(crate::rules::DebugCommand::SwapPositions),
+                )
+                .unwrap();
+        }
+        simulation.tick().unwrap();
+        if members(&simulation, ids, horde) == 4 {
+            return (t, slots(&simulation));
+        }
+    }
+    panic!("the horde never regrew");
+}
+
+#[test]
+fn a_regrowth_redeals_the_slots_of_members_standing_on_each_others_slots() {
+    let (regrew_on, kept) = regrow_with_swap(None);
+    let (_, swapped) = regrow_with_swap(Some(regrew_on));
+    assert_ne!(kept[0], kept[1]);
+    assert_eq!(swapped, [kept[1], kept[0]]);
+}
+
 #[test]
 fn a_horde_still_being_hit_does_not_regrow() {
     let b = load();

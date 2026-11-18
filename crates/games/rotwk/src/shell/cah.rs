@@ -12,6 +12,7 @@ use super::{Screen, ShellApp};
 use crate::cah_screen::{CahHost, CahState, Request, HERO_LIST, STATS_LIST};
 use crate::hud::{EntrySpec, ImageSource};
 
+const LANGUAGE_DATA: &str = "langdata.dat";
 const NAME_ENTRY: (&str, &str) = ("CahAppearance::InitGadgets", "CreateAHero::HeroName");
 
 impl ShellApp {
@@ -36,6 +37,11 @@ impl ShellApp {
             store,
             self.cah_suppress_promo,
         );
+        if let Ok(bytes) = self.vfs.read(LANGUAGE_DATA) {
+            state
+                .borrow_mut()
+                .set_language_filter(mint_sage_cah::LanguageFilter::parse(&bytes));
+        }
         self.enter(Screen::CreateAHero);
         self.cah
             .view
@@ -182,6 +188,7 @@ impl ShellApp {
                                     tint: [1.0, 1.0, 1.0, 1.0],
                                     premultiplied: false,
                                     rotated: false,
+                                    ignores_color_transform: false,
                                 })
                             });
                     view.set_surface(*instance, Some(content));

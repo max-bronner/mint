@@ -137,8 +137,7 @@ fn a_drag_east_places_the_pair_across_the_anchor_facing_east() {
     assert!(dy > 15.0, "the pair collapsed onto one y: {bodies:?}");
 }
 
-#[test]
-fn a_drag_inside_the_selections_own_spread_tightens_with_no_facing() {
+fn drag_inside_the_spread(planning: bool) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
@@ -165,7 +164,11 @@ fn a_drag_inside_the_selections_own_spread_tightens_with_no_facing() {
         .with_combat(data.combat.clone())
         .with_construction(Arc::clone(&kinds), production)
         .with_drag_formation(Arc::new(assistant()))
-        .with_teams(vec![None, None]);
+        .with_teams(vec![None, None])
+        .with_group_formation(GroupFormation {
+            planning_mode_enabled: planning,
+            ..GroupFormation::default()
+        });
     let mut simulation = Simulation::new(5, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
     let units = simulation
@@ -196,6 +199,12 @@ fn a_drag_inside_the_selections_own_spread_tightens_with_no_facing() {
         )
         .unwrap();
     simulation.tick().unwrap();
+    (simulation, ids, units)
+}
+
+#[test]
+fn a_drag_inside_the_selections_own_spread_tightens_with_no_facing() {
+    let (simulation, ids, units) = drag_inside_the_spread(false);
     for unit in &units {
         assert!(
             !simulation
@@ -203,6 +212,16 @@ fn a_drag_inside_the_selections_own_spread_tightens_with_no_facing() {
                 .contains(ids.in_formation_template, *unit),
             "a tightened drag must not mark a facing status"
         );
+    }
+}
+
+#[test]
+fn a_planning_mode_drag_never_tightens() {
+    let (simulation, ids, units) = drag_inside_the_spread(true);
+    for unit in &units {
+        assert!(simulation
+            .state()
+            .contains(ids.in_formation_template, *unit));
     }
 }
 

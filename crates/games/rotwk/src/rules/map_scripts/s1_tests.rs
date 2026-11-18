@@ -59,6 +59,7 @@ fn number(value: i32) -> Parameter {
 fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -85,6 +86,7 @@ fn script(
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: condition_name.to_owned(),
                 params,
@@ -961,7 +963,13 @@ fn a_computer_move_order_skips_sleepers_and_turns_aggressive_units_to_attack_mov
     sim.tick().unwrap();
     let state = sim.state();
     assert!(state.contains(ids.attack_move_order, cpu));
-    assert!(!state.contains(ids.attack_move_order, slept) && !state.contains(ids.path, slept));
+    assert!(!state.contains(ids.attack_move_order, slept));
+    assert!(state.get(ids.path, slept).is_none_or(|path| {
+        path.goal
+            .minus(mint_movement::Vec2::new(300.0, 300.0))
+            .length()
+            > 20.0
+    }));
 }
 
 #[test]

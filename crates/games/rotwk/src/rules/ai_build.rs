@@ -40,6 +40,7 @@ impl RotwkRules {
             self.step_ai_upgrades_and_powers(tick, ids, player)?;
             self.step_ai_spells(tick, ids, player)?;
         }
+        self.step_ai_forfeits(tick, ids)?;
         Ok(())
     }
 
@@ -176,6 +177,10 @@ impl RotwkRules {
                             &self.upgrade_buildables,
                             &gate,
                             self.production_cost_change_percent(player),
+                            self.brutal_cheats_for(player).build_cost_reduction,
+                            &|world, builder, bit| {
+                                self.sub_upgrade_counted(world, ids, builder, bit)
+                            },
                         )
                         .is_ok()
                     });
@@ -377,13 +382,22 @@ impl RotwkRules {
 
         for (index, state) in progress.tasks.iter_mut().enumerate() {
             match *state {
-                AiTaskState::Ordered(porter) => {
+                AiTaskState::Ordered(porter, spot) => {
                     if let Some(site) = Self::site_of_builder(tick, ids, porter) {
                         *state = AiTaskState::Underway(site);
                     } else if !tick.state().is_live(porter)
                         || !tick.state().contains(ids.build_task, porter)
                     {
-                        *state = AiTaskState::Pending;
+                        *state = match Self::finished_at(
+                            tick,
+                            ids,
+                            player,
+                            tasks.get(index).map(|task| task.kind),
+                            spot,
+                        ) {
+                            Some(site) => AiTaskState::Built(site),
+                            None => AiTaskState::Pending,
+                        };
                     }
                 }
                 AiTaskState::Underway(site) => {
@@ -422,7 +436,7 @@ impl RotwkRules {
         let building_now = progress
             .tasks
             .iter()
-            .any(|state| matches!(state, AiTaskState::Ordered(_) | AiTaskState::Underway(_)));
+            .any(|state| matches!(state, AiTaskState::Ordered(..) | AiTaskState::Underway(_)));
 
         let purse = crate::economy::purse_of(tick.state(), economy, player).amount();
         progress.structure_timer = crate::skirmish_ai::structure_timer_frames(
@@ -442,7 +456,10 @@ impl RotwkRules {
 
         let max_phase = crate::skirmish_ai::allowed_phase(tasks, &progress.tasks);
         let now = tick.frame();
-        let delay = LogicFrames::from_seconds(self.ai_timing.rebuild_delay_seconds);
+        let delay = LogicFrames::from_authored_seconds_truncated(
+            self.ai_timing.rebuild_delay_seconds.trunc(),
+            crate::game_data::RETAIL_HZ,
+        );
         let next = tasks.iter().enumerate().find(|(index, task)| {
             task.phase <= max_phase
                 && match progress.tasks.get(*index) {
@@ -520,7 +537,7 @@ impl RotwkRules {
 
         if tick.state().contains(ids.build_task, porter) {
             if let Some(slot) = progress.tasks.get_mut(index) {
-                *slot = AiTaskState::Ordered(porter);
+                *slot = AiTaskState::Ordered(porter, [x.to_bits(), y.to_bits()]);
             }
             diag!(
                 "skirmish-ai: player {} ordered porter {} to build {} at ({x:.0}, {y:.0}) - \
@@ -740,6 +757,9 @@ impl RotwkRules {
                     continue;
                 }
                 for entry in producer.queue.entries() {
+                    if entry.kind.table() != mint_sage_economy::ItemTable::Objects {
+                        continue;
+                    }
                     let Ok(index) = usize::try_from(entry.item.index()) else {
                         continue;
                     };
@@ -833,6 +853,34 @@ impl RotwkRules {
             &RotwkCommand::QueueUnit { button },
         )?;
         Ok(true)
+    }
+
+    fn finished_at(
+        tick: &Tick<'_>,
+        ids: Ids,
+        player: PlayerId,
+        kind: Option<crate::unit::Kind>,
+        spot: [u32; 2],
+    ) -> Option<Entity> {
+        let kind = kind?;
+        let (x, y) = (f32::from_bits(spot[0]), f32::from_bits(spot[1]));
+        tick.state()
+            .store(ids.kind)?
+            .iter()
+            .filter(|(_, held)| **held == kind)
+            .map(|(entity, _)| entity)
+            .find(|entity| {
+                tick.state().is_live(*entity)
+                    && tick.state().get(ids.construction, *entity).is_none()
+                    && tick
+                        .state()
+                        .get(ids.owner, *entity)
+                        .is_some_and(|owner| owner.0 == player)
+                    && tick.state().get(ids.body, *entity).is_some_and(|body| {
+                        let at = body.0.position;
+                        (at.x - x).abs() <= 1.0 && (at.y - y).abs() <= 1.0
+                    })
+            })
     }
 
     fn site_of_builder(tick: &Tick<'_>, ids: Ids, builder: Entity) -> Option<Entity> {
@@ -937,7 +985,7 @@ impl RotwkRules {
                 .filter(|state| {
                     matches!(
                         state,
-                        crate::skirmish_ai::AiTaskState::Ordered(_)
+                        crate::skirmish_ai::AiTaskState::Ordered(..)
                             | crate::skirmish_ai::AiTaskState::Underway(_)
                     )
                 })

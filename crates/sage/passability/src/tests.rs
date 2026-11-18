@@ -50,13 +50,29 @@ fn lake(points: Vec<[f32; 2]>, water_height: u32) -> Water {
 }
 
 #[test]
-fn the_pinched_cost_is_one_orthogonal_step() {
-    assert_eq!(u32::from(PINCHED_COST), mint_movement::COST_ORTHOGONAL);
+fn the_pinched_cost_is_one_diagonal_step() {
+    assert_eq!(u32::from(PINCHED_COST), mint_movement::COST_DIAGONAL);
 }
 
 #[test]
-fn the_ford_cost_is_one_orthogonal_step() {
-    assert_eq!(u32::from(FORD_COST), mint_movement::COST_ORTHOGONAL);
+fn a_ground_route_keeps_a_node_on_a_pinched_cell() {
+    use mint_movement::{CellPath, Smoothing as _, StringPull};
+    let hm = height_field(24, 6, |_, _| 0);
+    let mut pass = Passability::build(&hm, UNIT_SCALE).unwrap();
+    pass.grid.add_flags(Cell::new(10, 2), PINCHED).unwrap();
+    let path = CellPath {
+        cells: (0..=20).map(|x| Cell::new(x, 2)).collect(),
+        cost: 0,
+        hops: Vec::new(),
+    };
+    for mover in [GROUND, mover_class(&["GROUND".to_owned()], false).unwrap()] {
+        let pulled = StringPull.smooth(&pass.grid, mover, &path);
+        assert!(
+            pulled.cells.contains(&Cell::new(10, 2)),
+            "{:?}",
+            pulled.cells
+        );
+    }
 }
 
 #[test]
@@ -86,7 +102,7 @@ fn a_step_below_the_limit_is_walkable_and_one_above_it_is_a_cliff() {
 }
 
 #[test]
-fn a_cliff_cell_blocks_its_neighbours_too_and_charges_the_ring_beyond() {
+fn a_cliff_cell_blocks_its_neighbours_too_and_nothing_beyond_is_pinched() {
     let hm = height_field(16, 16, |x, y| if x == 8 && y == 8 { 400 } else { 0 });
     let pass = Passability::build(&hm, UNIT_SCALE).unwrap();
     for (x, y) in [(7u16, 7u16), (8, 7), (7, 8), (8, 8)] {
@@ -98,13 +114,8 @@ fn a_cliff_cell_blocks_its_neighbours_too_and_charges_the_ring_beyond() {
     assert!(!pass.grid.is_passable(Cell::new(6, 6), GROUND));
     assert!(!pass.grid.is_passable(Cell::new(9, 9), GROUND));
     assert!(pass.grid.is_passable(Cell::new(5, 5), GROUND));
-    assert_eq!(
-        pass.grid.extra_cost(Cell::new(5, 5)),
-        u32::from(PINCHED_COST)
-    );
-    assert!(pass.grid.flags(Cell::new(5, 5)).intersects(PINCHED));
-    assert!(pass.grid.is_passable(Cell::new(1, 1), GROUND));
-    assert_eq!(pass.grid.extra_cost(Cell::new(1, 1)), 0);
+    assert_eq!(pass.grid.extra_cost(Cell::new(5, 5)), 0);
+    assert!(!pass.grid.flags(Cell::new(5, 5)).intersects(PINCHED));
 }
 
 #[test]
@@ -244,7 +255,7 @@ fn deep_water_blocks_a_ground_unit_and_the_cliff_only_grid_does_not() {
 }
 
 #[test]
-fn a_ford_stays_passable_and_costs_one_orthogonal_step() {
+fn a_ford_is_plain_ground_with_no_cost() {
     let hm = height_field(20, 20, |_, _| 0);
     let water = lake(
         vec![[45.0, 45.0], [145.0, 45.0], [145.0, 145.0], [45.0, 145.0]],
@@ -257,7 +268,112 @@ fn a_ford_stays_passable_and_costs_one_orthogonal_step() {
     let cell = Cell::new(10, 10);
     assert!(grid.grid.is_passable(cell, GROUND));
     assert!(grid.grid.flags(cell).intersects(FORD));
-    assert_eq!(grid.grid.extra_cost(cell), u32::from(FORD_COST));
+    assert_eq!(grid.grid.extra_cost(cell), 0);
+}
+
+#[test]
+fn the_last_corner_deeper_than_wading_decides_water_or_deep() {
+    let hm = height_field(12, 12, |x, y| match (x, y) {
+        (4, 4) => 80,
+        (5, 4) => 89,
+        _ => 98,
+    });
+    let water = lake(
+        vec![
+            [-50.0, -50.0],
+            [250.0, -50.0],
+            [250.0, 250.0],
+            [-50.0, 250.0],
+        ],
+        50,
+    );
+    let grid = Passability::builder(&hm, 0.5)
+        .water(&water, WaterDepths::SHIPPED)
+        .build()
+        .unwrap();
+    let flags = grid.grid.flags(Cell::new(4, 4));
+    assert!(flags.intersects(WATER), "{flags:?}");
+    assert!(!flags.intersects(DEEP_WATER), "{flags:?}");
+}
+
+#[test]
+fn a_cliff_is_never_water_and_does_not_grow_onto_water() {
+    let hm = height_field(20, 20, |x, y| if x == 4 && y == 4 { 400 } else { 0 });
+    let water = lake(
+        vec![
+            [-50.0, -50.0],
+            [250.0, -50.0],
+            [250.0, 250.0],
+            [-50.0, 250.0],
+        ],
+        500,
+    );
+    let dry = Passability::build(&hm, UNIT_SCALE).unwrap();
+    assert!(dry.grid.flags(Cell::new(3, 3)).intersects(CLIFF));
+    let wet = Passability::builder(&hm, UNIT_SCALE)
+        .water(&water, WaterDepths::SHIPPED)
+        .build()
+        .unwrap();
+    let cliff = wet.grid.flags(Cell::new(3, 3));
+    assert!(cliff.intersects(CLIFF) && !cliff.intersects(WATER.union(DEEP_WATER).union(FORD)));
+    let beside = wet.grid.flags(Cell::new(6, 6));
+    assert!(beside.intersects(DEEP_WATER) && !beside.intersects(CLIFF));
+}
+
+#[test]
+fn a_deep_channel_has_a_costed_band_along_its_edges_and_a_free_middle() {
+    let hm = height_field(40, 40, |_, _| 0);
+    let water = lake(
+        vec![[45.0, 45.0], [355.0, 45.0], [355.0, 355.0], [45.0, 355.0]],
+        50,
+    );
+    let grid = Passability::builder(&hm, UNIT_SCALE)
+        .water(&water, WaterDepths::SHIPPED)
+        .build()
+        .unwrap();
+    assert!(grid.grid.flags(Cell::new(10, 20)).intersects(DEEP_BAND));
+    assert!(!grid.grid.flags(Cell::new(11, 20)).intersects(DEEP_BAND));
+    assert!(!grid.grid.flags(Cell::new(20, 20)).intersects(DEEP_BAND));
+    let extent = grid.grid.extent();
+    let counts = vec![0u8; usize::try_from(extent.cell_count()).unwrap()];
+    let view = DynamicView {
+        grid: &grid.grid,
+        counts: &counts,
+        rubble: &[],
+        wall_rim: &[],
+        tags: &[],
+        connect: &[],
+        released: &[],
+        closed: &[],
+        obstacle_pinched: &[],
+        ramp_side: &[],
+        scaleable: &[],
+        barred: &[],
+    };
+    let band = Cell::new(8, 20);
+    let cost = |cell, goal| mint_movement::Passability::goal_extra_cost(&view, cell, goal);
+    assert_eq!(cost(band, Some(Cell::new(30, 20))), 10);
+    assert_eq!(cost(band, None), 10);
+    assert_eq!(cost(band, Some(Cell::new(10, 21))), 0);
+    assert_eq!(cost(Cell::new(20, 20), None), 0);
+    assert_eq!(grid.grid.extra_cost(band), 0);
+}
+
+#[test]
+fn the_water_column_is_surface_minus_the_triangle_ground_at_the_exact_point() {
+    let hm = height_field(20, 20, |x, y| if (x, y) == (4, 4) { 8 } else { 0 });
+    let water = lake(
+        vec![[5.0, 5.0], [185.0, 5.0], [185.0, 185.0], [5.0, 185.0]],
+        4,
+    );
+    let grid = Passability::builder(&hm, UNIT_SCALE)
+        .water(&water, WaterDepths::SHIPPED)
+        .build()
+        .unwrap();
+    assert!((grid.water_depth(Vec2::new(45.0, 35.0)) - 4.0).abs() < 1e-4);
+    assert!((grid.water_depth(Vec2::new(35.0, 45.0)) - 4.0).abs() < 1e-4);
+    assert!((grid.water_depth(Vec2::new(41.0, 49.0)) - 3.2).abs() < 1e-3);
+    assert_eq!(grid.water_depth(Vec2::new(1.0, 1.0)), 0.0);
 }
 
 #[test]
@@ -946,6 +1062,9 @@ fn a_tag_mismatched_neighbour_is_refused_without_a_ramps_connect() {
         origin: None,
         corner_radius: 0.0,
         departure: None,
+        approach: None,
+        prune: false,
+        final_goal: true,
     };
     let mut search = AStar::octile();
     let mut budget = NodeBudget::unlimited();
@@ -1086,31 +1205,6 @@ fn adding_a_source_only_ever_blocks_more_cells() {
     }
 }
 
-#[test]
-fn a_cell_that_is_both_pinched_and_a_ford_pays_for_both() {
-    let hm = height_field(20, 20, |x, y| if x == 10 && y == 10 { 400 } else { 0 });
-    let water = lake(
-        vec![
-            [-50.0, -50.0],
-            [250.0, -50.0],
-            [250.0, 250.0],
-            [-50.0, 250.0],
-        ],
-        3,
-    );
-    let grid = Passability::builder(&hm, UNIT_SCALE)
-        .water(&water, WaterDepths::SHIPPED)
-        .build()
-        .unwrap();
-    let pinched = Cell::new(7, 7);
-    assert!(grid.grid.flags(pinched).intersects(PINCHED));
-    assert!(grid.grid.flags(pinched).intersects(FORD));
-    assert_eq!(
-        grid.grid.extra_cost(pinched),
-        u32::from(PINCHED_COST).saturating_add(u32::from(FORD_COST))
-    );
-}
-
 fn blend_tile_2x2(plane_bit: Option<(usize, bool)>, flammability_byte: u8) -> BlendTileData {
     let plane_len = 2usize;
     let mut bit_planes = vec![vec![0u8; plane_len]; 6];
@@ -1153,6 +1247,48 @@ fn extra_passable_overrides_the_persisted_impassable_bit() {
 }
 
 #[test]
+fn an_extra_passable_pinched_cell_pays_half_the_far_goal_charge() {
+    let hm = height_field(3, 3, |_, _| 500);
+    let mut bt = blend_tile_2x2(None, 0);
+    bt.bit_planes[4][0] = 0x01;
+    let mut grid = Passability::builder(&hm, UNIT_SCALE)
+        .cliff_source(&bt)
+        .build()
+        .unwrap();
+    assert!(grid.grid.flags(Cell::new(0, 0)).intersects(EXTRA_PASSABLE));
+    assert!(!grid.grid.flags(Cell::new(1, 0)).intersects(EXTRA_PASSABLE));
+    for x in 0..2 {
+        grid.grid.add_flags(Cell::new(x, 0), PINCHED).unwrap();
+        grid.grid
+            .set_extra_cost(Cell::new(x, 0), PINCHED_COST)
+            .unwrap();
+    }
+    let counts = vec![0u8; usize::try_from(grid.grid.extent().cell_count()).unwrap()];
+    let view = DynamicView {
+        grid: &grid.grid,
+        counts: &counts,
+        rubble: &[],
+        wall_rim: &[],
+        tags: &[],
+        connect: &[],
+        released: &[],
+        closed: &[],
+        obstacle_pinched: &[],
+        ramp_side: &[],
+        scaleable: &[],
+        barred: &[],
+    };
+    let far = Some(Cell::new(20, 20));
+    let cost = |cell| mint_movement::Passability::goal_extra_cost(&view, cell, far);
+    assert_eq!(cost(Cell::new(0, 0)), 5);
+    assert_eq!(cost(Cell::new(1, 0)), 10);
+    assert_eq!(
+        mint_movement::Passability::extra_cost(&view, Cell::new(0, 0)),
+        u32::from(PINCHED_COST)
+    );
+}
+
+#[test]
 fn the_persisted_impassable_bit_blocks_flat_ground_at_version_18() {
     let hm = height_field(2, 2, |_, _| 500);
     let bt = blend_tile_2x2(Some((0, true)), 0);
@@ -1162,6 +1298,33 @@ fn the_persisted_impassable_bit_blocks_flat_ground_at_version_18() {
         .unwrap();
     assert!(!grid.grid.is_passable(Cell::new(0, 0), GROUND));
     assert_eq!(grid.blocked_cells(), 1);
+}
+
+#[test]
+fn a_version_8_chunk_recomputes_its_impassable_plane_from_heights() {
+    let mut painted = blend_tile_2x2(Some((0, true)), 0);
+    painted.version = 8;
+    let flat = height_field(2, 2, |_, _| 500);
+    let grid = Passability::builder(&flat, UNIT_SCALE)
+        .cliff_source(&painted)
+        .build()
+        .unwrap();
+    assert!(
+        grid.grid.is_passable(Cell::new(0, 0), GROUND),
+        "paint on flat ground clears"
+    );
+
+    let mut bare = blend_tile_2x2(None, 0);
+    bare.version = 8;
+    let steep = height_field(2, 2, |x, _| if x == 0 { 0 } else { 300 });
+    let grid = Passability::builder(&steep, UNIT_SCALE)
+        .cliff_source(&bare)
+        .build()
+        .unwrap();
+    assert!(
+        !grid.grid.is_passable(Cell::new(0, 0), GROUND),
+        "a 300 raw drop blocks"
+    );
 }
 
 #[test]

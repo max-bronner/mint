@@ -8,6 +8,8 @@ use crate::damage::{DamageTypeId, DamageTypes};
 
 pub const MODIFIER_LIST_KEYWORD: &str = "ModifierList";
 
+const INNATE_PREFIX: &str = "INNATE_";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AttributeKind {
     Armor,
@@ -32,6 +34,7 @@ pub enum AttributeKind {
     CrushedDecelerate,
     MinimumCrushVelocity,
     CrushableLevel,
+    CrusherLevel,
     ResistFear,
     ResistTerror,
     ResistKnockback,
@@ -64,6 +67,7 @@ impl AttributeKind {
             "CRUSHED_DECELERATE" => Self::CrushedDecelerate,
             "MINIMUM_CRUSH_VELOCITY" => Self::MinimumCrushVelocity,
             "CRUSHABLE_LEVEL" => Self::CrushableLevel,
+            "CRUSHER_LEVEL" => Self::CrusherLevel,
             "RESIST_FEAR" => Self::ResistFear,
             "RESIST_TERROR" => Self::ResistTerror,
             "RESIST_KNOCKBACK" => Self::ResistKnockback,
@@ -256,6 +260,7 @@ fn value(raw: &str, macros: &MacroTable) -> Option<f32> {
 pub struct Attributes {
     pub damage_add: f32,
     pub damage_mult: f32,
+    pub innate_damage_mult: f32,
     pub armor: f32,
     pub speed: f32,
     pub range: f32,
@@ -274,6 +279,7 @@ pub struct Attributes {
     pub crushed_decelerate: f32,
     pub minimum_crush_velocity: Option<f32>,
     pub crushable_level: f32,
+    pub crusher_level: f32,
     pub resist_fear: f32,
     pub resist_terror: f32,
     pub resist_knockback: f32,
@@ -289,6 +295,7 @@ impl Attributes {
     pub const IDENTITY: Self = Self {
         damage_add: 0.0,
         damage_mult: 1.0,
+        innate_damage_mult: 1.0,
         armor: 0.0,
         speed: 1.0,
         range: 0.0,
@@ -307,17 +314,24 @@ impl Attributes {
         crushed_decelerate: 1.0,
         minimum_crush_velocity: None,
         crushable_level: 0.0,
+        crusher_level: 0.0,
         resist_fear: 0.0,
         resist_terror: 0.0,
         resist_knockback: 0.0,
     };
 
     pub fn fold(&mut self, list: &ModifierList) {
+        let innate = list.category.as_deref().is_some_and(|category| {
+            category
+                .get(..INNATE_PREFIX.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(INNATE_PREFIX))
+        });
         for modifier in &list.modifiers {
             let v = modifier.value;
             match modifier.kind {
                 AttributeKind::Armor => self.armor += v,
                 AttributeKind::DamageAdd => self.damage_add += v,
+                AttributeKind::DamageMult if innate => self.innate_damage_mult *= v,
                 AttributeKind::DamageMult => self.damage_mult *= v,
                 AttributeKind::Speed => self.speed *= v,
                 AttributeKind::Range => self.range += v,
@@ -341,6 +355,7 @@ impl Attributes {
                         Some(self.minimum_crush_velocity.map_or(v, |held| held * v));
                 }
                 AttributeKind::CrushableLevel => self.crushable_level += v,
+                AttributeKind::CrusherLevel => self.crusher_level += v,
                 AttributeKind::ResistFear => self.resist_fear += v,
                 AttributeKind::ResistTerror => self.resist_terror += v,
                 AttributeKind::ResistKnockback => self.resist_knockback += v,
@@ -356,16 +371,18 @@ impl Attributes {
 
     #[must_use]
     pub fn damage(&self, amount: f32) -> f32 {
-        self.damage_of(amount, false, true)
+        self.damage_of(amount, false, true, false)
     }
 
     #[must_use]
-    pub fn damage_of(&self, amount: f32, magic: bool, accepts_add: bool) -> f32 {
+    pub fn damage_of(&self, amount: f32, magic: bool, accepts_add: bool, use_innate: bool) -> f32 {
         if amount.is_nan() || amount <= 0.0 {
             return amount;
         }
         let mult = if magic {
             self.spell_damage
+        } else if use_innate {
+            self.damage_mult * self.innate_damage_mult
         } else {
             self.damage_mult
         };
@@ -455,6 +472,17 @@ impl Attributes {
     }
 
     #[must_use]
+    pub fn crusher_level_bonus(&self) -> i16 {
+        let sum = self.crusher_level;
+        if !sum.is_finite() || sum.abs() > 1.0e4 {
+            return 0;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let whole = sum.trunc() as i16;
+        whole
+    }
+
+    #[must_use]
     pub fn command_point_bonus(&self) -> i32 {
         let sum = self.command_points;
         if !sum.is_finite() || sum.abs() > 1.0e6 {
@@ -489,6 +517,9 @@ impl Attributes {
             self.resist_knockback,
         ] {
             hasher.write_f32(v);
+        }
+        if self.crusher_level != 0.0 {
+            hasher.write_f32(self.crusher_level);
         }
         match self.minimum_crush_velocity {
             Some(v) => {
@@ -662,18 +693,36 @@ mod tests {
         assert_eq!(s.unapplied(), 0);
         let mut a = Attributes::IDENTITY;
         a.fold(s.get(s.id("L").unwrap()).unwrap());
-        assert_eq!(a.damage_of(10.0, false, true), 5.0);
-        assert_eq!(a.damage_of(10.0, true, true), 20.0);
+        assert_eq!(a.damage_of(10.0, false, true, false), 5.0);
+        assert_eq!(a.damage_of(10.0, true, true, false), 20.0);
         assert_eq!(a.rate_of_fire, 2.0);
         assert!((a.shroud_range(100.0) - 300.0).abs() < 1e-3);
-        assert_eq!(Attributes::IDENTITY.damage_of(10.0, true, true), 10.0);
-        a.damage_add = 4.0;
-        assert_eq!(a.damage_of(10.0, false, true), 7.0);
         assert_eq!(
-            a.damage_of(10.0, false, false),
+            Attributes::IDENTITY.damage_of(10.0, true, true, false),
+            10.0
+        );
+        a.damage_add = 4.0;
+        assert_eq!(a.damage_of(10.0, false, true, false), 7.0);
+        assert_eq!(
+            a.damage_of(10.0, false, false, false),
             5.0,
             "AcceptDamageAdd = No skips the add"
         );
+    }
+
+    #[test]
+    fn innate_damage_mult_reaches_only_a_weapon_that_uses_innate_attributes() {
+        let s = store(
+            "ModifierList Born
+  Category = INNATE_DAMAGEMULT
+  Modifier = DAMAGE_MULT 200%
+End
+",
+        );
+        let mut a = Attributes::IDENTITY;
+        a.fold(s.get(s.id("Born").unwrap()).unwrap());
+        assert_eq!(a.damage_of(10.0, false, true, false), 10.0);
+        assert_eq!(a.damage_of(10.0, false, true, true), 20.0);
     }
 
     #[test]
@@ -800,5 +849,23 @@ End
             ..Attributes::IDENTITY
         };
         assert_eq!(down.crushable_level_bonus(), -1);
+    }
+
+    #[test]
+    fn crusher_level_bonus_truncates_the_named_kind() {
+        assert_eq!(
+            AttributeKind::parse("CRUSHER_LEVEL"),
+            AttributeKind::CrusherLevel
+        );
+        let up = Attributes {
+            crusher_level: 1.9,
+            ..Attributes::IDENTITY
+        };
+        assert_eq!(up.crusher_level_bonus(), 1);
+        let down = Attributes {
+            crusher_level: -1.9,
+            ..Attributes::IDENTITY
+        };
+        assert_eq!(down.crusher_level_bonus(), -1);
     }
 }

@@ -106,6 +106,17 @@ pub fn static_lod_effects(documents: &[Document], level: DetailLevel) -> Option<
     DetailLevel::parse(&static_lod_field(documents, level, "EffectsLOD")?.to_ascii_lowercase())
 }
 
+#[must_use]
+pub fn static_lod_shadow_decals(documents: &[Document], level: DetailLevel) -> Option<bool> {
+    let flag = |field: &str| {
+        static_lod_field(documents, level, field).and_then(mint_sage_ini::value::parse_bool)
+    };
+    match (flag("UseShadowDecals"), flag("UseShadowMapping")) {
+        (None, None) => None,
+        (decals, mapping) => Some(decals.unwrap_or(false) && !mapping.unwrap_or(false)),
+    }
+}
+
 fn static_lod_field<'a>(
     documents: &'a [Document],
     level: DetailLevel,
@@ -248,6 +259,31 @@ mod tests {
         assert_eq!(DetailLevel::Medium.retail_max_particles(), Some(1_500));
         assert_eq!(DetailLevel::High.retail_max_particles(), Some(3_000));
         assert_eq!(DetailLevel::UltraHigh.retail_max_particles(), Some(3_000));
+    }
+
+    #[test]
+    fn shadow_mapping_leaves_a_static_lod_without_shadow_decals() {
+        use mint_sage_ini::BlockTable;
+        let text = "StaticGameLOD = Medium
+  UseShadowDecals=Yes
+  UseShadowMapping = No
+End
+StaticGameLOD = UltraHigh
+  UseShadowDecals=Yes    ;use 2D decal shadows
+  UseShadowMapping = Yes ;use shadow mapping
+End
+";
+        let document = Document::parse("lod.ini", text, &BlockTable::corpus_path()).unwrap();
+        let docs = [document];
+        assert_eq!(
+            static_lod_shadow_decals(&docs, DetailLevel::Medium),
+            Some(true)
+        );
+        assert_eq!(
+            static_lod_shadow_decals(&docs, DetailLevel::UltraHigh),
+            Some(false)
+        );
+        assert_eq!(static_lod_shadow_decals(&docs, DetailLevel::Low), None);
     }
 
     #[test]

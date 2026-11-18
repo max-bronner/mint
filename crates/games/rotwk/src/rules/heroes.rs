@@ -1,15 +1,37 @@
-use mint_sage_economy::{CommandPointPool, ItemId, Money, QueueRequest};
+use mint_sage_economy::{ItemId, ItemTable, Money, QueueRequest};
 use mint_sim::{Entity, PlayerId, Result, Tick, World};
 
 use super::{Ids, RotwkRules};
 use crate::diag::diag;
 use crate::economy::{Buildable, Purse};
 use crate::heroes::{
-    discounted, hero_discount, respawn_rule, HeroAvailability, HeroOrder, HeroRefusal, HeroRoster,
-    HeroState,
+    discounted, hero_discount, respawn_rule, revive_price, HeldRevive, HeroAvailability, HeroOrder,
+    HeroRefusal, HeroRoster, HeroState, ReviveTerms,
 };
 
 impl RotwkRules {
+    pub(crate) fn unit_command_points_fit(
+        &self,
+        world: &World,
+        player: PlayerId,
+        kind: crate::unit::Kind,
+    ) -> bool {
+        let (Some(ids), Some(buildable)) = (
+            self.ids,
+            self.buildables
+                .iter()
+                .find(|buildable| buildable.kind == kind),
+        ) else {
+            return true;
+        };
+        let army_of_dead = self
+            .kinds
+            .get(kind)
+            .is_some_and(|entry| entry.record.has_kind("ARMY_OF_DEAD"));
+        let free = crate::economy::points_of(world, Self::economy_ids(ids), player).free();
+        crate::heroes::command_points_fit(buildable.command_points, free, army_of_dead)
+    }
+
     pub(super) fn buildable_at(&self, index: u16) -> Option<&Buildable> {
         let index = usize::from(index);
         self.buildables.get(index).or_else(|| {
@@ -117,12 +139,13 @@ impl RotwkRules {
             },
             self.production_cost_change_percent(player),
         );
-        let cost_modifier =
-            (1.0 + modifiers.production_cost_change_percent) * modifiers.kind_of_modifier;
-        let discount = (cost_mult * cost_modifier, time_mult);
+        let brutal = self.brutal_cheats_for(player);
         let power_cost = i64::from(self.cah_power_cost(player, kind));
         let held_revive =
             revive.is_some() && self.cah_plan_of(player).is_some() && self.is_cah_kind(kind);
+        let seeded = self
+            .wotr_run(world)
+            .and_then(|run| run.revive_price(player, kind));
         let (base_cost, seconds) = match revive {
             None => (
                 record
@@ -134,19 +157,18 @@ impl RotwkRules {
                     .build_time
                     .filter(|s| (0.0..=crate::templates::MAX_BUILD_SECONDS).contains(s)),
             ),
+            Some(_) if !held_revive && seeded.is_some() => {
+                let (cost, seconds) = seeded.unwrap_or_default();
+                (Some(cost), Some(seconds))
+            }
             Some(points) => {
-                let rank = self
-                    .level_tables
-                    .get(kind)
-                    .and_then(|table| table.level(table.index_for(points)))
-                    .map_or(1, |level| level.rank);
+                let rank = self.rank_at(kind, points);
                 let rule = respawn_rule(&record.respawn, &record.respawn_entries, rank);
                 let cost = if held_revive {
                     record
                         .build_cost
                         .and_then(crate::templates::whole)
                         .filter(|cost| *cost >= 0)
-                        .map(|cost| cost.saturating_add(power_cost))
                 } else {
                     rule.and_then(|rule| rule.cost)
                         .and_then(crate::templates::whole)
@@ -163,11 +185,29 @@ impl RotwkRules {
         let (Some(base_cost), Some(seconds)) = (base_cost, seconds) else {
             return Err(HeroRefusal::NoPrice);
         };
-        let (cost, build_time) = discounted(base_cost, seconds, discount);
-        let cost = if held_revive {
-            cost.saturating_mul(i64::from(self.cah_revival_discount)) / 100
+        let (cost, build_time) = if revive.is_some() {
+            revive_price(
+                base_cost,
+                seconds,
+                &ReviveTerms {
+                    player: modifiers,
+                    slot: (cost_mult, time_mult),
+                    brutal,
+                    held: held_revive.then_some(HeldRevive {
+                        sum: power_cost,
+                        discount_percent: self.cah_revival_discount,
+                    }),
+                },
+            )
         } else {
-            cost
+            let player_factor =
+                (1.0 + modifiers.production_cost_change_percent) * modifiers.kind_of_modifier;
+            discounted(
+                base_cost,
+                seconds,
+                (cost_mult * player_factor, time_mult),
+                brutal,
+            )
         };
         let purse = crate::economy::purse_of(world, Self::economy_ids(ids), player);
         if !purse.can_afford(cost) {
@@ -182,9 +222,7 @@ impl RotwkRules {
                 .hero_buildable_index(kind)
                 .and_then(|item| self.buildable_at(item))
                 .map_or(0, |buildable| buildable.command_points);
-            let free = crate::economy::points_of(world, Self::economy_ids(ids), player)
-                .free()
-                .saturating_sub(producer.queue.reserved_command_points());
+            let free = crate::economy::points_of(world, Self::economy_ids(ids), player).free();
             if !crate::heroes::command_points_fit(needed, free, record.has_kind("ARMY_OF_DEAD")) {
                 return Err(HeroRefusal::CommandPoints { needed, free });
             }
@@ -196,6 +234,13 @@ impl RotwkRules {
             cost,
             build_time,
         })
+    }
+
+    pub(crate) fn rank_at(&self, kind: crate::unit::Kind, points: u32) -> u16 {
+        self.level_tables
+            .get(kind)
+            .and_then(|table| table.level(table.index_for(points)))
+            .map_or(1, |level| level.rank)
     }
 
     pub(super) fn recruit_hero(
@@ -245,10 +290,6 @@ impl RotwkRules {
             .state()
             .get(ids.purse, player_entity)
             .map_or(Money::new(0), |held| held.0);
-        let points = tick
-            .state()
-            .get(ids.points, player_entity)
-            .map_or(CommandPointPool::new(0), |held| held.0);
         let Some(producer) = tick.state_mut().get_mut(ids.producer, structure) else {
             return Ok(());
         };
@@ -264,7 +305,7 @@ impl RotwkRules {
                     .is_some_and(|buildable| buildable.builder),
             },
         };
-        if let Err(refusal) = producer.queue.queue(request, &mut purse, &points) {
+        if let Err(refusal) = producer.queue.queue(request, &mut purse) {
             diag!(
                 "hero: {} at entity {} refused - {}: {refusal}",
                 self.kind_name(Some(order.kind)),
@@ -527,6 +568,9 @@ impl RotwkRules {
                             self.kind_name(entry.kind),
                             hero.index()
                         );
+                        if let Some(kind) = entry.kind {
+                            self.note_wotr_fallen(tick, ids, player_entity, hero, kind);
+                        }
                         if let (Some(kind), Some(at)) = (entry.kind, at) {
                             self.play_hero_death_fx(tick, ids, kind, hero, at);
                         }
@@ -614,7 +658,7 @@ impl RotwkRules {
         world
             .get(ids.producer, structure)?
             .queue
-            .first_of(ItemId::new(u32::from(item)))
+            .first_of(ItemTable::Objects, ItemId::new(u32::from(item)))
             .map(|entry| entry.fraction())
     }
 
@@ -674,7 +718,7 @@ impl RotwkRules {
         let entry = |producer: &crate::economy::Producer| {
             producer
                 .queue
-                .last_of(ItemId::new(u32::from(item)))
+                .last_of(ItemTable::Objects, ItemId::new(u32::from(item)))
                 .map(|entry| entry.id)
         };
         self.cancel_production(tick, ids, player, &[structure], &entry)
@@ -740,6 +784,14 @@ impl RotwkRules {
             .enumerate()
             .map(|(at, entry)| {
                 let fielded = hero_page_fielded(entry.state);
+                let points = match entry.state {
+                    HeroState::Dead { points }
+                    | HeroState::Queued {
+                        revive: Some(points),
+                        ..
+                    } => points,
+                    _ => 0,
+                };
                 let answer = structure.and_then(|structure| {
                     u8::try_from(at)
                         .ok()
@@ -757,6 +809,19 @@ impl RotwkRules {
                     affordable,
                     allowed,
                     cost,
+                    revive: matches!(
+                        entry.state,
+                        HeroState::Dead { .. }
+                            | HeroState::Queued {
+                                revive: Some(_),
+                                ..
+                            }
+                    ),
+                    level: entry
+                        .kind
+                        .and_then(|kind| self.level_tables.get(kind))
+                        .and_then(|table| table.level(table.index_for(points)))
+                        .map_or(1, |level| level.rank),
                 }
             })
             .collect()

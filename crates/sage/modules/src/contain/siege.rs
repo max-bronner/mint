@@ -2,6 +2,7 @@ use mint_sim::module::{CapabilityMask, ModuleKind};
 use mint_sim::{Component, FieldError, Frame, ModuleFieldSource, StateHasher};
 
 use super::{count, open_contain_from_fields, owned, OpenContain, MAX_CONTAIN};
+use crate::effects::{names, Names};
 use crate::object_filter::ObjectFilter;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -11,6 +12,7 @@ pub struct SiegeEngineContain {
     crew_max: u32,
     initial_crew: Option<InitialCrew>,
     speed_percent_per_crew: f32,
+    status_of_crew: Names,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,11 @@ impl SiegeEngineContain {
     }
 
     #[must_use]
+    pub fn status_of_crew(&self) -> &[std::sync::Arc<str>] {
+        &self.status_of_crew
+    }
+
+    #[must_use]
     pub const fn speed_percent_per_crew(&self) -> f32 {
         self.speed_percent_per_crew
     }
@@ -59,6 +66,9 @@ impl Component for SiegeEngineContain {
             None => hasher.write_u32(0),
         }
         hasher.write_f32(self.speed_percent_per_crew);
+        for status in self.status_of_crew.iter() {
+            hasher.write_bytes(status.as_bytes());
+        }
     }
 }
 
@@ -114,5 +124,6 @@ pub fn siege_engine_contain_from_fields(
         crew_max: count(fields, "CrewMax", 0, MAX_CONTAIN)?,
         initial_crew: initial_crew(fields)?,
         speed_percent_per_crew: percent_or(fields, "SpeedPercentPerCrew", 1.0)?,
+        status_of_crew: names(owned(fields.field_args("ObjectStatusOfCrew"))),
     })
 }

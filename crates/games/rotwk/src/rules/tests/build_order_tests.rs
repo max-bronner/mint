@@ -246,6 +246,35 @@ fn re_tasking_a_builder_refunds_its_pending_order() {
 }
 
 #[test]
+fn a_builder_killed_on_its_way_places_no_site_and_its_order_is_refunded() {
+    let (mut simulation, ids, shed, _, far) = porters([PLAYER, PLAYER], Vec::new());
+    order_shed(&mut simulation, shed, far, 150.0, 200.0);
+    simulation.tick().unwrap();
+    assert_eq!(purse(&simulation, ids, PLAYER), 900);
+    assert!(simulation.state().contains(ids.build_task, far));
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::Debug(crate::rules::DebugCommand::Kill {
+                target: crate::rules::DebugTarget::All,
+            }),
+        )
+        .unwrap();
+    for _ in 0..300 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        simulation
+            .state()
+            .store(ids.construction)
+            .map_or(0, |store| store.len())
+            == 0,
+        "a dead builder raised a site"
+    );
+    assert_eq!(purse(&simulation, ids, PLAYER), 1_000, "refunded in full");
+}
+
+#[test]
 fn a_builder_within_arrival_tolerance_starts_without_walking_the_rest_of_the_way() {
     let (mut simulation, ids, shed, _near, far) = porters([PLAYER, PLAYER], Vec::new());
     order_shed(&mut simulation, shed, far, 300.0, 200.0);
@@ -347,6 +376,7 @@ fn allow_disallow_one_building_refuses_then_permits_construction() {
             or_conditions: vec![OrCondition {
                 conditions: vec![Condition {
                     condition_type: 0,
+                    inverted: false,
                     enabled: true,
                     name: "CONDITION_TRUE".to_owned(),
                     params: Vec::new(),
@@ -354,6 +384,7 @@ fn allow_disallow_one_building_refuses_then_permits_construction() {
             }],
             actions: vec![ScriptAction {
                 action_type: 0,
+                enabled: true,
                 name: action.to_owned(),
                 params,
             }],

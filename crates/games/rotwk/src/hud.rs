@@ -79,8 +79,17 @@ pub(crate) enum ImageSource {
     Entry(std::sync::Arc<EntrySpec>),
     HelpText(std::sync::Arc<Vec<crate::help_box::HelpLineSpec>>),
     Message(std::sync::Arc<Vec<crate::help_box::HelpLineSpec>>),
-    Progress(u8),
+    Progress(Clock),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Clock {
+    pub(crate) percent: u8,
+    pub(crate) tint: u32,
+}
+
+const SIDE_BAR_CLOCK_COLOR: u32 = 0x80FF_FFFF;
+const DEFAULT_BUILD_UP_CLOCK_COLOR: u32 = 0x8000_0000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CheckSpec {
@@ -140,6 +149,7 @@ pub(crate) struct ListSpec {
     pub(crate) selected: Option<usize>,
     pub(crate) scroll_bar: Option<bool>,
     pub(crate) text_inset_percent: u8,
+    pub(crate) scroll_to_top: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -166,6 +176,9 @@ pub(crate) struct HudState {
     pub(crate) gold: i64,
     pub(crate) command_points: (i32, i32),
     pub(crate) evil: bool,
+    pub(crate) portrait_object: Option<mint_sim::Entity>,
+    pub(crate) spell_clock_color: u32,
+    pub(crate) faction: String,
     pub(crate) faction_icon: Option<String>,
     pub(crate) selected: bool,
     pub(crate) portrait: Option<String>,
@@ -232,7 +245,7 @@ pub(crate) fn read_hud(
                 })
             })
         });
-        affordable && producer_free
+        affordable && producer_free && rules.unit_command_points_fit(world, LOCAL_PLAYER, target)
     };
     let subject = selected_entities
         .first()
@@ -292,6 +305,20 @@ pub(crate) fn read_hud(
                     |offer| offer.affordable,
                 ),
                 allowed: offer.is_none_or(|offer| offer.allowed),
+                display_name: record.and_then(|r| r.display_name.clone()),
+                literal_name: record
+                    .filter(|r| r.has_kind(crate::create_a_hero::CREATE_A_HERO_KIND))
+                    .and_then(|_| rules.cah_plan_of(LOCAL_PLAYER))
+                    .map(|plan| plan.name.clone()),
+                revive: offer.is_some_and(|offer| offer.revive),
+                hotkey: record.and_then(|r| r.hotkey.clone()),
+                revive_text: record.and_then(|r| r.revive_text.clone()),
+                recruit_text: record.and_then(|r| r.recruit_text.clone()),
+                level: offer.map_or(1, |offer| offer.level),
+                command_points: record
+                    .and_then(|r| r.command_points)
+                    .and_then(crate::templates::whole)
+                    .unwrap_or(0),
             }
         })
         .collect();
@@ -370,9 +397,10 @@ pub(crate) fn read_hud(
     };
     let now = state.simulation.frame();
     let power_clock = |power: &str| {
-        first
-            .zip(ids)
-            .and_then(|(entity, ids)| rules.power_clock(world, ids, entity, power, now))
+        first.zip(ids).and_then(|(entity, ids)| {
+            let power = rules.button_readiness_power(world, ids, entity, power);
+            rules.power_clock(world, ids, entity, power, now)
+        })
     };
     let auto_cast_holder = first
         .zip(ids)
@@ -387,6 +415,9 @@ pub(crate) fn read_hud(
             .zip(rules.upgrade_state_id())
             .and_then(|(entity, id)| world.get(id, entity))
             .is_some_and(|upgraded| flags.iter().all(|flag| upgraded.has_weapon_set_flag(flag)))
+    };
+    let model_condition_gate = |enable: &[String], disable: &[String]| {
+        first.is_none_or(|entity| rules.model_condition_gate(world, entity, enable, disable))
     };
     let passenger_list: Vec<mint_sim::Entity> = first
         .zip(ids)
@@ -443,6 +474,7 @@ pub(crate) fn read_hud(
         power_clock: &power_clock,
         auto_cast_on: &auto_cast_on,
         weapon_set_raised: &weapon_set_raised,
+        model_condition_gate: &model_condition_gate,
         passengers: &passengers,
         passenger_entities: &passenger_list,
         capacity,
@@ -600,10 +632,22 @@ pub(crate) fn read_hud(
         gold: purse.map_or(0, mint_sage_economy::Money::amount),
         command_points: points.map_or((0, 0), |p| (p.used(), p.limit())),
         evil: state.local_evil,
+        portrait_object: subject,
+        spell_clock_color: state
+            .local_side
+            .as_deref()
+            .and_then(|side| data.control_bar_schemes.for_side(side))
+            .or_else(|| {
+                data.control_bar_schemes
+                    .for_side(mint_sage_ini::control_bar_scheme::DEFAULT_SCHEME)
+            })
+            .and_then(|scheme| scheme.build_up_clock_color)
+            .map_or(DEFAULT_BUILD_UP_CLOCK_COLOR, mint_sage_ini::Argb8::packed),
+        faction: state.local_faction.clone().unwrap_or_default(),
         faction_icon: state
-            .local_faction_icon
-            .clone()
-            .filter(|name| data.mapped_images.get(name).is_some()),
+            .local_faction
+            .as_deref()
+            .and_then(|faction| resource_bar_icon(faction, &data.mapped_images)),
         selected: selected_kind.is_some(),
         portrait: subject
             .and_then(|entity| state_image(state, entity, |s| &s.portrait_image))
@@ -892,9 +936,12 @@ fn command_slot(
                 None => ImageSource::Button(slot.command_button.clone()),
             };
             ex.image(ImageKey::Name(format!("{key}_Image")), Some(source));
-            let timer = slot
-                .progress
-                .map_or(ImageSource::Hidden, ImageSource::Progress);
+            let timer = slot.progress.map_or(ImageSource::Hidden, |percent| {
+                ImageSource::Progress(Clock {
+                    percent,
+                    tint: SIDE_BAR_CLOCK_COLOR,
+                })
+            });
             ex.image(ImageKey::Name(format!("{key}_Timer")), Some(timer));
         }
         None => {
@@ -950,6 +997,17 @@ pub(crate) fn flyout_frame(position: u8, button: usize) -> String {
     format!("CommandButtons.subMenu{position}.trays.{button}.rot.bttnFrame")
 }
 
+pub(crate) fn resource_bar_icon(
+    faction: &str,
+    images: &mint_sage_ini::MappedImageIndex,
+) -> Option<String> {
+    if faction.is_empty() {
+        return None;
+    }
+    let name = format!("ResourceBar_{faction}");
+    images.get(&name).is_some().then_some(name)
+}
+
 pub(crate) fn declare_palantir(ex: &mut Exposure<ImageSource>, hud: &HudState) {
     ex.global(IN_GAME, Value::Bool(true));
     ex.set_extern(IN_GAME, Value::Bool(true));
@@ -959,6 +1017,13 @@ pub(crate) fn declare_palantir(ex: &mut Exposure<ImageSource>, hud: &HudState) {
         "SetPalantirFrameState",
         vec![Value::str(state)],
     );
+    if !hud.faction.is_empty() {
+        ex.call(
+            "faction",
+            "SetPlayerFaction",
+            vec![Value::str(&hud.faction)],
+        );
+    }
     let side = if hud.evil { "_ring" } else { "_evenstar" };
     for clip in SIDE_CLIPS {
         ex.call_on(
@@ -1211,11 +1276,11 @@ pub(crate) fn declare_hero_select(
     root_path: &str,
 ) {
     ex.call(&under(root, "show"), &under(root, "Show"), Vec::new());
-    if let Some(side) = &hud.side {
+    if !hud.faction.is_empty() {
         ex.call(
             &under(root, "faction"),
             &under(root, "SetFaction"),
-            vec![Value::str(side)],
+            vec![Value::str(&hud.faction)],
         );
     }
     let crystal = if hud.fielded_heroes.is_empty() {
@@ -1325,7 +1390,12 @@ pub(crate) fn declare_spell_row(ex: &mut Exposure<ImageSource>, hud: &HudState, 
         }
         let image = slot.map(|s| ImageSource::Button(s.command_button.clone()));
         ex.image(ImageKey::Name(format!("InGameSpellBook{clip}Image")), image);
-        let timer = percent.map_or(ImageSource::Hidden, ImageSource::Progress);
+        let timer = percent.map_or(ImageSource::Hidden, |percent| {
+            ImageSource::Progress(Clock {
+                percent,
+                tint: hud.spell_clock_color,
+            })
+        });
         ex.image(
             ImageKey::Name(format!("InGameSpellBook{clip}Timer")),
             Some(timer),

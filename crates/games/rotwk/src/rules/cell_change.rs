@@ -145,28 +145,19 @@ impl RotwkRules {
     }
 
     fn in_melee_cells(&self, tick: &Tick<'_>, ids: Ids, entity: Entity, other: Entity) -> bool {
-        let world = tick.state();
-        let Some(range) = world
-            .get(ids.armed, entity)
-            .and_then(|armed| self.combat.weapons.get(armed.weapon))
-            .filter(|template| template.melee)
-            .map(|template| template.attack_range)
+        let Some(at) = tick
+            .state()
+            .get(ids.body, entity)
+            .map(|body| body.0.position)
         else {
             return false;
         };
-        let (Some(mine), Some(theirs)) = (
-            self.cell_rect(tick, ids, entity),
-            self.cell_rect(tick, ids, other),
-        ) else {
-            return false;
+        let striker = super::melee_contact::Striker {
+            entity,
+            at,
+            footprint: self.footprint_of(tick, ids, entity),
         };
-        #[allow(clippy::cast_possible_truncation)]
-        let rings = (range / self.passability.geometry.cell_size() + 0.1)
-            .ceil()
-            .clamp(0.0, 64.0) as i32;
-        let (ax0, ay0, ax1, ay1) = mine.span();
-        let (bx0, by0, bx1, by1) = theirs.span();
-        ax0 - rings <= bx1 && bx0 <= ax1 + rings && ay0 - rings <= by1 && by0 <= ay1 + rings
+        self.melee_contact(tick, ids, striker, other)
     }
 
     fn units_beside(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> Vec<Beside> {

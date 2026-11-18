@@ -16,9 +16,11 @@ pub(crate) const QUIT_MENU_MOVIE: &str = "quitmenu";
 pub(crate) const OPTIONS_MOVIE: &str = "options";
 pub(crate) const MENU_READY: &str = "OnInitialized";
 
-const UNBUILT_BUTTONS: [&str; 1] = ["Save"];
+const SAVE_BUTTON: &str = "Save";
 const LOAD_BUTTON: &str = "Load";
+const SESSION_DISABLED: [&str; 2] = ["Options", "Restart"];
 const CAMPAIGN_TAB: u8 = 1;
+const WOTR_TAB: u8 = 8;
 
 const RESTART_LABEL: &str = "RestartOrSurrender";
 pub(crate) const RESTART_TEXT: &str = "APT:Restart";
@@ -29,6 +31,7 @@ pub(crate) enum MenuRequest {
     RestartMission,
     ApplyOptions(OptionsPreferences),
     LoadSave(std::path::PathBuf),
+    SaveGame { stem: String, description: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +48,9 @@ pub(crate) struct InGameMenus {
     save_screen: Option<SaveLoad>,
     save_sources: Option<(Arc<Vfs>, Arc<mint_sage_str::StringTable>)>,
     load_enabled: bool,
+    save_enabled: bool,
+    tabs: u8,
+    disabled: &'static [&'static str],
     shown: Option<Shown>,
     requests: Vec<MenuRequest>,
     restart_label: Option<String>,
@@ -78,6 +84,9 @@ impl InGameMenus {
             save_screen: None,
             save_sources: None,
             load_enabled: false,
+            save_enabled: false,
+            tabs: CAMPAIGN_TAB,
+            disabled: &[],
             shown: None,
             requests: Vec::new(),
             restart_label,
@@ -99,6 +108,16 @@ impl InGameMenus {
         self.save_load = hosted;
         self.save_sources = Some((vfs, strings));
         self
+    }
+
+    pub(crate) fn for_session(mut self) -> Self {
+        self.tabs = WOTR_TAB;
+        self.disabled = &SESSION_DISABLED;
+        self
+    }
+
+    pub(crate) fn set_save_enabled(&mut self, enabled: bool) {
+        self.save_enabled = enabled;
     }
 
     pub(crate) fn set_load_enabled(&mut self, enabled: bool) {
@@ -155,7 +174,7 @@ impl InGameMenus {
         self.shown = Some(Shown::Quit);
     }
 
-    fn open_save_load(&mut self) {
+    fn open_save_load(&mut self, mode: Mode) {
         self.shown = None;
         let env = self
             .save_sources
@@ -170,7 +189,7 @@ impl InGameMenus {
             return;
         }
         hosted.expose.set_extern("InGame", Value::Bool(true));
-        let screen = SaveLoad::open(Mode::Load, CAMPAIGN_TAB, true, env);
+        let screen = SaveLoad::open(mode, self.tabs, true, env);
         hosted.view.player.set_sync_host(Some(screen.sync_host()));
         self.save_screen = Some(screen);
         self.options_gadget_held = false;
@@ -202,7 +221,11 @@ impl InGameMenus {
                 println!("load: {} - leaving the match", path.display());
                 self.requests.push(MenuRequest::LoadSave(path));
             }
-            Exit::Closed | Exit::Save { .. } => self.open_quit(),
+            Exit::Save { stem, description } => {
+                self.requests
+                    .push(MenuRequest::SaveGame { stem, description });
+            }
+            Exit::Closed => self.open_quit(),
         }
     }
 
@@ -336,6 +359,22 @@ impl InGameMenus {
         let _ = hosted.view.player.pointer_button(pressed);
     }
 
+    pub(crate) fn key(&mut self, key: mint_app::Key, pressed: bool) {
+        if let Some(screen) = self.save_screen.as_mut() {
+            screen.key(key, pressed);
+        }
+    }
+
+    pub(crate) fn quit_call(&mut self, command: &str) {
+        self.on_quit_call(command);
+    }
+
+    pub(crate) fn commit_save(&mut self) -> Result<(), String> {
+        let screen = self.save_screen.as_mut().ok_or("no save screen is up")?;
+        screen.command("Save");
+        Ok(())
+    }
+
     pub(crate) fn shown_mut(&mut self) -> Option<&mut Hosted> {
         match self.shown? {
             Shown::Quit => self.quit.as_mut(),
@@ -396,9 +435,11 @@ impl InGameMenus {
         match command {
             "OnInitialized" => {
                 if let Some(quit) = self.quit.as_mut() {
-                    let load =
-                        (!(self.load_enabled && self.save_load.is_some())).then_some(LOAD_BUTTON);
-                    for button in UNBUILT_BUTTONS.into_iter().chain(load) {
+                    let screen = self.save_load.is_some();
+                    let load = (!(self.load_enabled && screen)).then_some(LOAD_BUTTON);
+                    let save = (!(self.save_enabled && screen)).then_some(SAVE_BUTTON);
+                    let fixed = self.disabled.iter().copied();
+                    for button in fixed.chain(save).chain(load) {
                         quit.expose.fire("disableButton", vec![Value::str(button)]);
                     }
                 }
@@ -418,7 +459,8 @@ impl InGameMenus {
                 self.requests.push(MenuRequest::RestartMission);
             }
             "OptionsScreen" => self.open_options(),
-            "LoadMenu" => self.open_save_load(),
+            "LoadMenu" => self.open_save_load(Mode::Load),
+            "SaveMenu" => self.open_save_load(Mode::Save),
             other => println!("quit menu: AptQuitMenu::{other} - not answered"),
         }
     }

@@ -20,6 +20,8 @@ pub enum Effect {
     ClearWeaponSetFlag(Name),
     LockWeaponSlot(u8),
     ReleaseWeaponLock,
+    LockWeaponSlotTemporarily(u8),
+    ReleaseTemporaryWeaponLock,
     ArmorSetFlag(Name),
     ModelConditions {
         add: Names,
@@ -28,6 +30,7 @@ pub enum Effect {
     SubObjects {
         show: Names,
         hide: Names,
+        permanent: bool,
     },
     Texture {
         swaps: Arc<[(Name, Name)]>,
@@ -88,6 +91,11 @@ pub enum Effect {
         repeat: Option<u8>,
         alive_only: bool,
         reload_slot: Option<u32>,
+    },
+    FireWeaponAtDeath {
+        weapon: Name,
+        offset: (f32, f32, f32),
+        delay: LogicFrames,
     },
     LoseStealth,
     PlayWeaponPreFireFX {
@@ -231,6 +239,7 @@ pub enum Effect {
     },
     Halt,
     HoldOrders(bool),
+    AiBusy(LogicFrames),
     FaceObject {
         target: Entity,
     },
@@ -285,6 +294,7 @@ pub enum Effect {
     CaptureFlash {
         target: Entity,
     },
+    Flood(Arc<crate::FloodSpec>),
     CreateSlave {
         name: Name,
         offset: (f32, f32, f32),
@@ -386,6 +396,7 @@ pub enum CastEdge {
     Prepare,
     Trigger,
     Abort,
+    Finish { triggers: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -635,12 +646,20 @@ pub struct TextureSwap {
     pub exclude: Names,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubObjectWrite {
+    pub name: Name,
+    pub shown: bool,
+    pub permanent: bool,
+    pub rewrites: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UpgradeState {
     pub weapon_set_flags: Vec<Name>,
     pub armor_set_flags: Vec<Name>,
     pub model_conditions: Vec<Name>,
-    pub sub_objects: Vec<(Name, bool)>,
+    pub sub_objects: Vec<SubObjectWrite>,
     pub textures: Vec<TextureSwap>,
     pub command_set: Option<Name>,
     pub unpaused_powers: Vec<Name>,
@@ -649,10 +668,19 @@ pub struct UpgradeState {
     pub levels_gained: u32,
     pub attribute_modifiers: Vec<Name>,
     pub weapon_lock: Option<u8>,
+    pub weapon_lock_temporary: bool,
     pub revision: u32,
 }
 
 const WEAPONSET_PREFIX: &str = "WEAPONSET_";
+
+const WEAPON_LOCK_CONDITIONS: [&str; 5] = [
+    "WEAPONLOCK_PRIMARY",
+    "WEAPONLOCK_SECONDARY",
+    "WEAPONLOCK_TERTIARY",
+    "WEAPONLOCK_QUATERNARY",
+    "WEAPONLOCK_QUINARY",
+];
 
 const WEAPON_RIDER_PREFIX: &str = "WEAPON_RIDER";
 
@@ -726,6 +754,34 @@ fn show(overrides: &mut Vec<(Name, bool)>, name: &Name, shown: bool) -> bool {
     }
 }
 
+fn write_sub_object(
+    list: &mut Vec<SubObjectWrite>,
+    name: &Name,
+    shown: bool,
+    permanent: bool,
+) -> (bool, bool) {
+    match list
+        .iter_mut()
+        .find(|held| held.permanent == permanent && same(&held.name, name))
+    {
+        Some(held) => {
+            let changed = held.shown != shown;
+            held.shown = shown;
+            held.rewrites = held.rewrites.wrapping_add(1);
+            (changed, true)
+        }
+        None => {
+            list.push(SubObjectWrite {
+                name: Name::clone(name),
+                shown,
+                permanent,
+                rewrites: 0,
+            });
+            (true, false)
+        }
+    }
+}
+
 impl UpgradeState {
     pub fn apply(&mut self, effect: &Effect) -> Changed {
         let changed = self.apply_unrevised(effect);
@@ -748,14 +804,32 @@ impl UpgradeState {
                 }
             }
             Effect::LockWeaponSlot(slot) => {
-                if self.weapon_lock != Some(*slot) {
+                if self.weapon_lock != Some(*slot) || self.weapon_lock_temporary {
                     self.weapon_lock = Some(*slot);
+                    self.weapon_lock_temporary = false;
                     return Changed::WEAPON_SET;
                 }
             }
             Effect::ReleaseWeaponLock => {
+                self.weapon_lock_temporary = false;
                 if self.weapon_lock.take().is_some() {
                     return Changed::WEAPON_SET;
+                }
+            }
+            Effect::LockWeaponSlotTemporarily(slot) => {
+                let permanent = self.weapon_lock.is_some() && !self.weapon_lock_temporary;
+                if !permanent && self.weapon_lock != Some(*slot) {
+                    self.weapon_lock = Some(*slot);
+                    self.weapon_lock_temporary = true;
+                    return Changed::WEAPON_SET;
+                }
+            }
+            Effect::ReleaseTemporaryWeaponLock => {
+                if self.weapon_lock_temporary {
+                    self.weapon_lock_temporary = false;
+                    if self.weapon_lock.take().is_some() {
+                        return Changed::WEAPON_SET;
+                    }
                 }
             }
             Effect::ArmorSetFlag(flag) => {
@@ -785,16 +859,27 @@ impl UpgradeState {
                     return Changed::LOOK;
                 }
             }
-            Effect::SubObjects { show: shown, hide } => {
-                let mut changed = false;
-                for name in shown.iter() {
-                    changed |= show(&mut self.sub_objects, name, true);
-                }
-                for name in hide.iter() {
-                    changed |= show(&mut self.sub_objects, name, false);
+            Effect::SubObjects {
+                show: shown,
+                hide,
+                permanent,
+            } => {
+                let (mut changed, mut rewrote) = (false, false);
+                let writes = shown
+                    .iter()
+                    .map(|name| (name, true))
+                    .chain(hide.iter().map(|name| (name, false)));
+                for (name, visible) in writes {
+                    let (moved, again) =
+                        write_sub_object(&mut self.sub_objects, name, visible, *permanent);
+                    changed |= moved;
+                    rewrote |= again;
                 }
                 if changed {
                     return Changed::LOOK;
+                }
+                if rewrote {
+                    self.revision = self.revision.wrapping_add(1);
                 }
             }
             Effect::Texture { swaps, exclude } => {
@@ -874,6 +959,7 @@ impl UpgradeState {
             | Effect::GrantPlayerUpgrade(_)
             | Effect::GrantUpgrade(_)
             | Effect::FireWeapon { .. }
+            | Effect::FireWeaponAtDeath { .. }
             | Effect::PlayFx { .. }
             | Effect::CreateObject { .. }
             | Effect::Aura { .. }
@@ -898,6 +984,7 @@ impl UpgradeState {
             | Effect::MoveToApproachPoint { .. }
             | Effect::Halt
             | Effect::HoldOrders(_)
+            | Effect::AiBusy(_)
             | Effect::FaceObject { .. }
             | Effect::FacePosition { .. }
             | Effect::StartRecharge(_)
@@ -917,6 +1004,7 @@ impl UpgradeState {
             | Effect::StopLoopSound
             | Effect::CaptureFlash { .. }
             | Effect::CreateSlave { .. }
+            | Effect::Flood(_)
             | Effect::CommandPointBonus(_)
             | Effect::SpellRechargeCount { .. }
             | Effect::Replace { .. }
@@ -956,6 +1044,7 @@ impl UpgradeState {
                 | Effect::GrantPlayerUpgrade(_)
                 | Effect::GrantUpgrade(_)
                 | Effect::FireWeapon { .. }
+                | Effect::FireWeaponAtDeath { .. }
                 | Effect::PlayFx { .. }
                 | Effect::CreateObject { .. }
                 | Effect::Aura { .. }
@@ -981,6 +1070,7 @@ impl UpgradeState {
                 | Effect::CastEdge { .. }
                 | Effect::Spawn { .. }
                 | Effect::CreateSlave { .. }
+                | Effect::Flood(_)
                 | Effect::CommandPointBonus(_)
                 | Effect::SpellRechargeCount { .. }
                 | Effect::Replace { .. }
@@ -1026,6 +1116,14 @@ impl UpgradeState {
                 out.push(mapped);
             }
         }
+        if let Some(lock) = self
+            .weapon_lock
+            .and_then(|slot| WEAPON_LOCK_CONDITIONS.get(usize::from(slot)))
+        {
+            if !out.iter().any(|held| held.eq_ignore_ascii_case(lock)) {
+                out.push((*lock).to_string());
+            }
+        }
         out
     }
 
@@ -1036,10 +1134,12 @@ impl UpgradeState {
 
     #[must_use]
     pub fn sub_object(&self, name: &str) -> Option<bool> {
-        self.sub_objects
-            .iter()
-            .find(|(held, _)| same(held, name))
-            .map(|(_, shown)| *shown)
+        let named = |permanent: bool| {
+            self.sub_objects
+                .iter()
+                .find(|held| held.permanent == permanent && same(&held.name, name))
+        };
+        named(true).or_else(|| named(false)).map(|held| held.shown)
     }
 
     #[must_use]
@@ -1108,7 +1208,13 @@ impl Component for UpgradeState {
             hash_names(hasher, &self.model_conditions);
         }
         if sub_objects {
-            hash_overrides(hasher, &self.sub_objects);
+            hasher.write_usize(self.sub_objects.len());
+            for write in &self.sub_objects {
+                hash_name(hasher, &write.name);
+                hasher.write_bool(write.shown);
+                hasher.write_bool(write.permanent);
+                hasher.write_u32(write.rewrites);
+            }
         }
         if textures {
             hasher.write_usize(self.textures.len());
@@ -1141,6 +1247,7 @@ impl Component for UpgradeState {
         }
         if let (true, Some(slot)) = (lock, self.weapon_lock) {
             hasher.write_u8(slot);
+            hasher.write_bool(self.weapon_lock_temporary);
         }
     }
 }
@@ -1151,6 +1258,36 @@ mod tests {
 
     fn name(text: &str) -> Name {
         Name::from(text)
+    }
+
+    #[test]
+    fn a_rewrite_of_the_same_value_changes_nothing_but_reaches_presentation() {
+        let hide = Effect::SubObjects {
+            show: list(&[]),
+            hide: list(&["Part"]),
+            permanent: true,
+        };
+        let mut state = UpgradeState::default();
+        assert_eq!(state.apply(&hide), Changed::LOOK);
+        let revision = state.revision;
+        assert_eq!(state.apply(&hide), Changed::NONE);
+        assert_ne!(state.revision, revision);
+        assert_eq!(state.sub_objects[0].rewrites, 1);
+        assert_eq!(state.sub_objects.len(), 1);
+    }
+
+    #[test]
+    fn a_name_has_one_entry_on_each_list_and_the_permanent_one_decides() {
+        let write = |shown: bool, permanent: bool| Effect::SubObjects {
+            show: if shown { list(&["Part"]) } else { list(&[]) },
+            hide: if shown { list(&[]) } else { list(&["Part"]) },
+            permanent,
+        };
+        let mut state = UpgradeState::default();
+        state.apply(&write(true, true));
+        state.apply(&write(false, false));
+        assert_eq!(state.sub_objects.len(), 2);
+        assert_eq!(state.sub_object("part"), Some(true));
     }
 
     fn list(items: &[&str]) -> Names {
@@ -1189,16 +1326,19 @@ mod tests {
         state.apply(&Effect::SubObjects {
             show: list(&[]),
             hide: list(&["V1", "V2"]),
+            permanent: true,
         });
         state.apply(&Effect::SubObjects {
             show: list(&["V1"]),
             hide: list(&["V2"]),
+            permanent: true,
         });
         assert_eq!(state.sub_object("v1"), Some(true));
         assert_eq!(state.sub_object("V2"), Some(false));
         state.apply(&Effect::SubObjects {
             show: list(&["V1", "V2"]),
             hide: list(&[]),
+            permanent: true,
         });
         assert_eq!(state.sub_object("V2"), Some(true));
         assert_eq!(state.sub_object("Tower"), None);
@@ -1210,6 +1350,7 @@ mod tests {
         state.apply(&Effect::SubObjects {
             show: list(&["Flag"]),
             hide: list(&["Flag"]),
+            permanent: true,
         });
         assert_eq!(state.sub_object("Flag"), Some(false));
     }
@@ -1291,6 +1432,15 @@ mod tests {
     }
 
     #[test]
+    fn a_weapon_lock_holds_its_slot_condition_until_released() {
+        let mut state = UpgradeState::default();
+        state.apply(&Effect::LockWeaponSlot(1));
+        assert_eq!(state.model_condition_names(), ["WEAPONLOCK_SECONDARY"]);
+        state.apply(&Effect::ReleaseWeaponLock);
+        assert!(state.model_condition_names().is_empty());
+    }
+
+    #[test]
     fn weapon_set_flags_have_the_engine_exceptions() {
         let mut rider = UpgradeState::default();
         rider.apply(&Effect::WeaponSetFlag(name("WEAPON_RIDER3")));
@@ -1346,6 +1496,7 @@ mod tests {
             Effect::SubObjects {
                 show: list(&["A"]),
                 hide: list(&[]),
+                permanent: true,
             },
             Effect::Texture {
                 swaps: Arc::from([(name("a.tga"), name("b.tga"))]),
@@ -1392,6 +1543,7 @@ mod tests {
                 Effect::SubObjects {
                     show: list(&[name_]),
                     hide: list(&[]),
+                    permanent: true,
                 },
                 Effect::Texture {
                     swaps: Arc::from([(name(name_), name("b.tga"))]),

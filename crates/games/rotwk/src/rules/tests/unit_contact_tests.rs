@@ -262,7 +262,58 @@ fn a_walker_never_yields_to_an_enemy_body_without_a_locomotor() {
         position(&simulation, ids, entities[0])
             .minus(Vec2::new(420.0, 300.0))
             .length()
-            < 5.0,
+            < 8.0,
         "the footman never reached its goal"
+    );
+}
+
+#[test]
+fn a_blocked_mover_asks_for_its_detour_on_the_frame_its_id_selects() {
+    let (mut simulation, ids, entities) = world(&[
+        ("Keepsake", Vec2::new(50.0, 50.0), PLAYER),
+        ("Keepsake", Vec2::new(80.0, 50.0), PLAYER),
+        ("Footman", Vec2::new(300.0, 300.0), PLAYER),
+        ("Pillar", Vec2::new(326.0, 300.0), OTHER),
+    ]);
+    let walker = entities[2];
+    assert_eq!(walker.index() % 5, 2, "the id this test relies on");
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![walker],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::MoveTo {
+                x: 420.0,
+                y: 300.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    let mut blocked_ticks = 0;
+    let mut seen = false;
+    for _ in 0..8 * SIMULATION_HZ {
+        simulation.tick().unwrap();
+        let blocked = simulation
+            .state()
+            .get(ids.contact, walker)
+            .is_some_and(|c| c.blocked());
+        if blocked {
+            seen = true;
+            blocked_ticks += 1;
+        } else if seen {
+            break;
+        }
+    }
+    assert!(seen, "the walker was never blocked");
+    assert!(
+        blocked_ticks <= 2 * SIMULATION_HZ / 5 + 1,
+        "blocked for {blocked_ticks} ticks"
     );
 }

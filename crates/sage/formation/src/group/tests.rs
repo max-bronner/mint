@@ -16,6 +16,13 @@ fn member(x: f32, y: f32, priority: u8, width: u32) -> GroupMember {
     }
 }
 
+#[test]
+fn the_squad_count_divides_by_the_unclamped_columns() {
+    assert_eq!(squad_count(40, 4), 1);
+    assert_eq!(squad_count(40, 2), 2);
+    assert_eq!(squad_count(40, 0), 4);
+}
+
 fn near(a: Vec2, b: Vec2) -> bool {
     a.minus(b).length() < 1e-3
 }

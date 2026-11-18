@@ -51,6 +51,29 @@ fn simulation() -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
 }
 
 fn scene(keep: Option<(u16, u16)>) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    scene_with_slots(
+        keep,
+        vec![crate::rules::siege::DockBone {
+            ladder: false,
+            at: Vec2::new(0.0, -40.0),
+            height: 0.0,
+            axis: Facing::from_vector(Vec2::new(0.0, -1.0)).unwrap(),
+        }],
+    )
+}
+
+fn scene_with_slots(
+    keep: Option<(u16, u16)>,
+    wall_slots: Vec<crate::rules::siege::DockBone>,
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    scene_with(keep, wall_slots, true)
+}
+
+fn scene_with(
+    keep: Option<(u16, u16)>,
+    wall_slots: Vec<crate::rules::siege::DockBone>,
+    walled: bool,
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
@@ -88,18 +111,24 @@ fn scene(keep: Option<(u16, u16)>) -> (Simulation<RotwkRules>, Ids, Vec<Entity>)
     })
     .collect();
     let mut docks = vec![Vec::new(); kinds.len()];
-    docks[usize::from(kinds.kind("ZWall").unwrap().0)] = vec![crate::rules::siege::DockBone {
-        ladder: false,
-        at: Vec2::new(0.0, -40.0),
-        axis: Facing::from_vector(Vec2::new(0.0, -1.0)).unwrap(),
-    }];
+    docks[usize::from(kinds.kind("ZWall").unwrap().0)] = wall_slots;
     let mut above = vec![None; kinds.len()];
-    above[usize::from(kinds.kind("ZTower").unwrap().0)] = Some(Vec2::new(35.0, 0.0));
+    above[usize::from(kinds.kind("ZTower").unwrap().0)] = Some(
+        crate::rules::siege::AboveWall::Bone(Vec2::new(35.0, 0.0), 35.0),
+    );
     let mut ladder_exit = vec![None; kinds.len()];
     ladder_exit[usize::from(kinds.kind("ZTower").unwrap().0)] = Some(crate::perches::Perch {
         position: [0.0, 4.0, 20.0],
         facing: Facing::EAST,
     });
+    let mut wall_bounds = vec![None; kinds.len()];
+    if walled {
+        wall_bounds[usize::from(kinds.kind("ZWall").unwrap().0)] =
+            Some(crate::wall_meshes::WallBounds {
+                perimeter: vec![(-50.0, -10.0), (50.0, -10.0), (50.0, 10.0), (-50.0, 10.0)],
+                height: 40.0,
+            });
+    }
     let mut map = flat_map(96, 96);
     if let Some((cx, cy)) = keep {
         let (cx, cy) = (u32::from(cx), u32::from(cy));
@@ -116,6 +145,8 @@ fn scene(keep: Option<(u16, u16)>) -> (Simulation<RotwkRules>, Ids, Vec<Entity>)
         .with_menus(production.menus.clone())
         .with_upgrades(kinds.upgrades(&data), Arc::clone(&data.upgrade_bits))
         .with_powers(power_names, power_reload)
+        .with_structure_footprints(vec![(0, Vec::new())])
+        .with_wall_bounds(wall_bounds)
         .with_siege_bones(docks, above, ladder_exit);
     let mut simulation = Simulation::new(5, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
@@ -290,6 +321,55 @@ fn a_deployed_siege_tower_passenger_exits_at_the_ladder_bone_on_layer_17() {
         (at.x - expected.x).abs() < 1.0 && (at.y - expected.y).abs() < 1.0,
         "stands at the Ladder04 bone {expected:?}, not the ordinary exit's point: {at:?}"
     );
+}
+
+#[test]
+fn a_wall_attacker_aims_at_a_deployed_tower_along_its_above_wall_bearing() {
+    let (mut simulation, ids, entities) = simulation();
+    let (wall, tower, ram) = (entities[0], entities[1], entities[2]);
+    let passenger = simulation.state().get(ids.passengers, tower).unwrap().0[0];
+    select(&mut simulation, tower);
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::FireSpecialPower {
+                button: 0,
+                target: Some(wall),
+                at: None,
+            },
+        )
+        .unwrap();
+    for _ in 0..900 {
+        simulation.tick().unwrap();
+        if holds(&simulation, tower, "DEPLOYED") {
+            break;
+        }
+    }
+    for _ in 0..5 {
+        simulation.tick().unwrap();
+    }
+    let rules = simulation.rules();
+    let world = simulation.state();
+    let goal = rules
+        .siege_tower_wall_goal(world, ids, passenger, tower)
+        .expect("a wall attacker gets a goal");
+    let body = world.get(ids.body, tower).unwrap().0;
+    let along = goal.minus(body.position);
+    let facing = body.facing.to_vector();
+    assert!(
+        along.length() > 8.0 && along.normalised().unwrap().minus(facing).length() < 0.01,
+        "goal {along:?} off the tower's bearing {facing:?}"
+    );
+    let step = 8.0 * std::f32::consts::FRAC_1_SQRT_2;
+    let steps = along.length() / step;
+    assert!(
+        (steps - steps.round()).abs() < 1e-3,
+        "{} is not a whole number of {step}-long steps",
+        along.length()
+    );
+    assert!(rules
+        .siege_tower_wall_goal(world, ids, ram, tower)
+        .is_none());
 }
 
 #[test]
@@ -500,5 +580,129 @@ fn toggling_mid_unpack_requests_and_plays_nothing() {
             .iter()
             .any(|event| event.kind == crate::voice::VoiceKind::ObjectSound),
         "{events:?}"
+    );
+}
+
+#[test]
+fn a_reservation_sets_the_deploying_status() {
+    let (mut simulation, ids, entities) = simulation();
+    let (wall, tower) = (entities[0], entities[1]);
+    select(&mut simulation, tower);
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::FireSpecialPower {
+                button: 0,
+                target: Some(wall),
+                at: None,
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    simulation.tick().unwrap();
+    assert!(simulation
+        .rules()
+        .carries_object_status(simulation.state(), tower, "DEPLOYING"));
+    assert_eq!(
+        simulation
+            .state()
+            .get(ids.dock_occupants, wall)
+            .map(|held| held.held_by(tower)),
+        Some(1)
+    );
+}
+
+#[test]
+fn a_high_slot_bone_shortens_the_horizontal_push() {
+    let n = crate::rules::siege::push_direction(Vec2::new(10.0, 0.0), 30.0).unwrap();
+    assert!((n.x * 5.0 - 5.0 / 10.0f32.sqrt()).abs() < 1e-4, "{n:?}");
+}
+
+#[test]
+fn a_footprint_without_a_wall_layer_stamp_does_not_pass_the_portal_test() {
+    let (mut simulation, _, entities) = scene_with(
+        None,
+        vec![crate::rules::siege::DockBone {
+            ladder: false,
+            at: Vec2::new(0.0, -40.0),
+            height: 0.0,
+            axis: Facing::from_vector(Vec2::new(0.0, -1.0)).unwrap(),
+        }],
+        false,
+    );
+    let (wall, tower) = (entities[0], entities[1]);
+    select(&mut simulation, tower);
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::FireSpecialPower {
+                button: 0,
+                target: Some(wall),
+                at: None,
+            },
+        )
+        .unwrap();
+    for _ in 0..600 {
+        simulation.tick().unwrap();
+        assert!(
+            !holds(&simulation, tower, "DEPLOYED"),
+            "docked on a footprint"
+        );
+    }
+}
+
+#[test]
+fn an_unwritten_above_wall_passes_the_dock_test() {
+    let text = format!(
+        "{DATA}Object ZPortalTower\n  KindOf = SELECTABLE SIEGE_TOWER\n  \
+         Behavior = SiegeDeploySpecialPower Tag_Deploy\n    SpecialPowerTemplate = ZDeploy\n  End\n  \
+         Behavior = DynamicPortalBehaviour Tag_Portal\n    BonePrefix = ZBone\n    NumberOfBones = 1\n    \
+         WayPoint = Index:0 Type:Walk\n  End\nEnd\n"
+    );
+    let doc =
+        mint_sage_ini::Document::parse("t.ini", &text, &mint_sage_ini::BlockTable::corpus_path())
+            .unwrap();
+    let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
+    let seeds = vec!["ZPortalTower".to_owned()];
+    let (kinds, missing) = KindTable::closure(&data, &seeds);
+    assert!(missing.is_empty(), "{missing:?}");
+    let above = crate::skirmish::siege_above_wall(&data, &kinds, &|_, _| Vec::new());
+    let tower = usize::from(kinds.kind("ZPortalTower").unwrap().0);
+    assert!(matches!(
+        above.get(tower),
+        Some(Some(crate::rules::siege::AboveWall::Unlisted))
+    ));
+}
+
+#[test]
+fn the_nearest_slot_is_measured_in_three_dimensions() {
+    let bone = |x: f32, height: f32| crate::rules::siege::DockBone {
+        ladder: false,
+        at: Vec2::new(x, -40.0),
+        height,
+        axis: Facing::from_vector(Vec2::new(0.0, -1.0)).unwrap(),
+    };
+    let (mut simulation, ids, entities) =
+        scene_with_slots(None, vec![bone(0.0, 100.0), bone(60.0, 0.0)]);
+    let (wall, tower) = (entities[0], entities[1]);
+    select(&mut simulation, tower);
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::FireSpecialPower {
+                button: 0,
+                target: Some(wall),
+                at: None,
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    simulation.tick().unwrap();
+    assert_eq!(
+        simulation
+            .state()
+            .get(ids.dock_occupants, wall)
+            .and_then(|held| held.slot_of(tower)),
+        Some(1)
     );
 }

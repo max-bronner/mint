@@ -50,6 +50,13 @@ pub(crate) struct Restriction<'a> {
 }
 
 impl Restriction<'_> {
+    pub(crate) fn confine(self, class: MoverClass) -> MoverClass {
+        match self.confine {
+            Some(rect) => class.restricted(mint_movement::CellFlags::NONE, Some(rect)),
+            None => class,
+        }
+    }
+
     pub(crate) fn apply(self, class: MoverClass, owner: Option<PlayerId>) -> MoverClass {
         if owner.is_some_and(|owner| self.rules.is_human(owner)) {
             let flier = class.blocked_by == mint_sage_passability::BOUNDARY;

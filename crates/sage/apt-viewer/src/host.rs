@@ -10,13 +10,13 @@ use mint_render::{
 use mint_sage_apt::{parse_ru, standalone_texture_path, Character, TextureLocation};
 use mint_sage_apt_player::{
     CharacterRef, ColorTransform, HitArea, HitMode, InstanceId, Library, Limits, MovieId, Outward,
-    Player, RenderCommand, RenderList, RenderOptions,
+    Player, RenderCommand, RenderList, RenderOptions, SharedGlobal,
 };
 use mint_sage_asset::Resolver;
 use mint_sage_ini::{CommandButtonIndex, MappedImageIndex, MappedRect};
 use mint_sage_str::StringTable;
 use mint_ui::{FontId, GlyphAtlas, GlyphAtlasConfig};
-use mint_vfs::Vfs;
+use mint_vfs::{Vfs, VfsPath};
 
 use crate::gadget::check::{
     check_box, check_label, CheckContent, CheckStyle, CheckView, State as GadgetState,
@@ -44,8 +44,6 @@ use crate::{
 };
 
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-const TIMER_OVERLAY_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.5];
-const TIMER_RIM_COLOR: [f32; 4] = [0.82, 0.17, 0.05, 1.0];
 const TIMER_RIM_HOLE: f32 = 0.905;
 const GLYPHS_PER_FRAME: usize = 64;
 pub const DISABLED_TINT: f32 = 0.4;
@@ -147,6 +145,16 @@ pub struct SurfaceIcon {
     pub tint: [f32; 4],
     pub premultiplied: bool,
     pub rotated: bool,
+    pub ignores_color_transform: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TimerClock {
+    pub covered: f32,
+    pub tint: [f32; 4],
+    pub rim: [f32; 4],
+    pub fill: Option<SurfaceIcon>,
+    pub ring: Option<SurfaceIcon>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,8 +167,9 @@ pub enum SurfaceContent {
     Entry(Arc<EntryContent>),
     MapWindow(Arc<MapWindowContent>),
     Text(Arc<TextBoxContent>),
-    Progress(f32),
+    Progress(TimerClock),
     Graph(Arc<GraphContent>),
+    Placed(Arc<PlacedText>),
     Hidden,
 }
 
@@ -196,6 +205,21 @@ pub struct TextLine {
     pub font: String,
     pub point_size: f32,
     pub bold: bool,
+    pub color: [f32; 4],
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlacedText {
+    pub rows: Vec<PlacedRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedRow {
+    pub text: String,
+    pub font: String,
+    pub point_size: f32,
+    pub x: f32,
+    pub y: f32,
     pub color: [f32; 4],
 }
 
@@ -320,6 +344,7 @@ impl IconProvider {
             tint: [1.0, 1.0, 1.0, 1.0],
             premultiplied: false,
             rotated: false,
+            ignores_color_transform: false,
         })
     }
 
@@ -335,6 +360,7 @@ impl IconProvider {
             tint: [1.0, 1.0, 1.0, 1.0],
             premultiplied: false,
             rotated: false,
+            ignores_color_transform: false,
         }
     }
 
@@ -465,6 +491,7 @@ impl IconProvider {
             tint: [1.0, 1.0, 1.0, 1.0],
             premultiplied: false,
             rotated: is_rotated(mapped.status.as_deref()),
+            ignores_color_transform: false,
         })
     }
 }
@@ -532,7 +559,15 @@ fn decode_image(vfs: &Vfs, path: &str) -> Option<mint_image::RgbaImage> {
     Some(match extension.as_str() {
         "dds" => Dds::parse(&bytes).ok()?.decode().ok()?,
         "tga" => mint_image::tga::decode(&bytes).ok()?,
-        "jpg" | "jpeg" => mint_image::jpeg::decode(&bytes).ok()?,
+        "jpg" | "jpeg" => {
+            let colour = mint_image::jpeg::decode(&bytes).ok()?;
+            match mint_sage_asset::alpha_sidecar(&VfsPath::new(path))
+                .and_then(|sidecar| vfs.read(sidecar.as_str()).ok())
+            {
+                Some(alpha) => colour.with_alpha_of(&mint_image::png::decode(&alpha).ok()?)?,
+                None => colour,
+            }
+        }
         _ => return None,
     })
 }
@@ -593,6 +628,7 @@ pub struct MovieView {
     library: Arc<Library>,
     movie_id: MovieId,
     limits: Limits,
+    shared_global: Option<SharedGlobal>,
     assets: MovieLibrary,
     pub player: Player,
     list: RenderList,
@@ -618,6 +654,7 @@ pub struct MovieView {
     atlas_near_full: bool,
     pub stats: OverlayStats,
     pub scale_mode: ScaleMode,
+    pub host: Option<Letterbox>,
     anchor_cache: AnchorCache,
     pub last_build: BuildProfile,
     surface_icons: HashMap<InstanceId, SurfaceContent>,
@@ -726,6 +763,7 @@ impl MovieView {
             library,
             movie_id: id,
             limits,
+            shared_global: None,
             assets: MovieLibrary::new_with_roots(asset_roots),
             player,
             list: RenderList::default(),
@@ -751,6 +789,7 @@ impl MovieView {
             atlas_near_full: false,
             stats: OverlayStats::default(),
             scale_mode: ScaleMode::default(),
+            host: None,
             anchor_cache: AnchorCache::new(),
             last_build: BuildProfile::default(),
             text_anchor: TextAnchor::default(),
@@ -791,9 +830,17 @@ impl MovieView {
         })
     }
 
+    pub fn share_global(&mut self, shared: &SharedGlobal) {
+        self.player.share_global(shared);
+        self.shared_global = Some(shared.clone());
+    }
+
     pub fn restart(&mut self) -> Result<(), Error> {
         let mut player = Player::new(Arc::clone(&self.library), self.movie_id, self.limits)?;
         player.set_hit_mode(HitMode::Records);
+        if let Some(shared) = &self.shared_global {
+            player.share_global(shared);
+        }
         self.player = player;
         self.list = RenderList::default();
         self.frame_accum = 0.0;
@@ -884,20 +931,28 @@ impl MovieView {
     #[must_use]
     pub fn letterbox(&self) -> Letterbox {
         let (sw, sh) = self.stage_size();
-        Letterbox::stretch(sw, sh, self.window_size.0, self.window_size.1)
+        let stretch = Letterbox::stretch(sw, sh, self.window_size.0, self.window_size.1);
+        self.host.map_or(stretch, |host| stretch.after(host))
     }
 
     #[must_use]
     pub fn anchors(&mut self) -> HashMap<InstanceId, Letterbox> {
         let (sw, sh) = self.stage_size();
-        self.anchor_cache.letterboxes(
+        let table = self.anchor_cache.letterboxes(
             &self.player,
             sw,
             sh,
             self.window_size.0,
             self.window_size.1,
             crate::ANCHOR_EDGE_SLACK,
-        )
+        );
+        match self.host {
+            None => table,
+            Some(host) => table
+                .into_iter()
+                .map(|(id, lb)| (id, lb.after(host)))
+                .collect(),
+        }
     }
 
     #[must_use]
@@ -908,6 +963,15 @@ impl MovieView {
     #[must_use]
     pub fn resolve_stage_point(&mut self, window_pos: [f32; 2]) -> [f32; 2] {
         let (sw, sh) = self.stage_size();
+        if self.host.is_some() {
+            return match self.scale_mode {
+                ScaleMode::Stretch => self.letterbox().to_stage(window_pos),
+                ScaleMode::Anchored => {
+                    let anchors = self.anchors();
+                    crate::resolve_hosted(&self.player, self.letterbox(), &anchors, window_pos)
+                }
+            };
+        }
         self.anchor_cache.resolve_point(
             &self.player,
             self.scale_mode,
@@ -1507,8 +1571,15 @@ impl MovieView {
                     color,
                     clip,
                 } => {
+                    let colorless = matches!(
+                        self.surface_icons.get(&instance),
+                        Some(SurfaceContent::Icon(SurfaceIcon {
+                            ignores_color_transform: true,
+                            ..
+                        }))
+                    );
                     if !on_screen(&world, bounds, clip, self.window_size)
-                        || !can_show(color.mult, color.add)
+                        || (!colorless && !can_show(color.mult, color.add))
                     {
                         self.stats.culled = self.stats.culled.saturating_add(1);
                         surfaces_time += item_started.elapsed();
@@ -1533,7 +1604,8 @@ impl MovieView {
                         | SurfaceContent::Entry(_)
                         | SurfaceContent::MapWindow(_)
                         | SurfaceContent::Graph(_)
-                        | SurfaceContent::Text(_)),
+                        | SurfaceContent::Text(_)
+                        | SurfaceContent::Placed(_)),
                     ) = &content
                     {
                         let start = quads.len();
@@ -1598,6 +1670,14 @@ impl MovieView {
                                     &mut atlas_dirty,
                                 );
                             }
+                            SurfaceContent::Placed(text) => {
+                                self.draw_placed_text(
+                                    &place,
+                                    &Arc::clone(text),
+                                    &mut quads,
+                                    &mut atlas_dirty,
+                                );
+                            }
                             SurfaceContent::Entry(entry) => {
                                 self.draw_text_entry(
                                     place,
@@ -1644,13 +1724,18 @@ impl MovieView {
                         let surface_type = self.player.own_string(instance, "_type");
                         let mode = self.player.own_string(instance, "_mode");
                         let disc = self.disc_pictures && self.image_modes.disc(mode.as_deref());
+                        let (mult, add) = if icon.ignores_color_transform {
+                            (icon.tint, [0.0; 4])
+                        } else {
+                            (multiply_color(color.mult, icon.tint), color.add)
+                        };
                         let quad = UiQuad {
                             affine,
                             translation,
                             texture: Some(icon.texture),
                             uv_rect: icon.uv_rect,
-                            color_multiply: multiply_color(color.mult, icon.tint),
-                            color_add: color.add,
+                            color_multiply: mult,
+                            color_add: add,
                             clip,
                             premultiplied: icon.premultiplied,
                             uv_rotated_cw: icon.rotated,
@@ -1672,41 +1757,45 @@ impl MovieView {
                         surfaces_time += item_started.elapsed();
                         continue;
                     }
-                    if let Some(SurfaceContent::Progress(covered)) = content {
+                    if let Some(SurfaceContent::Progress(clock)) = content {
                         let [l, t, r, b] = bounds;
                         let (w, h) = (r - l, b - t);
                         let (m, _tr) = world;
                         let affine = [[m[0][0] * w, m[0][1] * h], [m[1][0] * w, m[1][1] * h]];
                         let translation = apply(&world, [l, t]);
                         let wedge = if self.timer_overlay_covers_remaining {
-                            covered
+                            clock.covered
                         } else {
-                            1.0 - covered
+                            1.0 - clock.covered
                         };
-                        let quad = UiQuad {
+                        let layer = |icon: Option<SurfaceIcon>, tint: [f32; 4]| UiQuad {
                             affine,
                             translation,
-                            texture: None,
-                            uv_rect: [0.0, 0.0, 1.0, 1.0],
-                            color_multiply: multiply_color(color.mult, TIMER_OVERLAY_COLOR),
+                            texture: icon.map(|i| i.texture),
+                            uv_rect: icon.map_or([0.0, 0.0, 1.0, 1.0], |i| i.uv_rect),
+                            color_multiply: multiply_color(color.mult, tint),
                             color_add: color.add,
                             clip,
                             premultiplied: false,
                             greyscale: false,
                             opaque: false,
                             additive: false,
-                            disc: true,
+                            disc: false,
                             wedge,
                             hole: 0.0,
-                            uv_rotated_cw: false,
+                            uv_rotated_cw: icon.is_some_and(|i| i.rotated),
                         };
-                        let rim = UiQuad {
-                            color_multiply: multiply_color(color.mult, TIMER_RIM_COLOR),
-                            hole: TIMER_RIM_HOLE,
-                            ..quad
+                        let fill = layer(clock.fill, clock.tint);
+                        let rim = match clock.ring {
+                            Some(_) => layer(clock.ring, clock.rim),
+                            None => UiQuad {
+                                disc: true,
+                                hole: TIMER_RIM_HOLE,
+                                ..layer(None, clock.rim)
+                            },
                         };
                         let start = quads.len();
-                        quads.push(quad);
+                        quads.push(fill);
                         quads.push(rim);
                         ops.push(Op::Quads(start..quads.len()));
                         surfaces_time += item_started.elapsed();
@@ -1930,6 +2019,26 @@ impl MovieView {
         self.slot_rects(std::slice::from_ref(&id)).remove(&id)
     }
 
+    pub fn surface_instances(&mut self) -> Vec<InstanceId> {
+        self.player
+            .render_with(&mut self.list, RenderOptions { surfaces: true });
+        self.list
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::Surface { instance, .. } => Some(*instance),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn surface_with_key(&self, ids: &[InstanceId], key: &str) -> Option<InstanceId> {
+        ids.iter()
+            .copied()
+            .find(|&id| self.gadget_key(id).as_deref() == Some(key))
+    }
+
     pub fn draw_label(
         &mut self,
         renderer: &mut Renderer,
@@ -2080,6 +2189,14 @@ impl MovieView {
             .chain(open_list)
             .find(|view| view.thumb_grab.is_some())
             .map(|view| view.display_pos)
+    }
+
+    #[must_use]
+    pub fn map_window_hover(&self, key: &str) -> Option<usize> {
+        self.map_windows
+            .iter()
+            .filter(|(instance, _)| self.gadget_key(**instance).as_deref() == Some(key))
+            .find_map(|(_, view)| view.hover)
     }
 
     #[must_use]
@@ -2596,6 +2713,11 @@ impl MovieView {
             Some((old, laid, heights)) if old == key => (laid, heights),
             _ => lay_out_rows(&content.rows, &frame, line, content.text_inset, &measure),
         };
+        let frame = if style.auto_hide && content.scroll_bar.is_none() {
+            frame.hiding_bar_while_content_fits(&heights)
+        } else {
+            frame
+        };
         view.laid_out(frame.clone(), heights.clone());
 
         let paint = Painter {
@@ -2795,6 +2917,55 @@ impl MovieView {
                 atlas_dirty,
             );
         }
+    }
+
+    fn draw_placed_text(
+        &mut self,
+        place: &GadgetPlace,
+        content: &PlacedText,
+        out: &mut Vec<UiQuad>,
+        atlas_dirty: &mut bool,
+    ) {
+        let (bounds, world) = self.stage_frame(place);
+        let origin = apply(&world, [bounds[0], bounds[1]]);
+        let window = [self.window_size.0, self.window_size.1];
+        let fonts = Arc::clone(&self.fonts);
+        for row in &content.rows {
+            let file = resolved_font_file(&row.font);
+            let size_px = native_text_px(row.point_size, window);
+            #[allow(clippy::cast_precision_loss)]
+            let ascent = file
+                .and_then(|f| fonts.get(f))
+                .and_then(|f| f.metrics(size_px).ok())
+                .map_or(size_px as f32 * 0.8, |m| m.win_ascent);
+            let pen = [origin[0] + row.x, origin[1] + row.y + ascent];
+            let shadow = multiply_color(place.color.mult, [0.0, 0.0, 0.0, row.color[3]]);
+            let colour = multiply_color(place.color.mult, row.color);
+            for (at, colour) in [([pen[0] + 1.0, pen[1] + 1.0], shadow), (pen, colour)] {
+                self.layout_text_at(
+                    &row.text,
+                    file,
+                    size_px,
+                    at,
+                    colour,
+                    place.clip,
+                    out,
+                    atlas_dirty,
+                );
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn measure_native_text(&self, text: &str, font: &str, point_size: f32) -> [f32; 2] {
+        let file = resolved_font_file(font);
+        let font = file.and_then(|f| self.fonts.get(f));
+        let size_px = native_text_px(point_size, [self.window_size.0, self.window_size.1]);
+        #[allow(clippy::cast_precision_loss)]
+        let height = font
+            .and_then(|f| f.metrics(size_px).ok())
+            .map_or(size_px as f32 * 1.2, |m| m.win_ascent + m.win_descent);
+        [mint_ui::measure_text(text, font, size_px), height]
     }
 
     fn draw_text_entry(
@@ -3500,8 +3671,10 @@ impl MovieView {
                     clip,
                     texture,
                 } => {
-                    let Some(r) = self.frame_meshes.get(*mesh).and_then(|m| m.runs.get(*run))
-                    else {
+                    let Some(m) = self.frame_meshes.get(*mesh) else {
+                        continue;
+                    };
+                    let Some(r) = m.runs.get(*run) else {
                         continue;
                     };
                     let mut g = UiGeometry::new()
@@ -3511,6 +3684,9 @@ impl MovieView {
                         .with_color(*color)
                         .with_color_add(*add)
                         .with_clip(*clip);
+                    if let Some(key) = m.retain_key(*run) {
+                        g = g.with_retention(key);
+                    }
                     if let Some((tex, transform, translate)) = texture {
                         g = g.with_texture(*tex, *transform, *translate);
                     }
@@ -4235,11 +4411,18 @@ mod pull_tests {
             ),
             "the type when the id names nothing"
         );
-        named.insert("Button_Timer".to_owned(), SurfaceContent::Progress(0.25));
+        let clock = super::TimerClock {
+            covered: 0.25,
+            tint: [1.0; 4],
+            rim: [1.0; 4],
+            fill: None,
+            ring: None,
+        };
+        named.insert("Button_Timer".to_owned(), SurfaceContent::Progress(clock));
         assert!(
             matches!(
                 pulled_content(&player, timer, &named),
-                Some(SurfaceContent::Progress(covered)) if (covered - 0.25).abs() < f32::EPSILON
+                Some(SurfaceContent::Progress(clock)) if (clock.covered - 0.25).abs() < f32::EPSILON
             ),
             "the id before the type"
         );

@@ -160,6 +160,35 @@ fn a_piece_on_a_cliff_becomes_the_cap_pair_and_ends_the_span() {
 }
 
 #[test]
+fn a_wall_piece_stands_on_a_slope_that_refuses_a_structure() {
+    let ramp = HeightMapData {
+        width: 40,
+        height: 20,
+        border_size: 0,
+        boundaries: Vec::new(),
+        samples: (0..40 * 20).map(|i| (i % 40) * 150).collect(),
+    };
+    let (simulation, ids, _hub, kinds) = setup(ramp, 100_000);
+    let rules = simulation.rules();
+    let place = |name: &str| {
+        let entry = kinds.get(kinds.kind(name).unwrap()).unwrap();
+        let footprint = crate::construction::footprint_of(&entry.record);
+        rules.validate_placement(
+            simulation.state(),
+            ids,
+            PLAYER,
+            &entry.record,
+            &footprint,
+            Vec2::new(200.0, 100.0),
+            0.0,
+            Vec2::new(50.0, 100.0),
+        )
+    };
+    assert_eq!(place("CC"), Err(Reason::NotFlat));
+    assert_eq!(place("Segment"), Ok(()));
+}
+
+#[test]
 fn a_piece_beyond_the_buildout_distance_from_every_command_center_refuses_the_whole_span() {
     let (simulation, ids, _hub, _kinds) = setup(flat_map(60, 60), 100_000);
     let plan = simulation

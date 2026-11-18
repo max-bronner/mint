@@ -126,13 +126,14 @@ impl FrameSnapshot {
                     .mount_opacity(world, entity)
                     .min(rules.disguise_opacity(world, entity))
                     .min(rules.corpse_fade_opacity(world, entity, now))
-                    .min(rules.join_fade_opacity(world, entity, now)),
+                    .min(rules.join_fade_opacity(world, entity, now))
+                    .min(rules.portal_fade_opacity(world, entity, now)),
                 casts_shadow: !upgrade.is_some_and(|held| {
                     held.model_conditions.iter().any(|name| {
                         name.eq_ignore_ascii_case("CLIMBING")
                             || name.eq_ignore_ascii_case("RAPPELLING")
                     })
-                }),
+                }) && !rules.portal_fade_shadowless(world, entity),
                 geometry_kind: RotwkRules::geometry_kind(world, ids, entity),
                 collapse: unit
                     .dying

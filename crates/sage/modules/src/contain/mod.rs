@@ -58,6 +58,7 @@ pub struct OpenContain {
     exit_offset: Offset,
     exit_delay: LogicFrames,
     force_orientation: bool,
+    passengers_test_collision_height: f32,
 }
 
 impl OpenContain {
@@ -174,6 +175,11 @@ impl OpenContain {
         self.force_orientation
     }
 
+    #[must_use]
+    pub const fn passengers_test_collision_height(&self) -> f32 {
+        self.passengers_test_collision_height
+    }
+
     pub(crate) fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_u32(self.contain_max);
         hasher.write_u32(self.number_of_exit_paths);
@@ -182,6 +188,7 @@ impl OpenContain {
         hasher.write_bool(self.eject_passengers_on_death);
         hasher.write_bool(self.enabled);
         hasher.write_bool(self.force_orientation);
+        hasher.write_f32(self.passengers_test_collision_height);
         for point in [self.entry_offset, self.entry_position, self.exit_offset] {
             hasher.write_f32(point.x);
             hasher.write_f32(point.y);
@@ -204,7 +211,7 @@ pub fn open_contain_from_fields(fields: &dyn ModuleFieldSource) -> Result<OpenCo
         show_pips: boolean(fields, "ShowPips")?.unwrap_or(true),
         enter_sound: fields.field("EnterSound").map(str::to_owned),
         exit_sound: fields.field("ExitSound").map(str::to_owned),
-        number_of_exit_paths: count(fields, "NumberOfExitPaths", 1, MAX_EXIT_PATHS)?.max(1),
+        number_of_exit_paths: count(fields, "NumberOfExitPaths", 1, MAX_EXIT_PATHS)?,
         passenger_bone_prefix: bone_prefix,
         passenger_bone_kind: bone_kind,
         kill_passengers_on_death: boolean(fields, "KillPassengersOnDeath")?.unwrap_or(false),
@@ -215,6 +222,17 @@ pub fn open_contain_from_fields(fields: &dyn ModuleFieldSource) -> Result<OpenCo
         exit_offset: offset(fields, "ExitOffset")?,
         exit_delay: milliseconds(fields, "ExitDelay"),
         force_orientation: boolean(fields, "ForceOrientationContainer")?.unwrap_or(true),
+        passengers_test_collision_height: match fields.field("PassengersTestCollisionHeight") {
+            None => -1000.0,
+            Some(raw) => fields
+                .field_numeric("PassengersTestCollisionHeight")
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    FieldError::new(format!(
+                        "PassengersTestCollisionHeight '{raw}' is not a number"
+                    ))
+                })?,
+        },
     })
 }
 

@@ -55,7 +55,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
 
 pub(crate) fn open_audio(vfs: &Vfs) -> Option<SageAudio> {
     match mint_sage_audio::load_library(vfs) {
-        Ok(library) => Some(SageAudio::open(library)),
+        Ok(library) => Some(SageAudio::open_named(library, "movie")),
         Err(error) => {
             println!("movie: audio library unreadable ({error}) - playing silent");
             None

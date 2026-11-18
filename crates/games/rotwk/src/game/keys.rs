@@ -301,9 +301,9 @@ impl Game {
                             "already done"
                         },
                         if covers_remaining {
-                            "GadgetButtonDrawInverseClock, default"
+                            "retail"
                         } else {
-                            "GadgetButtonDrawClock"
+                            "NOT retail, comparison only"
                         }
                     );
                 }
@@ -347,6 +347,19 @@ impl Game {
                 println!(
                     "render: attached particle systems use {} axes",
                     next.label()
+                );
+            }
+            Key::CtrlCharacter('j') if pressed => {
+                let next = self.state.scene.particle_scene.bone_lookup().next();
+                self.state.scene.particle_scene.set_bone_lookup(next);
+                println!(
+                    "render: particle bone lookup {} [{}]",
+                    next.label(),
+                    match next {
+                        mint_sage_scene::BoneLookup::DrawableWide =>
+                            "default, retail-unproven unless ParticleBonesCheckDrawable is set",
+                        mint_sage_scene::BoneLookup::ModuleLocal => "alternative, retail-unproven",
+                    }
                 );
             }
             Key::Function(7) if pressed => {

@@ -246,6 +246,15 @@ pub(crate) fn alpha_block(alpha0: u8, alpha1: u8, indices: u64) -> [u8; 8] {
 }
 
 pub(crate) fn jpeg_grey_8x8() -> Vec<u8> {
+    let mut out = jpeg_headers(8, 8);
+
+    out.push(0b0000_1111);
+
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+fn jpeg_headers(width: u16, height: u16) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&[0xFF, 0xD8]);
 
@@ -254,7 +263,7 @@ pub(crate) fn jpeg_grey_8x8() -> Vec<u8> {
     out.push(0x00);
     out.extend_from_slice(&[16u8; 64]);
 
-    out.extend_from_slice(&jpeg_sof0(8, 8));
+    out.extend_from_slice(&jpeg_sof0(width, height));
 
     for class_and_id in [0x00u8, 0x10] {
         out.extend_from_slice(&[0xFF, 0xC4]);
@@ -271,18 +280,11 @@ pub(crate) fn jpeg_grey_8x8() -> Vec<u8> {
     out.push(0x01);
     out.extend_from_slice(&[0x01, 0x00]);
     out.extend_from_slice(&[0x00, 0x3F, 0x00]);
-
-    out.push(0b0000_1111);
-
-    out.extend_from_slice(&[0xFF, 0xD9]);
     out
 }
 
 pub(crate) fn jpeg_with_frame_size(width: u16, height: u16) -> Vec<u8> {
-    let mut out = vec![0xFF, 0xD8];
-    out.extend_from_slice(&jpeg_sof0(width, height));
-    out.extend_from_slice(&[0xFF, 0xD9]);
-    out
+    jpeg_headers(width, height)
 }
 
 fn jpeg_sof0(width: u16, height: u16) -> Vec<u8> {

@@ -4,9 +4,9 @@ use super::{Ids, RotwkRules};
 use crate::construction::{AutoRepair, Repairing, WorkerStage};
 use crate::diag::diag;
 
-const WAKE: LogicFrames = LogicFrames::from_milliseconds(1000);
+const WAKE: LogicFrames = LogicFrames::from_engine_milliseconds(1000);
 
-const UNDER_ATTACK: LogicFrames = LogicFrames::from_milliseconds(4000);
+const UNDER_ATTACK: LogicFrames = LogicFrames::from_engine_milliseconds(4000);
 
 pub(super) fn hit_recently_at(world: &World, ids: Ids, entity: Entity, now: Frame) -> bool {
     world
@@ -197,7 +197,7 @@ impl RotwkRules {
         if rubble {
             let frames = record
                 .rebuild_seconds
-                .map(|seconds| LogicFrames::from_seconds(seconds).get().max(1))
+                .map(crate::game_data::rebuild_time_ticks)
                 .or(frames)
                 .unwrap_or(1);
             self.rebuild_rubble(tick, ids, structure, &record, owner, frames)?;

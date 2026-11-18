@@ -141,3 +141,41 @@ fn an_object_anchored_to_the_top_of_its_parent_ends_the_tick_above_it() {
         "halo {halo_z}, hero feet {feet}"
     );
 }
+
+#[test]
+fn the_scan_measures_to_the_candidates_bounding_circle() {
+    let (mut simulation, ids, entities) = scene(&[
+        ("Trinket", 300.0, 300.0, PLAYER),
+        ("Hero", 352.0, 300.0, OTHER),
+        ("Trinket", 100.0, 100.0, PLAYER),
+        ("Hero", 100.0, 156.0, OTHER),
+    ]);
+    for _ in 0..5 {
+        simulation.tick().unwrap();
+    }
+    let parent = |entity| {
+        simulation
+            .state()
+            .get(ids.attach_link, entity)
+            .map(|link| link.parent)
+    };
+    assert_eq!(parent(entities[0]), Some(entities[1]));
+    assert_eq!(parent(entities[2]), None);
+}
+
+#[test]
+fn the_scan_ranks_overlapping_candidates_by_the_signed_gap() {
+    let (mut simulation, ids, entities) = scene(&[
+        ("Trinket", 300.0, 300.0, PLAYER),
+        ("Hero", 302.0, 300.0, OTHER),
+        ("Hero", 300.0, 300.5, OTHER),
+    ]);
+    for _ in 0..5 {
+        simulation.tick().unwrap();
+    }
+    let link = simulation
+        .state()
+        .get(ids.attach_link, entities[0])
+        .copied();
+    assert_eq!(link.map(|l| l.parent), Some(entities[2]));
+}

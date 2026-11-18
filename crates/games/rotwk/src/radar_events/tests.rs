@@ -151,6 +151,7 @@ fn under_attack_observes_only_the_local_players_own_objects() {
             moving: false,
             health: Some(1.0),
             dying: false,
+            created: 0,
             speed: 0.0,
             weapon_cycle: 0.0,
             attack_cycle: 0,

@@ -204,7 +204,8 @@ fn swarm_members_hop_at_most_four_rings_and_wait_two_or_four_seconds() {
             let before = seen.insert(*member, (record.goal, record.wait_until));
             if record.state == SwarmState::Moving && before.map(|b| b.0) != Some(record.goal) {
                 hops += 1;
-                longest = longest.max(record.goal.minus(at).length());
+                let hop = record.goal.minus(at);
+                longest = longest.max(hop.x.abs().max(hop.y.abs()));
             }
             if let Some(until) = record.wait_until {
                 if before.and_then(|b| b.1) != Some(until) {
@@ -216,7 +217,7 @@ fn swarm_members_hop_at_most_four_rings_and_wait_two_or_four_seconds() {
     }
     assert!(fought, "the armies never fought");
     assert!(hops > 10, "only {hops} hops");
-    assert!(longest <= 60.0, "a hop of {longest:.1} units");
+    assert!(longest <= 45.0, "a hop of {longest:.1} units");
     assert!(
         waits
             .iter()

@@ -186,6 +186,12 @@ impl UiPanel {
             Self::StanceSubMenu => 2,
         }
     }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        [Self::SpellStore, Self::Objectives, Self::StanceSubMenu]
+            .into_iter()
+            .find(|panel| format!("{panel:?}").eq_ignore_ascii_case(name))
+    }
 }
 
 impl Command for RotwkCommand {

@@ -34,7 +34,22 @@ fn data() -> String {
         ));
     }
     out.push_str(
-        "Object ZTree\n  Side = Neutral\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+        "Weapon ZBite\n  AttackRange = 60\n  DelayBetweenShots = 500\n  \
+         DamageNugget\n    Damage = 1\n    DamageType = CRUSH\n  End\nEnd\n\
+         Object ZArmedDen\n  Side = Neutral\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+         Body = StructureBody Tag_Body\n    MaxHealth = 2000\n  End\n  \
+         Behavior = SpawnBehavior Tag_Spawn\n    SpawnNumber = 1\n    InitialBurst = 1\n    \
+         SpawnTemplateName = ZArmedImp\n    SpawnReplaceDelay = 100000\n  End\n  \
+         Geometry = BOX\n  GeometryMajorRadius = 20\n  GeometryMinorRadius = 20\n  \
+         GeometryHeight = 30\nEnd\n\
+         Object ZArmedImp\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE\n  \
+         Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+         WeaponSet\n    Conditions = None\n    Weapon = PRIMARY ZBite\n  End\n  \
+         Behavior = AIUpdateInterface Tag_AI\n  End\n  \
+         LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+         Behavior = SlavedUpdate Tag_Slave\n    GuardMaxRange = 60\n    GuardWanderRange = 30\n  End\n  \
+         Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+         Object ZTree\n  Side = Neutral\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
          Body = StructureBody Tag_Body\n    MaxHealth = 2000\n  End\n  \
          Behavior = SpawnPointProductionExitUpdate Tag_Exit\n    SpawnPointBoneName = PERCH_\n  End\n  \
          Behavior = SpawnBehavior Tag_Spawn\n    SpawnNumber = 2\n    InitialBurst = 2\n    \
@@ -301,9 +316,28 @@ fn leashed_returning_marks_a_busy_slave_walking_back_from_beyond_its_leash() {
         saw_it,
         "the hound should have been marked LEASHED_RETURNING while walked back from beyond its leash"
     );
+}
+
+#[test]
+fn an_ai_move_to_a_busy_slave_sets_its_attack_move_aside() {
+    let (mut simulation, ids, dens, slaves) = dens(&["ZDen"]);
+    let goal = DEN_AT.plus(Vec2::new(500.0, 0.0));
+    order(
+        &mut simulation,
+        vec![slaves[0]],
+        RotwkCommand::AttackMove {
+            x: goal.x,
+            y: goal.y,
+            queue: false,
+        },
+    );
+    let (farthest, _, _, _) = run(&mut simulation, ids, dens[0], slaves[0], 300);
+    assert!(farthest >= 60.0, "it should have strayed to the limit");
     assert!(
-        !leashed_returning(&simulation, slaves[0]),
-        "it should have settled back near its master and cleared the mark by now"
+        simulation
+            .state()
+            .contains(ids.attack_move_order, slaves[0]),
+        "the attack-move should survive the AI walk back"
     );
 }
 
@@ -363,4 +397,33 @@ fn a_spawn_point_exit_stands_each_spawn_on_its_own_bone_where_it_stays() {
         .map(|slave| position(&simulation, ids, *slave))
         .collect();
     assert_eq!(before, after);
+}
+
+#[test]
+fn a_spawner_is_able_to_attack_while_a_spawn_of_it_is() {
+    let (simulation, ids, dens, _) = dens(&["ZDen", "ZArmedDen"]);
+    let able = |den: Entity| {
+        simulation
+            .rules()
+            .object_able_to_attack(simulation.state(), ids, den)
+    };
+    assert!(!able(dens[0]), "an unarmed spawn is no weapon");
+    assert!(able(dens[1]));
+}
+
+#[test]
+fn a_move_cut_by_the_leash_walk_ends_where_the_walk_ends() {
+    let (mut simulation, ids, dens, slaves) = dens(&["ZKennel"]);
+    order(
+        &mut simulation,
+        vec![slaves[0]],
+        RotwkCommand::MoveTo {
+            x: 800.0,
+            y: 300.0,
+            queue: false,
+        },
+    );
+    run(&mut simulation, ids, dens[0], slaves[0], 450);
+    let (farthest, _, _, _) = run(&mut simulation, ids, dens[0], slaves[0], 450);
+    assert!(farthest < 60.0, "walked out again to {farthest}");
 }

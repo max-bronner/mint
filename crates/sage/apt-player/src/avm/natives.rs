@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::geom::ColorTransform;
 use crate::instance::{InstanceId, InstanceKind};
-use crate::library::Library;
+use crate::library::{Library, MovieId};
 use crate::timeline::{Stage, AVM_DEPTH_BIAS};
 
 use super::interp::Frame;
@@ -565,6 +565,32 @@ fn mc_swap_depths(
     Ok(Value::Undefined)
 }
 
+pub(crate) fn find_linkage(
+    stage: &Stage,
+    lib: &Library,
+    clip: InstanceId,
+    name: &str,
+) -> Option<(MovieId, u32)> {
+    let mut at = Some(clip);
+    let mut first = true;
+    while let Some(id) = at {
+        let inst = stage.arena.get(id)?;
+        let movie = inst.character.movie;
+        let m = &lib.movie(movie)?.movie;
+        if let Some(e) = m.exports.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+            return Some((movie, e.character));
+        }
+        if first {
+            if let Some(i) = m.imports.iter().find(|i| i.name.eq_ignore_ascii_case(name)) {
+                return Some((movie, i.local_character));
+            }
+        }
+        first = false;
+        at = inst.parent;
+    }
+    None
+}
+
 fn mc_attach_movie(
     stage: &mut Stage,
     lib: &Library,
@@ -584,16 +610,7 @@ fn mc_attach_movie(
     if !(0..=AVM_MAX_DEPTH).contains(&depth) {
         return Ok(Value::Undefined);
     }
-    let Some(movie) = stage.arena.get(clip).map(|i| i.character.movie) else {
-        return Ok(Value::Undefined);
-    };
-    let Some(id) = lib.movie(movie).and_then(|m| {
-        m.movie
-            .exports
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(&export))
-            .map(|e| e.character)
-    }) else {
+    let Some((movie, id)) = find_linkage(stage, lib, clip, &export) else {
         return Ok(Value::Undefined);
     };
     let Some(child) = stage.create_by_script(lib, clip, movie, id, depth, &name, |_| {}) else {

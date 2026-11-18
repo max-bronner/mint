@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use mint_render::UiQuad;
@@ -61,9 +62,18 @@ pub struct ShapeMesh {
     pub fill: Vec<[f32; 2]>,
     pub unresolved_textures: u32,
     pub bounds: Option<[f32; 4]>,
+    id: u64,
 }
 
+static NEXT_MESH_ID: AtomicU64 = AtomicU64::new(1);
+
 impl ShapeMesh {
+    #[must_use]
+    pub fn retain_key(&self, run: usize) -> Option<u64> {
+        let run = u64::try_from(run).ok().filter(|run| *run < 1 << 20)?;
+        (self.id != 0).then_some(self.id << 20 | run)
+    }
+
     pub fn from_ru(
         ru: &RuFile,
         mut texture_of: impl FnMut(u32) -> Option<(String, String)>,
@@ -532,7 +542,10 @@ impl MeshCache {
         if let Some(found) = self.map.get(&character) {
             return found.clone();
         }
-        let mesh = build().map(Arc::new);
+        let mesh = build().map(|mut mesh| {
+            mesh.id = NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed);
+            Arc::new(mesh)
+        });
         self.built = self.built.saturating_add(1);
         self.map.insert(character, mesh.clone());
         mesh

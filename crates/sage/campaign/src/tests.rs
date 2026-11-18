@@ -150,7 +150,7 @@ fn restore_spawns_the_captured_units_and_holds_back_the_delayed_name() {
 fn capture_keeps_only_grantable_sciences_and_persistent_upgrades() {
     let mut carry = Carryover::default();
     let player = PlayerCapture {
-        money: 250.0,
+        skill_points: 250.0,
         sciences: vec![
             ScienceFact {
                 name: "KeptScience".into(),
@@ -171,12 +171,13 @@ fn capture_keeps_only_grantable_sciences_and_persistent_upgrades() {
                 persists: false,
             },
         ],
-        cost_multiplier: 0.0,
+        cash_bounty: 0.5,
     };
+    assert_eq!((carry.skill_points(), carry.cash_bounty()), (0.0, 0.0));
     carry.capture(&[], &[], Some(&player));
+    assert_eq!((carry.skill_points(), carry.cash_bounty()), (250.0, 0.5));
     assert_eq!(carry.sciences(), ["KeptScience"]);
     assert_eq!(carry.upgrades(), ["KeptUpgrade"]);
-    assert!((carry.money() - 250.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -254,4 +255,15 @@ fn starting_at_a_mission_begins_there_and_past_the_end_is_the_main_menu() {
         }
     );
     assert_eq!(state.start_at(3), Outcome::MainMenu);
+}
+
+#[test]
+fn a_saved_roster_keeps_its_skill_points_and_cash_bounty() {
+    let saved = mint_sage_save::CampaignState {
+        skill_points: 400.0,
+        cash_bounty: 0.25,
+        ..mint_sage_save::CampaignState::default()
+    };
+    let carry = CampaignState::carryover_from_save(&saved);
+    assert_eq!((carry.skill_points(), carry.cash_bounty()), (400.0, 0.25));
 }

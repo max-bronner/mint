@@ -6,6 +6,7 @@ pub(crate) enum MeleePhase {
     Approach,
     Wait { until: Frame },
     WaitPath { until: Frame, checks: u8 },
+    Squish { fast: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,10 @@ impl Component for HordeMelee {
             MeleePhase::Wait { until } => {
                 hasher.write_u8(1);
                 until.hash_into(hasher);
+            }
+            MeleePhase::Squish { fast } => {
+                hasher.write_u8(3);
+                hasher.write_bool(fast);
             }
             MeleePhase::WaitPath { until, checks } => {
                 hasher.write_u8(2);
@@ -239,7 +244,8 @@ impl MemberMelee {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MemberAttack {
     pub(crate) victim: Entity,
-    pub(crate) out_of_reach_since: Option<Frame>,
+    pub(crate) hold_until: Option<Frame>,
+    pub(crate) no_spot: bool,
     pub(crate) spot: Option<Vec2>,
     pub(crate) planned: Option<(Vec2, Frame)>,
     pub(crate) waits_until: Option<Frame>,
@@ -249,7 +255,8 @@ impl MemberAttack {
     pub(crate) const fn on(victim: Entity) -> Self {
         Self {
             victim,
-            out_of_reach_since: None,
+            hold_until: None,
+            no_spot: false,
             spot: None,
             planned: None,
             waits_until: None,
@@ -260,13 +267,14 @@ impl MemberAttack {
 impl Component for MemberAttack {
     fn hash_into(&self, hasher: &mut StateHasher) {
         self.victim.hash_into(hasher);
-        match self.out_of_reach_since {
-            Some(since) => {
+        match self.hold_until {
+            Some(until) => {
                 hasher.write_u8(1);
-                since.hash_into(hasher);
+                until.hash_into(hasher);
             }
             None => hasher.write_u8(0),
         }
+        hasher.write_u8(u8::from(self.no_spot));
         match self.spot {
             Some(spot) => {
                 hasher.write_u8(1);
@@ -296,6 +304,8 @@ impl Component for MemberAttack {
 
 pub(crate) const GIVE_UP_MS: u32 = 2000;
 
+pub(crate) const NO_SPOT_HOLD_MS: u32 = 5000;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AmoebaTuning {
     pub(crate) facing_bonus: f32,
@@ -313,7 +323,7 @@ impl AmoebaTuning {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let frames = |ms: f32| {
             (ms / 1000.0 * crate::game_data::RETAIL_LOGIC_HZ as f32)
-                .round()
+                .ceil()
                 .clamp(0.0, 1.0e6) as u32
         };
         Self {

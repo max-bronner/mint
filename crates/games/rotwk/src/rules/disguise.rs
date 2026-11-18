@@ -23,6 +23,7 @@ impl RotwkRules {
             .get(wiring.state, entity)
             .is_some_and(|state| state.has_model_condition(DISGUISED));
         self.set_model_condition(tick, ids, entity, DISGUISED, !was_disguised)?;
+        self.stamp_creation(tick, ids, entity)?;
         crate::diag::diag!(
             "disguise: entity {} -> DISGUISED {}",
             entity.index(),
@@ -76,6 +77,7 @@ impl RotwkRules {
             return Ok(());
         }
         self.set_model_condition(tick, ids, entity, DISGUISED, false)?;
+        self.stamp_creation(tick, ids, entity)?;
         crate::diag::diag!(
             "disguise: entity {} -> DISGUISED cleared (break)",
             entity.index()
@@ -94,7 +96,32 @@ impl RotwkRules {
         Ok(())
     }
 
-    fn set_model_condition(
+    pub(super) fn reveal_disguised_climber(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+    ) -> Result<()> {
+        let disguised = self.modules.as_ref().is_some_and(|wiring| {
+            tick.state()
+                .get(wiring.state, entity)
+                .is_some_and(|state| state.has_model_condition(DISGUISED))
+        });
+        let detected = tick
+            .state()
+            .get(ids.stealth, entity)
+            .is_some_and(|state| state.detected_at(tick.frame()));
+        if !disguised || detected {
+            return Ok(());
+        }
+        self.break_disguise(tick, ids, entity, false)?;
+        if tick.state().contains(ids.stealth, entity) {
+            self.apply_lose_stealth_trigger(tick, ids, entity)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_model_condition(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,

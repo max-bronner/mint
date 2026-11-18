@@ -73,7 +73,8 @@ pub fn invisibility_special_power_from_fields(
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(0.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let duration = mint_sim::LogicFrames::from_milliseconds(duration_ms.min(86_400_000.0) as u32);
+    let duration =
+        crate::special_ability_update::retail_duration_ticks(duration_ms.min(86_400_000.0) as u32);
     let update = crate::invisibility_update::invisibility_update_from_fields(fields, now)?;
     Ok(InvisibilitySpecialPower(Arc::new(
         InvisibilitySpecialPowerData {
@@ -192,7 +193,10 @@ mod tests {
             } = effect
             {
                 assert_eq!(radius, 120.0);
-                assert_eq!(duration, mint_sim::LogicFrames::from_milliseconds(9000));
+                assert_eq!(
+                    duration,
+                    mint_sim::LogicFrames::from_engine_milliseconds(9000)
+                );
                 assert_eq!(nugget.kind, crate::InvisibilityType::Camouflage);
                 found = true;
             }

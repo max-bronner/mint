@@ -58,6 +58,7 @@ pub struct WetGrid {
     height: u32,
     wetness: Vec<Wetness>,
     surfaces: Vec<(f32, bool)>,
+    column: Vec<f32>,
     pub areas_used: u32,
     pub areas_degenerate: u32,
 }
@@ -74,6 +75,7 @@ impl WetGrid {
             height,
             wetness: vec![Wetness::Dry; count],
             surfaces: vec![(f32::NEG_INFINITY, false); count],
+            column: vec![0.0; count],
             areas_used: 0,
             areas_degenerate: 0,
         }
@@ -96,6 +98,14 @@ impl WetGrid {
             .and_then(|index| self.wetness.get(index))
             .copied()
             .unwrap_or(Wetness::Dry)
+    }
+
+    #[must_use]
+    pub fn column_at(&self, x: u32, y: u32) -> f32 {
+        self.wetness_index(x, y)
+            .and_then(|index| self.column.get(index))
+            .copied()
+            .unwrap_or(0.0)
     }
 
     #[must_use]
@@ -220,11 +230,19 @@ impl WetGrid {
         let (surface, _) = surface;
         let ground = f32::from(sample) * scale;
         let depth = surface - ground;
+        if let Some(column) = self
+            .wetness_index(x, y)
+            .and_then(|index| self.column.get_mut(index))
+        {
+            if depth > *column {
+                *column = depth;
+            }
+        }
         let wetness = if depth <= 0.0 {
             Wetness::Dry
         } else if depth <= depths.wade {
             Wetness::Ford
-        } else if depth < depths.deep {
+        } else if depth <= depths.deep {
             Wetness::Water
         } else {
             Wetness::Deep
@@ -250,6 +268,97 @@ impl WetGrid {
         if rank(wetness) > rank(*slot) {
             *slot = wetness;
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct WaterSurfaces {
+    areas: Vec<SurfaceArea>,
+}
+
+#[derive(Debug)]
+struct SurfaceArea {
+    height: f32,
+    low: [f32; 2],
+    high: [f32; 2],
+    polygon: Vec<[f32; 2]>,
+}
+
+impl SurfaceArea {
+    fn new(height: f32, polygon: Vec<[f32; 2]>) -> Self {
+        let mut low = [f32::INFINITY; 2];
+        let mut high = [f32::NEG_INFINITY; 2];
+        for point in &polygon {
+            for (axis, value) in point.iter().enumerate() {
+                if let Some(slot) = low.get_mut(axis) {
+                    *slot = slot.min(*value);
+                }
+                if let Some(slot) = high.get_mut(axis) {
+                    *slot = slot.max(*value);
+                }
+            }
+        }
+        Self {
+            height,
+            low,
+            high,
+            polygon,
+        }
+    }
+
+    fn contains(&self, point: [f32; 2]) -> bool {
+        let within = |axis: usize| {
+            let (Some(&value), Some(&low), Some(&high)) =
+                (point.get(axis), self.low.get(axis), self.high.get(axis))
+            else {
+                return false;
+            };
+            value >= low && value <= high
+        };
+        within(0) && within(1) && inside(&self.polygon, point)
+    }
+}
+
+impl WaterSurfaces {
+    #[must_use]
+    pub fn build(water: &Water) -> Self {
+        let mut areas = Vec::new();
+        for area in water.standing_areas() {
+            if standing_polygon(area).len() >= 3 {
+                areas.push(SurfaceArea::new(
+                    surface_of(area.water_height),
+                    standing_polygon(area).to_vec(),
+                ));
+            }
+        }
+        for area in water.river_areas() {
+            for pair in area.lines.windows(2) {
+                let (Some(near), Some(far)) = (pair.first(), pair.get(1)) else {
+                    continue;
+                };
+                areas.push(SurfaceArea::new(
+                    surface_of(area.water_height),
+                    vec![near.a, near.b, far.b, far.a],
+                ));
+            }
+        }
+        Self { areas }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.areas.is_empty()
+    }
+
+    #[must_use]
+    pub fn surface_at(&self, point: [f32; 2]) -> Option<f32> {
+        self.areas
+            .iter()
+            .filter(|area| area.contains(point))
+            .map(|area| area.height)
+            .fold(None, |best: Option<f32>, height| {
+                Some(best.map_or(height, |b| b.max(height)))
+            })
     }
 }
 
@@ -452,12 +561,14 @@ mod tests {
             (0u32, Wetness::Dry),
             (4, Wetness::Ford),
             (5, Wetness::Ford),
-            (6, Wetness::Deep),
+            (6, Wetness::Water),
+            (7, Wetness::Deep),
             (20, Wetness::Deep),
         ] {
             let hm = height_field(12, 12, 0);
             let grid = WetGrid::build(&hm, 1.0, &lake(square(), surface), WaterDepths::SHIPPED);
             assert_eq!(grid.at(5, 5), expected, "a surface at {surface}");
+            assert!((grid.column_at(5, 5) - surface as f32).abs() < 1e-3);
         }
         let mut hm = height_field(12, 12, 0);
         hm.samples = vec![1; 144];

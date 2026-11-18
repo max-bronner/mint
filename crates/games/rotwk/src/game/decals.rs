@@ -1,5 +1,7 @@
 use mint_render::{Renderer, Vec3};
 use mint_sage_asset::KindOf;
+use mint_sage_ini::DecalShader;
+use mint_sage_scene::dynamic_decal::{DecalTimeline, FiredDecal};
 use mint_sim::PlayerId;
 
 use super::claim_outline::{self, ClaimCircle};
@@ -106,10 +108,57 @@ pub(super) fn push_ground_decals(
         }
     }
     let obscured = obscured_ids(units);
+    let now = state.visuals.fading_decals.now();
+    let shadow_decals = *state
+        .visuals
+        .shadow_decals
+        .get_or_insert_with(|| crate::scene::static_lod_shadow_decals(&state.vfs));
+    let mut shown = Vec::new();
     for (id, placement, decal) in state.units.state_decals() {
-        if obscured.binary_search(&id).is_ok() {
+        if obscured.binary_search(&id).is_ok() || !(shadow_decals || decal.override_lod_visibility)
+        {
             continue;
         }
+        let [forward, _, _, origin] = placement.to_cols();
+        shown.push(ShownDecal {
+            id,
+            decal: decal.clone(),
+            centre: Vec3::new(
+                origin[0],
+                origin[1],
+                ground_at(&state.scene, origin[0], origin[1]),
+            ),
+            facing: mint_math::f32::atan2(forward[1], forward[0]),
+        });
+    }
+    let shadows = state.visuals.fading_decals.shadows(now, shown);
+    for (shown, opacity) in shadows {
+        let Some(texture) = state.visuals.ground_texture(
+            renderer,
+            &state.vfs,
+            &state.scene.resolver,
+            &shown.decal.texture,
+        ) else {
+            continue;
+        };
+        let additive = shown.decal.blend == mint_sage_ini::DecalBlend::Additive;
+        let view = crate::visuals::DecalView {
+            centre: shown.centre,
+            half_x: shown.decal.size_x / 2.0,
+            half_y: shown.decal.size_y / 2.0,
+            facing: shown.facing,
+            texture,
+            tint: opacity_tint([1.0; 3], opacity, additive),
+        };
+        if additive {
+            additive_decals.push(view);
+        } else {
+            decals.push(view);
+        }
+    }
+    let fired = state.visuals.fading_decals.fired(now);
+    for (fired, opacity) in fired {
+        let decal = &fired.decal;
         let Some(texture) = state.visuals.ground_texture(
             renderer,
             &state.vfs,
@@ -118,22 +167,20 @@ pub(super) fn push_ground_decals(
         ) else {
             continue;
         };
-        let [forward, _, _, origin] = placement.to_cols();
+        let (x, y) = (fired.centre.x, fired.centre.y);
+        let colour = decal.color.map(|channel| channel.clamp(0.0, 255.0) / 255.0);
         let view = crate::visuals::DecalView {
-            centre: Vec3::new(
-                origin[0],
-                origin[1],
-                ground_at(&state.scene, origin[0], origin[1]),
-            ),
-            half_x: decal.size_x / 2.0,
-            half_y: decal.size_y / 2.0,
-            facing: mint_math::f32::atan2(forward[1], forward[0]),
+            centre: Vec3::new(x, y, ground_at(&state.scene, x, y)),
+            half_x: decal.size / 2.0,
+            half_y: decal.size / 2.0,
+            facing: fired.facing,
             texture,
-            tint: [1.0; 4],
+            tint: opacity_tint(colour, opacity, decal.shader != DecalShader::Alpha),
         };
-        match decal.blend {
-            mint_sage_ini::DecalBlend::Alpha => decals.push(view),
-            mint_sage_ini::DecalBlend::Additive => additive_decals.push(view),
+        match decal.shader {
+            DecalShader::Alpha => decals.push(view),
+            DecalShader::Additive => additive_decals.push(view),
+            DecalShader::Subtract => {}
         }
     }
     for item in &state.visuals.formation_preview.clone() {
@@ -216,6 +263,100 @@ pub(super) fn push_ground_decals(
         mint_render::Blend::MergeAlphaBlend,
         &mut state.scene.drawn,
     );
+}
+
+fn opacity_tint(colour: [f32; 3], opacity: i64, additive: bool) -> [f32; 4] {
+    #[allow(clippy::cast_precision_loss)]
+    let alpha = opacity.clamp(0, 255) as f32 / 255.0;
+    let [r, g, b] = colour;
+    if additive {
+        [r * alpha, g * alpha, b * alpha, 1.0]
+    } else {
+        [r, g, b, alpha]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShownDecal {
+    id: u32,
+    decal: mint_sage_ini::StateDecal,
+    centre: Vec3,
+    facing: f32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FadingDecals {
+    seconds: f64,
+    shown: Vec<(ShownDecal, DecalTimeline)>,
+    leaving: Vec<(ShownDecal, DecalTimeline)>,
+    fired: Vec<(FiredDecal, DecalTimeline)>,
+}
+
+const MAX_FIRED_DECALS: usize = 512;
+
+impl FadingDecals {
+    pub(crate) fn set_clock(&mut self, seconds: f32) {
+        if seconds.is_finite() {
+            self.seconds = self.seconds.max(f64::from(seconds));
+        }
+    }
+
+    pub(crate) fn now(&self) -> u32 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let frames = (self.seconds * 30.0).clamp(0.0, f64::from(u32::MAX)) as u32;
+        frames
+    }
+
+    pub(crate) fn fire(&mut self, now: u32, decals: impl IntoIterator<Item = FiredDecal>) {
+        for decal in decals {
+            if self.fired.len() >= MAX_FIRED_DECALS {
+                self.fired.remove(0);
+            }
+            let timeline = DecalTimeline::fired(now, &decal.decal);
+            self.fired.push((decal, timeline));
+        }
+    }
+
+    fn fired(&mut self, now: u32) -> Vec<(FiredDecal, i64)> {
+        self.fired
+            .retain(|(_, timeline)| timeline.opacity_at(now).is_some());
+        self.fired
+            .iter()
+            .filter_map(|(decal, timeline)| Some((decal.clone(), timeline.opacity_at(now)?)))
+            .collect()
+    }
+
+    fn shadows(&mut self, now: u32, shown: Vec<ShownDecal>) -> Vec<(ShownDecal, i64)> {
+        let same = |a: &ShownDecal, b: &ShownDecal| a.id == b.id && a.decal == b.decal;
+        let mut next = Vec::with_capacity(shown.len());
+        for decal in shown {
+            let timeline = self
+                .shown
+                .iter()
+                .find(|(held, _)| same(held, &decal))
+                .map_or_else(
+                    || DecalTimeline::shadow(now, &decal.decal.opacity),
+                    |(_, timeline)| *timeline,
+                );
+            next.push((decal, timeline));
+        }
+        for (held, timeline) in std::mem::take(&mut self.shown) {
+            if next.iter().any(|(decal, _)| same(decal, &held)) {
+                continue;
+            }
+            if let Some(leaving) = timeline.removed(now, held.decal.opacity.dynamic) {
+                self.leaving.push((held, leaving));
+            }
+        }
+        self.shown = next;
+        self.leaving
+            .retain(|(_, timeline)| timeline.opacity_at(now).is_some());
+        self.shown
+            .iter()
+            .chain(&self.leaving)
+            .filter_map(|(decal, timeline)| Some((decal.clone(), timeline.opacity_at(now)?)))
+            .collect()
+    }
 }
 
 fn obscured_ids(units: &[UnitView]) -> Vec<u32> {

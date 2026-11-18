@@ -1,6 +1,5 @@
 use mint_sim::{LogicFrames, StateHasher};
 
-use crate::command_points::CommandPointPool;
 use crate::money::Money;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,8 +41,6 @@ pub enum Refusal {
     QueueFull { limit: u32 },
     #[error("costs {cost} and the player holds {held}")]
     CannotAfford { cost: i64, held: i64 },
-    #[error("needs {needed} command points and {free} are free of {limit}")]
-    NoCommandPoints { needed: i32, free: i32, limit: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,6 +48,22 @@ pub enum EntryKind {
     Unit { builder: bool },
     Upgrade,
     Revival { builder: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ItemTable {
+    Objects,
+    Upgrades,
+}
+
+impl EntryKind {
+    #[must_use]
+    pub const fn table(self) -> ItemTable {
+        match self {
+            Self::Unit { .. } | Self::Revival { .. } => ItemTable::Objects,
+            Self::Upgrade => ItemTable::Upgrades,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +90,11 @@ pub struct ProductionEntry {
 }
 
 impl ProductionEntry {
+    #[must_use]
+    pub fn makes(&self, table: ItemTable, item: ItemId) -> bool {
+        self.item == item && self.kind.table() == table
+    }
+
     #[must_use]
     pub const fn quantity_remaining(&self) -> u32 {
         self.quantity_total.saturating_sub(self.quantity_produced)
@@ -193,7 +211,6 @@ impl ProductionQueue {
         &mut self,
         request: QueueRequest,
         purse: &mut Money,
-        points: &CommandPointPool,
     ) -> Result<ProductionId, Refusal> {
         if u32::try_from(self.entries.len()).unwrap_or(u32::MAX) >= self.max_entries {
             return Err(Refusal::QueueFull {
@@ -204,14 +221,6 @@ impl ProductionQueue {
             return Err(Refusal::CannotAfford {
                 cost: request.cost,
                 held: purse.amount(),
-            });
-        }
-        let free = points.free().saturating_sub(self.reserved_command_points());
-        if request.command_points > 0 && request.command_points > free {
-            return Err(Refusal::NoCommandPoints {
-                needed: request.command_points,
-                free,
-                limit: points.limit(),
             });
         }
 
@@ -347,13 +356,16 @@ impl ProductionQueue {
     }
 
     #[must_use]
-    pub fn last_of(&self, item: ItemId) -> Option<&ProductionEntry> {
-        self.entries.iter().rev().find(|entry| entry.item == item)
+    pub fn last_of(&self, table: ItemTable, item: ItemId) -> Option<&ProductionEntry> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.makes(table, item))
     }
 
     #[must_use]
-    pub fn first_of(&self, item: ItemId) -> Option<&ProductionEntry> {
-        self.entries.iter().find(|entry| entry.item == item)
+    pub fn first_of(&self, table: ItemTable, item: ItemId) -> Option<&ProductionEntry> {
+        self.entries.iter().find(|entry| entry.makes(table, item))
     }
 
     pub fn cancel(&mut self, id: ProductionId, purse: &mut Money) -> Option<Cancellation> {

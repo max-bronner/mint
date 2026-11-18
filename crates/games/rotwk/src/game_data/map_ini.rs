@@ -6,7 +6,8 @@ use mint_vfs::Vfs;
 
 use super::{horde_formation, GameData, LoadRefusal};
 
-const COMPOSED: [&str; 8] = [
+const COMPOSED: [&str; 9] = [
+    "Locomotor",
     "Science",
     "SpecialPower",
     "PlayerTemplate",
@@ -16,6 +17,10 @@ const COMPOSED: [&str; 8] = [
     "Weapon",
     "Rank",
 ];
+
+const SINGLETONS: [&str; 3] = ["GameData", "AIData", "SkirmishAIData"];
+
+const PARTICLES: [&str; 2] = ["FXParticleSystem", "ParticleSystem"];
 
 pub(crate) fn compose_map_ini(
     data: &mut GameData,
@@ -69,6 +74,9 @@ pub(crate) fn compose_document(
     }
     let globals = Arc::clone(&data.ini_documents);
     let mut lines = compose_stores(data, &document, &globals, &macros)?;
+    lines.extend(compose_singletons_and_particles(
+        data, &document, &globals, &macros,
+    )?);
     let weapons_changed = document
         .roots()
         .iter()
@@ -91,6 +99,8 @@ pub(crate) fn compose_document(
     for block in document.roots() {
         let keyword = block.keyword.as_str();
         if !COMPOSED.contains(&keyword)
+            && !SINGLETONS.contains(&keyword)
+            && !PARTICLES.contains(&keyword)
             && !mint_sage_ini::object::OBJECT_KEYWORDS.contains(&keyword)
         {
             let count = elsewhere.entry(keyword).or_default();
@@ -195,6 +205,39 @@ fn compose_templates(
     });
     data.templates = Arc::new(templates);
     Ok(line)
+}
+
+fn compose_singletons_and_particles(
+    data: &mut GameData,
+    document: &Document,
+    globals: &[Document],
+    macros: &mint_sage_ini::MacroTable,
+) -> Result<Vec<String>, LoadRefusal> {
+    let mut lines = Vec::new();
+    let singletons = document
+        .roots()
+        .iter()
+        .filter(|block| SINGLETONS.contains(&block.keyword.as_str()))
+        .count();
+    if singletons > 0 {
+        super::recompose_singletons(data, globals, document, macros).map_err(refusals)?;
+        lines.push(format!(
+            "{singletons} GameData/AIData/SkirmishAIData block(s) merged"
+        ));
+    }
+    let mut systems = mint_sage_ini::ParticleIndex::new();
+    systems.insert_override_document(globals, document);
+    let errors = systems.value_errors().take();
+    if !errors.is_empty() {
+        return Err(refusals(errors.iter().map(ToString::to_string)));
+    }
+    if !systems.is_empty() {
+        lines.push(format!(
+            "{} particle system(s) for the scene",
+            systems.len()
+        ));
+    }
+    Ok(lines)
 }
 
 fn compose_stores(
@@ -302,6 +345,15 @@ fn compose_stores(
         }
         data.upgrades = Arc::new(mint_sage_modules::build_upgrade_records(&upgrades, macros));
         data.upgrade_bits = Arc::new(mint_sage_modules::UpgradeBits::from_index(&upgrades));
+    }
+    if has("Locomotor") {
+        let mut locomotors = (*data.locomotors).clone();
+        let before = locomotors.errors().len();
+        for block in &merged {
+            locomotors.insert_block(block);
+        }
+        value_errors.extend(locomotors.errors().iter().skip(before).cloned());
+        data.locomotors = Arc::new(locomotors);
     }
     if has("Weapon") {
         for block in merged.iter().filter(|block| block.keyword == "Weapon") {

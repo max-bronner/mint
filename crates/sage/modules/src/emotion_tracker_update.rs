@@ -210,7 +210,8 @@ pub fn emotion_tracker_update_from_fields(
             whole
         }
     };
-    let cadence = LogicFrames::from_milliseconds(cadence_ms).max(LogicFrames::ONE);
+    let cadence =
+        crate::special_ability_update::retail_duration_ticks(cadence_ms).max(LogicFrames::ONE);
     let mut emotions: Vec<Block> = fields
         .field_args_each(mint_sage_ini::ADD_EMOTION_KEYWORD)
         .into_iter()

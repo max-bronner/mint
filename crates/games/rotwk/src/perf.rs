@@ -2,10 +2,12 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-pub(crate) const PASS_NAMES: [&str; 59] = [
+pub(crate) const PASS_NAMES: [&str; 69] = [
     "clock",
     "step_map_scripts",
     "step_team_builders",
+    "step_castle_unpack",
+    "end_ai_busy",
     "replay_deferred_orders",
     "ai",
     "path_budgets",
@@ -20,8 +22,10 @@ pub(crate) const PASS_NAMES: [&str; 59] = [
     "fly_giant_birds",
     "contain",
     "grid",
+    "step_disabled",
     "members",
     "advance_knockback",
+    "advance_floods",
     "player_overrides",
     "visibility",
     "advance_stealth",
@@ -41,11 +45,16 @@ pub(crate) const PASS_NAMES: [&str; 59] = [
     "step_crush_notices",
     "step_emotions",
     "step_animals",
+    "step_repulsors",
+    "step_repulsed",
+    "step_portal_fades",
+    "step_critter_emitters",
     "step_amphibious",
     "step_siege",
     "step_group_bonuses",
     "settle_path_requests",
     "damage",
+    "pending_impacts",
     "tick_fire",
     "note_attackers",
     "step_engaged",
@@ -62,6 +71,7 @@ pub(crate) const PASS_NAMES: [&str; 59] = [
     "advance_match_stats",
     "modifiers",
     "stand_on_terrain",
+    "wading",
 ];
 
 pub(crate) const fn position(names: &[&str], name: &str) -> usize {
@@ -95,7 +105,7 @@ macro_rules! row {
 }
 pub(crate) use row;
 
-pub(crate) const SUB_NAMES: [&str; 14] = [
+pub(crate) const SUB_NAMES: [&str; 65] = [
     "advance_group_attacks",
     "horde_melee",
     "ranged_horde_spot",
@@ -110,6 +120,57 @@ pub(crate) const SUB_NAMES: [&str; 14] = [
     "unit_index_sync",
     "unit_index_query",
     "amoeba",
+    "decide_guards",
+    "decide_group_attacks",
+    "decide_armed",
+    "fill_unit_cells",
+    "melee_destination",
+    "member_contact",
+    "adjacent_enemy",
+    "acquire_scan",
+    "fire_shot",
+    "area_victims",
+    "projectile_collide",
+    "living_walk",
+    "continued_victim",
+    "adjust_victim",
+    "armed_choose",
+    "armed_engage",
+    "fill_bodies",
+    "acquire_for",
+    "friendly_fire",
+    "choose_bird_ground",
+    "choose_order",
+    "choose_idle_scan",
+    "choose_reacquire",
+    "choose_sticky_common",
+    "engage_no_target",
+    "engage_uncohere",
+    "engage_weapon_choice",
+    "engage_after_firing",
+    "engage_reach",
+    "engage_close",
+    "engage_settle",
+    "engage_aim",
+    "engage_fire",
+    "path_expanded",
+    "member_reach",
+    "member_replan",
+    "engage_aim_weapon",
+    "engage_range_gate",
+    "engage_approach",
+    "path_site_attack",
+    "path_site_move",
+    "path_site_rescue",
+    "path_site_contact",
+    "unit_cost_limits",
+    "death_phase_updates",
+    "remove_corpses",
+    "reap_portals",
+    "reap_obstacles",
+    "reap_walls",
+    "reap_goal_cells",
+    "settle_claims",
 ];
 
 macro_rules! sub_row {
@@ -135,6 +196,16 @@ pub(crate) fn sub(row: usize) -> SubTimer {
     }
 }
 
+pub(crate) fn count(row: usize, n: usize) {
+    if enabled() {
+        SUB_TICK.with(|cells| {
+            if let Some((_, calls)) = cells.borrow_mut().get_mut(row) {
+                *calls = calls.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+            }
+        });
+    }
+}
+
 impl Drop for SubTimer {
     fn drop(&mut self) {
         if let Some(started) = self.started {
@@ -152,6 +223,25 @@ impl Drop for SubTimer {
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("MINT_ROTWK_PROFILE").is_ok())
+}
+
+fn clock_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enabled() && std::env::var("MINT_ROTWK_PROFILE_CLOCK").is_ok())
+}
+
+const CLOCK_PROBE_STEPS: u32 = 160_000;
+
+fn clock_probe_us() -> f64 {
+    let started = Instant::now();
+    let mut x = std::hint::black_box(0x9E37_79B9_7F4A_7C15_u64);
+    for _ in 0..CLOCK_PROBE_STEPS {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+    }
+    std::hint::black_box(x);
+    started.elapsed().as_secs_f64() * 1e6
 }
 
 fn spike_threshold_ms() -> f64 {
@@ -186,6 +276,7 @@ struct Samples {
     apply_ms: Vec<f64>,
     hash_ms: Vec<f64>,
     counts: Vec<(u32, u32, u32, u32, u32)>,
+    clock_probe_us: Vec<f64>,
 }
 
 impl Samples {
@@ -199,6 +290,7 @@ impl Samples {
             apply_ms: Vec::new(),
             hash_ms: Vec::new(),
             counts: Vec::new(),
+            clock_probe_us: Vec::new(),
         }
     }
 }
@@ -240,6 +332,7 @@ fn take_counts() -> (u32, u32, u32, u32, u32) {
 pub(crate) struct TickProfile {
     frame: u64,
     durations: [Duration; PASS_NAMES.len()],
+    probe_us: Option<f64>,
 }
 
 impl TickProfile {
@@ -247,6 +340,7 @@ impl TickProfile {
         Self {
             frame,
             durations: [Duration::ZERO; PASS_NAMES.len()],
+            probe_us: clock_probe_enabled().then(clock_probe_us),
         }
     }
 
@@ -257,6 +351,10 @@ impl TickProfile {
     }
 
     pub(crate) fn finish(self, step_whole: Duration) {
+        if let Some(before) = self.probe_us {
+            let probe = (before + clock_probe_us()) / 2.0;
+            SAMPLES.with(|samples| samples.borrow_mut().clock_probe_us.push(probe));
+        }
         let (plan_calls, armed, living, projectiles, stragglers) = take_counts();
         let total: Duration = self.durations.iter().sum();
         let total_ms = total.as_secs_f64() * 1000.0;
@@ -379,6 +477,36 @@ fn report_range(samples: &Samples, prefix: &str, range: std::ops::Range<usize>) 
     line("apply", &samples.apply_ms);
     if !samples.hash_ms.is_empty() {
         line("state_hash", &samples.hash_ms);
+    }
+    if !samples.clock_probe_us.is_empty() {
+        let mut probes = cut(&samples.clock_probe_us);
+        probes.sort_by(f64::total_cmp);
+        let at = |share: usize| {
+            probes
+                .get(probes.len().saturating_mul(share) / 100)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let median = at(50);
+        println!(
+            "perf: {prefix}clock_probe_us p1 {:.2} p50 {median:.2} p90 {:.2} p99 {:.2}",
+            at(1),
+            at(90),
+            at(99)
+        );
+        let (mut fast, mut slow) = (Vec::new(), Vec::new());
+        for (probe, total) in cut(&samples.clock_probe_us)
+            .iter()
+            .zip(cut(&samples.total_ms))
+        {
+            if *probe <= median {
+                fast.push(total);
+            } else {
+                slow.push(total);
+            }
+        }
+        line("TOTAL, probe <= p50", &fast);
+        line("TOTAL, probe > p50", &slow);
     }
     for (name, bucket) in SUB_NAMES.iter().zip(&samples.per_sub) {
         let times: Vec<f64> = bucket.iter().map(|(time, _)| *time).collect();

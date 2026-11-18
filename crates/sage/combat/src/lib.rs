@@ -35,12 +35,12 @@ pub use geom::{surface_distance_squared_2d, within_attack_range, Point3};
 pub use load::{CombatData, LoadReport};
 pub use match_set::{best_match, ConditionMask, ConditionTable};
 pub use nugget::{
-    DamageNugget, DotNugget, EffectNugget, MetaImpactNugget, ModifierNugget, Nugget,
+    DamageNugget, DamageShape, DotNugget, EffectNugget, MetaImpactNugget, ModifierNugget, Nugget,
     ProjectileNugget,
 };
 pub use projectile::{
-    highest_terrain_along, BezierArc, ProjectileFlight, DEFAULT_FIRST_PERCENT_HEIGHT,
-    DEFAULT_SECOND_PERCENT_HEIGHT,
+    bezier_length, bezier_points, highest_terrain_along, BezierArc, ProjectileFlight,
+    DEFAULT_FIRST_PERCENT_HEIGHT, DEFAULT_SECOND_PERCENT_HEIGHT,
 };
 pub use slow_death::{choose_slow_death, SlowDeathOption};
 pub use target::{nearest_target, sort_candidates, sort_victims, Candidate};
@@ -53,6 +53,6 @@ pub use weapon::{
 };
 pub use weapon_bonus::{compute_bonus, BonusConditions, WeaponBonus, WeaponBonusSet};
 pub use weapon_slots::{
-    choose_slot, CommandSource, SlotArm, SlotCandidate, SlotFitness, SourceMask,
-    WeaponChoiceCriteria, WeaponSlot, SLOT_COUNT,
+    choose_slot, choose_slot_without_victim, CommandSource, NoVictimSlot, SlotArm, SlotCandidate,
+    SlotFitness, SourceMask, WeaponChoiceCriteria, WeaponSlot, SLOT_COUNT,
 };

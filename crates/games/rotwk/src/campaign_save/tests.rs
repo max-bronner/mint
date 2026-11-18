@@ -20,7 +20,7 @@ fn synthetic() -> Autosave {
             ..CarryoverUnit::default()
         }],
         hero_record_count: 1,
-        money: 1200.0,
+        skill_points: 1200.0,
         ..CampaignState::default()
     };
     Autosave {

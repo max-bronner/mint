@@ -178,7 +178,7 @@ pub(super) fn frames_of_ms(milliseconds: f32) -> LogicFrames {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = milliseconds.min(86_400_000.0) as u32;
-    LogicFrames::from_milliseconds(whole)
+    mint_sage_modules::retail_duration_ticks(whole)
 }
 
 fn bearing_to(world: &World, ids: Ids, entity: Entity, killer: Entity) -> Option<f32> {
@@ -312,6 +312,7 @@ impl RotwkRules {
                 alive_only: false,
                 reload_slot: None,
                 owner_if_gone: owner,
+                victim: None,
             },
         )
     }
@@ -353,7 +354,14 @@ impl RotwkRules {
         Ok(())
     }
 
-    fn height_above_terrain(&self, world: &World, ids: Ids, entity: Entity) -> f32 {
+    pub(super) fn object_z(&self, world: &World, ids: Ids, entity: Entity) -> f32 {
+        let at = world
+            .get(ids.body, entity)
+            .map_or(Vec2::ZERO, |body| body.0.position);
+        self.ground_height(at.x, at.y) + self.height_above_terrain(world, ids, entity)
+    }
+
+    pub(super) fn height_above_terrain(&self, world: &World, ids: Ids, entity: Entity) -> f32 {
         let Some(body) = world.get(ids.body, entity) else {
             return 0.0;
         };
@@ -453,6 +461,28 @@ impl RotwkRules {
         }
     }
 
+    fn firing_terms(&self, world: &World, ids: Ids, event: &DamageEvent) -> (f32, bool) {
+        let Some(template) = event
+            .weapon
+            .and_then(|weapon| self.combat.weapons.get(weapon))
+        else {
+            return (1.0, false);
+        };
+        let mut share = 1.0;
+        if template.passenger_proportional_attack
+            && template.max_attack_passengers > 0
+            && self.contain_view(world, event.attacker).is_some()
+        {
+            let held = world
+                .get(ids.passengers, event.attacker)
+                .map_or(0, |list| list.0.len());
+            #[allow(clippy::cast_precision_loss)]
+            let held = held as f32;
+            share = (held / f32::from(template.max_attack_passengers)).min(1.0);
+        }
+        (share, template.use_innate_attributes)
+    }
+
     pub(super) fn apply_damage(
         &self,
         tick: &mut Tick<'_>,
@@ -466,7 +496,24 @@ impl RotwkRules {
         let mut killed = Vec::new();
         let mut kills: Vec<(Entity, Entity)> = Vec::new();
         let magic = self.combat.damage_types.lookup("MAGIC");
+        let passenger_type = self.combat.damage_types.lookup("PASSENGER");
+        let unresistable = self.combat.damage_types.lookup("UNRESISTABLE");
+        let healing = self.combat.damage_types.lookup("HEALING");
+        let now = tick.frame();
         for event in events.iter_mut() {
+            if Some(event.damage_type) == healing {
+                let base = tick
+                    .state()
+                    .get(ids.bonuses, event.attacker)
+                    .filter(|_| !event.bonuses_applied)
+                    .map_or(event.amount, |bonuses| {
+                        bonuses
+                            .0
+                            .damage_of(event.amount, false, event.accepts_add, false)
+                    });
+                self.heal(tick, ids, event.victim, base * event.scalar, false, now)?;
+                continue;
+            }
             let Some(mut health) = tick.state().get(ids.health, event.victim).copied() else {
                 continue;
             };
@@ -480,16 +527,31 @@ impl RotwkRules {
             {
                 continue;
             }
+            if tick.state().contains(ids.contained, event.victim)
+                && self.container_shields(tick.state(), ids, event.victim)
+            {
+                let through = Some(event.damage_type) == passenger_type
+                    || Some(event.damage_type) == unresistable;
+                if !through {
+                    continue;
+                }
+                if event.force_kill {
+                    self.remove_from_contain(tick, ids, event.victim)?;
+                }
+            }
             let armour = tick.state().get(ids.armour, event.victim).copied();
+            let (passenger_share, use_innate) = self.firing_terms(tick.state(), ids, event);
+            let raw = event.amount * passenger_share;
             let base = tick
                 .state()
                 .get(ids.bonuses, event.attacker)
                 .filter(|_| !event.bonuses_applied)
-                .map_or(event.amount, |bonuses| {
+                .map_or(raw, |bonuses| {
                     bonuses.0.damage_of(
-                        event.amount,
+                        raw,
                         Some(event.damage_type) == magic,
                         event.accepts_add,
+                        use_innate,
                     )
                 });
             let base = tick
@@ -507,6 +569,13 @@ impl RotwkRules {
             };
             let (flank_bonus, flank_penalty) = self.strike_flank(tick, ids, event)?;
             let amount = amount * flank_bonus;
+            let amount = match self.flanked_scalar(tick, ids, event)? {
+                None => amount,
+                Some(scalar) => match crate::rules::flank::flanked_amount(amount, scalar) {
+                    Some(amount) => amount,
+                    None => continue,
+                },
+            };
             let before = health.0.fraction();
             let outcome = {
                 let template = armour_of(&self.combat, armour, &self.unarmoured);
@@ -535,12 +604,35 @@ impl RotwkRules {
                 });
             }
             tick.state_mut().insert(ids.health, event.victim, health)?;
+            if event.drain_life > 0.0
+                && outcome.dealt > 0.0
+                && !tick
+                    .state()
+                    .get(ids.shape, event.attacker)
+                    .is_some_and(|shape| shape.kind_of.contains(KindOf::PROJECTILE))
+            {
+                self.heal(
+                    tick,
+                    ids,
+                    event.attacker,
+                    event.drain_life * outcome.dealt,
+                    false,
+                    now,
+                )?;
+            }
             let after = health.0.fraction();
             if let Some(launched) = event.launched {
                 self.knock_side_off(tick, ids, event.victim, launched, before, after)?;
             }
             if !outcome.died {
                 let thresholds = self.thresholds_of(tick.state(), ids, event.victim);
+                self.enter_damage_rung(
+                    tick,
+                    ids,
+                    event.victim,
+                    thresholds.rung(before),
+                    thresholds.rung(after),
+                )?;
                 if thresholds.rung(before) < crate::combat::DamageRung::ReallyDamaged
                     && thresholds.rung(after) >= crate::combat::DamageRung::ReallyDamaged
                 {
@@ -550,6 +642,7 @@ impl RotwkRules {
             }
             self.play_damage_fx(tick, ids, event, outcome.dealt);
             self.note_hurt(tick, ids, event.victim);
+            self.note_repulsor_damage(tick, ids, event.victim)?;
             self.note_emotion_hurt(tick, ids, event.victim);
             self.react_evacuate_damage(tick, ids, event.victim, event.weapon)?;
             self.react_horde_transport_contain_damage(tick, ids, event.victim)?;
@@ -760,6 +853,9 @@ impl RotwkRules {
                     .map(|death| death.death_flags.iter().map(String::as_str).collect())
                     .unwrap_or_default();
                 status.extend_from_slice(sold);
+                if world.contains(ids.construction, *entity) {
+                    status.push("UNDER_CONSTRUCTION");
+                }
                 let death = self.killing_blow(world, ids, *entity, &status, &held);
                 wiring.broadcast_die(
                     world,

@@ -1,3 +1,4 @@
+use crate::spell_state::PendingImpact;
 use mint_sage_combat::{Point3, ProjectileFlight};
 use mint_sage_modules::{Effect, ObjectRecord};
 
@@ -25,11 +26,12 @@ impl Phase {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Knocked {
     launch: Point3,
-    flight: Option<ProjectileFlight>,
+    pub(crate) flight: Option<ProjectileFlight>,
     pub(crate) ground: f32,
     pub(crate) had_ground: bool,
     pub(crate) until: Frame,
     pub(crate) phase: Phase,
+    pub(crate) age: u16,
 }
 
 impl Component for Knocked {
@@ -40,6 +42,7 @@ impl Component for Knocked {
         hasher.write_bool(self.flight.is_some());
         if let Some(flight) = &self.flight {
             flight.hash_into(hasher);
+            hasher.write_u16(self.age);
         }
         hasher.write_f32(self.ground);
         hasher.write_bool(self.had_ground);
@@ -97,6 +100,18 @@ pub(crate) fn inside_arc(facing: Vec2, direction: Vec2, arc: Option<f32>, invert
     within != inverted
 }
 
+pub(crate) fn bend_shock(offset: Vec2, factor: f32) -> Vec2 {
+    if factor == 0.0 || !factor.is_finite() {
+        return offset;
+    }
+    let c = factor.min(1.0);
+    let swirl = c * c;
+    Vec2::new(
+        offset.x * (1.0 - c) + offset.y * swirl,
+        offset.y * (1.0 - c) - offset.x * swirl,
+    )
+}
+
 fn unit(v: Vec2) -> Option<Vec2> {
     let length = v.length();
     if !length.is_finite() || length <= 1e-4 {
@@ -122,6 +137,7 @@ impl RotwkRules {
             .get(ids.body, shot.attacker)
             .map_or(Vec2::new(1.0, 0.0), |body| body.0.facing.to_vector());
         let mut effects: Vec<(Entity, Effect)> = Vec::new();
+        let mut held: Vec<PendingImpact> = Vec::new();
         let mut thrown = 0usize;
         let mut radius = 0.0f32;
         for &(victim, index) in hits {
@@ -134,7 +150,19 @@ impl RotwkRules {
                 continue;
             };
             radius = impact.radius;
-            if impact.only_when_just_died && !tick.state().contains(ids.doomed, shot.attacker) {
+            if !self.meta_impact_accepts(tick, ids, victim, impact) {
+                continue;
+            }
+            if impact.only_when_just_died {
+                if let Ok(nugget) = u16::try_from(index) {
+                    held.push(PendingImpact {
+                        attacker: shot.attacker,
+                        victim,
+                        weapon,
+                        nugget,
+                        centre: shot.centre,
+                    });
+                }
                 continue;
             }
             if self.throw_one(
@@ -157,7 +185,108 @@ impl RotwkRules {
                 shot.centre.y
             );
         }
+        self.hold_impacts(tick, ids, held)?;
         self.apply_effects(tick, ids, effects)
+    }
+
+    fn hold_impacts(&self, tick: &mut Tick<'_>, ids: Ids, held: Vec<PendingImpact>) -> Result<()> {
+        if held.is_empty() {
+            return Ok(());
+        }
+        let Some(clock) = tick
+            .state()
+            .store(ids.clock)
+            .and_then(|store| store.entities().first().copied())
+        else {
+            return Ok(());
+        };
+        let mut queue = tick
+            .state()
+            .get(ids.pending_impacts, clock)
+            .cloned()
+            .unwrap_or_default();
+        queue.0.extend(held);
+        tick.state_mut().insert(ids.pending_impacts, clock, queue)?;
+        Ok(())
+    }
+
+    pub(super) fn resolve_pending_impacts(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        killed: &[(Entity, f32)],
+    ) -> Result<()> {
+        let Some(clock) = tick
+            .state()
+            .store(ids.clock)
+            .and_then(|store| store.entities().first().copied())
+        else {
+            return Ok(());
+        };
+        let Some(queue) = tick.state_mut().remove(ids.pending_impacts, clock) else {
+            return Ok(());
+        };
+        let mut effects: Vec<(Entity, Effect)> = Vec::new();
+        for held in queue.0 {
+            if !killed.iter().any(|(victim, _)| *victim == held.victim) {
+                continue;
+            }
+            let Some(mint_sage_combat::Nugget::MetaImpact(impact)) = self
+                .combat
+                .weapons
+                .get(held.weapon)
+                .and_then(|template| template.nuggets.get(usize::from(held.nugget)))
+            else {
+                continue;
+            };
+            let facing = tick
+                .state()
+                .get(ids.body, held.attacker)
+                .map_or(Vec2::new(1.0, 0.0), |body| body.0.facing.to_vector());
+            self.throw_one(
+                tick,
+                ids,
+                held.centre,
+                facing,
+                held.attacker,
+                held.victim,
+                impact,
+                &mut effects,
+            )?;
+        }
+        self.apply_effects(tick, ids, effects)
+    }
+
+    fn meta_impact_accepts(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        victim: Entity,
+        impact: &mint_sage_combat::MetaImpactNugget,
+    ) -> bool {
+        let Some(record) = self.record_of(tick, ids, victim) else {
+            return false;
+        };
+        let has = |kind: &str| record.kind_of.iter().any(|held| held == kind);
+        if has("TREE") || has("STRUCTURE") {
+            return false;
+        }
+        if has("HORDE") && !impact.affect_hordes {
+            return false;
+        }
+        let cyclonic_ship = impact.cyclonic_factor != 0.0 && has("SHIP");
+        if !cyclonic_ship
+            && (self.resists_shockwave(tick, ids, victim, 100.0)
+                || self.resists_shockwave(tick, ids, victim, impact.amount))
+        {
+            return false;
+        }
+        if let Some(held) = tick.state().get(ids.contained, victim) {
+            if !tick.state().contains(ids.horde, held.container) || impact.affect_hordes {
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) fn shove(
@@ -225,12 +354,12 @@ impl RotwkRules {
         if self.stands_against_knockback(tick, ids, victim, impact.hero_resist) {
             return Ok(false);
         }
-        let away = unit(offset).unwrap_or(Vec2::new(0.0, 0.0));
-        let away = if impact.invert {
-            Vec2::new(-away.x, -away.y)
+        let signed = if impact.invert && !impact.clear_radius {
+            Vec2::new(-offset.x, -offset.y)
         } else {
-            away
+            offset
         };
+        let away = unit(bend_shock(signed, impact.cyclonic_factor)).unwrap_or(Vec2::new(0.0, 0.0));
         let distance = offset.length();
         let force = impact.amount * taper(distance, impact.radius, impact.taper_off);
         diag!(
@@ -411,6 +540,13 @@ impl RotwkRules {
         {
             return Ok(false);
         }
+        if tick
+            .state()
+            .get(ids.contained, victim)
+            .is_some_and(|held| !tick.state().contains(ids.horde, held.container))
+        {
+            return Ok(false);
+        }
         let now = tick.frame();
         let ground = tick.state().get(ids.ground_offset, victim).map(|g| g.0);
         let mut knocked = Knocked {
@@ -419,6 +555,7 @@ impl RotwkRules {
             ground: ground.unwrap_or(0.0),
             had_ground: ground.is_some(),
             until,
+            age: 0,
             phase: if until > now {
                 Phase::Waiting
             } else {
@@ -538,17 +675,18 @@ impl RotwkRules {
             landing.y,
             self.ground_height(landing.x, landing.y) + knocked.ground,
         );
-        let speed = ((horizontal.length() + 2.0 * apex + h0) / span).max(-gravity);
+        let speed = fling_speed(v, rise, span, apex, h0).max(-gravity);
         let points = self.fling_points(&physics.fling_arc(), start, end, apex);
         let length = ProjectileFlight::through(points, 1).curve_length();
-        let count = (length / speed).ceil();
+        let count = (length / speed).ceil() + 1.0;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let count = if count.is_finite() {
             (count.min(f32::from(u16::MAX)) as u32).max(MIN_FLING_POINTS)
         } else {
             MIN_FLING_POINTS
         };
-        let total = u16::try_from(count.saturating_mul(ticks)).unwrap_or(u16::MAX);
+        let total =
+            u16::try_from(count.saturating_sub(1).saturating_mul(ticks)).unwrap_or(u16::MAX);
         diag!(
             "knockback: {victim:?} flung {frames} frame(s), apex {apex:.1}, {count} point(s), lands ({:.0},{:.0})",
             landing.x,
@@ -729,7 +867,7 @@ impl RotwkRules {
                 .filter(|ms| ms.is_finite() && *ms >= 0.0)
                 .unwrap_or(default);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            LogicFrames::from_milliseconds(ms.min(f32::from(u16::MAX)) as u32)
+            mint_sage_modules::retail_duration_ticks(ms.min(f32::from(u16::MAX)) as u32)
         };
         let written = |read: fn(&mint_sage_modules::PhysicsBehavior) -> Option<f32>| {
             physics.as_ref().and_then(read)
@@ -827,10 +965,28 @@ impl RotwkRules {
                         tick.state_mut().remove(ids.knocked, entity);
                         continue;
                     };
+                    let sit = u16::try_from(SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ)
+                        .unwrap_or(1)
+                        .max(1);
+                    knocked.age = knocked.age.saturating_add(1);
+                    let age = knocked.age;
+                    let orients = self
+                        .physics_of_entity(tick, ids, entity)
+                        .is_some_and(|physics| physics.orients_to_flight_path());
                     let landed = match knocked.flight.as_mut() {
                         Some(flight) => {
-                            let landed = flight.advance();
+                            if age > sit {
+                                flight.advance();
+                            }
+                            let landed =
+                                age >= flight.frames().saturating_add(sit.saturating_mul(2));
                             let at = flight.position();
+                            let moved = Vec2::new(at.x, at.y).minus(body.0.position);
+                            if orients {
+                                if let Some(heading) = mint_movement::Facing::from_vector(moved) {
+                                    body.0.facing = heading;
+                                }
+                            }
                             body.0.position = Vec2::new(at.x, at.y);
                             let ground = self.ground_height(at.x, at.y);
                             tick.state_mut().insert(
@@ -925,6 +1081,11 @@ impl RotwkRules {
         tick.state_mut().insert(ids.knocked, entity, knocked)?;
         Ok(())
     }
+}
+
+pub(crate) fn fling_speed(v: Point3, rise: f32, span: f32, apex: f32, h0: f32) -> f32 {
+    let (x, y, z) = (v.x * span, v.y * span, span * rise / 2.0);
+    ((x * x + y * y + z * z).sqrt() + 2.0 * apex + h0) / span
 }
 
 fn conditions(add: &[&str], remove: &[&str]) -> Effect {

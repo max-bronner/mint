@@ -14,6 +14,7 @@ pub(crate) struct PendingShot {
     pub(crate) alive_only: bool,
     pub(crate) reload_slot: Option<u32>,
     pub(crate) owner_if_gone: Option<PlayerId>,
+    pub(crate) victim: Option<Entity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -31,6 +32,7 @@ impl Component for PendingShots {
             hasher.write_bool(shot.alive_only);
             hasher.write_u32(shot.reload_slot.map_or(u32::MAX, |n| n));
             hasher.write_u32(shot.owner_if_gone.map_or(u32::MAX, |p| u32::from(p.get())));
+            hasher.write_u32(shot.victim.map_or(u32::MAX, |v| v.index()));
         }
     }
 }
@@ -45,6 +47,7 @@ pub(crate) struct DelayedHit {
     pub(crate) due: Frame,
     pub(crate) nugget: Option<u16>,
     pub(crate) owner_if_gone: Option<PlayerId>,
+    pub(crate) blow: Option<crate::combat::DamageEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -63,6 +66,34 @@ impl Component for DelayedHits {
             hit.due.hash_into(hasher);
             hasher.write_u32(hit.nugget.map_or(u32::MAX, u32::from));
             hasher.write_u32(hit.owner_if_gone.map_or(u32::MAX, |p| u32::from(p.get())));
+            hasher.write_u32(hit.blow.map_or(u32::MAX, |blow| blow.victim.index()));
+            hasher.write_f32(hit.blow.map_or(0.0, |blow| blow.amount));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PendingImpact {
+    pub(crate) attacker: Entity,
+    pub(crate) victim: Entity,
+    pub(crate) weapon: WeaponId,
+    pub(crate) nugget: u16,
+    pub(crate) centre: Vec2,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct PendingImpacts(pub(crate) Vec<PendingImpact>);
+
+impl Component for PendingImpacts {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_usize(self.0.len());
+        for impact in &self.0 {
+            hasher.write_u32(impact.attacker.index());
+            hasher.write_u32(impact.victim.index());
+            impact.weapon.hash_into(hasher);
+            hasher.write_u16(impact.nugget);
+            hasher.write_f32(impact.centre.x);
+            hasher.write_f32(impact.centre.y);
         }
     }
 }
@@ -190,6 +221,8 @@ impl Dot {
             nugget: 0,
             accepts_add: self.accepts_add,
             bonuses_applied: self.from_nugget,
+            force_kill: false,
+            drain_life: 0.0,
         }
     }
 }
@@ -387,6 +420,55 @@ impl Component for CashBounty {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_f32(self.0);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct CashBountyPower(pub(crate) f32);
+
+impl Component for CashBountyPower {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0);
+    }
+}
+
+pub(crate) fn bounty_fraction(own: f32, players: f32) -> f32 {
+    if own != 0.0 {
+        own
+    } else {
+        players
+    }
+}
+
+pub(crate) fn pause_bounty(
+    world: &mut mint_sim::World,
+    ids: (
+        mint_sim::ComponentId<CashBounty>,
+        mint_sim::ComponentId<CashBountyPower>,
+    ),
+    source: Entity,
+    player: Entity,
+    disabled: bool,
+) -> mint_sim::Result<()> {
+    let Some(CashBountyPower(fraction)) = world.get(ids.1, source).copied() else {
+        return Ok(());
+    };
+    let bounty = if disabled { 0.0 } else { fraction };
+    world.insert(ids.0, player, CashBounty(bounty))?;
+    Ok(())
+}
+
+pub(crate) fn restore_bounty(
+    world: &mut mint_sim::World,
+    id: mint_sim::ComponentId<CashBounty>,
+    player: Entity,
+    bounty: f32,
+) -> mint_sim::Result<()> {
+    if bounty.is_finite() && bounty > 0.0 {
+        world.insert(id, player, CashBounty(bounty))?;
+    } else {
+        world.remove(id, player);
+    }
+    Ok(())
 }
 
 pub(crate) fn bounty_for(value: f32, fraction: f32) -> i64 {
@@ -644,6 +726,44 @@ impl Component for WeatherEffect {
 mod tests {
     use super::*;
     use mint_sage_combat::DamageTypes;
+
+    #[test]
+    fn a_non_zero_killer_bounty_wins_over_the_players_otherwise_the_players_applies() {
+        assert_eq!(bounty_fraction(0.5, 1.0), 0.5);
+        assert_eq!(bounty_fraction(0.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn a_disabled_bounty_power_holds_the_bounty_at_zero_until_it_is_enabled() {
+        let mut world = mint_sim::World::new();
+        let bounty = world.register::<CashBounty>();
+        let power = world.register::<CashBountyPower>();
+        let (source, player) = (world.spawn().unwrap(), world.spawn().unwrap());
+        let other = world.spawn().unwrap();
+        world.insert(power, source, CashBountyPower(0.5)).unwrap();
+        pause_bounty(&mut world, (bounty, power), source, player, true).unwrap();
+        assert_eq!(world.get(bounty, player), Some(&CashBounty(0.0)));
+        pause_bounty(&mut world, (bounty, power), source, player, false).unwrap();
+        assert_eq!(world.get(bounty, player), Some(&CashBounty(0.5)));
+        pause_bounty(&mut world, (bounty, power), other, player, true).unwrap();
+        assert_eq!(
+            world.get(bounty, player),
+            Some(&CashBounty(0.5)),
+            "no power, no change"
+        );
+    }
+
+    #[test]
+    fn restoring_a_zero_bounty_clears_the_one_the_player_held() {
+        let mut world = mint_sim::World::new();
+        let id = world.register::<CashBounty>();
+        let player = world.spawn().unwrap();
+        world.insert(id, player, CashBounty(0.7)).unwrap();
+        restore_bounty(&mut world, id, player, 0.0).unwrap();
+        assert!(world.get(id, player).is_none());
+        restore_bounty(&mut world, id, player, 0.4).unwrap();
+        assert_eq!(world.get(id, player), Some(&CashBounty(0.4)));
+    }
 
     fn entity(index: u32) -> Entity {
         let mut world = mint_sim::World::new();

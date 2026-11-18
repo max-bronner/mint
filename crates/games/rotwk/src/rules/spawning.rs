@@ -228,6 +228,7 @@ impl RotwkRules {
             route: Route {
                 points: points.clone(),
                 extra_distance: 0.0,
+                unsearched: false,
                 portals: Vec::new(),
             },
             goal,
@@ -475,7 +476,7 @@ impl RotwkRules {
                     planned: false,
                     horde: None,
                     guard: false,
-                    forced: false,
+                    relation_free: false,
                     order_owner: None,
                 },
             )?;
@@ -638,17 +639,14 @@ impl RotwkRules {
                 if std::env::var_os("MINT_ROTWK_SLAVED_DEBUG").is_some() {
                     self.log_slave_walk(tick, ids, entity, from, to);
                 }
-                tick.state_mut().remove(ids.attack_order, entity);
-                tick.state_mut().remove(ids.attack_move_order, entity);
-                tick.state_mut().remove(ids.player_order, entity);
-                tick.state_mut().remove(ids.path, mover);
                 let kind = if *acquires {
                     PathKind::Ability
                 } else {
                     PathKind::Ordered
                 };
-                self.close_on_target(tick, ids, mover, from, to, 0.0, kind, budgets)?;
+                self.ai_move(tick, ids, (entity, mover), from, to, kind, budgets)?;
             }
+
             Effect::AiAttack { target } => {
                 let current = tick.state().get(ids.attack_order, entity).map(|o| o.target);
                 if current != Some(*target) {
@@ -661,7 +659,7 @@ impl RotwkRules {
                             planned: false,
                             horde: None,
                             guard: false,
-                            forced: false,
+                            relation_free: false,
                             order_owner: None,
                         },
                     )?;

@@ -54,7 +54,7 @@ fn shipped_postern() -> TestFields {
             "CustomAnimAndDuration",
             &["AnimState:UPGRADE_POSTERN_GATE", "AnimTime:0"],
         ),
-        ("ActivationDelaySeconds", &["7.0"]),
+        ("ActivationDelaySeconds", &["7.3"]),
         (
             "ObjectFilter",
             &["ANY", "+INFANTRY", "-MONSTER", "-MACHINE", "-CAVALRY"],
@@ -109,8 +109,8 @@ fn firing_the_mixin_activates_the_passage_only_after_its_own_delay() {
     module.attempt_upgrade(&active, &mut ctx);
 
     assert!(!module.is_active(Frame::new(100)));
-    assert!(!module.is_active(Frame::new(309)));
-    assert!(module.is_active(Frame::new(310)));
+    assert!(!module.is_active(Frame::new(315)));
+    assert!(module.is_active(Frame::new(316)));
 }
 
 #[test]

@@ -43,6 +43,8 @@ impl RotwkRules {
             return Ok(());
         }
         tick.state_mut().remove(ids.deferred_order, unit);
+        self.hold_bird_stop(tick, ids, unit)?;
+        tick.state_mut().remove(ids.order_goal, unit);
         Self::clear_path_retry(tick, ids, unit);
         if depth > 0 {
             if let Some(horde) = tick.state().get(ids.horde, unit).cloned() {

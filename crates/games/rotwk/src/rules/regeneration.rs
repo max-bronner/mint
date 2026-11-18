@@ -5,9 +5,9 @@ use super::{Ids, RotwkRules};
 use crate::combat::{grid_cell, grid_radius_cells, Foe, TargetGrid};
 use crate::spell_state::{HealedAt, LastHurt, PointBonus, SoleHealer};
 
-pub(crate) const AUTO_HEAL_PULSE: LogicFrames = LogicFrames::from_milliseconds(400);
+pub(crate) const AUTO_HEAL_PULSE: LogicFrames = LogicFrames::from_engine_milliseconds(400);
 
-const RECENT_DAMAGE_WINDOW: LogicFrames = LogicFrames::from_milliseconds(4_000);
+const RECENT_DAMAGE_WINDOW: LogicFrames = LogicFrames::from_engine_milliseconds(4_000);
 
 pub(super) struct HealPulse<'a> {
     pub(super) amount: f32,
@@ -25,7 +25,7 @@ pub(super) struct HealPulse<'a> {
 }
 
 impl RotwkRules {
-    fn heal(
+    pub(super) fn heal(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,

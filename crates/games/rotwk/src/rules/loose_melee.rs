@@ -7,9 +7,19 @@ const REPLAN_TICKS: u64 = mint_sim::SIMULATION_HZ as u64;
 
 const CUT_OFF_LEAD: f32 = 60.0;
 
-const RUN_DOWN_REACH: f32 = 10.0;
+pub(super) const RUN_DOWN_REACH: f32 = 10.0;
 
-const SQUISH_OVERRUN: f32 = 50.0;
+const APPROACH_SPOT_MIN: f32 = 20.0;
+
+pub(super) fn squish_goal(from: (Vec2, f32), to: (Vec2, f32), radius: f32) -> Vec2 {
+    let flat = to.0.minus(from.0);
+    let dz = to.1 - from.1;
+    let length = (flat.length_squared() + dz * dz).sqrt();
+    if length <= 0.0 {
+        return to.0;
+    }
+    to.0.plus(flat.scale(2.0 * radius / length))
+}
 
 const ARMY_OF_DEAD: &str = "ARMY_OF_DEAD";
 
@@ -27,6 +37,8 @@ pub(crate) struct LooseMelee {
     spot: Option<Vec2>,
     planned: Option<(Vec2, Frame)>,
     waits_until: Option<Frame>,
+    routeless: bool,
+    fast: bool,
 }
 
 impl LooseMelee {
@@ -39,7 +51,7 @@ impl LooseMelee {
     }
 
     pub(super) fn melee_attacking(&self, standing: bool) -> bool {
-        self.phase == Phase::Squish || (standing && self.waits_until.is_none())
+        (self.phase == Phase::Squish && self.fast) || (standing && self.waits_until.is_none())
     }
 
     const fn on(victim: Entity) -> Self {
@@ -49,6 +61,8 @@ impl LooseMelee {
             spot: None,
             planned: None,
             waits_until: None,
+            routeless: false,
+            fast: false,
         }
     }
 }
@@ -85,7 +99,28 @@ impl Component for LooseMelee {
             }
             None => hasher.write_u8(0),
         }
+        hasher.write_bool(self.routeless);
+        hasher.write_bool(self.fast);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ApproachPlan {
+    Walk(Vec2),
+    Engage,
+    Fail,
+}
+
+fn approach_plan(spot: Option<Vec2>, at: Vec2, entering: bool) -> ApproachPlan {
+    match spot {
+        Some(spot) if spot.minus(at).length() >= APPROACH_SPOT_MIN => ApproachPlan::Walk(spot),
+        _ if entering => ApproachPlan::Engage,
+        _ => ApproachPlan::Fail,
+    }
+}
+
+fn engage_settles(walking: bool, stand_free: bool, routeless_in_reach: bool) -> bool {
+    !walking && (stand_free || routeless_in_reach)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +128,7 @@ pub(super) enum LooseStep {
     Fight,
     Walk,
     Strike,
+    Fail,
 }
 
 impl RotwkRules {
@@ -134,22 +170,53 @@ impl RotwkRules {
             }
             return Ok(LooseStep::Walk);
         }
-        if let Some(flight) = self.victim_flight(tick, ids, me, victim) {
-            let step = self.run_down(tick, ids, entity, me, victim, flight, &mut plan, budgets)?;
-            if before != Some(plan) {
-                tick.state_mut().insert(ids.loose_melee, entity, plan)?;
-            }
-            return Ok(step);
+        let flight = self.victim_flight(tick, ids, me, victim);
+        if flight.is_some() && plan.phase == Phase::Approach && plan.planned.is_none() {
+            plan.phase = Phase::Engage;
         }
-        let in_reach = self.melee_in_reach(tick, ids, me, victim, range);
+        match (flight, plan.phase) {
+            (Some(flight), Phase::Engage) => {
+                let step =
+                    self.run_down(tick, ids, entity, me, victim, flight, &mut plan, budgets)?;
+                if before != Some(plan) {
+                    tick.state_mut().insert(ids.loose_melee, entity, plan)?;
+                }
+                return Ok(step);
+            }
+            (Some(_), _) => {
+                let in_reach = self.melee_in_reach(tick, ids, me, victim);
+                if in_reach {
+                    plan.phase = Phase::Engage;
+                    plan.spot = None;
+                    plan.planned = None;
+                } else if Self::replan_due(tick, me, victim, &plan, walking) {
+                    return Ok(LooseStep::Fail);
+                }
+                if before != Some(plan) {
+                    tick.state_mut().insert(ids.loose_melee, entity, plan)?;
+                }
+                return Ok(LooseStep::Walk);
+            }
+            (None, _) => self.end_run_down(tick, ids, entity)?,
+        }
+        let in_reach = self.melee_in_reach(tick, ids, me, victim);
         let settles = in_reach
             && match plan.phase {
                 Phase::Approach => {
                     !walking || self.melee_stand_free(tick, ids, entity, victim.entity)
                 }
-                Phase::Engage | Phase::Squish => {
-                    !walking && self.melee_stand_free(tick, ids, entity, victim.entity)
-                }
+                Phase::Engage | Phase::Squish => engage_settles(
+                    walking,
+                    self.melee_stand_free(tick, ids, entity, victim.entity),
+                    plan.routeless
+                        && plan.spot.is_some_and(|spot| {
+                            let there = Foe {
+                                position: spot,
+                                ..*me
+                            };
+                            self.melee_in_reach(tick, ids, &there, victim)
+                        }),
+                ),
             };
         let step = if settles {
             self.claim_spot(tick, ids, entity, me.position);
@@ -163,7 +230,9 @@ impl RotwkRules {
             }
             LooseStep::Walk
         } else {
-            self.plan_loose_melee(tick, ids, entity, me, victim, range, &mut plan, walking)?;
+            if self.plan_loose_melee(tick, ids, entity, me, victim, range, &mut plan, walking)? {
+                return Ok(LooseStep::Fail);
+            }
             if let Some(spot) = plan.spot {
                 self.close_on_target(
                     tick,
@@ -175,8 +244,16 @@ impl RotwkRules {
                     PathKind::Closing,
                     budgets,
                 )?;
-            } else if walking {
-                tick.state_mut().remove(ids.path, entity);
+                plan.routeless = !tick.state().contains(ids.path, entity)
+                    && tick
+                        .state()
+                        .get(ids.path_retry, entity)
+                        .is_some_and(|retry| retry.failures > 0);
+            } else {
+                plan.routeless = false;
+                if walking {
+                    tick.state_mut().remove(ids.path, entity);
+                }
             }
             LooseStep::Walk
         };
@@ -184,6 +261,21 @@ impl RotwkRules {
             tick.state_mut().insert(ids.loose_melee, entity, plan)?;
         }
         Ok(step)
+    }
+
+    fn replan_due(
+        tick: &Tick<'_>,
+        me: &Foe,
+        victim: &Foe,
+        plan: &LooseMelee,
+        walking: bool,
+    ) -> bool {
+        let now = tick.frame();
+        plan.spot.is_none()
+            || plan.planned.is_none_or(|(seen, when)| {
+                now.get().saturating_sub(when.get()) >= REPLAN_TICKS
+                    && (!walking || super::movement::goal_moved(me.position, seen, victim.position))
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -197,7 +289,7 @@ impl RotwkRules {
         range: f32,
         plan: &mut LooseMelee,
         walking: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now = tick.frame();
         let placement = self.melee_placement;
         let engage_within = placement.approach_dist + placement.approach_tolerance;
@@ -206,8 +298,13 @@ impl RotwkRules {
             && plan.spot.is_some_and(|spot| {
                 spot.minus(me.position).length() <= self.passability.geometry.cell_size()
             });
+        let blocked = tick
+            .state()
+            .get(ids.contact, entity)
+            .is_some_and(|contact| contact.blocked());
+        let fresh = plan.planned.is_none();
         match plan.phase {
-            Phase::Approach if near || arrived => {
+            Phase::Approach if (!walking && (near || arrived)) || (fresh && blocked) => {
                 plan.phase = Phase::Engage;
                 plan.spot = None;
                 plan.planned = None;
@@ -216,27 +313,27 @@ impl RotwkRules {
                 plan.spot = None;
                 plan.planned = None;
                 plan.waits_until = Some(Self::after(now, SETTLE_RETRY_MS));
-                return Ok(());
+                return Ok(false);
             }
             _ => {}
         }
-        let due = plan.spot.is_none()
-            || plan.planned.is_none_or(|(seen, when)| {
-                now.get().saturating_sub(when.get()) >= REPLAN_TICKS
-                    && (!walking || super::movement::goal_moved(me.position, seen, victim.position))
-            });
-        if !due {
-            return Ok(());
+        if !Self::replan_due(tick, me, victim, plan, walking) {
+            return Ok(false);
+        }
+        if plan.phase == Phase::Approach && (blocked || (walking && near)) {
+            return Ok(true);
         }
         plan.planned = Some((victim.position, now));
         if plan.phase == Phase::Approach {
-            match self.melee_approach_spot(tick, ids, entity, victim.entity) {
-                Some(spot) => {
+            let spot = self.melee_approach_spot(tick, ids, entity, victim.entity);
+            match approach_plan(spot, me.position, fresh) {
+                ApproachPlan::Walk(spot) => {
                     plan.spot = Some(spot);
                     self.claim_spot(tick, ids, entity, spot);
-                    return Ok(());
+                    return Ok(false);
                 }
-                None => plan.phase = Phase::Engage,
+                ApproachPlan::Engage => plan.phase = Phase::Engage,
+                ApproachPlan::Fail => return Ok(true),
             }
         }
         let keep = walking
@@ -245,10 +342,10 @@ impl RotwkRules {
                     position: spot,
                     ..*me
                 };
-                self.melee_in_reach(tick, ids, &there, victim, range)
+                self.melee_in_reach(tick, ids, &there, victim)
             });
         if keep {
-            return Ok(());
+            return Ok(false);
         }
         match self.melee_engage_spot(tick, ids, entity, victim.entity, range) {
             Engage::At(spot) => {
@@ -256,11 +353,29 @@ impl RotwkRules {
                 self.claim_spot(tick, ids, entity, spot);
             }
             Engage::Wait => {
-                plan.spot = None;
-                plan.waits_until = Some(Self::after(now, ENGAGE_WAIT_MS));
+                let walk = self.engage_fallback_point(tick, ids, me, victim);
+                let spot = walk.and_then(|point| {
+                    self.adjust_destination(
+                        tick,
+                        ids,
+                        super::adjust_destination::Request {
+                            mover: entity,
+                            dest: point,
+                            group_goal: None,
+                        },
+                        &mut super::adjust_destination::OrderClaims::none(),
+                    )
+                });
+                if let Some(spot) = spot {
+                    plan.spot = Some(spot);
+                    self.claim_spot(tick, ids, entity, spot);
+                } else {
+                    plan.spot = None;
+                    plan.waits_until = Some(Self::after(now, ENGAGE_WAIT_MS));
+                }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     fn crush_run_open(
@@ -271,26 +386,36 @@ impl RotwkRules {
         me: &Foe,
         victim: &Foe,
     ) -> bool {
+        !self.stands_ground(tick.state(), ids, entity)
+            && self.squish_gate(tick, ids, entity, me.radius, victim)
+            && !self.crush_state(tick, ids, entity, me.radius).too_slow
+    }
+
+    pub(super) fn squish_gate(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        radius: f32,
+        victim: &Foe,
+    ) -> bool {
         if !self
             .record_of(tick, ids, entity)
-            .is_some_and(|record| record.crush.use_crush_attack && record.crush.crusher_level > 0)
+            .is_some_and(|record| record.crush.use_crush_attack)
         {
             return false;
         }
-        let owner = |of: Entity| tick.state().get(ids.owner, of).map(|owner| owner.0);
-        let (Some(mine), Some(theirs)) = (owner(entity), owner(victim.entity)) else {
-            return false;
-        };
         if self.object_allied(tick.state(), entity, victim.entity) {
             return false;
         }
-        let states = self.crush_states(tick, ids, &[(*me, mine), (*victim, theirs)]);
-        let (Some(crusher), Some(crushed)) = (states.first(), states.get(1)) else {
-            return false;
-        };
+        let crusher = self.crush_state(tick, ids, entity, radius);
+        let crushed = self.crush_state(tick, ids, victim.entity, victim.radius);
         crusher.crusher_level > 0
-            && !crusher.too_slow
             && i16::from(crusher.crusher_level) > crushed.crushable_level
+            && (self.is_rampaging(tick.state(), entity)
+                || self.carries_object_status(tick.state(), entity, "FLEE_OFF_MAP")
+                || self.charging_with_horde(tick, ids, entity)
+                || self.has_melee_weapon(tick, ids, entity))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -331,12 +456,8 @@ impl RotwkRules {
             );
         }
         plan.phase = Phase::Squish;
-        let ahead = victim
-            .position
-            .minus(me.position)
-            .normalised()
-            .unwrap_or(Vec2::ZERO);
-        let spot = victim.position.plus(ahead.scale(SQUISH_OVERRUN));
+        plan.fast = !self.crush_state(tick, ids, entity, me.radius).too_slow;
+        let spot = squish_goal((me.position, me.z), (victim.position, victim.z), me.radius);
         plan.spot = Some(spot);
         plan.planned = Some((victim.position, tick.frame()));
         self.close_on_target(
@@ -351,18 +472,12 @@ impl RotwkRules {
         )
     }
 
-    fn victim_flight(
-        &self,
-        tick: &Tick<'_>,
-        ids: Ids,
-        me: &Foe,
-        victim: &Foe,
-    ) -> Option<(Vec2, f32)> {
+    fn victim_flight(&self, tick: &Tick<'_>, ids: Ids, me: &Foe, victim: &Foe) -> Option<Vec2> {
         if !self.fleeing(tick, ids, me.position, victim.entity) {
             return None;
         }
         let body = tick.state().get(ids.body, victim.entity)?.0;
-        Some((body.facing.to_vector(), body.speed))
+        Some(body.facing.to_vector())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -373,20 +488,18 @@ impl RotwkRules {
         entity: Entity,
         me: &Foe,
         victim: &Foe,
-        (heading, speed): (Vec2, f32),
+        heading: Vec2,
         plan: &mut LooseMelee,
         budgets: &mut PathBudgets,
     ) -> Result<LooseStep> {
-        #[allow(clippy::cast_precision_loss)]
-        let frame = 1.0 / crate::game_data::RETAIL_LOGIC_HZ as f32;
-        let mine = tick
-            .state()
-            .get(ids.body, entity)
-            .map_or(0.0, |b| b.0.speed);
-        let centre = victim.position.minus(me.position).length();
-        let gap = (centre - (me.radius + RUN_DOWN_REACH) - victim.radius + speed * frame).max(0.0);
-        let border = (centre - me.radius - victim.radius).max(0.0);
-        if gap < mine * frame && border <= self.melee_placement.chase_from_behind {
+        self.update_running_down(tick, ids, entity, victim.entity)?;
+        let held = tick.state().contains(ids.running_down, entity);
+        let striker = super::melee_contact::Striker {
+            entity,
+            at: me.position,
+            footprint: self.footprint_of(tick, ids, entity),
+        };
+        if self.melee_in_range(tick, ids, striker, victim.entity, held) {
             return Ok(LooseStep::Strike);
         }
         let now = tick.frame();
@@ -417,8 +530,18 @@ impl RotwkRules {
         Ok(LooseStep::Walk)
     }
 
+    fn end_run_down(&self, tick: &mut Tick<'_>, ids: Ids, entity: Entity) -> Result<()> {
+        if tick.state().contains(ids.running_down, entity) {
+            self.write_running_down(tick, ids, entity, false)?;
+        }
+        tick.state_mut().remove(ids.desired_speed, entity);
+        Ok(())
+    }
+
     pub(super) fn end_loose_attack(&self, tick: &mut Tick<'_>, ids: Ids, entity: Entity) {
         tick.state_mut().remove(ids.loose_melee, entity);
+        tick.state_mut().remove(ids.running_down, entity);
+        tick.state_mut().remove(ids.desired_speed, entity);
         let held = crate::goal_cells::layer(tick.state(), ids.goal_cells)
             .is_some_and(|layer| layer.held(entity).is_some());
         if held {
@@ -426,5 +549,51 @@ impl RotwkRules {
                 layer.release(entity);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_approach_spot_under_twenty_away_ends_a_replanned_approach() {
+        let at = Vec2::new(0.0, 0.0);
+        let near = Some(Vec2::new(15.0, 0.0));
+        let far = Some(Vec2::new(25.0, 0.0));
+        assert_eq!(approach_plan(near, at, false), ApproachPlan::Fail);
+        assert_eq!(approach_plan(None, at, false), ApproachPlan::Fail);
+        assert_eq!(approach_plan(near, at, true), ApproachPlan::Engage);
+        assert_eq!(
+            approach_plan(far, at, false),
+            ApproachPlan::Walk(Vec2::new(25.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn a_routeless_engage_in_reach_settles_on_an_occupied_cell() {
+        assert!(engage_settles(false, false, true));
+        assert!(!engage_settles(false, false, false));
+        assert!(!engage_settles(true, true, true));
+        assert!(engage_settles(false, true, false));
+    }
+
+    #[test]
+    fn a_crush_run_aims_two_radii_past_its_victim() {
+        let flat = squish_goal(
+            (Vec2::new(0.0, 0.0), 0.0),
+            (Vec2::new(100.0, 0.0), 0.0),
+            10.0,
+        );
+        assert!(
+            (flat.x - 120.0).abs() < 1e-3 && flat.y.abs() < 1e-3,
+            "{flat:?}"
+        );
+        let rising = squish_goal(
+            (Vec2::new(0.0, 0.0), 0.0),
+            (Vec2::new(30.0, 0.0), 40.0),
+            10.0,
+        );
+        assert!((rising.x - 42.0).abs() < 1e-3, "{rising:?}");
     }
 }

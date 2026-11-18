@@ -322,14 +322,22 @@ impl RotwkRules {
                 .is_some_and(|entry| entry.build_variants.contains(&a))
     }
 
-    fn cost_of(&self, kind: Kind) -> i64 {
+    fn cost_of(&self, player: PlayerId, kind: Kind) -> i64 {
         if self.template_flag(kind, "BUILD_FOR_FREE") {
             return 0;
         }
         self.buildables
             .iter()
             .find(|buildable| buildable.kind == kind)
-            .map_or(0, |buildable| buildable.cost)
+            .map_or(0, |buildable| {
+                mint_sage_economy::cost_to_build(
+                    buildable.cost,
+                    &mint_sage_economy::CostModifiers {
+                        brutal_reduction: self.brutal_cheats_for(player).build_cost_reduction,
+                        ..mint_sage_economy::CostModifiers::default()
+                    },
+                )
+            })
     }
 
     fn template_flag(&self, kind: Kind, flag: &str) -> bool {
@@ -439,7 +447,7 @@ impl RotwkRules {
                 return false;
             }
             let short = i64::from(slot.min.saturating_sub(have));
-            total = total.saturating_add(short.saturating_mul(self.cost_of(kind)));
+            total = total.saturating_add(short.saturating_mul(self.cost_of(player, kind)));
         }
         total <= self.purse_amount(world, ids, player)
     }
@@ -466,7 +474,7 @@ impl RotwkRules {
                 return (false, false);
             };
             any_idle |= factory.idle;
-            let cost = self.cost_of(kind);
+            let cost = self.cost_of(player, kind);
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             {
                 let average = slot.min.saturating_add(slot.max) as f32 * 0.5;

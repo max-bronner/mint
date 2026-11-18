@@ -11,7 +11,7 @@ use crate::diag::diag;
 use crate::horde::Horde;
 use crate::unit::Kind;
 
-const BANNER_RESPAWN_QUIET: LogicFrames = LogicFrames::from_milliseconds(4000);
+const BANNER_RESPAWN_QUIET: LogicFrames = LogicFrames::from_engine_milliseconds(4000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HordeCombat(pub(crate) Frame);
@@ -229,6 +229,7 @@ impl RotwkRules {
             horde_entity.index(),
             tick.frame().get()
         );
+        self.reform_horde(tick, ids, horde_entity)?;
         if let (Some(list), Some(at)) = (
             pulse.fx,
             tick.state().get(ids.body, spawned).map(|b| b.0.position),
@@ -434,7 +435,8 @@ impl RotwkRules {
         horde.free.retain(|free| *free != slot);
         horde.dirty = true;
         tick.state_mut().insert(ids.horde, horde_entity, horde)?;
-        self.propagate_rank(tick, ids, horde_entity)?;
+        self.raise_member_to_horde(tick, ids, horde_entity, spawned)?;
+        self.seat_from_pool(tick, ids, horde_entity, spawned)?;
         Ok(Some(spawned))
     }
 

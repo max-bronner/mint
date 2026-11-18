@@ -19,18 +19,38 @@ const OFFSET_SCALE: f32 = 0.1;
 pub(crate) struct DockBone {
     pub(crate) ladder: bool,
     pub(crate) at: Vec2,
+    pub(crate) height: f32,
     pub(crate) axis: Facing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AboveWall {
+    Bone(Vec2, f32),
+    Unlisted,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Slot {
     ladder: bool,
     at: Vec2,
+    height: f32,
     dir: Vec2,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct DockOccupants(Vec<Option<Entity>>);
+
+impl DockOccupants {
+    #[cfg(test)]
+    pub(crate) fn held_by(&self, engine: Entity) -> usize {
+        self.0.iter().filter(|held| **held == Some(engine)).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, engine: Entity) -> Option<usize> {
+        self.0.iter().position(|held| *held == Some(engine))
+    }
+}
 
 impl Component for DockOccupants {
     fn hash_into(&self, hasher: &mut StateHasher) {
@@ -160,8 +180,10 @@ fn ticks(ms: f32) -> LogicFrames {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(3_600_000.0) as u32;
-    LogicFrames::from_milliseconds(whole)
+    mint_sage_modules::retail_duration_ticks(whole)
 }
+
+const SIEGE_GOAL_STEPS: u32 = 10;
 
 fn placed(origin: Vec2, facing: Facing, local: Vec2) -> Vec2 {
     let (sin, cos) = mint_math::f32::sin_cos(facing.radians());
@@ -169,11 +191,6 @@ fn placed(origin: Vec2, facing: Facing, local: Vec2) -> Vec2 {
         origin.x + local.x * cos - local.y * sin,
         origin.y + local.x * sin + local.y * cos,
     )
-}
-
-fn normalized(v: Vec2) -> Option<Vec2> {
-    let length = v.length();
-    (length.is_finite() && length > 0.0).then(|| Vec2::new(v.x / length, v.y / length))
 }
 
 impl RotwkRules {
@@ -205,6 +222,55 @@ impl RotwkRules {
                 .is_some_and(|deploy| deploy.phase.active())
     }
 
+    pub(super) fn siege_tower_wall_goal(
+        &self,
+        world: &World,
+        ids: Ids,
+        attacker: Entity,
+        tower: Entity,
+    ) -> Option<Vec2> {
+        if world
+            .get(ids.layer, attacker)
+            .is_none_or(|layer| *layer == crate::wall_layer::Layer::GROUND)
+            || !Self::siege_deployed(world, ids, tower)
+        {
+            return None;
+        }
+        let kind = world.get(ids.kind, tower)?;
+        if !self
+            .kinds
+            .get(*kind)
+            .is_some_and(|entry| entry.record.has_kind("SIEGE_TOWER"))
+        {
+            return None;
+        }
+        let body = world.get(ids.body, tower)?;
+        let (bone, rise) = match (*self.siege_above_wall.get(usize::from(kind.0))?)? {
+            AboveWall::Bone(bone, rise) => (bone, rise),
+            AboveWall::Unlisted => return Some(body.0.position),
+        };
+        let at = placed(body.0.position, body.0.facing, bone);
+        if !self.cell_on_wall(world, ids, at) {
+            return None;
+        }
+        let radius = self.pusher_radius(world, ids, tower);
+        let step = push_direction(at.minus(body.0.position), rise)?.scale(radius);
+        let walls = crate::wall_layer::layer_of(world, ids.wall_layer)?;
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        let mut point = body.0.position.plus(step);
+        for _ in 0..SIEGE_GOAL_STEPS {
+            let on_wall = geometry
+                .cell_at(point, 0, extent)
+                .is_some_and(|cell| walls.tag_at(extent, cell).is_wall_top());
+            if on_wall {
+                break;
+            }
+            point = point.plus(step);
+        }
+        Some(point)
+    }
+
     pub(super) fn siege_deployed(world: &World, ids: Ids, entity: Entity) -> bool {
         world
             .get(ids.siege_deploy, entity)
@@ -230,6 +296,7 @@ impl RotwkRules {
                 Slot {
                     ladder: bone.ladder,
                     at,
+                    height: bone.height,
                     dir: Vec2::new(-x.x, -x.y),
                 }
             })
@@ -270,7 +337,7 @@ impl RotwkRules {
         held
     }
 
-    fn is_gone_object(&self, world: &World, ids: Ids, entity: Entity) -> bool {
+    pub(super) fn is_gone_object(&self, world: &World, ids: Ids, entity: Entity) -> bool {
         !world.contains(ids.body, entity)
             || world.contains(ids.doomed, entity)
             || world
@@ -298,15 +365,15 @@ impl RotwkRules {
         let Some(from) = world.get(ids.body, engine).map(|body| body.0.position) else {
             return Ok(None);
         };
+        let from_z = self.object_z(world, ids, engine);
+        let wall_z = self.object_z(world, ids, wall);
         let slots = self.slots_of(world, ids, wall);
         let mut held = self.live_occupants(world, ids, wall, slots.len());
-        if let Some(own) = held
-            .0
-            .iter_mut()
-            .find(|occupant| **occupant == Some(engine))
-        {
-            *own = None;
-        }
+        let distance = |slot: &Slot| {
+            let along = slot.at.minus(from);
+            let up = wall_z + slot.height - from_z;
+            along.x * along.x + along.y * along.y + up * up
+        };
         let best = slots
             .iter()
             .enumerate()
@@ -314,11 +381,7 @@ impl RotwkRules {
                 held.0.get(*index).is_some_and(Option::is_none)
                     && self.may_use(world, ids, engine, slot)
             })
-            .min_by(|(_, a), (_, b)| {
-                a.at.minus(from)
-                    .length()
-                    .total_cmp(&b.at.minus(from).length())
-            })
+            .min_by(|(_, a), (_, b)| distance(a).total_cmp(&distance(b)))
             .map(|(index, slot)| (index, *slot));
         let Some((index, slot)) = best else {
             tick.state_mut().insert(ids.dock_occupants, wall, held)?;
@@ -374,6 +437,24 @@ impl RotwkRules {
         })
     }
 
+    fn cell_on_wall(&self, world: &World, ids: Ids, point: Vec2) -> bool {
+        let extent = self.passability.grid.extent();
+        crate::wall_layer::layer_of(world, ids.wall_layer).is_some_and(|walls| {
+            self.passability
+                .geometry
+                .cell_at(point, 0, extent)
+                .is_some_and(|cell| walls.tag_at(extent, cell).is_wall_top())
+        })
+    }
+
+    fn set_deploying(&self, tick: &mut Tick<'_>, ids: Ids, engine: Entity, on: bool) -> Result<()> {
+        let names: mint_sage_modules::effects::Names =
+            vec![std::sync::Arc::<str>::from("DEPLOYING")].into();
+        let none: mint_sage_modules::effects::Names = Vec::<std::sync::Arc<str>>::new().into();
+        let (set, clear) = if on { (names, none) } else { (none, names) };
+        self.apply_effects(tick, ids, vec![(engine, Effect::StatusBits { set, clear })])
+    }
+
     fn approach_point(
         &self,
         tick: &mut Tick<'_>,
@@ -382,9 +463,11 @@ impl RotwkRules {
         wall: Entity,
         def: &SiegeDeployDef,
     ) -> Result<Option<(Vec2, Vec2)>> {
+        self.set_deploying(tick, ids, engine, false)?;
         let Some(slot) = self.reserve(tick, ids, wall, engine)? else {
             return Ok(None);
         };
+        self.set_deploying(tick, ids, engine, true)?;
         let world = tick.state();
         let Some(wall_at) = world.get(ids.body, wall).map(|body| body.0.position) else {
             return Ok(None);
@@ -393,12 +476,13 @@ impl RotwkRules {
         let offset = point.minus(wall_at);
         if offset.x * offset.x + offset.y * offset.y > 1.0 {
             let scaled = Vec2::new(offset.x * OFFSET_SCALE, offset.y * OFFSET_SCALE);
+            let push = push_direction(scaled, slot.height * OFFSET_SCALE);
             if !def.skip_adjust_position {
                 point = Vec2::new(wall_at.x + scaled.x, wall_at.y + scaled.y);
             }
-            if let Some(n) = normalized(scaled) {
+            if let Some(n) = push {
                 for _ in 0..WALL_STEPS {
-                    if !self.point_on_wall(world, ids, point, 0.0) {
+                    if !self.cell_on_wall(world, ids, point) {
                         break;
                     }
                     point = Vec2::new(point.x + n.x * WALL_STEP, point.y + n.y * WALL_STEP);
@@ -669,14 +753,16 @@ impl RotwkRules {
         let Some(kind) = world.get(ids.kind, engine) else {
             return false;
         };
-        let Some(Some(bone)) = self.siege_above_wall.get(usize::from(kind.0)) else {
-            return false;
+        let bone = match self.siege_above_wall.get(usize::from(kind.0)) {
+            Some(Some(AboveWall::Bone(bone, _))) => bone,
+            Some(Some(AboveWall::Unlisted)) => return true,
+            _ => return false,
         };
         let Some(body) = world.get(ids.body, engine) else {
             return false;
         };
         let at = placed(body.0.position, body.0.facing, *bone);
-        self.point_on_wall(world, ids, at, 0.0)
+        self.cell_on_wall(world, ids, at)
     }
 
     fn set_siege_phase(
@@ -993,8 +1079,8 @@ impl RotwkRules {
             radius(engine),
             to.0.position,
             radius(target),
-            weapon.minimum_attack_range,
-            weapon.attack_range,
+            weapon.minimum_reach(),
+            weapon.reach(1.0),
         )
     }
 
@@ -1132,17 +1218,23 @@ impl RotwkRules {
     }
 }
 
+pub(super) fn push_direction(offset: Vec2, height: f32) -> Option<Vec2> {
+    let length = (offset.x * offset.x + offset.y * offset.y + height * height).sqrt();
+    (length > 0.0 && length.is_finite()).then(|| Vec2::new(offset.x / length, offset.y / length))
+}
+
 fn walk(tick: &mut Tick<'_>, ids: Ids, entity: Entity, to: Vec2) -> Result<()> {
-    crate::unit::give_path(
-        tick.state_mut(),
-        (ids.body, ids.path),
-        entity,
-        Path {
-            route: Route::to_point(to),
-            goal: to,
-            kind: PathKind::Ability,
-            facing: None,
-        },
-    )?;
-    Ok(())
+    super::RotwkRules::ai_move_with(tick, ids, (entity, entity), |tick| {
+        crate::unit::give_path(
+            tick.state_mut(),
+            (ids.body, ids.path),
+            entity,
+            Path {
+                route: Route::to_point(to),
+                goal: to,
+                kind: PathKind::Ability,
+                facing: None,
+            },
+        )
+    })
 }

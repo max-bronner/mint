@@ -11,7 +11,7 @@ pub(crate) struct UiFacts {
     formation_order: BTreeSet<PlayerId>,
     spell_store_disabled: bool,
     objectives_disabled: bool,
-    planning_disabled: bool,
+    planning: Option<bool>,
     objectives_closes: u32,
 }
 
@@ -36,7 +36,11 @@ impl UiFacts {
         }
         hasher.write_bool(self.spell_store_disabled);
         hasher.write_bool(self.objectives_disabled);
-        hasher.write_bool(self.planning_disabled);
+        hasher.write_u8(match self.planning {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        });
         hasher.write_u32(self.objectives_closes);
     }
 
@@ -110,12 +114,11 @@ impl UiFacts {
     }
 
     pub(crate) fn set_planning_allowed(&mut self, allowed: bool) {
-        self.planning_disabled = !allowed;
+        self.planning = Some(allowed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn planning_allowed(&self) -> bool {
-        !self.planning_disabled
+    pub(crate) fn planning_mode(&self) -> Option<bool> {
+        self.planning
     }
 
     pub(crate) fn view(&self) -> UiView {
@@ -156,10 +159,9 @@ mod tests {
         assert!(!facts.panel_open(ME, UiPanel::SpellStore));
         assert_ne!(hash(&facts), hash(&fresh));
         facts.set_spell_store_enabled(true);
-        facts.set_planning_allowed(false);
-        assert!(!facts.planning_allowed());
-        assert_ne!(hash(&facts), hash(&fresh));
-        facts.set_planning_allowed(true);
         assert_eq!(hash(&facts), hash(&fresh));
+        facts.set_planning_allowed(false);
+        assert_eq!(facts.planning_mode(), Some(false));
+        assert_ne!(hash(&facts), hash(&fresh));
     }
 }

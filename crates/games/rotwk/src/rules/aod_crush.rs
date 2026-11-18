@@ -205,7 +205,7 @@ impl RotwkRules {
                 ));
             }
             next.firing_until = Some(
-                now.checked_add(LogicFrames::from_milliseconds(FIRING_HOLD_MS))
+                now.checked_add(LogicFrames::from_engine_milliseconds(FIRING_HOLD_MS))
                     .unwrap_or(Frame::FOREVER),
             );
         } else if stored.firing_until.is_some_and(|until| now >= until) {
@@ -308,6 +308,8 @@ impl RotwkRules {
             nugget: 0,
             accepts_add: true,
             bonuses_applied: false,
+            force_kill: false,
+            drain_life: 0.0,
         });
     }
 }

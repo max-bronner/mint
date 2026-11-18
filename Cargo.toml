@@ -22,6 +22,7 @@ members = [
     "crates/core/vp6",
     "crates/sage/asset",
     "crates/sage/audio",
+    "crates/sage/autoresolve",
     "crates/sage/apt",
     "crates/sage/apt-player",
     "crates/sage/apt-viewer",
@@ -34,6 +35,7 @@ members = [
     "crates/sage/fx-viewer",
     "crates/sage/ini",
     "crates/sage/ini-coverage",
+    "crates/sage/livingworld",
     "crates/sage/lua",
     "crates/sage/map",
     "crates/sage/model",
@@ -52,13 +54,14 @@ members = [
     "crates/sage/vp6",
     "crates/sage/w3d",
     "crates/sage/wnd",
+    "crates/sage/worldmap",
 ]
 
 [workspace.dependencies]
-thiserror = "1"
-byteorder = "1"
+thiserror = "2"
 tracing = "0.1"
-jpeg-decoder = { version = "0.3", default-features = false, features = ["platform_independent"] }
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+zune-png = { version = "=0.5.2", default-features = false, features = ["std"] }
 libm = { version = "=0.2.16", default-features = false, features = ["force-soft-floats"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }

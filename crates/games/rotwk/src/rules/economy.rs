@@ -3,7 +3,8 @@ use crate::claims::{ClaimLayer, Holder, Registered};
 use crate::diag::diag;
 use mint_sage_passability::claims::{Claim, ClaimGrid, ClaimGround, Claimer, Viewer};
 
-const REVIVAL_COOLDOWN: mint_sim::LogicFrames = mint_sim::LogicFrames::from_milliseconds(4_000);
+const REVIVAL_COOLDOWN: mint_sim::LogicFrames =
+    mint_sim::LogicFrames::from_engine_milliseconds(4_000);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct IncomeView {
@@ -15,6 +16,21 @@ pub(crate) struct IncomeView {
 }
 
 impl RotwkRules {
+    pub(crate) fn brutal_cheats_for(
+        &self,
+        player: PlayerId,
+    ) -> mint_sage_ini::game_data::BrutalCheats {
+        let brutal_ai = self.difficulty.multiplayer
+            && self.ai_power_difficulty.iter().any(|(ai, difficulty)| {
+                *ai == player && *difficulty == crate::lobby::Difficulty::Brutal
+            });
+        if brutal_ai {
+            self.brutal_cheats
+        } else {
+            mint_sage_ini::game_data::BrutalCheats::NONE
+        }
+    }
+
     pub(super) fn cost_modifiers_for_record(
         &self,
         world: &World,
@@ -22,24 +38,35 @@ impl RotwkRules {
         player: PlayerId,
         record: &mint_sage_modules::ObjectRecord,
     ) -> mint_sage_economy::CostModifiers {
-        crate::economy::cost_modifiers_for(
-            world,
-            Self::economy_ids(ids),
-            &self.kinds,
-            &self.upgrade_bits,
-            player,
-            &crate::economy::PriceTarget::Object {
-                kind_of: &record.kind_of,
-                name: &record.name,
-            },
-            self.production_cost_change_percent(player),
-        )
+        mint_sage_economy::CostModifiers {
+            brutal_reduction: self.brutal_cheats_for(player).build_cost_reduction,
+            ..crate::economy::cost_modifiers_for(
+                world,
+                Self::economy_ids(ids),
+                &self.kinds,
+                &self.upgrade_bits,
+                player,
+                &crate::economy::PriceTarget::Object {
+                    kind_of: &record.kind_of,
+                    name: &record.name,
+                },
+                self.production_cost_change_percent(player),
+            )
+        }
     }
 
     pub(crate) fn time_modifiers_for(&self, player: PlayerId) -> mint_sage_economy::TimeModifiers {
         mint_sage_economy::TimeModifiers {
             handicap: self.handicap_of(Some(player)).build_time,
-            production_time_change_percent: 0.0,
+            brutal_reduction: self.brutal_cheats_for(player).build_time_reduction,
+            ..mint_sage_economy::TimeModifiers::default()
+        }
+    }
+
+    pub(crate) fn unit_time_modifiers(&self, player: PlayerId) -> mint_sage_economy::TimeModifiers {
+        mint_sage_economy::TimeModifiers {
+            speed_multiplier: self.multiplay.unit_speed(self.players),
+            ..self.time_modifiers_for(player)
         }
     }
 
@@ -73,16 +100,19 @@ impl RotwkRules {
         target: crate::unit::Kind,
     ) -> Option<i64> {
         let record = &self.kinds.get(target)?.record;
-        let modifiers = crate::economy::cost_modifiers_from_counts(
-            counts,
-            &self.kinds,
-            &self.upgrade_bits,
-            &crate::economy::PriceTarget::Object {
-                kind_of: &record.kind_of,
-                name: &record.name,
-            },
-            self.production_cost_change_percent(player),
-        );
+        let modifiers = mint_sage_economy::CostModifiers {
+            brutal_reduction: self.brutal_cheats_for(player).build_cost_reduction,
+            ..crate::economy::cost_modifiers_from_counts(
+                counts,
+                &self.kinds,
+                &self.upgrade_bits,
+                &crate::economy::PriceTarget::Object {
+                    kind_of: &record.kind_of,
+                    name: &record.name,
+                },
+                self.production_cost_change_percent(player),
+            )
+        };
         crate::construction::price_of(record, &modifiers, &self.time_modifiers_for(player))
             .map(|(cost, _)| cost)
     }
@@ -525,13 +555,14 @@ impl RotwkRules {
                 let buildable = u16::try_from(item)
                     .ok()
                     .and_then(|item| self.buildable_at(item))?;
+                let owner = world.get(ids.owner, structure)?.0;
                 Some(
-                    crate::economy::frames_to_produce(
+                    crate::economy::unit_frames_to_produce(
                         world,
                         economy,
                         structure,
-                        buildable.build_time,
-                        self.multiplay.unit_speed(self.players),
+                        buildable.build_seconds,
+                        &self.unit_time_modifiers(owner),
                     )
                     .get(),
                 )
@@ -630,11 +661,11 @@ impl RotwkRules {
                             &self.combat,
                         )?;
                         self.attach_upgrade_state(tick, ids, entity, spawn.kind)?;
-                        let loose_walk = if no_exit_path && player_rally.is_none() {
-                            None
-                        } else {
-                            walk
-                        };
+                        let no_walk = no_exit_path && player_rally.is_none();
+                        let loose_walk = if no_walk { None } else { walk };
+                        if !no_walk {
+                            self.begin_factory_exit(tick, ids, entity)?;
+                        }
                         self.route_out(
                             tick,
                             ids,
@@ -643,6 +674,9 @@ impl RotwkRules {
                             loose_walk,
                             player_rally,
                         )?;
+                        if !tick.state().contains(ids.path, entity) {
+                            self.end_factory_exit(tick, ids, entity)?;
+                        }
                         if is_hero {
                             self.hero_delivered(tick, ids, structure, owner, entity)?;
                             if let Some(producer) =
@@ -661,6 +695,7 @@ impl RotwkRules {
                             entity,
                             template.kind,
                         )?;
+                        self.inherit_army(tick, ids, structure, entity);
                         Ok(Some(entity))
                     }
                     crate::economy::Output::Horde {
@@ -710,6 +745,9 @@ impl RotwkRules {
                         )?;
                         tick.state_mut().insert(ids.kind, horde, template.kind)?;
                         self.attach_upgrade_state(tick, ids, horde, Some(template.kind))?;
+                        if !no_exit_path {
+                            self.begin_factory_exit(tick, ids, horde)?;
+                        }
                         tick.state_mut().insert(ids.owner, horde, Owner(owner))?;
                         tick.state_mut().insert(
                             ids.vision,
@@ -762,6 +800,7 @@ impl RotwkRules {
                             horde,
                             template.kind,
                         )?;
+                        self.inherit_army(tick, ids, structure, horde);
                         Ok(Some(horde))
                     }
                 }
@@ -776,7 +815,6 @@ impl RotwkRules {
                         economy,
                         structure,
                         upgrade.build_time,
-                        self.multiplay.unit_speed(self.players),
                     )
                     .get(),
                 )
@@ -819,6 +857,7 @@ impl RotwkRules {
             },
         )?;
         self.advance_production_streams(tick, ids)?;
+        self.settle_factory_exits(tick, ids)?;
         crate::economy::recount_command_points(tick, economy)?;
         self.recount_point_limits(tick, ids)
     }
@@ -864,7 +903,11 @@ impl RotwkRules {
                     .and_then(|producer| producer.player_rally);
                 for _ in 0..stream.remaining {
                     let member = spawn_member(tick, stream.create, stream.facing)?;
+                    self.begin_factory_exit(tick, ids, member)?;
                     self.route_out(tick, ids, member, stream.source, Some(rally), player_rally)?;
+                    if !tick.state().contains(ids.path, member) {
+                        self.end_factory_exit(tick, ids, member)?;
+                    }
                     self.emit_voice(tick, ids, member, crate::voice::VoiceKind::Created, None);
                 }
                 tick.state_mut().remove(ids.production_stream, horde);
@@ -960,21 +1003,39 @@ impl RotwkRules {
         member: Entity,
         slot: Vec2,
     ) -> Result<()> {
-        crate::unit::give_path(
-            tick.state_mut(),
-            (ids.body, ids.path),
-            member,
-            Path {
-                route: Route {
-                    points: vec![stream.midpoint, slot],
-                    extra_distance: 0.0,
-                    portals: Vec::new(),
+        let no_exit_path = tick
+            .state()
+            .get(ids.kind, stream.source)
+            .and_then(|kind| self.kinds.get(*kind))
+            .is_some_and(|entry| entry.record.no_exit_path);
+        if no_exit_path {
+            tick.state_mut().insert(
+                ids.ignored_obstacle,
+                member,
+                IgnoredObstacle(stream.source),
+            )?;
+            self.emit_voice(tick, ids, member, crate::voice::VoiceKind::Created, None);
+            return Ok(());
+        }
+        self.begin_factory_exit(tick, ids, member)?;
+        Self::ai_move_with(tick, ids, (member, member), |tick| {
+            crate::unit::give_path(
+                tick.state_mut(),
+                (ids.body, ids.path),
+                member,
+                Path {
+                    route: Route {
+                        points: vec![stream.midpoint, slot],
+                        extra_distance: 0.0,
+                        unsearched: false,
+                        portals: Vec::new(),
+                    },
+                    goal: slot,
+                    kind: PathKind::Ordered,
+                    facing: None,
                 },
-                goal: slot,
-                kind: PathKind::Ordered,
-                facing: None,
-            },
-        )?;
+            )
+        })?;
         tick.state_mut()
             .insert(ids.ignored_obstacle, member, IgnoredObstacle(stream.source))?;
         self.emit_voice(tick, ids, member, crate::voice::VoiceKind::Created, None);
@@ -1037,7 +1098,11 @@ impl RotwkRules {
             gather,
             &self.kinds,
             destination,
-        )
+        )?;
+        if destination.is_some() {
+            self.end_factory_exit(tick, ids, horde)?;
+        }
+        Ok(())
     }
 
     pub(super) fn complete_upgrade(

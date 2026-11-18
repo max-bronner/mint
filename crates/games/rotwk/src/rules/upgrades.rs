@@ -1,6 +1,6 @@
 use mint_sage_combat::{
     best_match, ArmorId, CommandSource, ConditionMask, ConditionTable, SlotArm, SlotCandidate,
-    SlotFitness, WeaponId, WeaponState, WeaponStatus, SLOT_COUNT,
+    SlotFitness, WeaponId, WeaponState, WeaponStatus, WeaponTemplate, SLOT_COUNT,
 };
 use mint_sage_modules::{
     AIGateUpdate, AimWeaponBehavior, AutoAbilityBehavior, Changed, CitadelSlaughterHordeContain,
@@ -101,6 +101,10 @@ struct KindSets {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct SlotSet {
     pub(crate) arms: [Option<SlotArm>; SLOT_COUNT],
+    pub(crate) share_reload: bool,
+    pub(crate) lock_shared: bool,
+    pub(crate) ready_shared: bool,
+    pub(crate) criteria: Option<mint_sage_combat::WeaponChoiceCriteria>,
 }
 
 impl SlotSet {
@@ -346,6 +350,14 @@ impl ModuleWiring {
             .store(self.spawn_state)
             .map(|store| store.entities().to_vec())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn spawn_behavior<'a>(
+        &self,
+        world: &'a World,
+        entity: Entity,
+    ) -> Option<&'a SpawnBehavior> {
+        first(world, self.spawn_state, entity)
     }
 
     pub(super) fn reclaimable_spawner<'a>(
@@ -876,6 +888,10 @@ fn kind_sets(
                 });
             }
         }
+        slots.share_reload = set.share_weapon_reload_time;
+        slots.lock_shared = set.weapon_lock_shared_across_sets;
+        slots.ready_shared = set.ready_status_shared_within_set;
+        slots.criteria = set.default_weapon_choice_criteria;
         sets.weapons.push((mask, slots));
     }
     for set in &record.armor_sets {
@@ -888,6 +904,44 @@ fn kind_sets(
 }
 
 const USING_ABILITY_STATUS: &str = "IS_USING_ABILITY";
+
+const MAX_EFFECT_NESTING: u16 = 6;
+
+thread_local! {
+    static EFFECT_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+    static EFFECT_CAP_REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct EffectNesting;
+
+impl EffectNesting {
+    fn enter() -> Option<Self> {
+        let depth = EFFECT_DEPTH.with(std::cell::Cell::get);
+        if depth >= MAX_EFFECT_NESTING {
+            if !EFFECT_CAP_REPORTED.with(|seen| seen.replace(true)) {
+                diag!(
+                    "power: effects nest {MAX_EFFECT_NESTING} deep and the nested ones are dropped; an object creates itself"
+                );
+            }
+            return None;
+        }
+        EFFECT_DEPTH.with(|d| d.set(depth.saturating_add(1)));
+        Some(Self)
+    }
+}
+
+impl Drop for EffectNesting {
+    fn drop(&mut self) {
+        let depth = EFFECT_DEPTH.with(|d| {
+            let depth = d.get().saturating_sub(1);
+            d.set(depth);
+            depth
+        });
+        if depth == 0 {
+            EFFECT_CAP_REPORTED.with(|seen| seen.set(false));
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UsingAbility;
@@ -1191,155 +1245,14 @@ impl RotwkRules {
         let Some(wiring) = self.modules.as_ref() else {
             return Ok(());
         };
+        let Some(_nesting) = EffectNesting::enter() else {
+            return Ok(());
+        };
         for (entity, effect) in entries {
-            if let Effect::CastleUpgrade {
-                upgrade,
-                wall_radius,
-            } = &effect
-            {
-                self.castle_upgrade(tick, ids, entity, upgrade, *wall_radius)?;
+            if self.apply_object_reading_effect(tick, ids, entity, &effect)? {
                 continue;
             }
-            if let Effect::InheritUpgrade {
-                upgrade,
-                radius,
-                filter,
-            } = &effect
-            {
-                self.inherit_upgrade(tick, ids, entity, upgrade, *radius, filter)?;
-                continue;
-            }
-            if let Effect::ReplaceAndAdd {
-                template,
-                carry,
-                attendants,
-            } = &effect
-            {
-                self.replace_and_add(tick, ids, entity, template, *carry, attendants)?;
-                continue;
-            }
-            if let Effect::ReplenishHorde {
-                melee_free,
-                fx,
-                nearby,
-                all_nearby,
-                upgrade_required,
-            } = &effect
-            {
-                self.replenish_hordes(
-                    tick,
-                    ids,
-                    entity,
-                    &super::replenish::Replenishment {
-                        melee_free: *melee_free,
-                        fx: fx.as_ref(),
-                        nearby: *nearby,
-                        all_nearby: *all_nearby,
-                        upgrade_required,
-                    },
-                )?;
-                continue;
-            }
-            if let Effect::EmotionPulse {
-                at,
-                radius,
-                kind,
-                filter,
-                lasts,
-            } = &effect
-            {
-                self.emotion_pulse(
-                    tick,
-                    ids,
-                    entity,
-                    super::emotions::Pulse {
-                        at: *at,
-                        radius: *radius,
-                        kind: *kind,
-                        filter,
-                        lasts: *lasts,
-                    },
-                )?;
-                continue;
-            }
-            if let Effect::ToggleDisguise { force_mounted } = &effect {
-                self.apply_toggle_disguise(tick, ids, entity, *force_mounted)?;
-                continue;
-            }
-            if let Effect::HoldOrders(held) = effect {
-                let frame = tick.frame().get();
-                let at = tick
-                    .state()
-                    .get(ids.body, entity)
-                    .map_or(mint_movement::Vec2::ZERO, |body| body.0.position);
-                if held {
-                    tick.state_mut()
-                        .insert(wiring.ability_hold, entity, AbilityHold)?;
-                } else {
-                    tick.state_mut().remove(wiring.ability_hold, entity);
-                }
-                let edge = if held { "held" } else { "released" };
-                diag!(
-                    "hold: {entity:?} {edge} by its ability at frame {frame}, at ({:.1},{:.1})",
-                    at.x,
-                    at.y
-                );
-                continue;
-            }
-            if matches!(effect, Effect::ShareUpgradesWithSlaves) {
-                self.share_upgrades_with_slaves(tick, ids, entity)?;
-                continue;
-            }
-            if matches!(effect, Effect::EnterRampage) {
-                self.enter_rampage(tick, ids, entity)?;
-                continue;
-            }
-            if let Effect::TriggerReward {
-                experience,
-                skill_points,
-            } = effect
-            {
-                self.reward_trigger(tick, ids, entity, experience, skill_points)?;
-                continue;
-            }
-            if let Effect::PlayObjectSound(name) = &effect {
-                self.play_object_sound(tick, entity, name);
-                self.emit_object_sound(tick, ids, entity, std::sync::Arc::clone(name));
-                continue;
-            }
-            if let Effect::StartLoopSound(name) = &effect {
-                if !tick.state().contains(ids.ability_loop_sound, entity) {
-                    tick.state_mut().insert(
-                        ids.ability_loop_sound,
-                        entity,
-                        AbilityLoop(std::sync::Arc::clone(name)),
-                    )?;
-                }
-                continue;
-            }
-            if matches!(effect, Effect::StopLoopSound) {
-                tick.state_mut().remove(ids.ability_loop_sound, entity);
-                continue;
-            }
-            if let Effect::CaptureFlash { target } = &effect {
-                self.apply_capture_flash(tick, ids, entity, *target)?;
-                continue;
-            }
-            if matches!(effect, Effect::Die) {
-                if !tick.state().contains(ids.doomed, entity)
-                    && !tick.state().contains(ids.lifetime, entity)
-                {
-                    let dies_at = tick.frame();
-                    tick.state_mut().insert(
-                        ids.lifetime,
-                        entity,
-                        crate::summons::Lifetime {
-                            dies_at,
-                            death: crate::combat::DeathNaming::Normal,
-                            set_at: None,
-                        },
-                    )?;
-                }
+            if self.apply_instant_effect(tick, ids, wiring, entity, &effect)? {
                 continue;
             }
             if UpgradeState::is_world_effect(&effect) {
@@ -1347,148 +1260,372 @@ impl RotwkRules {
                 continue;
             }
             if let Effect::RemoveUpgrades(removed, remove_from_all_player_objects) = &effect {
-                let (player_bits, object_bits) = self.split_removed_upgrades(removed);
-                let owner = tick.state().get(ids.owner, entity).map(|held| held.0);
-                if !player_bits.is_empty() {
-                    if let Some(owner) = owner {
-                        self.remove_player_upgrade(tick, ids, owner, &player_bits)?;
-                    }
-                }
-                if !object_bits.is_empty() {
-                    if *remove_from_all_player_objects {
-                        if let Some(owner) = owner {
-                            self.remove_object_upgrades_from_all(tick, ids, owner, &object_bits)?;
-                        }
-                    } else if let Some(held) = tick.state_mut().get_mut(ids.object_upgrades, entity)
-                    {
-                        held.0.clear_all(&object_bits);
-                    }
-                }
-                let mut log = EffectLog::new();
-                wiring.registry.broadcast_upgrade_removed(
-                    tick.state_mut(),
+                self.apply_remove_upgrades_effect(
+                    tick,
+                    ids,
+                    wiring,
                     entity,
                     removed,
-                    Effects::into_sink(&mut log),
-                );
-                self.apply_effects(tick, ids, log.drain())?;
-                if let Some(owner) = owner {
-                    self.cancel_heroes_missing_upgrade(tick, ids, owner)?;
-                }
+                    *remove_from_all_player_objects,
+                )?;
                 continue;
             }
-            let changed = match tick.state_mut().get_mut(wiring.state, entity) {
-                Some(state) => state.apply(&effect),
-                None => {
-                    let mut state = UpgradeState::default();
-                    let changed = state.apply(&effect);
-                    if changed != Changed::NONE {
-                        tick.state_mut().insert(wiring.state, entity, state)?;
+            self.apply_state_effect(tick, ids, wiring, entity, &effect)?;
+        }
+        Ok(())
+    }
+
+    fn apply_object_reading_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        effect: &Effect,
+    ) -> Result<bool> {
+        if let Effect::CastleUpgrade {
+            upgrade,
+            wall_radius,
+        } = effect
+        {
+            self.castle_upgrade(tick, ids, entity, upgrade, *wall_radius)?;
+            return Ok(true);
+        }
+        if let Effect::InheritUpgrade {
+            upgrade,
+            radius,
+            filter,
+        } = effect
+        {
+            self.inherit_upgrade(tick, ids, entity, upgrade, *radius, filter)?;
+            return Ok(true);
+        }
+        if let Effect::ReplaceAndAdd {
+            template,
+            carry,
+            attendants,
+        } = effect
+        {
+            self.replace_and_add(tick, ids, entity, template, *carry, attendants)?;
+            return Ok(true);
+        }
+        if let Effect::ReplenishHorde {
+            melee_free,
+            fx,
+            nearby,
+            all_nearby,
+            upgrade_required,
+        } = effect
+        {
+            self.replenish_hordes(
+                tick,
+                ids,
+                entity,
+                &super::replenish::Replenishment {
+                    melee_free: *melee_free,
+                    fx: fx.as_ref(),
+                    nearby: *nearby,
+                    all_nearby: *all_nearby,
+                    upgrade_required,
+                },
+            )?;
+            return Ok(true);
+        }
+        if let Effect::EmotionPulse {
+            at,
+            radius,
+            kind,
+            filter,
+            lasts,
+        } = effect
+        {
+            self.emotion_pulse(
+                tick,
+                ids,
+                entity,
+                super::emotions::Pulse {
+                    at: *at,
+                    radius: *radius,
+                    kind: *kind,
+                    filter,
+                    lasts: *lasts,
+                },
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn apply_instant_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        wiring: &ModuleWiring,
+        entity: Entity,
+        effect: &Effect,
+    ) -> Result<bool> {
+        if let Effect::ToggleDisguise { force_mounted } = effect {
+            self.apply_toggle_disguise(tick, ids, entity, *force_mounted)?;
+            return Ok(true);
+        }
+        if let Effect::AiBusy(frames) = effect {
+            Self::start_ai_busy(tick, ids, entity, *frames)?;
+            return Ok(true);
+        }
+        if let Effect::HoldOrders(held) = effect {
+            let held = *held;
+            let frame = tick.frame().get();
+            let at = tick
+                .state()
+                .get(ids.body, entity)
+                .map_or(mint_movement::Vec2::ZERO, |body| body.0.position);
+            if held {
+                tick.state_mut()
+                    .insert(wiring.ability_hold, entity, AbilityHold)?;
+            } else {
+                tick.state_mut().remove(wiring.ability_hold, entity);
+            }
+            let edge = if held { "held" } else { "released" };
+            diag!(
+                "hold: {entity:?} {edge} by its ability at frame {frame}, at ({:.1},{:.1})",
+                at.x,
+                at.y
+            );
+            return Ok(true);
+        }
+        if matches!(effect, Effect::ShareUpgradesWithSlaves) {
+            self.share_upgrades_with_slaves(tick, ids, entity)?;
+            return Ok(true);
+        }
+        if matches!(effect, Effect::EnterRampage) {
+            self.enter_rampage(tick, ids, entity)?;
+            return Ok(true);
+        }
+        if let Effect::TriggerReward {
+            experience,
+            skill_points,
+        } = effect
+        {
+            self.reward_trigger(tick, ids, entity, *experience, *skill_points)?;
+            return Ok(true);
+        }
+        if let Effect::PlayObjectSound(name) = effect {
+            self.play_object_sound(tick, entity, name);
+            self.emit_object_sound(tick, ids, entity, std::sync::Arc::clone(name));
+            return Ok(true);
+        }
+        if let Effect::StartLoopSound(name) = effect {
+            if !tick.state().contains(ids.ability_loop_sound, entity) {
+                tick.state_mut().insert(
+                    ids.ability_loop_sound,
+                    entity,
+                    AbilityLoop(std::sync::Arc::clone(name)),
+                )?;
+            }
+            return Ok(true);
+        }
+        if matches!(effect, Effect::StopLoopSound) {
+            tick.state_mut().remove(ids.ability_loop_sound, entity);
+            return Ok(true);
+        }
+        if let Effect::CaptureFlash { target } = effect {
+            self.apply_capture_flash(tick, ids, entity, *target)?;
+            return Ok(true);
+        }
+        if matches!(effect, Effect::Die) {
+            if !tick.state().contains(ids.doomed, entity)
+                && !tick.state().contains(ids.lifetime, entity)
+            {
+                let dies_at = tick.frame();
+                tick.state_mut().insert(
+                    ids.lifetime,
+                    entity,
+                    crate::summons::Lifetime {
+                        dies_at,
+                        death: crate::combat::DeathNaming::Normal,
+                        set_at: None,
+                    },
+                )?;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn apply_remove_upgrades_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        wiring: &ModuleWiring,
+        entity: Entity,
+        removed: &UpgradeMask,
+        remove_from_all_player_objects: bool,
+    ) -> Result<()> {
+        let (player_bits, object_bits) = self.split_removed_upgrades(removed);
+        let owner = tick.state().get(ids.owner, entity).map(|held| held.0);
+        if !player_bits.is_empty() {
+            if let Some(owner) = owner {
+                self.remove_player_upgrade(tick, ids, owner, &player_bits)?;
+            }
+        }
+        if !object_bits.is_empty() {
+            if remove_from_all_player_objects {
+                if let Some(owner) = owner {
+                    self.remove_object_upgrades_from_all(tick, ids, owner, &object_bits)?;
+                }
+            } else if let Some(held) = tick.state_mut().get_mut(ids.object_upgrades, entity) {
+                held.0.clear_all(&object_bits);
+            }
+        }
+        let mut log = EffectLog::new();
+        wiring.registry.broadcast_upgrade_removed(
+            tick.state_mut(),
+            entity,
+            removed,
+            Effects::into_sink(&mut log),
+        );
+        self.apply_effects(tick, ids, log.drain())?;
+        if let Some(owner) = owner {
+            self.cancel_heroes_missing_upgrade(tick, ids, owner)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_state_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        wiring: &ModuleWiring,
+        entity: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        if let Effect::LockWeaponSlot(slot) | Effect::LockWeaponSlotTemporarily(slot) = effect {
+            let armed = self
+                .selected_set(tick, ids, entity)
+                .and_then(|(_, slots)| slots.arms.get(usize::from(*slot)).copied().flatten());
+            if armed.is_none() {
+                return Ok(());
+            }
+        }
+        let changed = match tick.state_mut().get_mut(wiring.state, entity) {
+            Some(state) => state.apply(effect),
+            None => {
+                let mut state = UpgradeState::default();
+                let changed = state.apply(effect);
+                if changed != Changed::NONE {
+                    tick.state_mut().insert(wiring.state, entity, state)?;
+                }
+                changed
+            }
+        };
+        if let Effect::WeaponSetFlag(flag) | Effect::ClearWeaponSetFlag(flag) = effect {
+            if let Some(swap) = mint_sage_modules::effects::weapon_set_toggle_swap_condition(flag) {
+                self.apply_power_effect(
+                    tick,
+                    ids,
+                    entity,
+                    &Effect::TimedModelCondition {
+                        flag: mint_sage_modules::effects::Name::from(swap),
+                        lasts: mint_sage_modules::retail_duration_ticks(1000),
+                        only_if_absent: false,
+                    },
+                )?;
+            }
+        }
+        if let Effect::ToggleModelCondition(flag) = effect {
+            if flag.eq_ignore_ascii_case("MOUNTED")
+                && changed.intersects(Changed::LOOK)
+                && !tick
+                    .state()
+                    .get(wiring.state, entity)
+                    .is_some_and(|state| state.has_model_condition("MOUNTED"))
+                && wiring.cancels_disguise_on_dismount(tick.state(), entity)
+            {
+                self.break_disguise(tick, ids, entity, false)?;
+            }
+        }
+        if let Effect::StatusBits { set, clear } = effect {
+            self.apply_status_bits_effect(tick, ids, entity, set, clear)?;
+        }
+        if changed.intersects(Changed::WEAPON_SET.union(Changed::LOOK)) {
+            self.reselect_weapon(tick, ids, wiring, entity)?;
+        }
+        if changed.intersects(Changed::ARMOR_SET.union(Changed::LOOK)) {
+            self.reselect_armour(tick, ids, wiring, entity)?;
+        }
+        if changed.intersects(Changed::LOOK) {
+            self.reselect_locomotion(tick, ids, wiring, entity)?;
+        }
+        if changed.intersects(Changed::COMMAND_SET) {
+            self.apply_command_set(tick, ids, wiring, entity)?;
+        }
+        if changed.intersects(Changed::GEOMETRY) {
+            self.reshape_geometry(tick, ids, wiring, entity)?;
+        }
+        match effect {
+            Effect::ModelConditions { add, .. } if changed.intersects(Changed::LOOK) => {
+                self.fire_state_enter_events(tick, ids, entity, add)?;
+            }
+            Effect::LevelUp { levels, cap } => {
+                self.gain_levels(tick, ids, entity, *levels, *cap)?;
+            }
+            Effect::AttributeModifier(name) if changed.intersects(Changed::ATTRIBUTES) => {
+                self.attribute_modifier_gained(tick, ids, entity, name)?;
+            }
+            Effect::UnpausePower(power) if changed.intersects(Changed::POWERS) => {
+                self.power_unpaused(tick, ids, entity, power)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_status_bits_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        set: &[mint_sage_modules::effects::Name],
+        clear: &[mint_sage_modules::effects::Name],
+    ) -> Result<()> {
+        if set
+            .iter()
+            .any(|bit| bit.eq_ignore_ascii_case(USING_ABILITY_STATUS))
+        {
+            tick.state_mut()
+                .insert(ids.using_ability, entity, UsingAbility)?;
+            self.disengage_for_ability(tick, ids, entity, false)?;
+        } else if clear
+            .iter()
+            .any(|bit| bit.eq_ignore_ascii_case(USING_ABILITY_STATUS))
+        {
+            tick.state_mut().remove(ids.using_ability, entity);
+        }
+        if set
+            .iter()
+            .any(|bit| bit.eq_ignore_ascii_case(NO_AUTO_ACQUIRE_STATUS))
+        {
+            tick.state_mut()
+                .insert(ids.no_auto_acquire, entity, NoAutoAcquire)?;
+        } else if clear
+            .iter()
+            .any(|bit| bit.eq_ignore_ascii_case(NO_AUTO_ACQUIRE_STATUS))
+        {
+            tick.state_mut().remove(ids.no_auto_acquire, entity);
+            let has_newer_order = tick.state().contains(ids.player_order, entity)
+                || tick.state().contains(ids.attack_order, entity);
+            if !has_newer_order {
+                if let Some(suspended) = tick.state_mut().remove(ids.suspended_order, entity) {
+                    if let Some(order) = suspended.attack_order {
+                        tick.state_mut().insert(ids.attack_order, entity, order)?;
                     }
-                    changed
-                }
-            };
-            if let Effect::WeaponSetFlag(flag) | Effect::ClearWeaponSetFlag(flag) = &effect {
-                if let Some(swap) =
-                    mint_sage_modules::effects::weapon_set_toggle_swap_condition(flag)
-                {
-                    self.apply_power_effect(
-                        tick,
-                        ids,
-                        entity,
-                        &Effect::TimedModelCondition {
-                            flag: mint_sage_modules::effects::Name::from(swap),
-                            lasts: mint_sage_modules::retail_duration_ticks(1000),
-                            only_if_absent: false,
-                        },
-                    )?;
-                }
-            }
-            if let Effect::ToggleModelCondition(flag) = &effect {
-                if flag.eq_ignore_ascii_case("MOUNTED")
-                    && changed.intersects(Changed::LOOK)
-                    && !tick
-                        .state()
-                        .get(wiring.state, entity)
-                        .is_some_and(|state| state.has_model_condition("MOUNTED"))
-                    && wiring.cancels_disguise_on_dismount(tick.state(), entity)
-                {
-                    self.break_disguise(tick, ids, entity, false)?;
-                }
-            }
-            if let Effect::StatusBits { set, clear } = &effect {
-                if set
-                    .iter()
-                    .any(|bit| bit.eq_ignore_ascii_case(USING_ABILITY_STATUS))
-                {
-                    tick.state_mut()
-                        .insert(ids.using_ability, entity, UsingAbility)?;
-                    self.disengage_for_ability(tick, ids, entity, false)?;
-                } else if clear
-                    .iter()
-                    .any(|bit| bit.eq_ignore_ascii_case(USING_ABILITY_STATUS))
-                {
-                    tick.state_mut().remove(ids.using_ability, entity);
-                }
-                if set
-                    .iter()
-                    .any(|bit| bit.eq_ignore_ascii_case(NO_AUTO_ACQUIRE_STATUS))
-                {
-                    tick.state_mut()
-                        .insert(ids.no_auto_acquire, entity, NoAutoAcquire)?;
-                } else if clear
-                    .iter()
-                    .any(|bit| bit.eq_ignore_ascii_case(NO_AUTO_ACQUIRE_STATUS))
-                {
-                    tick.state_mut().remove(ids.no_auto_acquire, entity);
-                    let has_newer_order = tick.state().contains(ids.player_order, entity)
-                        || tick.state().contains(ids.attack_order, entity);
-                    if !has_newer_order {
-                        if let Some(suspended) =
-                            tick.state_mut().remove(ids.suspended_order, entity)
-                        {
-                            if let Some(order) = suspended.attack_order {
-                                tick.state_mut().insert(ids.attack_order, entity, order)?;
-                            }
-                            if suspended.player_order {
-                                tick.state_mut()
-                                    .insert(ids.player_order, entity, PlayerOrder)?;
-                            }
-                        }
-                    } else {
-                        tick.state_mut().remove(ids.suspended_order, entity);
+                    if suspended.player_order {
+                        tick.state_mut()
+                            .insert(ids.player_order, entity, PlayerOrder)?;
                     }
                 }
-            }
-            if changed.intersects(Changed::WEAPON_SET.union(Changed::LOOK)) {
-                self.reselect_weapon(tick, ids, wiring, entity)?;
-            }
-            if changed.intersects(Changed::ARMOR_SET.union(Changed::LOOK)) {
-                self.reselect_armour(tick, ids, wiring, entity)?;
-            }
-            if changed.intersects(Changed::LOOK) {
-                self.reselect_locomotion(tick, ids, wiring, entity)?;
-            }
-            if changed.intersects(Changed::COMMAND_SET) {
-                self.apply_command_set(tick, ids, wiring, entity)?;
-            }
-            if changed.intersects(Changed::GEOMETRY) {
-                self.reshape_geometry(tick, ids, wiring, entity)?;
-            }
-            match &effect {
-                Effect::ModelConditions { add, .. } if changed.intersects(Changed::LOOK) => {
-                    self.fire_state_enter_events(tick, ids, entity, add)?;
-                }
-                Effect::LevelUp { levels, cap } => {
-                    self.gain_levels(tick, ids, entity, *levels, *cap)?;
-                }
-                Effect::AttributeModifier(name) if changed.intersects(Changed::ATTRIBUTES) => {
-                    self.attribute_modifier_gained(tick, ids, entity, name)?;
-                }
-                Effect::UnpausePower(power) if changed.intersects(Changed::POWERS) => {
-                    self.power_unpaused(tick, ids, entity, power)?;
-                }
-                _ => {}
+            } else {
+                tick.state_mut().remove(ids.suspended_order, entity);
             }
         }
         Ok(())
@@ -1537,6 +1674,7 @@ impl RotwkRules {
                 axis_extent(&crate::construction::footprint_of(&entry.record))
             });
         self.take_over_segments(tick, ids, entity, template, attendants)?;
+        self.clear_for_conversion(tick, ids, entity, template, attendants);
         let carried = self.links_to_carry(tick.state(), ids, entity);
         let made = self.replace_object(tick, ids, entity, template, carry)?;
         if let (Some(new), Some(carried)) = (made, carried) {
@@ -1620,46 +1758,107 @@ impl RotwkRules {
                     .is_some_and(|armed| armed.weapon == chosen));
         let mut switched = false;
         if !same_set {
+            let held_slots = tick.state().get(ids.weapon_slots, entity).copied();
+            let held_armed = tick.state().get(ids.armed, entity).copied();
+            let old_at = held_slots.map(|held| usize::from(held.set)).or_else(|| {
+                let weapon = held_armed?.weapon;
+                sets.weapons
+                    .iter()
+                    .position(|(_, set)| set.arms.iter().flatten().any(|arm| arm.weapon == weapon))
+            });
+            let carried = held_armed.and_then(|armed| {
+                let (_, old) = sets.weapons.get(old_at?)?;
+                (old.share_reload && slots.share_reload).then(|| {
+                    let current = held_slots.map_or_else(
+                        || {
+                            old.arms
+                                .iter()
+                                .position(|arm| arm.is_some_and(|arm| arm.weapon == armed.weapon))
+                        },
+                        |held| Some(usize::from(held.current)),
+                    );
+                    let mut saved: [Option<(WeaponId, WeaponState)>; SLOT_COUNT] =
+                        [None; SLOT_COUNT];
+                    for (index, entry) in saved.iter_mut().enumerate() {
+                        let Some(arm) = old.arms.get(index).copied().flatten() else {
+                            continue;
+                        };
+                        let state = if Some(index) == current {
+                            Some(armed.state)
+                        } else {
+                            held_slots
+                                .and_then(|held| held.states.get(index).copied().flatten())
+                                .or_else(|| {
+                                    self.combat.weapons.get(arm.weapon).map(WeaponState::new)
+                                })
+                        };
+                        *entry = state.map(|state| (arm.weapon, state));
+                    }
+                    saved
+                })
+            });
+            let activate = |tick: &mut Tick<'_>, weapon: WeaponId, template: &WeaponTemplate| {
+                if let Some((_, state)) = carried
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .find(|(saved, _)| *saved == weapon)
+                {
+                    return *state;
+                }
+                let rate = self.fire_rate(tick.state(), ids, entity, template);
+                let now = tick.frame();
+                WeaponState::activated(template, now, rate, tick.rng())
+            };
+            let state = activate(tick, chosen, template);
             if let Some(armed) = tick.state_mut().get_mut(ids.armed, entity) {
                 *armed = Armed {
                     weapon: chosen,
-                    state: WeaponState::new(template),
+                    state,
                     winding: false,
                     ..*armed
                 };
                 switched = true;
             }
-        }
-        if switched {
-            tick.state_mut().remove(ids.weapon_slots, entity);
-            if slots.arms.iter().filter(|arm| arm.is_some()).count() > 1 {
-                let mut states = [None; SLOT_COUNT];
-                for (index, arm) in slots.arms.iter().enumerate() {
-                    if index == slot {
-                        continue;
-                    }
-                    if let Some(template) = arm.and_then(|arm| self.combat.weapons.get(arm.weapon))
-                    {
-                        if let Some(entry) = states.get_mut(index) {
-                            *entry = Some(WeaponState::new(template));
+            if switched && !slots.lock_shared {
+                if let Some(upgrade) = tick.state_mut().get_mut(wiring.state, entity) {
+                    upgrade.weapon_lock = None;
+                    upgrade.weapon_lock_temporary = false;
+                }
+            }
+            if switched {
+                tick.state_mut().remove(ids.weapon_slots, entity);
+                if slots.arms.iter().filter(|arm| arm.is_some()).count() > 1 {
+                    let mut states = [None; SLOT_COUNT];
+                    for (index, arm) in slots.arms.iter().enumerate() {
+                        if index == slot {
+                            continue;
+                        }
+                        if let Some(arm) = *arm {
+                            if let Some(template) = self.combat.weapons.get(arm.weapon) {
+                                let state = activate(tick, arm.weapon, template);
+                                if let Some(entry) = states.get_mut(index) {
+                                    *entry = Some(state);
+                                }
+                            }
                         }
                     }
+                    let Ok(set) = u8::try_from(at) else {
+                        return Ok(());
+                    };
+                    let Ok(current) = u8::try_from(slot) else {
+                        return Ok(());
+                    };
+                    tick.state_mut().insert(
+                        ids.weapon_slots,
+                        entity,
+                        WeaponSlots {
+                            set,
+                            current,
+                            states,
+                        },
+                    )?;
                 }
-                let Ok(set) = u8::try_from(at) else {
-                    return Ok(());
-                };
-                let Ok(current) = u8::try_from(slot) else {
-                    return Ok(());
-                };
-                tick.state_mut().insert(
-                    ids.weapon_slots,
-                    entity,
-                    WeaponSlots {
-                        set,
-                        current,
-                        states,
-                    },
-                )?;
             }
         }
         if switched {
@@ -1670,6 +1869,14 @@ impl RotwkRules {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn holds_temporary_weapon_lock(&self, tick: &Tick<'_>, entity: Entity) -> bool {
+        self.modules.as_ref().is_some_and(|wiring| {
+            tick.state()
+                .get(wiring.state, entity)
+                .is_some_and(|state| state.weapon_lock.is_some() && state.weapon_lock_temporary)
+        })
     }
 
     pub(crate) fn armed_slots(
@@ -1717,7 +1924,7 @@ impl RotwkRules {
         source: CommandSource,
     ) -> Result<bool> {
         let Some(wiring) = self.modules.as_ref() else {
-            return Ok(false);
+            return Ok(true);
         };
         let held = tick.state().get(ids.weapon_slots, entity).copied();
         let current = held.map_or_else(
@@ -1761,19 +1968,26 @@ impl RotwkRules {
         let is_structure = victim_kind
             .is_some_and(|entry| entry.record.kind_of.iter().any(|kind| kind == "STRUCTURE"));
         let now = tick.frame();
-        let distance = match (
+        let (distance, height) = match (
             tick.state().get(ids.body, entity),
             tick.state().get(ids.body, victim),
         ) {
-            (Some(me), Some(them)) => them.0.position.minus(me.0.position).length(),
-            _ => f32::INFINITY,
+            (Some(me), Some(them)) => (
+                them.0.position.minus(me.0.position).length(),
+                self.object_z(tick.state(), ids, entity) - self.object_z(tick.state(), ids, victim),
+            ),
+            _ => (f32::INFINITY, 0.0),
         };
         let mut candidates: [Option<SlotCandidate>; SLOT_COUNT] = [None; SLOT_COUNT];
+        let mut statuses: [Option<WeaponStatus>; SLOT_COUNT] = [None; SLOT_COUNT];
         for (index, arm) in slots.arms.iter().enumerate() {
             let Some(arm) = *arm else { continue };
             let Some(template) = self.combat.weapons.get(arm.weapon) else {
                 continue;
             };
+            if template.bombard_type {
+                continue;
+            }
             let state = if index == current {
                 Some(armed.state)
             } else {
@@ -1782,8 +1996,9 @@ impl RotwkRules {
             };
             let Some(mut state) = state else { continue };
             let status = state.status(now);
-            let damage = self.combat.weapons.estimated_damage(arm.weapon, armour);
-            let unresistable = damage <= 0.0 && self.unresistable(arm.weapon);
+            if let Some(entry) = statuses.get_mut(index) {
+                *entry = Some(status);
+            }
             if let Some(entry) = candidates.get_mut(index) {
                 *entry = Some(SlotCandidate {
                     arm,
@@ -1793,16 +2008,19 @@ impl RotwkRules {
                             is_structure,
                             airborne,
                         ),
-                        damage,
-                        unresistable,
-                        ready: matches!(
+                        valid: self.combat.weapons.valid_against(arm.weapon, armour),
+                        unresistable: self.unresistable(arm.weapon),
+                        ready_status: matches!(
                             status,
                             mint_sage_combat::WeaponStatus::ReadyToFire
                                 | mint_sage_combat::WeaponStatus::PreAttack
-                        ) && distance >= template.minimum_attack_range,
-                        inside_minimum: distance < template.minimum_attack_range,
-                        out_of_ammo: status == mint_sage_combat::WeaponStatus::OutOfAmmo
-                            && !template.auto_reloads_clip,
+                        ) && !self.turret_aims_slot(tick, ids, entity, index),
+                        out_of_ammo: status == mint_sage_combat::WeaponStatus::OutOfAmmo,
+                        range: self.attack_range_at(tick.state(), ids, entity, template, height),
+                        distance,
+                        minimum: self.min_range_of(tick.state(), entity, template),
+                        melee: template.melee,
+                        grab: false,
                     },
                 });
             }
@@ -1815,20 +2033,34 @@ impl RotwkRules {
             .filter(|slot| slots.arms.get(*slot).is_some_and(Option::is_some));
         let chosen = match locked {
             Some(slot) => slot,
+            None if slots.ready_shared
+                && statuses
+                    .iter()
+                    .flatten()
+                    .any(|status| *status != mint_sage_combat::WeaponStatus::ReadyToFire) =>
+            {
+                return Ok(true);
+            }
             None => {
+                let criteria = slots
+                    .criteria
+                    .unwrap_or(mint_sage_combat::WeaponChoiceCriteria::PreferMostDamage);
                 let Some(chosen) = mint_sage_combat::choose_slot(
                     &candidates,
                     victim_kinds,
                     source,
                     active_conditions,
+                    criteria,
+                    &mut || tick.rng().next_f32(),
                 ) else {
+                    self.switch_slot(tick, ids, entity, armed, (at, slots), 0)?;
                     return Ok(false);
                 };
                 chosen.index()
             }
         };
         if !self.switch_slot(tick, ids, entity, armed, (at, slots), chosen)? {
-            return Ok(false);
+            return Ok(true);
         }
         diag!(
             "weapon: entity {} switched to slot {} against entity {}",
@@ -1837,6 +2069,25 @@ impl RotwkRules {
             victim.index()
         );
         Ok(true)
+    }
+
+    fn turret_aims_slot(&self, tick: &Tick<'_>, ids: Ids, entity: Entity, index: usize) -> bool {
+        let Some(turret) = self
+            .ai_table_of(tick, ids, entity)
+            .and_then(|ai| ai.turret.as_ref())
+        else {
+            return false;
+        };
+        turret.turn_rate != Some(0.0)
+            && turret
+                .controlled_weapon_slots
+                .iter()
+                .filter_map(|name| mint_sage_combat::WeaponSlot::parse(name))
+                .any(|slot| slot.index() == index)
+            && tick
+                .state()
+                .get(ids.turret_state, entity)
+                .is_some_and(|state| !state.aimed)
     }
 
     pub(crate) fn switch_slot(
@@ -2109,6 +2360,31 @@ impl RotwkRules {
         let mut mask = self.effective_upgrades_in(world, ids, entity);
         mask.set(bit);
         self.affected_with_fit(world, ids, entity, &mask, true)
+    }
+
+    pub(crate) fn sub_upgrade_counted(
+        &self,
+        world: &World,
+        ids: Ids,
+        builder: Option<Entity>,
+        bit: UpgradeBit,
+    ) -> bool {
+        let Some(builder) = builder else {
+            return true;
+        };
+        let horde = if world.contains(ids.horde, builder) {
+            Some(builder)
+        } else {
+            world.get(ids.member, builder).map(|member| member.horde)
+        };
+        let Some(horde) = horde.and_then(|horde| world.get(ids.horde, horde)) else {
+            return true;
+        };
+        horde.members.is_empty()
+            || horde
+                .members
+                .iter()
+                .any(|member| self.affected_by_upgrade(world, ids, *member, bit))
     }
 
     pub(super) fn power_released(&self, world: &World, entity: Entity, power: &str) -> bool {

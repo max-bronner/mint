@@ -14,6 +14,7 @@ fn lance(combat: &mut CombatData) -> mint_sage_combat::WeaponId {
                 ),
                 clip_size: 0,
                 nuggets: vec![Nugget::Damage(DamageNugget {
+                    shape: Default::default(),
                     damage: 10.0,
                     damage_type: crush,
                     death_type: None,

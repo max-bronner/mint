@@ -19,6 +19,9 @@ fn request() -> PathRequest {
     PathRequest {
         corner_radius: 0.0,
         departure: None,
+        approach: None,
+        prune: false,
+        final_goal: true,
         start: Cell::new(1, 1),
         goal: Cell::new(22, 5),
         mover: MOVER,
@@ -58,6 +61,8 @@ fn the_null_search_walks_into_the_wall_and_a_star_walks_round_it() {
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -155,6 +160,8 @@ fn null_avoidance_leaves_the_followers_motion_bit_identical() {
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -224,6 +231,8 @@ fn avoid_reconstructs_position_from_before_the_follower_stepped_not_after() {
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -328,6 +337,8 @@ fn avoid_refuses_to_push_a_mover_into_a_blocked_cell() {
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -413,4 +424,173 @@ fn the_configuration_prints_in_a_form_that_pastes_into_a_report() {
         PipelineConfig::default().to_string(),
         "search=a* smoothing=string-pull avoidance=off"
     );
+}
+
+struct Linked {
+    grid: CostGrid,
+    link: crate::grid::PortalLink,
+}
+
+impl crate::grid::Passability for Linked {
+    fn extent(&self) -> GridExtent {
+        self.grid.extent()
+    }
+    fn flags(&self, cell: Cell) -> CellFlags {
+        self.grid.flags(cell)
+    }
+    fn extra_cost(&self, cell: Cell) -> u32 {
+        self.grid.extra_cost(cell)
+    }
+    fn portal_links(&self, cell: Cell) -> &[crate::grid::PortalLink] {
+        if cell == self.link.entry {
+            std::slice::from_ref(&self.link)
+        } else {
+            &[]
+        }
+    }
+}
+
+fn walled_off_with_a_link() -> (Linked, [Vec2; 2], crate::grid::Portal) {
+    let mut grid = CostGrid::new(GridExtent::new(24, 24).unwrap());
+    for y in 0..24 {
+        grid.set_flags(Cell::new(10, y), WALL).unwrap();
+    }
+    let climb = crate::grid::Portal {
+        id: 1,
+        kind: 3,
+        leg: crate::grid::Leg::Climb,
+        rise: 40.0,
+    };
+    let walk = crate::grid::Portal::new(2, 2);
+    let bones = [Vec2::new(96.0, 126.0), Vec2::new(98.0, 127.0)];
+    let link = crate::grid::PortalLink {
+        entry: Cell::new(9, 12),
+        exit: Cell::new(11, 12),
+        slot: 3,
+        nodes: vec![
+            crate::grid::PortalNode {
+                position: bones[0],
+                tag: None,
+            },
+            crate::grid::PortalNode {
+                position: bones[1],
+                tag: Some(climb),
+            },
+        ],
+        after: Some(walk),
+    };
+    (Linked { grid, link }, bones, walk)
+}
+
+#[test]
+fn a_portal_link_is_a_search_edge_for_an_admitted_mover_and_its_nodes_enter_the_route() {
+    let (grid, bones, after) = walled_off_with_a_link();
+    let geometry = CellGeometry::new(10.0, Vec2::ZERO).unwrap();
+    let mut request = request();
+    request.start = Cell::new(1, 12);
+    request.goal = Cell::new(22, 12);
+    let mut pipeline = Pipeline::new(PipelineConfig::default());
+    let refused = pipeline
+        .plan(&grid, geometry, &request, &mut NodeBudget::unlimited())
+        .unwrap();
+    assert_eq!(refused, PlanOutcome::Unreachable);
+
+    request.mover = MOVER.passing(crate::grid::PortalPass::NONE.with(3));
+    let plan = ready(
+        pipeline
+            .plan(&grid, geometry, &request, &mut NodeBudget::unlimited())
+            .unwrap(),
+    );
+    let at = plan
+        .route
+        .points
+        .iter()
+        .position(|point| *point == bones[0])
+        .expect("the entry bone is on the route");
+    assert_eq!(plan.route.points.get(at + 1), Some(&bones[1]));
+    assert_eq!(plan.route.portals.get(at), Some(&None));
+    assert_eq!(
+        plan.route
+            .portals
+            .get(at + 1)
+            .copied()
+            .flatten()
+            .map(|t| t.id),
+        Some(1)
+    );
+    assert_eq!(plan.route.portals.get(at + 2), Some(&Some(after)));
+    assert_eq!(
+        plan.route.points.get(at + 2),
+        Some(&Vec2::new(125.0, 125.0))
+    );
+    assert_eq!(plan.cells.hops.len(), 1);
+}
+
+#[test]
+fn the_optimiser_runs_the_leg_into_a_portal_straight_to_its_entry_bone() {
+    let (mut grid, bones, _) = walled_off_with_a_link();
+    let pinched = CellFlags::from_bits(2);
+    for x in [6, 7, 8, 13, 14] {
+        grid.grid.set_flags(Cell::new(x, 12), pinched).unwrap();
+    }
+    let geometry = CellGeometry::new(10.0, Vec2::ZERO).unwrap();
+    let mut request = request();
+    request.start = Cell::new(1, 12);
+    request.goal = Cell::new(22, 12);
+    request.mover = MOVER
+        .passing(crate::grid::PortalPass::NONE.with(3))
+        .line_barring(pinched);
+    let mut pipeline = Pipeline::new(PipelineConfig::default());
+    let plan = ready(
+        pipeline
+            .plan(&grid, geometry, &request, &mut NodeBudget::unlimited())
+            .unwrap(),
+    );
+    let points = &plan.route.points;
+    let at = points
+        .iter()
+        .position(|point| *point == bones[0])
+        .expect("the entry bone is on the route");
+    let before: Vec<_> = points.get(..at).unwrap_or_default().to_vec();
+    assert_eq!(
+        before.last(),
+        Some(&Vec2::new(55.0, 125.0)),
+        "the last node before the bone is the last cell the start can see: {before:?}"
+    );
+    for x in [65.0, 75.0, 85.0, 95.0] {
+        assert!(!points.contains(&Vec2::new(x, 125.0)), "{x} is a node");
+    }
+    assert!(
+        !points.contains(&Vec2::new(135.0, 125.0)),
+        "the cell after `next` is taken untested"
+    );
+    assert!(points.contains(&Vec2::new(145.0, 125.0)));
+}
+
+#[test]
+fn a_non_final_request_goes_straight_across_a_pinched_cell() {
+    const PINCH: CellFlags = CellFlags::from_bits(2);
+    let mut grid = CostGrid::new(GridExtent::new(24, 24).unwrap());
+    grid.set_flags(Cell::new(10, 5), PINCH).unwrap();
+    let geometry = CellGeometry::new(10.0, Vec2::ZERO).unwrap();
+    let mut pipeline = Pipeline::new(PipelineConfig::default());
+    let mut asked = PathRequest {
+        start: Cell::new(1, 5),
+        goal: Cell::new(22, 5),
+        mover: MOVER.line_barring(PINCH),
+        ..request()
+    };
+    let final_leg = ready(
+        pipeline
+            .plan(&grid, geometry, &asked, &mut NodeBudget::unlimited())
+            .unwrap(),
+    );
+    assert!(final_leg.cells.cells.len() > 2, "{:?}", final_leg.cells);
+    asked.final_goal = false;
+    let leg = ready(
+        pipeline
+            .plan(&grid, geometry, &asked, &mut NodeBudget::unlimited())
+            .unwrap(),
+    );
+    assert_eq!(leg.cells.cells, vec![asked.start, asked.goal]);
 }

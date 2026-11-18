@@ -5,9 +5,14 @@ use std::collections::BTreeMap;
 
 pub(super) const PATH_NODE_BUDGET: u32 = 20_000;
 
+const CLOSEST_STEP_BACK: f32 = 30.0;
+const CLOSEST_STEP_BACK_MAX: i32 = 5;
+
 const ARRIVAL_FACING_SNAP: f32 = core::f32::consts::PI / 10.0;
 
 const TERROR_CONDITION: &str = "EMOTION_TERROR";
+
+const PASSENGER_ASK_DEPTH: u32 = 4;
 
 const ENTRY_REACHED: f32 = 2.5;
 
@@ -173,17 +178,76 @@ impl Component for IgnoredObstacle {
     }
 }
 
-const DIVE_DOWN_TOLERANCE: f32 = 0.5;
-
 const HORDE_RAMP_DESCENT_STEP: f32 = 9.0;
 
 const HORDE_RAMP_DESCENT_WINDOW: f32 = 20.0;
+
+const NO_Z_HOLD_ABOVE: f32 = 20.0;
+
+const STRUCTURE_SCAN_RANGE: f32 = 1.0;
+
+fn octagonal_length(offset: Vec2) -> f32 {
+    let (a, b) = (offset.x.abs(), offset.y.abs());
+    a.max(b) + 0.25 * a.min(b)
+}
+
+fn wings_aim(centre: Vec2, at: MoverState, circling_radius: f32, limits: &MotionLimits) -> Vec2 {
+    let mut radius = circling_radius;
+    if radius == 0.0 && limits.turn_rate > 0.0 {
+        radius = limits.min_speed / limits.turn_rate;
+    }
+    let mut turn = core::f32::consts::PI - core::f32::consts::PI / 8.0;
+    if radius < 0.0 {
+        radius = -radius;
+        turn = -turn;
+    }
+    let to_centre = centre.minus(at.position);
+    let toward = if to_centre.x.abs() < 0.001 && to_centre.y.abs() < 0.001 {
+        at.facing.radians()
+    } else {
+        mint_math::f32::atan2(to_centre.y, to_centre.x)
+    };
+    let (sin, cos) = mint_math::f32::sin_cos(toward + turn);
+    Vec2::new(centre.x + cos * radius, centre.y + sin * radius)
+}
 
 fn ramp_descent_step(current_z: f32, target_z: f32) -> f32 {
     if current_z - target_z < HORDE_RAMP_DESCENT_WINDOW {
         (current_z - HORDE_RAMP_DESCENT_STEP).max(target_z)
     } else {
         current_z
+    }
+}
+
+fn no_z_holds_height(layer: crate::wall_layer::Layer, above: f32, retail_frame: u64) -> bool {
+    retail_frame > u64::from(crate::game_data::RETAIL_LOGIC_HZ)
+        && (2..=crate::wall_layer::Layer::RAMPS.0).contains(&layer.0)
+        && above > NO_Z_HOLD_ABOVE
+}
+
+#[cfg(test)]
+mod no_z_hold_tests {
+    use super::no_z_holds_height;
+    use crate::wall_layer::Layer;
+
+    #[test]
+    fn the_hold_needs_a_ramp_or_bridge_layer_past_the_first_second_and_over_twenty_up() {
+        let rows = [
+            (Layer::RAMPS, 20.5, 6, true),
+            (Layer(2), 20.5, 6, true),
+            (Layer(15), 20.5, 6, true),
+            (Layer::RAMPS, 20.0, 6, false),
+            (Layer::RAMPS, 20.5, 5, false),
+            (Layer::GROUND, 20.5, 6, false),
+            (Layer(17), 20.5, 6, false),
+        ];
+        for (layer, above, frame, held) in rows {
+            assert_eq!(
+                no_z_holds_height(layer, above, frame),
+                held,
+                "{layer:?} {above} up at frame {frame}"
+            );
+        }
     }
 }
 
@@ -212,11 +276,19 @@ mod ramp_descent_step_tests {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct FlightLevel(pub(crate) f32);
+pub(crate) struct AttackHeight {
+    pub(crate) phase: mint_movement::AttackPhase,
+    pub(crate) level: f32,
+}
 
-impl Component for FlightLevel {
+impl Component for AttackHeight {
     fn hash_into(&self, hasher: &mut StateHasher) {
-        hasher.write_f32(self.0);
+        hasher.write_u8(match self.phase {
+            mint_movement::AttackPhase::Cruise => 0,
+            mint_movement::AttackPhase::Descending => 1,
+            mint_movement::AttackPhase::Climbing => 2,
+        });
+        hasher.write_f32(self.level);
     }
 }
 
@@ -228,6 +300,21 @@ impl Component for Held {
         hasher.write_bool(self.0.is_some());
         hasher.write_u64(self.0.map_or(0, Frame::get));
     }
+}
+
+pub(crate) fn octagonal_length_3d(dx: f32, dy: f32, dz: f32) -> f32 {
+    let (dx, dy, dz) = (dx.abs(), dy.abs(), dz.abs());
+    let a = dx.max(dy) + dx.min(dy) * 0.25;
+    a.max(dz) + a.min(dz) * 0.25
+}
+
+fn with_crusher_bonus(level: u8, bonus: i16) -> u8 {
+    u8::try_from(
+        i16::from(level)
+            .saturating_add(bonus)
+            .clamp(0, i16::from(u8::MAX)),
+    )
+    .unwrap_or(0)
 }
 
 impl RotwkRules {
@@ -291,6 +378,14 @@ impl mint_movement::Passability for ObstacleExemptView<'_> {
         self.inner.extra_cost(cell)
     }
 
+    fn goal_extra_cost(&self, cell: Cell, goal: Option<Cell>) -> u32 {
+        self.inner.goal_extra_cost(cell, goal)
+    }
+
+    fn tail_clear(&self, cell: Cell, mover: MoverClass) -> bool {
+        self.inner.tail_clear(cell, mover)
+    }
+
     fn admits(&self, cell: Cell, asker: mint_movement::Asker) -> bool {
         self.inner.admits(cell, asker)
     }
@@ -298,16 +393,21 @@ impl mint_movement::Passability for ObstacleExemptView<'_> {
     fn portal_at(&self, cell: Cell) -> Option<mint_movement::Portal> {
         self.inner.portal_at(cell)
     }
+
+    fn portal_links(&self, cell: Cell) -> &[mint_movement::PortalLink] {
+        self.inner.portal_links(cell)
+    }
 }
 
 pub(super) const REPLAN_COOLDOWN_FRAMES: u64 = 30;
 
-pub(super) const BOARDING_REPLAN_FRAMES: u64 =
-    10 * mint_sim::SIMULATION_HZ as u64 / crate::game_data::RETAIL_LOGIC_HZ as u64;
+pub(super) const BOARDING_REPLAN_FRAMES: u64 = (10 * crate::game_data::RETAIL_LOGIC_HZ as u64 + 1)
+    * (mint_sim::SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ) as u64;
 
 pub(super) const BOARDING_REPLAN_DISTANCE: f32 = 200.0;
 
 const CLIMBING: &str = "CLIMBING";
+const SPLATTED: &str = "SPLATTED";
 
 const RAPPELLING: &str = "RAPPELLING";
 
@@ -323,9 +423,6 @@ const CLIMB_LANDING_TOLERANCE: f32 = 1.0;
 const SCALING_WALL_HORDE: &str = "SCALING_WALL_HORDE";
 
 pub(super) const PORCUPINE: &str = "PORCUPINE";
-
-#[allow(clippy::cast_precision_loss)]
-const DIVE_EASE_TICKS: f32 = SIMULATION_HZ as f32 / 2.0;
 
 impl RotwkRules {
     pub(super) fn is_immobile(tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
@@ -401,7 +498,16 @@ impl RotwkRules {
         player: PlayerId,
         goal: Vec2,
     ) -> Result<()> {
-        self.move_to_inner(tick, ids, player, goal, false, None, false)
+        self.move_to_inner(
+            tick,
+            ids,
+            player,
+            goal,
+            false,
+            None,
+            false,
+            busy::MovePath::PlayerGroup,
+        )
     }
 
     pub(super) fn move_to_queued(
@@ -411,8 +517,9 @@ impl RotwkRules {
         player: PlayerId,
         goal: Vec2,
         queue: bool,
+        path: busy::MovePath,
     ) -> Result<()> {
-        self.move_to_inner(tick, ids, player, goal, false, None, queue)
+        self.move_to_inner(tick, ids, player, goal, false, None, queue, path)
     }
 
     pub(super) fn move_to_exact_goal(
@@ -422,7 +529,16 @@ impl RotwkRules {
         player: PlayerId,
         goal: Vec2,
     ) -> Result<()> {
-        self.move_to_inner(tick, ids, player, goal, true, None, false)
+        self.move_to_inner(
+            tick,
+            ids,
+            player,
+            goal,
+            true,
+            None,
+            false,
+            busy::MovePath::Group,
+        )
     }
 
     pub(super) fn move_to_with_drag_formation(
@@ -432,8 +548,9 @@ impl RotwkRules {
         player: PlayerId,
         anchor: Vec2,
         order: super::group_move::FormationOrder,
+        path: busy::MovePath,
     ) -> Result<()> {
-        self.move_to_inner(tick, ids, player, anchor, false, Some(order), false)
+        self.move_to_inner(tick, ids, player, anchor, false, Some(order), false, path)
     }
 
     pub(super) fn move_order_targets_and_movers(
@@ -446,15 +563,25 @@ impl RotwkRules {
         let modes = self.modes(tick, ids);
         let mut targets = self.selection(tick, ids, player);
         if modes.formation == FormationMode::On || force_hordes {
-            let owned: Vec<Entity> = targets
-                .iter()
-                .copied()
-                .filter(|entity| Self::commandable(tick, ids, *entity, player))
-                .collect();
-            let hordes = crate::horde::hordes_of(tick.state(), Self::horde_ids(ids), &owned);
-            targets.retain(|entity| !tick.state().contains(ids.member, *entity));
-            let mut ordered = hordes;
-            ordered.append(&mut targets);
+            let world = tick.state();
+            let mut seen = BTreeSet::new();
+            let mut ordered = Vec::with_capacity(targets.len());
+            for entity in targets {
+                let target = match world.get(ids.member, entity) {
+                    Some(member) => {
+                        if !Self::commandable(tick, ids, entity, player)
+                            || !world.is_live(member.horde)
+                        {
+                            continue;
+                        }
+                        member.horde
+                    }
+                    None => entity,
+                };
+                if seen.insert(target) {
+                    ordered.push(target);
+                }
+            }
             targets = ordered;
         }
 
@@ -473,6 +600,7 @@ impl RotwkRules {
         (targets, movers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn move_to_inner(
         &self,
         tick: &mut Tick<'_>,
@@ -482,6 +610,7 @@ impl RotwkRules {
         exact_goal: bool,
         drag: Option<super::group_move::FormationOrder>,
         queue: bool,
+        path: busy::MovePath,
     ) -> Result<()> {
         let modes = self.modes(tick, ids);
         let mut pipeline = Pipeline::new(modes.config());
@@ -502,20 +631,40 @@ impl RotwkRules {
         if !on_grid && off_map_movers.is_empty() {
             return Ok(());
         }
-        self.cohere_move_speed(tick, ids, &movers)?;
+        let per_member = path == busy::MovePath::PerMember;
+        if path.is_player_dispatch() {
+            if is_drag {
+                self.cohere_move_speed(tick, ids, &movers)?;
+            } else {
+                self.uncohere_move_speed(tick, ids, player);
+            }
+        }
+        let tightens =
+            !is_drag && !per_member && self.group_move_tightens(tick, ids, &movers, goal);
         let formation = if let Some(order) = drag {
             Some(order)
-        } else if !exact_goal
+        } else if !per_member
+            && !exact_goal
             && on_grid
             && modes.formation == FormationMode::On
-            && !self.group_move_tightens(tick, ids, &movers, goal)
+            && !tightens
         {
             self.formation_order(tick, ids, &movers, goal, &mut pipeline)?
         } else {
             None
         };
+        self.record_formation_slots(tick, ids, &movers, formation.as_ref())?;
+        let formations_on = modes.formation == FormationMode::On || formation.is_some();
         let destinations = if exact_goal || !on_grid {
             BTreeMap::new()
+        } else if per_member {
+            match &formation {
+                Some(order) => Self::slot_points_as_claimed(order),
+                None => {
+                    let starting = self.movers_starting_now(tick.state(), ids, &movers, queue);
+                    self.claim_in_member_order(tick, ids, &starting, goal, formations_on)
+                }
+            }
         } else {
             let wanted = formation.as_ref().map_or_else(
                 || Self::group_destinations(tick, ids, &movers, goal, true),
@@ -527,11 +676,18 @@ impl RotwkRules {
                 &movers,
                 &wanted,
                 goal,
-                modes.formation == FormationMode::On || formation.is_some(),
+                formations_on,
                 formation.as_ref().map(|order| order.facing),
             )
         };
 
+        let tag = (per_member && (queue || !is_drag)).then(|| crate::combat::OrderTag {
+            id: Self::next_order_id(tick.state(), ids),
+            click: goal,
+            members: movers.clone(),
+            copy_of: None,
+            lap_clone: None,
+        });
         let mut routed: Vec<(Entity, Vec<Vec2>)> = Vec::new();
         for entity in targets {
             let owned = Self::commandable(tick, ids, entity, player)
@@ -559,16 +715,21 @@ impl RotwkRules {
                     ids,
                     entity,
                     crate::combat::QueuedLeg {
-                        point: entity_goal,
+                        point: if per_member { goal } else { entity_goal },
                         attack: false,
+                        resolve: per_member,
+                        tag: tag.clone(),
+                        non_final: path == busy::MovePath::GroupLeg,
+                        follow: false,
                     },
                 )?;
                 continue;
             }
-            if !self.take_player_order(tick, ids, entity, false, !queue)? {
+            if !self.take_player_order(tick, ids, entity, false, !queue, !queue && !tightens)? {
                 continue;
             }
-            if queue {
+            self.note_order_origin(tick, ids, entity)?;
+            if queue || tag.is_some() {
                 tick.state_mut().insert(
                     ids.order_queue,
                     entity,
@@ -576,9 +737,14 @@ impl RotwkRules {
                         current: Some(crate::combat::QueuedLeg {
                             point: entity_goal,
                             attack: false,
+                            resolve: false,
+                            tag: tag.clone(),
+                            non_final: path == busy::MovePath::GroupLeg,
+                            follow: false,
                         }),
                         queued: Vec::new(),
                         idle_checks: 0,
+                        loop_start: None,
                     },
                 )?;
             }
@@ -639,6 +805,35 @@ impl RotwkRules {
                 }
                 continue;
             }
+            if formation
+                .as_ref()
+                .is_some_and(|order| order.points.contains_key(&entity))
+                && !self.inside_active(tick.state(), ids, body.0.position)
+                && self.inside_active(tick.state(), ids, entity_goal)
+            {
+                let route = self.quick_route(tick, ids, entity, body.0.position, entity_goal);
+                crate::unit::give_path(
+                    tick.state_mut(),
+                    (ids.body, ids.path),
+                    entity,
+                    Path {
+                        route,
+                        goal: entity_goal,
+                        kind: PathKind::Ordered,
+                        facing: None,
+                    },
+                )?;
+                if !exact_goal {
+                    self.emit_voice(tick, ids, entity, crate::voice::VoiceKind::Move, None);
+                }
+                continue;
+            }
+            if Self::on_portal_leg(tick.state(), ids, entity) {
+                if !exact_goal {
+                    self.emit_voice(tick, ids, entity, crate::voice::VoiceKind::Move, None);
+                }
+                continue;
+            }
             let mover = self.mover_class(tick, ids, entity);
             if self.passable_cell_for(tick, ids, goal, mover).is_none()
                 && self.is_amphibious_ship(tick, ids, entity)
@@ -674,6 +869,7 @@ impl RotwkRules {
                 mover,
                 (start, body.0.position),
                 via,
+                formation.is_some(),
             )?;
             let request = PathRequest {
                 start,
@@ -683,6 +879,16 @@ impl RotwkRules {
                 origin: Some(origin),
                 corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
                 departure: self.departure(tick, ids, entity),
+                approach: None,
+                prune: self
+                    .passable_cell_for(tick, ids, target_point, mover)
+                    .is_some_and(|valid| !self.reachable(mover, start, valid)),
+                final_goal: !(path == busy::MovePath::GroupLeg
+                    || exact_goal
+                    || via.is_empty()
+                        && formation
+                            .as_ref()
+                            .is_some_and(|order| order.points.contains_key(&entity))),
             };
             let mut budget = NodeBudget::new(PATH_NODE_BUDGET);
             let ground = self.dynamic_view(tick, ids);
@@ -691,7 +897,14 @@ impl RotwkRules {
                 .exempting(&[target_cell]);
             let view = self.footprint_view(tick, ids, entity, mover, &costs, &ground);
             let outcome = pipeline
-                .plan_closest(&view, geometry, &request, &mut budget)
+                .plan_closest_accepting(
+                    &view,
+                    geometry,
+                    &self.stepped_back(&request),
+                    &mut budget,
+                    &self.footprint_accepts(tick, ids, entity),
+                    0.0,
+                )
                 .map_err(|e| mint_sim::Error::Rules {
                     frame: tick.frame().get(),
                     reason: format!("planning a path for entity {}: {e}", entity.index()),
@@ -751,6 +964,9 @@ impl RotwkRules {
         for (entity, route) in routed {
             self.move_allies(tick, ids, &mut pipeline, entity, &route)?;
         }
+        if let Some(tag) = &tag {
+            self.link_waypoint_loop(tick, ids, tag)?;
+        }
         Ok(())
     }
 
@@ -809,6 +1025,9 @@ impl RotwkRules {
                 origin: Some(body.0.position),
                 corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
                 departure: self.departure(tick, ids, entity),
+                approach: None,
+                prune: false,
+                final_goal: true,
             };
             let mut budget = NodeBudget::new(PATH_NODE_BUDGET);
             let ground = self.dynamic_view(tick, ids);
@@ -900,6 +1119,20 @@ impl RotwkRules {
             .collect()
     }
 
+    pub(super) fn crushable_level(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> Option<i16> {
+        let crush = &self.record_of(tick, ids, entity)?.crush;
+        let mounted = crush.mounted_crushable_level.is_some() && self.is_mounted(tick, entity);
+        let base = crush
+            .mounted_crushable_level
+            .filter(|_| mounted)
+            .unwrap_or(crush.crushable_level);
+        let bonus = tick
+            .state()
+            .get(ids.bonuses, entity)
+            .map_or(0, |bonuses| bonuses.0.crushable_level_bonus());
+        Some(i16::from(base).saturating_add(bonus))
+    }
+
     pub(super) fn crush_state(
         &self,
         tick: &Tick<'_>,
@@ -938,14 +1171,12 @@ impl RotwkRules {
             .mounted_crusher_level
             .filter(|_| mounted)
             .unwrap_or(crush.crusher_level);
-        let crushable = crush
-            .mounted_crushable_level
-            .filter(|_| mounted)
-            .unwrap_or(crush.crushable_level);
-        let bonus = tick
-            .state()
-            .get(ids.bonuses, entity)
-            .map_or(0, |bonuses| bonuses.0.crushable_level_bonus());
+        let level = with_crusher_bonus(
+            level,
+            tick.state()
+                .get(ids.bonuses, entity)
+                .map_or(0, |bonuses| bonuses.0.crusher_level_bonus()),
+        );
         let (gate, share) = self
             .crushing_horde(tick, ids, entity)
             .and_then(|horde| Some((horde, self.record_of(tick, ids, horde)?.crush.min_velocity)))
@@ -955,13 +1186,15 @@ impl RotwkRules {
             .get(ids.body, gate)
             .map_or(0.0, |body| body.0.speed);
         let charging = self.holds_condition(tick, entity, "CHARGING");
-        let armed = level > 0 && (charging || !crush.only_while_charging);
+        let armed = level > 0
+            && (self.charging_with_horde(tick, ids, entity) || !crush.only_while_charging);
         CrushState {
             crusher_level: if armed { level } else { 0 },
             crushable_level: if tick.state().contains(ids.knocked, entity) {
                 i16::from(mint_sage_modules::UNCRUSHABLE)
             } else {
-                i16::from(crushable).saturating_add(bonus)
+                self.crushable_level(tick, ids, entity)
+                    .unwrap_or_else(|| i16::from(mint_sage_modules::UNCRUSHABLE))
             },
             crushes_allies: crush.allies || charging || self.is_rampaging(tick.state(), entity),
             velocity,
@@ -1206,6 +1439,13 @@ impl RotwkRules {
         tick.state().contains(ids.horde, horde).then_some(horde)
     }
 
+    pub(super) fn charging_with_horde(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
+        self.holds_condition(tick, entity, "CHARGING")
+            || self
+                .crushing_horde(tick, ids, entity)
+                .is_some_and(|horde| self.holds_condition(tick, horde, "CHARGING"))
+    }
+
     fn crush_cap_ticks() -> u64 {
         6 * u64::from(mint_sim::SIMULATION_HZ) / u64::from(crate::game_data::RETAIL_LOGIC_HZ)
     }
@@ -1230,7 +1470,17 @@ impl RotwkRules {
         limits
     }
 
-    fn has_melee_weapon(&self, tick: &Tick<'_>, ids: Ids, attacker: Entity) -> bool {
+    pub(super) fn has_a_weapon(&self, tick: &Tick<'_>, ids: Ids, attacker: Entity) -> bool {
+        tick.state().contains(ids.armed, attacker)
+            || tick.state().get(ids.horde, attacker).is_some_and(|horde| {
+                horde
+                    .members
+                    .iter()
+                    .any(|member| tick.state().contains(ids.armed, *member))
+            })
+    }
+
+    pub(super) fn has_melee_weapon(&self, tick: &Tick<'_>, ids: Ids, attacker: Entity) -> bool {
         let is_melee = |weapon: mint_sage_combat::WeaponId| {
             self.combat
                 .weapons
@@ -1249,7 +1499,7 @@ impl RotwkRules {
         })
     }
 
-    fn can_crush_instead(
+    pub(super) fn can_crush_instead(
         &self,
         tick: &Tick<'_>,
         ids: Ids,
@@ -1346,7 +1596,7 @@ impl RotwkRules {
                 planned: false,
                 horde: None,
                 guard: false,
-                forced: false,
+                relation_free: false,
                 order_owner: None,
             },
         )?;
@@ -1617,7 +1867,8 @@ impl RotwkRules {
         };
         let avoidance_grid = AvoidanceGrid::build(avoidance_population);
 
-        let moving: Vec<(Entity, Route)> = tick
+        let circling = self.circling_fliers(tick, ids)?;
+        let mut moving: Vec<(Entity, Route)> = tick
             .state()
             .store(ids.path)
             .map(|store| {
@@ -1630,20 +1881,29 @@ impl RotwkRules {
                         {
                             route.extra_distance = MELEE_HORDE_APPROACH_EXTRA;
                         }
+                        if path.kind == PathKind::Closing
+                            && self.on_crush_run(tick.state(), ids, entity)
+                        {
+                            route.extra_distance = SQUISH_PATH_EXTRA;
+                        }
                         (entity, route)
                     })
                     .collect()
             })
             .unwrap_or_default();
+        moving.extend(circling.iter().cloned());
+        moving.sort_by_key(|(entity, _)| entity.index());
 
         let mut replan: Vec<Entity> = Vec::new();
         let mut avoid_scratch: Vec<Neighbour> = Vec::new();
 
+        let mut climb_gaps: Vec<(Entity, f32)> = Vec::new();
         for (entity, route) in moving {
             if tick
                 .state()
                 .get(ids.knocked, entity)
                 .is_some_and(super::knockback::Knocked::off_its_feet)
+                || self.ai_disabled(tick.state(), ids, entity, tick.frame())
                 || self.flies_itself(tick.state(), ids, entity)
                 || self.holds_for_reload(tick, ids, entity)
             {
@@ -1689,13 +1949,36 @@ impl RotwkRules {
                     .get(ids.desired_speed, entity)
                     .map_or(f32::INFINITY, |desired| desired.0)
             };
+            if circling.iter().any(|(circler, _)| *circler == entity) {
+                limits.desired_speed = limits.min_speed;
+            }
             if let Some(kinematics) = self.kinematics_of(tick, ids, entity) {
                 limits.turn_pivot =
                     kinematics.turn_pivot_offset * self.object_radius(tick, ids, entity);
-                limits.backs = kinematics.backs_in_terror
-                    && self.holds_condition(tick, entity, TERROR_CONDITION);
+                let horde = tick
+                    .state()
+                    .get(ids.member, entity)
+                    .and_then(|member| self.kinematics_of(tick, ids, member.horde));
+                limits.backs = kinematics.backs_when_setting_off(
+                    self.holds_condition(tick, entity, TERROR_CONDITION),
+                    horde.as_ref(),
+                );
+                if tick.state().contains(ids.member, entity) {
+                    limits.backing_speed = Some(kinematics.backing_speed);
+                }
+            }
+            if let Some(wheels) = limits.wheel_backing.as_mut() {
+                wheels.moved_since_order = tick.state().get(ids.order_origin, entity).map_or_else(
+                    || octagonal_length(body.0.position),
+                    |origin| octagonal_length(body.0.position.minus(origin.0)),
+                );
+                wheels.turning = tick.state().get(ids.motive, entity).is_some_and(|motive| {
+                    motive.0.contains(mint_movement::MotionPhase::TURNING_LEFT)
+                        || motive.0.contains(mint_movement::MotionPhase::TURNING_RIGHT)
+                });
             }
             let limits = self.cavalry_creep(tick, ids, entity, body.0, &route, limits);
+            let (limits, climb_gap_left) = self.climbers_wait(tick, ids, entity, limits);
             let (start, reformed) = self.reform_turn(tick, ids, entity, body.0, &route, &limits);
             let entry_reached = start.speed <= 0.0
                 && start.waypoint == 0
@@ -1703,6 +1986,7 @@ impl RotwkRules {
                     .points
                     .last()
                     .is_some_and(|end| end.minus(start.position).length() <= ENTRY_REACHED);
+            let mut horde_stage: Option<super::horde_portal::Staged> = None;
             let motion = if entry_reached {
                 mint_movement::Motion {
                     state: start,
@@ -1710,9 +1994,18 @@ impl RotwkRules {
                     status: MotionStatus::Arrived,
                     phase: mint_movement::MotionPhase::NONE,
                 }
+            } else if let Some(staged) =
+                self.stage_horde_portal(tick, ids, entity, &route, start, &limits)
+            {
+                let motion = staged.motion;
+                horde_stage = Some(staged);
+                motion
             } else {
                 pipeline.follow(&context, start, &route, &limits, dt)
             };
+            if let Some(left) = climb_gap_left {
+                climb_gaps.push((entity, left));
+            }
             if motion
                 .phase
                 .contains(mint_movement::MotionPhase::TURNING_LEFT)
@@ -1748,15 +2041,20 @@ impl RotwkRules {
                 grid: &avoidance_grid,
                 ignored: Self::attack_goal(tick, ids, entity).map(|goal| MoverId(goal.index())),
             };
-            let motion = pipeline.avoid(
-                &context,
-                &agent,
-                body.0.position,
-                motion,
-                &query,
-                &mut avoid_scratch,
-                dt,
-            );
+            let motion =
+                if route.crossing_at(start.waypoint) || route.crossing_at(motion.state.waypoint) {
+                    motion
+                } else {
+                    pipeline.avoid(
+                        &context,
+                        &agent,
+                        body.0.position,
+                        motion,
+                        &query,
+                        &mut avoid_scratch,
+                        dt,
+                    )
+                };
 
             let mut arrived_state = motion.state;
             let mut reformed = reformed;
@@ -1781,12 +2079,62 @@ impl RotwkRules {
             }
             tick.state_mut()
                 .insert(ids.body, entity, Body(arrived_state))?;
+            if let Some(staged) = horde_stage {
+                staged.apply(tick, ids)?;
+            }
             if reformed {
                 self.reform_horde(tick, ids, entity)?;
             }
             self.stand(tick, ids, entity, arrived_state.position)?;
+            if route.crossing_at(motion.state.waypoint) {
+                diag!(
+                    "climb: entity {} frame {} on a portal leg: waypoint {} -> {} of {} at ({:.2}, {:.2}) -> ({:.2}, {:.2}) speed {:.1} {:?}",
+                    entity.index(),
+                    tick.frame().get(),
+                    start.waypoint,
+                    motion.state.waypoint,
+                    route.points.len(),
+                    start.position.x,
+                    start.position.y,
+                    arrived_state.position.x,
+                    arrived_state.position.y,
+                    motion.state.speed,
+                    motion.status
+                );
+            }
+            let was_climbing = tick
+                .state()
+                .get(ids.motive, entity)
+                .is_some_and(|motive| motive.0.contains(mint_movement::MotionPhase::CLIMBING));
             tick.state_mut()
                 .insert(ids.motive, entity, crate::unit::Motive(motion.phase))?;
+            let climbing = motion.phase.contains(mint_movement::MotionPhase::CLIMBING);
+            if climbing {
+                self.reveal_disguised_climber(tick, ids, entity)?;
+            }
+            if climbing != was_climbing {
+                diag!(
+                    "climb: entity {} {} a steep portal leg at frame {}, rise-leg facing {:.0} deg",
+                    entity.index(),
+                    if climbing { "starts" } else { "leaves" },
+                    tick.frame().get(),
+                    motion.state.facing.radians().to_degrees()
+                );
+                let names = vec![mint_sage_modules::effects::Name::from("CLIMBING")].into();
+                let none: std::sync::Arc<[mint_sage_modules::effects::Name]> = Vec::new().into();
+                let effect = if climbing {
+                    mint_sage_modules::effects::Effect::ModelConditions {
+                        add: names,
+                        remove: none,
+                    }
+                } else {
+                    mint_sage_modules::effects::Effect::ModelConditions {
+                        add: none,
+                        remove: names,
+                    }
+                };
+                self.apply_effects(tick, ids, vec![(entity, effect)])?;
+            }
             if !ignored_cells.is_empty() {
                 let reached_first_waypoint = route.points.first().is_some_and(|first| {
                     arrived_state.position.minus(*first).length() <= limits.capture_radius()
@@ -1803,10 +2151,27 @@ impl RotwkRules {
             match status {
                 MotionStatus::Moving => {}
                 MotionStatus::Arrived => {
-                    tick.state_mut().remove(ids.path, entity);
+                    let halted = Self::halted_on_type_seven(&route, arrived_state.waypoint);
+                    let ended = tick.state_mut().remove(ids.path, entity);
+                    if let Some(path) =
+                        ended.filter(|_| !tick.state().contains(ids.ai_busy, entity))
+                    {
+                        let goal = path.route.points.last().copied().unwrap_or(path.goal);
+                        tick.state_mut().insert(
+                            ids.order_goal,
+                            entity,
+                            crate::unit::OrderGoal(goal),
+                        )?;
+                    }
+                    if !tick.state().contains(ids.horde, entity) {
+                        self.end_factory_exit(tick, ids, entity)?;
+                    }
                     tick.state_mut().remove(ids.formation_speed, entity);
                     if tick.state().contains(ids.build_task, entity) {
                         self.begin_building(tick, ids, entity)?;
+                    }
+                    if halted {
+                        self.idle_after_type_seven(tick, ids, entity);
                     }
                 }
                 MotionStatus::Blocked => {
@@ -1815,10 +2180,88 @@ impl RotwkRules {
             }
         }
 
+        for (entity, left) in climb_gaps {
+            if let Some(horde) = tick.state_mut().get_mut(ids.horde, entity) {
+                horde.climb_gap = left;
+            }
+        }
         for entity in replan {
             self.replan_if_due(tick, ids, entity, budgets)?;
         }
         Ok(())
+    }
+
+    fn halted_on_type_seven(route: &Route, waypoint: u32) -> bool {
+        let at = usize::try_from(waypoint).unwrap_or(usize::MAX);
+        at.saturating_add(1) < route.points.len()
+            && [at, at.saturating_add(1)].iter().any(|&node| {
+                route
+                    .portals
+                    .get(node)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|tag| tag.leg == mint_movement::Leg::Halt)
+            })
+    }
+
+    fn idle_after_type_seven(&self, tick: &mut Tick<'_>, ids: Ids, entity: Entity) {
+        let world = tick.state();
+        if self.is_rampaging(world, entity)
+            || self
+                .record_of(tick, ids, entity)
+                .is_some_and(|record| record.has_kind("PROJECTILE"))
+        {
+            return;
+        }
+        let engaged = |world: &World, who: Entity| {
+            world.contains(ids.attack_order, who) || world.contains(ids.horde_target, who)
+        };
+        let container_is_horde = world.contains(ids.horde, entity);
+        let mover_engaged = engaged(world, entity);
+        let passengers: Vec<Entity> = world
+            .get(ids.passengers, entity)
+            .map(|held| held.0.clone())
+            .unwrap_or_default();
+        let idled: Vec<Entity> = passengers
+            .into_iter()
+            .filter(|passenger| {
+                halt_idles_passenger(
+                    container_is_horde,
+                    mover_engaged,
+                    world.contains(ids.horde, *passenger),
+                    engaged(world, *passenger),
+                )
+            })
+            .collect();
+        self.leave_guard(tick, ids, entity);
+        self.stop_unit(tick, ids, entity);
+        for passenger in idled {
+            self.stop_unit(tick, ids, passenger);
+        }
+    }
+
+    pub(super) fn moving_and_awaiting_path(tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
+        let world = tick.state();
+        let mut asked = entity;
+        for _ in 0..PASSENGER_ASK_DEPTH {
+            let Some(held) = world.get(ids.contained, asked) else {
+                break;
+            };
+            if world.contains(ids.horde, held.container)
+                || !world.contains(ids.body, held.container)
+            {
+                break;
+            }
+            asked = held.container;
+        }
+        if world
+            .get(ids.shape, asked)
+            .is_some_and(|shape| shape.kind_of.contains(mint_sage_asset::KindOf::IMMOBILE))
+            || world.contains(ids.path, asked)
+        {
+            return false;
+        }
+        awaiting_path(world, ids.path_queue, asked)
     }
 
     pub(super) fn coast_while_waiting(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
@@ -1865,6 +2308,79 @@ impl RotwkRules {
         Ok(())
     }
 
+    fn circling_fliers(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<Vec<(Entity, Route)>> {
+        let stale: Vec<Entity> = tick
+            .state()
+            .store(ids.maintain_point)
+            .map(|store| {
+                store
+                    .entities()
+                    .iter()
+                    .copied()
+                    .filter(|entity| {
+                        tick.state().contains(ids.path, *entity)
+                            || self.height_above_terrain(tick.state(), ids, *entity) <= 0.0
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for entity in stale {
+            tick.state_mut().remove(ids.maintain_point, entity);
+        }
+        let candidates: Vec<(Entity, f32)> = tick
+            .state()
+            .store(ids.body)
+            .map(|store| {
+                store
+                    .iter()
+                    .filter(|(entity, _)| {
+                        !tick.state().contains(ids.path, *entity)
+                            && !tick.state().contains(ids.member, *entity)
+                            && !tick.state().contains(ids.giant_bird, *entity)
+                    })
+                    .filter_map(|(entity, _)| {
+                        let kind = tick.state().get(ids.kind, entity)?;
+                        let radius = self.kinds.get(*kind)?.flight?.wings_circling?;
+                        Some((entity, radius))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut fliers = Vec::new();
+        for (entity, circling_radius) in candidates {
+            if self.height_above_terrain(tick.state(), ids, entity) <= 0.0 {
+                continue;
+            }
+            let (Some(body), Some(limits)) = (
+                tick.state().get(ids.body, entity).copied(),
+                self.current_locomotor(tick, ids, entity),
+            ) else {
+                continue;
+            };
+            let centre = match tick.state().get(ids.maintain_point, entity) {
+                Some(point) => point.0,
+                None => {
+                    tick.state_mut().insert(
+                        ids.maintain_point,
+                        entity,
+                        crate::unit::MaintainPoint(body.0.position),
+                    )?;
+                    body.0.position
+                }
+            };
+            if body.0.waypoint != 0 {
+                let mut fresh = body;
+                fresh.0.waypoint = 0;
+                tick.state_mut().insert(ids.body, entity, fresh)?;
+            }
+            fliers.push((
+                entity,
+                Route::to_point(wings_aim(centre, body.0, circling_radius, &limits)),
+            ));
+        }
+        Ok(fliers)
+    }
+
     pub(super) fn hold_still(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
         let world = tick.state();
         let waiting = world
@@ -1885,6 +2401,7 @@ impl RotwkRules {
                     .filter(|entity| {
                         !world.contains(ids.path, *entity)
                             && !world.contains(ids.member, *entity)
+                            && !world.contains(ids.maintain_point, *entity)
                             && !world.contains(ids.giant_bird, *entity)
                             && !waiting
                                 .as_ref()
@@ -1924,15 +2441,9 @@ impl RotwkRules {
         let Some(limit) = self.max_turn_without_reform(tick, ids, entity) else {
             return (state, false);
         };
-        let Some(look) = mint_movement::look_ahead(route, state, limits) else {
+        let Some(heading) = reform_heading(state, route, limits, limit) else {
             return (state, false);
         };
-        let Some(heading) = Facing::from_vector(look.point.minus(state.position)) else {
-            return (state, false);
-        };
-        if state.facing.delta_to(heading).abs() <= limit || look.path_left <= REFORM_MIN_PATH_LEFT {
-            return (state, false);
-        }
         let horse = self
             .formations
             .get(usize::from(horde.formation))
@@ -1961,11 +2472,14 @@ impl RotwkRules {
             .formations
             .get(usize::from(horde.formation))
             .is_some_and(|table| table.settings().horse);
-        if !horse || state.speed > HORSE_CREEP_BELOW * limits.max_speed {
+        if !horse
+            || !self.kind_facts(tick.state(), ids, entity).cavalry
+            || state.speed > HORSE_CREEP_BELOW * limits.max_speed
+        {
             return limits;
         }
         let Some(heading) = mint_movement::look_ahead(route, state, &limits)
-            .and_then(|look| Facing::from_vector(look.point.minus(state.position)))
+            .and_then(|look| horde_heading(state, &limits, look.point))
         else {
             return limits;
         };
@@ -1989,6 +2503,41 @@ impl RotwkRules {
         limits
     }
 
+    fn climbers_wait(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        mut limits: MotionLimits,
+    ) -> (MotionLimits, Option<f32>) {
+        let Some(gap) = tick
+            .state()
+            .get(ids.horde, entity)
+            .map(|horde| horde.climb_gap)
+        else {
+            return (limits, None);
+        };
+        if !self
+            .kinematics_of(tick, ids, entity)
+            .is_some_and(|kinematics| kinematics.scales_walls)
+        {
+            return (limits, None);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let hz = crate::game_data::RETAIL_LOGIC_HZ as f32;
+        let radius = self.pusher_radius(tick.state(), ids, entity);
+        let desired = limits.desired_speed.min(limits.max_speed);
+        let (per_frame, left) = crate::horde_climb::waits_for_climbers(desired / hz, radius, gap);
+        if left == gap {
+            return (limits, None);
+        }
+        limits.desired_speed = per_frame * hz;
+        let frame_due = tick.frame().get()
+            % u64::from(mint_sim::SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ)
+            == 0;
+        (limits, frame_due.then_some(left))
+    }
+
     fn max_turn_without_reform(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> Option<f32> {
         self.kinematics_of(tick, ids, entity)?
             .max_turn_without_reform
@@ -2009,6 +2558,41 @@ impl RotwkRules {
             })
     }
 
+    fn quick_route(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        from: Vec2,
+        to: Vec2,
+    ) -> Route {
+        let mut route = Route {
+            points: vec![from, to],
+            extra_distance: 0.0,
+            unsearched: false,
+            portals: vec![None, None],
+        };
+        if let Some(departure) = self.departure(tick, ids, entity) {
+            let view = self.dynamic_view(tick, ids);
+            let mover = self.mover_class(tick, ids, entity);
+            let clear = |point: Vec2| {
+                self.passability
+                    .cell_at(point)
+                    .is_some_and(|cell| view.is_passable(cell, mover))
+            };
+            let line_clear =
+                |a: Vec2, b: Vec2| match (self.passability.cell_at(a), self.passability.cell_at(b))
+                {
+                    (Some(a), Some(b)) => {
+                        mint_movement::smoothing::line_is_passable(&view, mover, a, b)
+                    }
+                    _ => false,
+                };
+            mint_movement::following::depart(&mut route, departure, clear, line_clear);
+        }
+        route
+    }
+
     pub(super) fn departure(
         &self,
         tick: &Tick<'_>,
@@ -2018,7 +2602,15 @@ impl RotwkRules {
         let radii = self.kinematics_of(tick, ids, entity)?.departure;
         let body = tick.state().get(ids.body, entity)?.0;
         let fast = body.speed > 0.25 * self.mover_limits(tick, ids, entity).max_speed;
+        let pass_first = tick
+            .state()
+            .get(ids.kind, entity)
+            .and_then(|kind| self.kinds.get(*kind))
+            .and_then(|entry| entry.flight)
+            .is_some_and(|flight| matches!(flight.height, mint_movement::HeightRule::Unchanged));
         Some(mint_movement::Departure {
+            pass_first,
+            backing: radii.backs_out.then(|| radii.slow.max(radii.fast)),
             heading: body.facing,
             radius: if fast { radii.fast } else { radii.slow },
             max_turn: if fast {
@@ -2186,6 +2778,7 @@ impl RotwkRules {
         let owner = world.get(ids.owner, entity).map(|owner| owner.0);
         self.restriction(world, ids)
             .apply(terrain.asking(mint_sage_passability::PORTAL, asker), owner)
+            .passing(self.portal_pass_in(world, ids, entity))
     }
 
     pub(crate) fn selection_reaches(&self, world: &World, player: PlayerId, at: Vec2) -> bool {
@@ -2228,9 +2821,58 @@ impl RotwkRules {
             })
     }
 
+    pub(super) fn stepped_back(&self, request: &PathRequest) -> PathRequest {
+        use mint_movement::Passability as _;
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        if self
+            .passability
+            .grid
+            .is_passable(request.goal, request.mover)
+        {
+            return *request;
+        }
+        let from = geometry.centre_of(request.start);
+        let to = geometry.centre_of(request.goal);
+        let along = to.minus(from);
+        let length = along.length();
+        let Some(unit) = along.normalised() else {
+            return *request;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let steps =
+            (((length / CLOSEST_STEP_BACK).floor() as i32) - 1).clamp(0, CLOSEST_STEP_BACK_MAX);
+        for step in 1..=steps {
+            #[allow(clippy::cast_precision_loss)]
+            let point = to.minus(unit.scale(CLOSEST_STEP_BACK * step as f32));
+            let Some(cell) = geometry.cell_at(point, 0, extent) else {
+                continue;
+            };
+            if self.passability.grid.is_passable(cell, request.mover)
+                && self.reachable(request.mover, request.start, cell)
+            {
+                return PathRequest {
+                    goal: cell,
+                    ..*request
+                };
+            }
+        }
+        *request
+    }
+
     pub(super) fn reachable(&self, mover: MoverClass, from: Cell, to: Cell) -> bool {
         let reachability = self.reachability.borrow();
-        reachability.mover() != mover.terrain() || reachability.same_component(from, to)
+        reachability.mover() != mover.terrain()
+            || reachability.joined_by(from, to, &self.portal_links.borrow(), mover.portal_pass)
+    }
+
+    pub(super) fn sync_portal_links(&self, tick: &Tick<'_>, ids: Ids) {
+        let links = crate::portals::links_of(tick.state(), ids.portals);
+        let mut held = self.portal_links.borrow_mut();
+        if held.as_slice() != links {
+            held.clear();
+            held.extend_from_slice(links);
+        }
     }
 
     pub(super) fn climbs_walls(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
@@ -2440,8 +3082,8 @@ impl RotwkRules {
         let rule = self
             .flight_profile(tick, ids, entity)
             .map_or(HeightRule::ON_SURFACE, |flight| flight.height);
-        match tick.state().get(ids.flight_level, entity) {
-            Some(level) => rule.at_level(level.0).undamped(),
+        match tick.state().get(ids.attack_phase, entity) {
+            Some(held) => rule.at_level(held.level),
             None => rule,
         }
     }
@@ -2459,140 +3101,69 @@ impl RotwkRules {
             .and_then(|entry| entry.flight)
     }
 
-    fn step_flight_level(
+    fn step_attack_height(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         entity: Entity,
         position: Vec2,
     ) -> Result<()> {
-        let Some(flight) = self.flight_profile(tick, ids, entity) else {
+        let flight = self.flight_profile(tick, ids, entity);
+        let blends = flight.is_some_and(|flight| {
+            flight.attack_height > 0.0
+                && flight.circling_radius > 0.0
+                && flight.height.damping().is_some()
+        });
+        let world = tick.state();
+        let dead = world.contains(ids.doomed, entity)
+            || world.get(ids.health, entity).is_some_and(|h| h.0.is_dead());
+        let (Some(flight), true, false) = (flight, blends, dead) else {
+            tick.state_mut().remove(ids.attack_phase, entity);
             return Ok(());
         };
-        let Some(dive) = flight.dive else {
-            return Ok(());
-        };
-        let own = flight.height.level();
-        let current = tick
-            .state()
-            .get(ids.flight_level, entity)
-            .map_or(own, |level| level.0);
-        let limits = self.mover_limits(tick, ids, entity);
-        let target = self.dive_target(tick, ids, entity, position, dive.reach);
-        let goal = if target.is_some() { dive.level } else { own };
-        if current.to_bits() == goal.to_bits() {
-            return self.set_flight_pose(tick, ids, entity, current, current);
-        }
-        let step = match target {
-            _ if limits.turn_circle.is_some() => {
-                dive.slope * self.flown_this_tick(tick, ids, entity)
-            }
-            _ => {
-                #[allow(clippy::cast_precision_loss)]
-                let per_tick = limits.max_speed / SIMULATION_HZ as f32;
-                let slope_step = dive.slope * per_tick;
-                match target {
-                    Some((approach, _)) if goal < current && per_tick > 0.0 => {
-                        let ticks = if approach > 0.0 {
-                            (approach / per_tick).max(1.0)
-                        } else {
-                            DIVE_EASE_TICKS
-                        };
-                        slope_step.max((current - goal) / ticks)
-                    }
-                    _ => slope_step,
-                }
-            }
-        };
-        let next = mint_movement::step_level(current, goal, step);
-        self.set_flight_pose(tick, ids, entity, current, next)?;
-        diag!(
-            "height: {} {} at frame {} level={next:.1} goal={goal:.1}",
-            entity.index(),
-            if goal < current { "dives" } else { "climbs" },
-            tick.frame().get()
+        let world = tick.state();
+        let held = world.get(ids.attack_phase, entity).copied();
+        let armed = world.get(ids.armed, entity).copied();
+        let target = Self::attack_goal(tick, ids, entity).or(armed.and_then(|armed| armed.target));
+        let aim = world
+            .get(ids.path, entity)
+            .map(|path| path.goal)
+            .or_else(|| target.and_then(|t| world.get(ids.body, t).map(|b| b.0.position)));
+        let fired = armed.is_some_and(|armed| {
+            let mut state = armed.state;
+            state.status(tick.frame()) != mint_sage_combat::WeaponStatus::ReadyToFire
+        });
+        let ground = self
+            .passability
+            .heights
+            .height_at_point(position)
+            .unwrap_or(0.0);
+        let phase = held.map_or(mint_movement::AttackPhase::Cruise, |held| held.phase);
+        let (next, level) = mint_movement::attack_height(
+            phase,
+            mint_movement::AttackHeightInput {
+                preferred: flight.height.level(),
+                attack: flight.attack_height,
+                circling_radius: flight.circling_radius,
+                distance: aim.map_or(f32::INFINITY, |aim| aim.minus(position).length()),
+                above: world
+                    .get(ids.elevation, entity)
+                    .map_or(0.0, |elevation| elevation.0 - ground),
+                armed: armed.is_some(),
+                attacking: target.is_some(),
+                fired,
+            },
         );
-        if next.to_bits() == own.to_bits() {
-            tick.state_mut().remove(ids.flight_level, entity);
+        if next == mint_movement::AttackPhase::Cruise {
+            tick.state_mut().remove(ids.attack_phase, entity);
         } else {
-            tick.state_mut()
-                .insert(ids.flight_level, entity, FlightLevel(next))?;
+            tick.state_mut().insert(
+                ids.attack_phase,
+                entity,
+                AttackHeight { phase: next, level },
+            )?;
         }
         Ok(())
-    }
-
-    fn set_flight_pose(
-        &self,
-        tick: &mut Tick<'_>,
-        ids: Ids,
-        entity: Entity,
-        current: f32,
-        next: f32,
-    ) -> Result<()> {
-        let climbing = next > current;
-        if climbing == self.holds_model_condition(tick, entity, CLIMBING) {
-            return Ok(());
-        }
-        if climbing {
-            self.set_conditions(tick, ids, entity, &[CLIMBING], &[])
-        } else {
-            self.set_conditions(tick, ids, entity, &[], &[CLIMBING])
-        }
-    }
-
-    fn flown_this_tick(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> f32 {
-        #[allow(clippy::cast_precision_loss)]
-        let hz = SIMULATION_HZ as f32;
-        tick.state()
-            .get(ids.body, entity)
-            .map_or(0.0, |body| body.0.speed.max(0.0))
-            / hz
-    }
-
-    pub(super) fn down_from_dive(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
-        let Some(dive) = self
-            .flight_profile(tick, ids, entity)
-            .and_then(|flight| flight.dive)
-        else {
-            return true;
-        };
-        tick.state()
-            .get(ids.flight_level, entity)
-            .is_some_and(|level| level.0 <= dive.level + DIVE_DOWN_TOLERANCE)
-    }
-
-    fn dive_target(
-        &self,
-        tick: &Tick<'_>,
-        ids: Ids,
-        entity: Entity,
-        position: Vec2,
-        reach: f32,
-    ) -> Option<(f32, Vec2)> {
-        let armed = tick.state().get(ids.armed, entity)?;
-        let weapon = self
-            .combat
-            .weapons
-            .get(armed.weapon)
-            .filter(|weapon| weapon.can_swoop)?;
-        let target = Self::attack_goal(tick, ids, entity)
-            .or(armed.target)
-            .filter(|target| !self.is_unattackable(tick.state(), ids, *target))?;
-        let body = tick.state().get(ids.body, target)?;
-        let offset = body.0.position.minus(position);
-        let distance = offset.length();
-        if distance > reach {
-            return None;
-        }
-        let radius = |of: Entity| {
-            tick.state()
-                .get(ids.shape, of)
-                .map_or(0.0, |shape| shape.radius)
-        };
-        Some((
-            (distance - weapon.attack_range - radius(entity) - radius(target)).max(0.0),
-            offset,
-        ))
     }
 
     pub(super) fn feet(world: &World, ids: Ids, entity: Entity) -> f32 {
@@ -2648,7 +3219,9 @@ impl RotwkRules {
         });
         let target = match rule {
             HeightRule::Surface { above, .. } => surface.or(ground).map(|s| s + above),
-            HeightRule::Fixed { height, .. } => Some(height),
+            HeightRule::Fixed { height, .. } => {
+                Some(height + self.structure_top_beside(tick, ids, entity, position))
+            }
             HeightRule::Unchanged => surface
                 .or(ground)
                 .map(|floor| previous.map_or(floor, |z| z.max(floor))),
@@ -2657,8 +3230,20 @@ impl RotwkRules {
             return Ok(None);
         };
         let mut stepped = None;
+        let fall = self.dead_flier_fall(tick, ids, entity, rule);
         let z = match (rule.damping(), previous) {
             (Some(_), None) => ground,
+            (Some(_), Some(current)) if fall.is_some() => {
+                let (step, splats) = fall.unwrap_or_default();
+                let floor = surface.unwrap_or(ground);
+                let next = (current + step).max(floor);
+                stepped = Some((next - current) * f32::from(Self::ticks_per_retail_frame()));
+                if splats && current <= floor && !self.holds_model_condition(tick, entity, SPLATTED)
+                {
+                    self.set_conditions(tick, ids, entity, &[SPLATTED], &[])?;
+                }
+                next
+            }
             (Some(share), Some(current)) => {
                 let ticks = u16::try_from(
                     mint_sim::SIMULATION_HZ
@@ -2697,7 +3282,11 @@ impl RotwkRules {
                 layer_height
             }
         } else if current_z > z {
-            Self::horde_member_height(tick, ids, entity, layer, current_z, z)
+            if !is_member && self.holds_above_layer(tick, ids, entity, layer, current_z, z) {
+                current_z
+            } else {
+                Self::horde_member_height(tick, ids, entity, layer, current_z, z)
+            }
         } else {
             z
         };
@@ -2715,6 +3304,82 @@ impl RotwkRules {
             }
         }
         Ok(Some((z, ground)))
+    }
+
+    fn structure_top_beside(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        position: Vec2,
+    ) -> f32 {
+        if !self
+            .flight_profile(tick, ids, entity)
+            .is_some_and(|flight| flight.over_structures)
+        {
+            return 0.0;
+        }
+        let world = tick.state();
+        let Some(shapes) = world.store(ids.shape) else {
+            return 0.0;
+        };
+        shapes
+            .iter()
+            .filter(|(other, shape)| {
+                *other != entity && shape.kind_of.contains(mint_sage_asset::KindOf::STRUCTURE)
+            })
+            .filter_map(|(other, shape)| {
+                let at = world.get(ids.body, other)?.0.position;
+                (at.minus(position).length() - shape.radius <= STRUCTURE_SCAN_RANGE)
+                    .then_some(shape.height)
+            })
+            .fold(0.0, f32::max)
+    }
+
+    fn holds_above_layer(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        layer: crate::wall_layer::Layer,
+        current_z: f32,
+        layer_height: f32,
+    ) -> bool {
+        let retail_frame = tick.frame().get() / u64::from(Self::ticks_per_retail_frame());
+        no_z_holds_height(layer, current_z - layer_height, retail_frame)
+            && self
+                .flight_profile(tick, ids, entity)
+                .is_some_and(|flight| flight.no_z_motive_force)
+    }
+
+    fn ticks_per_retail_frame() -> u16 {
+        u16::try_from(
+            mint_sim::SIMULATION_HZ
+                .checked_div(crate::game_data::RETAIL_LOGIC_HZ)
+                .unwrap_or(1),
+        )
+        .unwrap_or(1)
+    }
+
+    fn dead_flier_fall(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        rule: HeightRule,
+    ) -> Option<(f32, bool)> {
+        let world = tick.state();
+        let dead = world.contains(ids.doomed, entity)
+            || world.get(ids.health, entity).is_some_and(|h| h.0.is_dead());
+        if !dead || rule.damping().is_none() {
+            return None;
+        }
+        let flight = self.flight_profile(tick, ids, entity)?;
+        if !flight.works_when_dead {
+            return None;
+        }
+        let ticks = f32::from(Self::ticks_per_retail_frame());
+        Some((self.gravity * ticks, flight.attack_height > 0.0))
     }
 
     fn horde_member_height(
@@ -2783,7 +3448,7 @@ impl RotwkRules {
                     .map(|e| e.0.to_bits()),
                 tick.state().get(ids.layer, entity).copied(),
             );
-            self.step_flight_level(tick, ids, entity, position)?;
+            self.step_attack_height(tick, ids, entity, position)?;
             let Some((z, ground)) = self.stand(tick, ids, entity, position)? else {
                 continue;
             };
@@ -2821,7 +3486,7 @@ impl RotwkRules {
             && memo.y == position.y.to_bits()
             && world.get(ids.layer, entity) == Some(&memo.layer)
             && world.get(ids.kind, entity) == Some(&memo.kind)
-            && !world.contains(ids.flight_level, entity)
+            && !world.contains(ids.attack_phase, entity)
             && Self::horde_inputs(world, ids, entity)
                 == (memo.horde, memo.horde_layer, memo.glided, memo.path)
     }
@@ -2862,10 +3527,10 @@ impl RotwkRules {
         let unchanged = world.get(ids.elevation, entity).map(|e| e.0.to_bits()) == Some(z)
             && world.get(ids.layer, entity) == Some(&layer);
         if !unchanged
-            || world.contains(ids.flight_level, entity)
+            || world.contains(ids.attack_phase, entity)
             || self
                 .flight_profile(tick, ids, entity)
-                .is_some_and(|flight| flight.dive.is_some() || flight.height.damping().is_some())
+                .is_some_and(|flight| flight.height.damping().is_some())
         {
             return;
         }
@@ -2969,6 +3634,120 @@ impl RotwkRules {
                     speed: slowest,
                     group,
                 },
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn cohere_move_speed_banded(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        movers: &[Entity],
+    ) -> Result<()> {
+        let any_moving = movers.iter().any(|mover| {
+            tick.state().contains(ids.path, *mover)
+                || Self::attack_goal(tick, ids, *mover).is_some()
+        });
+        if movers.len() <= 1 || !any_moving {
+            return Ok(());
+        }
+        for mover in movers {
+            tick.state_mut().remove(ids.formation_speed, *mover);
+        }
+        let Some(&lead) = movers.first() else {
+            return Ok(());
+        };
+        let point = |entity: Entity| -> Option<(Vec2, f32)> {
+            let at = tick.state().get(ids.body, entity)?.0.position;
+            Some((at, Self::feet(tick.state(), ids, entity)))
+        };
+        let target = Self::attack_goal(tick, ids, lead)
+            .and_then(point)
+            .or_else(|| {
+                let goal = tick.state().get(ids.path, lead)?.goal;
+                Some((goal, point(lead)?.1))
+            });
+        let class_of = |mover: Entity| -> u8 {
+            let range = tick
+                .state()
+                .get(ids.horde, mover)
+                .and_then(|horde| self.horde_max_range(tick, ids, horde))
+                .or_else(|| {
+                    let armed = tick.state().get(ids.armed, mover)?;
+                    let template = self.combat.weapons.get(armed.weapon)?;
+                    Some(self.attack_range_of(tick.state(), ids, mover, template))
+                })
+                .unwrap_or(100.0);
+            if range < 100.0 {
+                0
+            } else if range < 450.0 {
+                1
+            } else {
+                2
+            }
+        };
+        let distance_squared = |mover: Entity, to: (Vec2, f32)| -> f32 {
+            point(mover).map_or(f32::INFINITY, |(at, z)| {
+                let dz = z - to.1;
+                at.minus(to.0).length_squared() + dz * dz
+            })
+        };
+        let lead_class = i32::from(class_of(lead));
+        let radii = |mover: Entity, to: (Vec2, f32)| {
+            ring_radii(
+                distance_squared(lead, to).sqrt(),
+                lead_class,
+                i32::from(class_of(mover)),
+            )
+        };
+        let past_ring = |mover: Entity| -> bool {
+            target.is_some_and(|to| {
+                mover != lead && {
+                    let outer = radii(mover, to).1;
+                    distance_squared(mover, to) > outer * outer
+                }
+            })
+        };
+        let mut slowest = f32::INFINITY;
+        for mover in movers {
+            let speed = self.mover_limits(tick, ids, *mover).max_speed;
+            if !(speed.is_finite() && speed > 0.0) {
+                continue;
+            }
+            let offered = if past_ring(*mover) {
+                speed * PAST_RING_SPEED
+            } else {
+                speed
+            };
+            slowest = slowest.min(offered);
+        }
+        if !slowest.is_finite()
+            || movers
+                .iter()
+                .any(|mover| self.has_near_victim(tick, ids, *mover))
+        {
+            return Ok(());
+        }
+        let caps: Vec<(Entity, f32)> = movers
+            .iter()
+            .filter_map(|mover| {
+                let Some(to) = target.filter(|_| *mover != lead) else {
+                    return Some((*mover, slowest));
+                };
+                let rings = radii(*mover, to);
+                banded_cap(distance_squared(*mover, to), rings, slowest).map(|cap| (*mover, cap))
+            })
+            .collect();
+        let group = crate::unit::CommandGroup {
+            issued: tick.frame(),
+            first: lead,
+        };
+        for (mover, speed) in caps {
+            tick.state_mut().insert(
+                ids.formation_speed,
+                mover,
+                crate::unit::FormationSpeed { speed, group },
             )?;
         }
         Ok(())
@@ -3107,14 +3886,19 @@ impl RotwkRules {
     ) -> crate::unit::ChargeState {
         let world = tick.state();
         let attacking = Self::is_attacking(world, ids, entity);
-        let ability = world.get(ids.power_book, entity).is_some_and(|book| {
+        let ability = self.owns_charge_attack(world, ids, entity)
+            && self.holds_condition(tick, entity, "CHARGING");
+        crate::unit::ChargeState { attacking, ability }
+    }
+
+    pub(super) fn owns_charge_attack(&self, world: &World, ids: Ids, entity: Entity) -> bool {
+        world.get(ids.power_book, entity).is_some_and(|book| {
             book.0.iter().any(|instance| {
                 self.power_cast_rules
                     .get(usize::from(instance.power.get()))
                     .is_some_and(|rule| rule.charge_attack)
             })
-        }) && self.holds_condition(tick, entity, "CHARGING");
-        crate::unit::ChargeState { attacking, ability }
+        })
     }
 
     pub(super) fn turn_towards(
@@ -3170,7 +3954,13 @@ impl RotwkRules {
         if pipeline.config() != config {
             *pipeline = Pipeline::new(config);
         }
-        pipeline.plan(grid, geometry, request, budget)
+        let spent = budget.spent();
+        let outcome = pipeline.plan(grid, geometry, request, budget);
+        crate::perf::count(
+            crate::perf::sub_row!("path_expanded"),
+            usize::try_from(budget.spent().saturating_sub(spent)).unwrap_or(usize::MAX),
+        );
+        outcome
     }
 
     pub(super) fn replan_if_due(
@@ -3183,6 +3973,9 @@ impl RotwkRules {
         let Some(path) = tick.state().get(ids.path, entity).cloned() else {
             return Ok(());
         };
+        if Self::on_portal_leg(tick.state(), ids, entity) {
+            return Ok(());
+        }
         let now = tick.frame();
         let is_head = budgets.is_head(entity);
         let due = tick
@@ -3214,10 +4007,7 @@ impl RotwkRules {
         let Some(goal_cell) = exact_goal.or_else(|| self.passability.cell_at(path.goal)) else {
             return Ok(());
         };
-        if exact_goal.is_some() && !self.reachable(mover, start, goal_cell) {
-            self.note_path_failure(tick, ids, entity)?;
-            return Ok(());
-        }
+        let prune = exact_goal.is_some() && !self.reachable(mover, start, goal_cell);
         let request = PathRequest {
             start,
             goal: goal_cell,
@@ -3226,6 +4016,9 @@ impl RotwkRules {
             origin: Some(body.0.position),
             corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
             departure: self.departure(tick, ids, entity),
+            approach: None,
+            prune,
+            final_goal: true,
         };
         let ground = self.dynamic_view(tick, ids);
         let costs = self
@@ -3240,21 +4033,31 @@ impl RotwkRules {
                 entity.index()
             ),
         };
+        let site = crate::perf::sub(crate::perf::sub_row!("path_site_move"));
         let outcome = if exact_goal.is_some() {
             self.plan_path(modes.config(), &view, &request, budget)
                 .map_err(planning_error)?
         } else {
             let mut whole = NodeBudget::new(PATH_NODE_BUDGET);
             Pipeline::new(modes.config())
-                .plan_closest(&view, self.passability.geometry, &request, &mut whole)
+                .plan_closest_accepting(
+                    &view,
+                    self.passability.geometry,
+                    &self.stepped_back(&request),
+                    &mut whole,
+                    &self.footprint_accepts(tick, ids, entity),
+                    0.0,
+                )
                 .map_err(planning_error)?
         };
+        drop(site);
         match outcome {
             PlanOutcome::Ready(plan) => {
                 Self::clear_path_retry(tick, ids, entity);
                 let mut state = body.0;
                 state.waypoint = 0;
                 tick.state_mut().insert(ids.body, entity, Body(state))?;
+                let points = plan.route.points.clone();
                 tick.state_mut().insert(
                     ids.path,
                     entity,
@@ -3265,6 +4068,8 @@ impl RotwkRules {
                         facing: path.facing,
                     },
                 )?;
+                let mut replanned = Pipeline::new(modes.config());
+                self.move_allies(tick, ids, &mut replanned, entity, &points)?;
             }
             PlanOutcome::Closest(plan) => {
                 Self::clear_path_retry(tick, ids, entity);
@@ -3272,6 +4077,7 @@ impl RotwkRules {
                 state.waypoint = 0;
                 tick.state_mut().insert(ids.body, entity, Body(state))?;
                 let goal = plan.route.points.last().copied().unwrap_or(path.goal);
+                let points = plan.route.points.clone();
                 tick.state_mut().insert(
                     ids.path,
                     entity,
@@ -3282,6 +4088,8 @@ impl RotwkRules {
                         facing: path.facing,
                     },
                 )?;
+                let mut replanned = Pipeline::new(modes.config());
+                self.move_allies(tick, ids, &mut replanned, entity, &points)?;
             }
             PlanOutcome::BudgetExhausted => {
                 if is_head {
@@ -3393,12 +4201,28 @@ impl RotwkRules {
         tick.state_mut().remove(ids.path_retry, entity);
     }
 
+    pub(super) fn on_portal_leg(world: &mint_sim::World, ids: Ids, entity: Entity) -> bool {
+        let (Some(path), Some(body)) = (world.get(ids.path, entity), world.get(ids.body, entity))
+        else {
+            return false;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let distance = (body.0.speed.max(0.0) / crate::game_data::RETAIL_LOGIC_HZ as f32).max(0.1);
+        let (_, waypoint) = path
+            .route
+            .place_along(body.0.position, body.0.waypoint, distance);
+        path.route.tagged_at(waypoint)
+    }
+
     pub(super) fn enqueue_path_request(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         entity: Entity,
     ) -> Result<()> {
+        if Self::on_portal_leg(tick.state(), ids, entity) {
+            return Ok(());
+        }
         let Some(clock_entity) = tick
             .state()
             .store(ids.path_queue)
@@ -3416,6 +4240,7 @@ impl RotwkRules {
     }
 
     pub(super) fn advance_members(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
+        self.advance_portal_walkers(tick, ids)?;
         let modes = self.modes(tick, ids);
         if modes.formation != FormationMode::On {
             return Ok(());
@@ -3435,7 +4260,19 @@ impl RotwkRules {
         if let Some(store) = tick.state().store(ids.contained) {
             held_elsewhere.extend(store.entities().iter().copied());
         }
-        held_elsewhere.extend(Self::backing_members(tick.state(), ids));
+        held_elsewhere.extend(self.backing_members(tick.state(), ids));
+        if let Some(store) = tick.state().store(ids.production_stream) {
+            for (horde, stream) in store.iter() {
+                let no_exit_path = tick
+                    .state()
+                    .get(ids.kind, stream.source)
+                    .and_then(|kind| self.kinds.get(*kind))
+                    .is_some_and(|entry| entry.record.no_exit_path);
+                if let Some(contain) = tick.state().get(ids.horde, horde).filter(|_| no_exit_path) {
+                    held_elsewhere.extend(contain.members.iter().copied());
+                }
+            }
+        }
         let horde_of = |member: &Entity| tick.state().get(ids.member, *member).map(|m| m.horde);
         let mut touched: BTreeSet<Entity> = tick
             .state()
@@ -3465,8 +4302,9 @@ impl RotwkRules {
             })
             .unwrap_or_default();
         touched.extend(attacking.iter().filter_map(horde_of));
-        let reachability = self.reachability.borrow();
-        let reachability_extra = self.reachability_extra.borrow();
+        let backing = self.backing_hordes(tick.state(), ids);
+        let orders = self.formation_orders(tick.state(), ids);
+        touched.extend(orders.keys().copied());
         let (stragglers, porcupine_arrivals, oath_effects) = crate::horde::advance_members(
             tick,
             Self::horde_ids(ids),
@@ -3475,6 +4313,7 @@ impl RotwkRules {
             self.passability.geometry,
             Self::tick_seconds(),
             &crate::horde::PassInputs {
+                orders: &orders,
                 held_elsewhere: &held_elsewhere,
                 touched: &touched,
                 attacking: &attacking,
@@ -3482,10 +4321,9 @@ impl RotwkRules {
                 formations: &self.formations,
                 extent: self.passability.grid.extent(),
                 heights: &self.passability.heights,
-                reachability: &reachability,
-                reachability_extra: &reachability_extra,
                 model_conditions: self.modules.as_ref().map(|wiring| wiring.state),
                 restriction: self.restriction(tick.state(), ids),
+                backing: &backing,
             },
         )?;
         let mut effects = porcupine_arrivals
@@ -3654,14 +4492,7 @@ impl RotwkRules {
                 ) else {
                     continue;
                 };
-                if !self.reachable(mover, start, goal_cell) {
-                    if straggler.place_on_failure {
-                        placed.push((straggler.member, straggler.rescue_target));
-                    } else {
-                        failed.push(straggler.member);
-                    }
-                    continue;
-                }
+                let prune = !self.reachable(mover, start, goal_cell);
                 let request = PathRequest {
                     start,
                     goal: goal_cell,
@@ -3670,7 +4501,11 @@ impl RotwkRules {
                     origin: Some(body.0.position),
                     corner_radius: self.mover_limits(tick, ids, straggler.member).corner_radius,
                     departure: self.departure(tick, ids, straggler.member),
+                    approach: None,
+                    prune,
+                    final_goal: true,
                 };
+                let _site = crate::perf::sub(crate::perf::sub_row!("path_site_rescue"));
                 let outcome = self
                     .plan_path(config, &view, &request, budget)
                     .map_err(|e| mint_sim::Error::Rules {
@@ -3725,8 +4560,228 @@ const HORDE_THROW_SHARE: f32 = 0.3;
 
 const MELEE_HORDE_APPROACH_EXTRA: f32 = 100.0;
 
+pub(super) const SQUISH_PATH_EXTRA: f32 = 50.0;
+
 const HORSE_CREEP_BELOW: f32 = 0.25;
 
 const HORSE_CREEP_SHARE: f32 = 0.1;
 
 const REFORM_MIN_PATH_LEFT: f32 = 20.0;
+
+const PAST_RING_SPEED: f32 = 0.769;
+const INSIDE_RING_SHARE: f32 = 0.7;
+const RING_WIDTH: f32 = 75.0;
+
+fn ring_radii(d: f32, lead_class: i32, class: i32) -> (f32, f32) {
+    #[allow(clippy::cast_precision_loss)]
+    let inner = (d + 100.0 * (class - lead_class) as f32).max(0.0);
+    let outer = if lead_class == 2 && class == 1 {
+        d - 25.0
+    } else {
+        (inner + RING_WIDTH).max(0.0)
+    };
+    (inner, outer)
+}
+
+fn banded_cap(d2: f32, (inner, outer): (f32, f32), slowest: f32) -> Option<f32> {
+    if d2 > outer * outer {
+        None
+    } else if d2 < inner * inner {
+        Some(slowest * INSIDE_RING_SHARE)
+    } else {
+        Some(slowest)
+    }
+}
+
+fn horde_heading(state: MoverState, limits: &MotionLimits, point: Vec2) -> Option<Facing> {
+    let backing = if state.speed > 0.0 {
+        state.ramp.backing && limits.backs
+    } else {
+        limits.backs
+    };
+    let toward = point.minus(state.position);
+    Facing::from_vector(if backing { toward.scale(-1.0) } else { toward })
+}
+
+fn reform_heading(
+    state: MoverState,
+    route: &Route,
+    limits: &MotionLimits,
+    limit: f32,
+) -> Option<Facing> {
+    let look = mint_movement::look_ahead(route, state, limits)?;
+    if route.tagged_at(look.waypoint) {
+        return None;
+    }
+    let heading = horde_heading(state, limits, look.point)?;
+    (state.facing.delta_to(heading).abs() > limit && look.path_left > REFORM_MIN_PATH_LEFT)
+        .then_some(heading)
+}
+
+#[cfg(test)]
+mod banded_tests {
+    use super::*;
+
+    #[test]
+    fn a_member_is_capped_by_its_ring_round_the_leads_distance() {
+        let rings = ring_radii(300.0, 1, 1);
+        let cap = |d: f32| banded_cap(d * d, rings, 60.0);
+        assert_eq!(cap(200.0), Some(60.0 * INSIDE_RING_SHARE));
+        assert_eq!(cap(340.0), Some(60.0));
+        assert_eq!(cap(400.0), None);
+    }
+}
+
+pub(crate) fn awaiting_path(
+    world: &mint_sim::World,
+    queue: ComponentId<PathQueue>,
+    entity: Entity,
+) -> bool {
+    world.store(queue).is_some_and(|store| {
+        store
+            .iter()
+            .any(|(_, queue)| queue.iter().any(|waiting| waiting == entity))
+    })
+}
+
+#[cfg(test)]
+mod reform_tests {
+    use super::*;
+    use mint_movement::{Leg, Portal};
+
+    const LIMIT: f32 = 0.785;
+
+    fn heading(
+        facing: Facing,
+        speed: f32,
+        ramp_backing: bool,
+        backs: bool,
+        portal: bool,
+    ) -> Option<Facing> {
+        let mut state = MoverState::new(Vec2::ZERO, facing);
+        state.speed = speed;
+        state.ramp.backing = ramp_backing;
+        let route = Route {
+            points: vec![Vec2::new(100.0, 0.0), Vec2::new(200.0, 0.0)],
+            extra_distance: 0.0,
+            unsearched: false,
+            portals: vec![
+                portal.then(|| Portal {
+                    leg: Leg::Walk,
+                    ..Portal::new(1, 7)
+                }),
+                None,
+            ],
+        };
+        let limits = MotionLimits {
+            backs,
+            ..crate::unit::PLACEHOLDER_LIMITS
+        };
+        reform_heading(state, &route, &limits, LIMIT)
+    }
+
+    #[test]
+    fn no_reform_on_a_portal_node() {
+        assert!(heading(
+            Facing::from_radians(core::f32::consts::FRAC_PI_2),
+            0.0,
+            false,
+            false,
+            false
+        )
+        .is_some());
+        assert!(heading(
+            Facing::from_radians(core::f32::consts::FRAC_PI_2),
+            0.0,
+            false,
+            false,
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_backing_horde_reforms_to_the_mirrored_heading() {
+        let west = Facing::from_radians(core::f32::consts::PI);
+        assert!(heading(west, 0.0, false, true, false).is_none());
+        let snapped = heading(Facing::EAST, 0.0, false, true, false).unwrap();
+        assert!(snapped.to_vector().x < -0.99);
+        assert!(heading(west, 5.0, false, true, false).is_some());
+        assert!(heading(west, 5.0, true, true, false).is_none());
+        assert!(heading(west, 5.0, true, false, false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+    use mint_movement::{Leg, Portal};
+
+    #[test]
+    fn only_a_type_seven_leg_short_of_the_end_is_a_halt() {
+        let tagged = |leg| Portal {
+            leg,
+            ..Portal::new(1, 7)
+        };
+        let route = |leg, last: bool| Route {
+            points: vec![Vec2::ZERO; 4],
+            extra_distance: 0.0,
+            unsearched: false,
+            portals: vec![None, Some(tagged(leg)), None, last.then(|| tagged(leg))],
+        };
+        assert!(RotwkRules::halted_on_type_seven(
+            &route(Leg::Halt, false),
+            1
+        ));
+        assert!(!RotwkRules::halted_on_type_seven(
+            &route(Leg::Walk, false),
+            1
+        ));
+        assert!(!RotwkRules::halted_on_type_seven(
+            &route(Leg::Halt, false),
+            3
+        ));
+    }
+}
+
+fn halt_idles_passenger(
+    container_is_horde: bool,
+    mover_engaged: bool,
+    passenger_is_horde: bool,
+    passenger_engaged: bool,
+) -> bool {
+    (!container_is_horde || mover_engaged) && (!passenger_is_horde || passenger_engaged)
+}
+
+#[cfg(test)]
+mod halt_gate_tests {
+    use super::halt_idles_passenger as idles;
+
+    #[test]
+    fn the_halt_idles_passengers_by_the_retail_gates() {
+        assert!(idles(false, false, false, false));
+        assert!(!idles(true, false, false, false));
+        assert!(idles(true, true, false, false));
+        assert!(!idles(false, false, true, false));
+        assert!(idles(false, false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod crusher_bonus_tests {
+    use super::{octagonal_length_3d, with_crusher_bonus};
+
+    #[test]
+    fn the_octagonal_length_reads_short_on_a_diagonal() {
+        assert_eq!(octagonal_length_3d(10.0, 0.0, 0.0), 10.0);
+        assert_eq!(octagonal_length_3d(10.0, 10.0, 0.0), 12.5);
+        assert_eq!(octagonal_length_3d(0.0, 0.0, -8.0), 8.0);
+        assert_eq!(octagonal_length_3d(10.0, 0.0, 10.0), 12.5);
+    }
+
+    #[test]
+    fn the_crusher_level_attribute_bonus_adds_and_a_negative_sum_reads_zero() {
+        assert_eq!(with_crusher_bonus(1, 1), 2);
+        assert_eq!(with_crusher_bonus(1, -3), 0);
+    }
+}

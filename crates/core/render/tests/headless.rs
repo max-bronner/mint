@@ -5893,3 +5893,82 @@ fn a_stale_texture_on_a_hidden_instance_is_still_an_error() {
         Err(Error::UnknownHandle)
     ));
 }
+
+fn retention_frame<'a>(
+    texture: mint_render::TextureHandle,
+    shapes: &'a [Vec<[f32; 2]>; 3],
+    dx: f32,
+    retain: bool,
+) -> Vec<UiGeometry<'a>> {
+    let keyed = |geometry: UiGeometry<'a>, key: u64| {
+        if retain {
+            geometry.with_retention(key)
+        } else {
+            geometry
+        }
+    };
+    vec![
+        keyed(
+            UiGeometry::new()
+                .with_triangles(&shapes[0])
+                .with_texture(texture, [[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0])
+                .with_transform([[12.0, 0.0], [0.0, 12.0]], [dx, 2.0])
+                .with_color([1.0, 0.5, 1.0, 1.0])
+                .with_clip([0.0, 0.0, 40.0 + dx, 64.0]),
+            11,
+        ),
+        keyed(
+            UiGeometry::new()
+                .with_triangles(&shapes[1])
+                .with_lines(&shapes[2])
+                .with_transform([[0.8, 0.3], [-0.3, 0.8]], [10.0 + dx, 30.0])
+                .with_color([0.0, 1.0, 0.0, 0.75])
+                .with_color_add([0.1, 0.0, 0.0, 0.0]),
+            12,
+        ),
+        keyed(
+            UiGeometry::new()
+                .with_lines(&shapes[2])
+                .with_transform([[1.0, 0.0], [0.0, 1.0]], [4.0, 50.0 - dx])
+                .with_color([1.0, 1.0, 0.0, 1.0]),
+            13,
+        ),
+    ]
+}
+
+#[test]
+fn retained_ui_geometry_draws_as_the_same_geometry_unretained_whatever_its_placement() {
+    let Some(mut renderer) = renderer(SIZE) else {
+        return;
+    };
+    let texture = renderer
+        .upload_texture(&quadrant_texture())
+        .expect("upload");
+    let shapes = [
+        vec![
+            [0.0, 0.0],
+            [4.0, 0.0],
+            [0.0, 4.0],
+            [4.0, 0.0],
+            [4.0, 4.0],
+            [0.0, 4.0],
+        ],
+        vec![[0.0, 0.0], [32.0, 0.0], [0.0, 32.0], [1.0, 1.0]],
+        vec![[0.0, 0.0], [40.0, 24.0], [3.0, 3.0]],
+    ];
+    for dx in [0.0, 6.5, 0.0, 13.0] {
+        let plain = retention_frame(texture, &shapes, dx, false);
+        renderer.render(&ui_geometry_scene(&plain)).expect("render");
+        let expected = renderer.read_pixels().expect("readback");
+        let retained = retention_frame(texture, &shapes, dx, true);
+        renderer
+            .render(&ui_geometry_scene(&retained))
+            .expect("render");
+        let actual = renderer.read_pixels().expect("readback");
+        assert!(
+            actual.iter().any(|byte| *byte != 0),
+            "the frame must draw something"
+        );
+        assert_eq!(actual, expected, "dx = {dx}");
+    }
+}

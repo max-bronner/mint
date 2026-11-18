@@ -11,6 +11,16 @@ use mint_sage_asset::{KindOf, PickType};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Body(pub(crate) MoverState);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OwnCellEntry(pub(crate) Vec2);
+
+impl Component for OwnCellEntry {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0.x);
+        hasher.write_f32(self.0.y);
+    }
+}
+
 impl Component for Body {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_f32(self.0.position.x);
@@ -19,6 +29,46 @@ impl Component for Body {
         hasher.write_f32(self.0.speed);
         hasher.write_u32(self.0.waypoint);
         hasher.write_u32(u32::from(self.0.ramp.bits()));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MaintainPoint(pub(crate) mint_movement::Vec2);
+
+impl Component for MaintainPoint {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0.x);
+        hasher.write_f32(self.0.y);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OrderOrigin(pub(crate) mint_movement::Vec2);
+
+impl Component for OrderOrigin {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0.x);
+        hasher.write_f32(self.0.y);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OrderGoal(pub(crate) mint_movement::Vec2);
+
+impl Component for OrderGoal {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0.x);
+        hasher.write_f32(self.0.y);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FormationSlot(pub(crate) mint_movement::Vec2);
+
+impl Component for FormationSlot {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0.x);
+        hasher.write_f32(self.0.y);
     }
 }
 
@@ -88,7 +138,8 @@ impl Component for Locomotion {
             u32::from(self.0.charge_available)
                 | u32::from(self.0.charge_ignores_condition) << 1
                 | u32::from(self.0.crew_powered) << 2
-                | u32::from(self.0.scales_walls) << 3,
+                | u32::from(self.0.scales_walls) << 3
+                | u32::from(self.0.scaling_walls) << 4,
         );
     }
 }
@@ -106,9 +157,13 @@ pub(crate) struct Kinematics {
     pub(crate) departure: DepartureRadii,
     pub(crate) turn_pivot_offset: f32,
     pub(crate) backs_in_terror: bool,
+    pub(crate) backing_speed: f32,
     pub(crate) crew_powered: bool,
     pub(crate) scales_walls: bool,
+    pub(crate) scaling_walls: bool,
     pub(crate) wander_radius: f32,
+    pub(crate) wander_width: f32,
+    pub(crate) crosses_air: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -117,6 +172,7 @@ pub(crate) struct DepartureRadii {
     pub(crate) fast: f32,
     pub(crate) max_turn: f32,
     pub(crate) max_turn_fast: f32,
+    pub(crate) backs_out: bool,
 }
 
 #[cfg(test)]
@@ -126,6 +182,7 @@ impl DepartureRadii {
         fast: 0.0,
         max_turn: 0.0,
         max_turn_fast: 0.0,
+        backs_out: false,
     };
 }
 
@@ -136,6 +193,11 @@ pub(crate) struct ChargeState {
 }
 
 impl Kinematics {
+    pub(crate) fn backs_when_setting_off(&self, terrified: bool, horde: Option<&Self>) -> bool {
+        (self.backs_in_terror && terrified)
+            || (self.limits.stops_dead && horde.is_some_and(|horde| horde.backs_in_terror))
+    }
+
     pub(crate) fn at_health(self, health: Option<f32>, penalty: f32) -> MotionLimits {
         self.at_health_charging(health, penalty, None, 1.0)
     }
@@ -296,8 +358,8 @@ impl Component for Owner {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Selected(pub(crate) u8);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Selected(pub(crate) u8, pub(crate) [u32; 8]);
 
 impl Selected {
     pub(crate) fn bit(player: PlayerId) -> Option<u8> {
@@ -307,11 +369,43 @@ impl Selected {
     pub(crate) fn holds(self, player: PlayerId) -> bool {
         Self::bit(player).is_some_and(|bit| self.0 & bit != 0)
     }
+
+    pub(crate) fn rank(self, player: PlayerId) -> u32 {
+        self.1.get(usize::from(player.get())).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn with(self, player: PlayerId, rank: u32) -> Self {
+        let Some(bit) = Self::bit(player) else {
+            return self;
+        };
+        if self.0 & bit != 0 {
+            return self;
+        }
+        let mut ranks = self.1;
+        if let Some(place) = ranks.get_mut(usize::from(player.get())) {
+            *place = rank;
+        }
+        Self(self.0 | bit, ranks)
+    }
+
+    pub(crate) fn without(self, player: PlayerId) -> Self {
+        let Some(bit) = Self::bit(player) else {
+            return self;
+        };
+        let mut ranks = self.1;
+        if let Some(place) = ranks.get_mut(usize::from(player.get())) {
+            *place = 0;
+        }
+        Self(self.0 & !bit, ranks)
+    }
 }
 
 impl Component for Selected {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_u8(self.0);
+        for rank in self.1 {
+            hasher.write_u32(rank);
+        }
     }
 }
 
@@ -342,6 +436,15 @@ impl Component for Path {
             hasher.write_f32(point.x);
             hasher.write_f32(point.y);
         }
+        for tag in &self.route.portals {
+            hasher.write_bool(tag.is_some());
+            if let Some(tag) = tag {
+                hasher.write_u32(tag.id);
+                hasher.write_u8(tag.kind);
+                hasher.write_f32(tag.rise);
+            }
+        }
+        hasher.write_bool(self.route.unsearched);
         hasher.write_f32(self.goal.x);
         hasher.write_f32(self.goal.y);
         hasher.write_u8(self.kind as u8);
@@ -432,6 +535,7 @@ pub(crate) struct Spawn {
     pub(crate) shape: Shape,
     pub(crate) owner: PlayerId,
     pub(crate) health: Option<f32>,
+    pub(crate) initial_health: Option<f32>,
     pub(crate) weapon: Option<WeaponId>,
     pub(crate) armour: Option<ArmorId>,
     pub(crate) kind: Option<Kind>,
@@ -463,6 +567,7 @@ impl Spawn {
             shape,
             owner,
             health: None,
+            initial_health: None,
             weapon: None,
             armour: None,
             kind: None,
@@ -509,12 +614,17 @@ impl Spawn {
         hasher.write_u8(u8::from(self.claim.is_some()));
         hasher.write_u8(u8::from(self.ground_offset.is_some()));
         hasher.write_i64(self.upkeep.map_or(i64::from(i32::MIN), i64::from));
+        if let Some(initial) = self.initial_health {
+            hasher.write_f32(initial);
+        }
     }
 }
 
 pub(crate) const PLACEHOLDER_LIMITS: MotionLimits = MotionLimits {
     turn_pivot: 0.0,
     backs: false,
+    backing_speed: None,
+    wheel_backing: None,
     desired_speed: f32::INFINITY,
     stops_dead: false,
     max_speed: 40.0,
@@ -538,6 +648,44 @@ pub(crate) const PLACEHOLDER_LIMITS: MotionLimits = MotionLimits {
 mod tests {
     use super::*;
 
+    fn locomotor(backs_in_terror: bool, legs: bool) -> Kinematics {
+        Kinematics {
+            limits: MotionLimits {
+                stops_dead: legs,
+                ..PLACEHOLDER_LIMITS
+            },
+            damaged_turn_rate: 1.0,
+            damaged_speed: 1.0,
+            look_ahead_mult: 1.0,
+            max_turn_without_reform: None,
+            charge_speed: 1.0,
+            charge_available: false,
+            charge_ignores_condition: false,
+            departure: DepartureRadii::NONE,
+            turn_pivot_offset: 0.0,
+            backs_in_terror,
+            backing_speed: 0.0,
+            crew_powered: false,
+            scales_walls: false,
+            scaling_walls: false,
+            wander_radius: 0.0,
+            wander_width: 0.0,
+            crosses_air: false,
+        }
+    }
+
+    #[test]
+    fn a_member_backs_on_its_hordes_locomotor_with_no_terror_of_its_own() {
+        let walker = locomotor(false, true);
+        let scared_horde = locomotor(true, false);
+        let rider = locomotor(false, false);
+        assert!(walker.backs_when_setting_off(false, Some(&scared_horde)));
+        assert!(!walker.backs_when_setting_off(false, Some(&locomotor(false, false))));
+        assert!(!walker.backs_when_setting_off(false, None));
+        assert!(locomotor(true, true).backs_when_setting_off(true, None));
+        assert!(!rider.backs_when_setting_off(false, Some(&scared_horde)));
+    }
+
     #[test]
     fn the_damaged_turn_rate_applies_from_the_penalty_state_down() {
         let kinematics = Kinematics {
@@ -552,9 +700,13 @@ mod tests {
             departure: DepartureRadii::NONE,
             turn_pivot_offset: 0.0,
             backs_in_terror: false,
+            backing_speed: 0.0,
             crew_powered: false,
             scales_walls: false,
+            scaling_walls: false,
             wander_radius: 0.0,
+            wander_width: 0.0,
+            crosses_air: false,
         };
         let rate = |health| kinematics.at_health(health, 0.4).turn_rate;
         assert_eq!(
@@ -587,9 +739,13 @@ mod tests {
             departure: DepartureRadii::NONE,
             turn_pivot_offset: 0.0,
             backs_in_terror: false,
+            backing_speed: 0.0,
             crew_powered: false,
             scales_walls: false,
+            scaling_walls: false,
             wander_radius: 0.0,
+            wander_width: 0.0,
+            crosses_air: false,
         };
         let base = PLACEHOLDER_LIMITS.max_speed;
         let state = |attacking, ability| Some(ChargeState { attacking, ability });
@@ -653,9 +809,13 @@ mod tests {
             departure: DepartureRadii::NONE,
             turn_pivot_offset: 0.0,
             backs_in_terror: false,
+            backing_speed: 0.0,
             crew_powered,
             scales_walls: false,
+            scaling_walls: false,
             wander_radius: 0.0,
+            wander_width: 0.0,
+            crosses_air: false,
         };
         let base = PLACEHOLDER_LIMITS.max_speed;
         let crew_factor = 6.0 * 0.5;
@@ -696,7 +856,7 @@ mod tests {
 
     #[test]
     fn a_selection_mask_holds_one_bit_per_player_and_refuses_a_ninth() {
-        let mask = Selected(0b0000_0101);
+        let mask = Selected(0b0000_0101, [0; 8]);
         assert!(mask.holds(PlayerId::new(0)));
         assert!(!mask.holds(PlayerId::new(1)));
         assert!(mask.holds(PlayerId::new(2)));

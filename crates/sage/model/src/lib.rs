@@ -61,6 +61,13 @@ pub enum Error {
     #[error("a decoded image's buffer does not match its declared size")]
     MalformedDecodedImage,
 
+    #[error("{sidecar} is {found:?}, but the image it carries the alpha of is {expected:?}")]
+    AlphaSidecarSize {
+        sidecar: String,
+        expected: (u32, u32),
+        found: (u32, u32),
+    },
+
     #[error("{name} contains no meshes")]
     NoGeometry { name: String },
 

@@ -652,7 +652,7 @@ impl RotwkRules {
             return Ok(true);
         };
         let seconds = record.rebuild_seconds.unwrap_or(0.0);
-        let frames = mint_sim::LogicFrames::from_seconds(seconds).get().max(1);
+        let frames = crate::game_data::rebuild_time_ticks(seconds);
         self.rebuild_rubble(tick, ids, rubble, &record, player, frames)?;
         Ok(true)
     }

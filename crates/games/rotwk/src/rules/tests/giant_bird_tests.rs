@@ -47,6 +47,10 @@ Object Prey\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100000\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 ChildObject Bait Prey\nEnd\n\
+ChildObject QuietBird Bird\n  \
+  Behavior = GiantBirdAIUpdate Tag_AI\n    AutoAcquireEnemiesWhenIdle = No\n    \
+    MoodAttackCheckRate = 100\n    FollowThroughDistance = 120\n    \
+    FollowThroughCheckStep = 20\n    FollowThroughGradient = 1.0\n  End\nEnd\n\
 ChildObject GuardBird Bird\n  \
   Behavior = GiantBirdAIUpdate Tag_AI\n    AutoAcquireEnemiesWhenIdle = No\n    \
     AttackPriority = BirdSet\n    MoodAttackCheckRate = 100\n    FollowThroughDistance = 120\n    \
@@ -323,6 +327,45 @@ fn a_giant_bird_swoops_strikes_follows_through_and_comes_round_again() {
         climbed_to > 40.0,
         "climbed only {climbed_to} up in its follow-through"
     );
+}
+
+#[test]
+fn a_giant_bird_stopped_during_its_follow_through_hovers_afterwards() {
+    let (mut simulation, ids, units) = scene(
+        &[
+            ("QuietBird", Vec2::new(300.0, 480.0), PLAYER),
+            ("Prey", Vec2::new(550.0, 480.0), OTHER),
+        ],
+        &flat_map(96, 96),
+    );
+    let (bird, prey) = (units[0], units[1]);
+    simulation.tick().unwrap();
+    select_and(
+        &mut simulation,
+        bird,
+        RotwkCommand::AttackObject { target: prey },
+    );
+    let mut halted = false;
+    for _ in 0..(25 * SIMULATION_HZ) {
+        simulation.tick().unwrap();
+        if !halted && phase(&simulation, ids, bird) == "follow-through" {
+            select_and(&mut simulation, bird, RotwkCommand::Stop);
+            halted = true;
+            continue;
+        }
+        if halted && phase(&simulation, ids, bird) == "hover" {
+            break;
+        }
+        assert!(
+            !(halted && matches!(phase(&simulation, ids, bird), "swoop" | "attack")),
+            "swooped again after the Stop"
+        );
+    }
+    assert!(halted, "never reached a follow-through");
+    for _ in 0..(5 * SIMULATION_HZ) {
+        simulation.tick().unwrap();
+        assert_eq!(phase(&simulation, ids, bird), "hover");
+    }
 }
 
 #[test]

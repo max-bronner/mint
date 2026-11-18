@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use crate::game_data::GameData;
 use crate::horde::FormationMode;
+use crate::match_values::{MatchStart, StartAt};
 use crate::templates::KindTable;
 use mint_sage_passability::{Obstacle, Passability};
 
@@ -38,7 +39,7 @@ mod cah;
 mod cinematic;
 pub(crate) mod claim_outline;
 mod crash_report;
-mod decals;
+pub(crate) mod decals;
 mod keys;
 mod projectile_art;
 mod script;
@@ -146,6 +147,14 @@ impl MatchConfig {
         }
     }
 
+    pub(crate) fn game_mode(&self) -> crate::game_mode::GameMode {
+        match self {
+            Self::Skirmish(_) => crate::game_mode::GameMode::Skirmish,
+            Self::ShellGame(_) => crate::game_mode::GameMode::Shell,
+            Self::Campaign(campaign) => campaign.mode,
+        }
+    }
+
     pub(crate) fn shell_game_kind(&self) -> Option<crate::shell_game::ShellGameKind> {
         match self {
             Self::Skirmish(_) | Self::Campaign(_) => None,
@@ -160,7 +169,7 @@ pub(crate) struct MatchSetup {
     pub(crate) focus: Vec3,
     pub(crate) starts: Vec<Vec3>,
     pub(crate) local_evil: bool,
-    pub(crate) local_faction_icon: Option<String>,
+    pub(crate) local_faction: Option<String>,
     pub(crate) local_heroes: Vec<String>,
     pub(crate) local_side: Option<String>,
     pub(crate) local_template: Option<String>,
@@ -171,6 +180,22 @@ pub(crate) fn faction_icon_image(side: &str) -> String {
     format!("AptIcon{side}")
 }
 
+pub(crate) fn palantir_faction(
+    map_icon: Option<String>,
+    template: &mint_sage_ini::PlayerTemplateDef,
+) -> String {
+    map_icon
+        .filter(|icon| !icon.is_empty())
+        .or_else(|| {
+            template
+                .playable
+                .unwrap_or(false)
+                .then(|| template.side.clone())
+                .flatten()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn build_match(
     scene: &MatchScene,
     data: &GameData,
@@ -178,195 +203,59 @@ pub(crate) fn build_match(
     config: &MatchConfig,
     sources: PassabilitySources,
 ) -> Result<MatchSetup, String> {
-    match config {
-        MatchConfig::Skirmish(setup) => build_skirmish(scene, data, vfs, setup, sources, None),
-        MatchConfig::Campaign(campaign) => {
-            let setup = crate::lobby::SkirmishSetup::two_player(
-                String::new(),
-                String::new(),
-                campaign.map.clone(),
-                [false, false],
-                None,
-            );
-            build_skirmish(scene, data, vfs, &setup, sources, Some(campaign))
-        }
-        MatchConfig::ShellGame(_) => {
-            let mut setup = crate::lobby::SkirmishSetup::two_player(
-                String::new(),
-                String::new(),
-                String::new(),
-                [false, false],
-                None,
-            );
-            setup.slots.clear();
-            setup.resolved = Some(Vec::new());
-            build_skirmish(scene, data, vfs, &setup, sources, None)
-        }
-    }
+    let start = match config {
+        MatchConfig::Skirmish(setup) => match &setup.wotr {
+            Some(spec) => MatchStart::for_wotr_battle(&spec.0, setup, data)?,
+            None => MatchStart::from_lobby(setup, &scene.objects, data, vfs)?,
+        },
+        MatchConfig::Campaign(mission) => MatchStart::for_mission(mission, &scene.sides, data)?,
+        MatchConfig::ShellGame(_) => MatchStart::scenery(),
+    };
+    build_from_start(scene, data, vfs, &start, sources)
 }
 
-fn build_skirmish(
+pub(crate) fn build_from_start(
     scene: &MatchScene,
     data: &GameData,
     vfs: &Vfs,
-    setup: &crate::lobby::SkirmishSetup,
+    start_value: &MatchStart,
     sources: PassabilitySources,
-    campaign: Option<&crate::campaign::CampaignMatch>,
 ) -> Result<MatchSetup, String> {
-    let waypoints = crate::skirmish::start_waypoints(&scene.objects);
-    let catalogue = crate::lobby::Catalogue {
-        factions: crate::lobby::playable_factions(data),
-        random_pool: crate::lobby::random_pool(data),
-        colours: u8::try_from(data.multiplayer_colors.len()).unwrap_or(u8::MAX),
-        starts: u8::try_from(waypoints.len()).unwrap_or(u8::MAX),
-        heroes: crate::setup_heroes::load_entries(vfs, &data.hero_subclasses),
-        sides: crate::lobby::template_sides(data),
-    };
-    let local_side = campaign
-        .map(|_| campaign_local_side(scene, data))
-        .transpose()?;
-    let mut players = match &local_side {
-        Some(local) => vec![crate::lobby::ResolvedPlayer {
-            slot: 0,
-            player: LOCAL_PLAYER,
-            faction: local.faction.clone(),
-            hero_pick: crate::lobby::HeroPick::None,
-            hero: None,
-            team: None,
-            colour: 0,
-            handicap: 0,
-            start: 0,
-            ai: None,
-        }],
-        None => setup
-            .resolved_players(&catalogue, &waypoints)
-            .map_err(|error| format!("skirmish setup: {error}"))?,
-    };
-    if let (Some(id), Some(first)) = (&setup.cah_hero, players.first_mut()) {
-        if first.hero.is_none() {
-            first.hero = catalogue
-                .heroes
-                .iter()
-                .find(|entry| {
-                    entry
-                        .record
-                        .id_str()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(id))
-                })
-                .map(|entry| crate::lobby::CarriedHero(Arc::clone(&entry.record)));
-            if first.hero.is_none() {
-                let ids: Vec<String> = catalogue
-                    .heroes
-                    .iter()
-                    .filter_map(|entry| entry.record.id_str())
-                    .collect();
-                println!("cah: --cah-hero {id} is not a stored hero; ids: {ids:?}");
-            }
-        }
-    }
-    for player in &players {
+    for seat in &start_value.players {
         println!(
-            "skirmish: slot {} is player {}: {}, {}, team {}, colour {}, handicap {}%, \
-             start {}",
-            player.slot,
-            player.player.get(),
-            player.faction,
-            player
-                .ai
+            "skirmish: player {}: {}, {}, team {}, colour {}, handicap {}%, start {}",
+            seat.player.get(),
+            seat.template,
+            seat.ai
                 .map_or_else(|| "human".to_owned(), |d| format!("{d:?} AI")),
-            player
-                .team
+            seat.team
                 .map_or_else(|| "-".to_owned(), |t| (t + 1).to_string()),
-            player.colour,
-            player.handicap,
-            player.start.saturating_add(1),
+            seat.colour,
+            seat.handicap,
+            match &seat.at {
+                StartAt::Waypoint(slot) => slot.saturating_add(1).to_string(),
+                StartAt::MapSide(name) => name.clone(),
+            },
         );
     }
-    let ai_players: Vec<PlayerId> = players
+    let ai_players: Vec<PlayerId> = start_value
+        .players
         .iter()
         .filter(|p| p.ai.is_some())
         .map(|p| p.player)
         .collect();
-    let ai_difficulty: Vec<(PlayerId, crate::lobby::Difficulty)> = players
-        .iter()
-        .filter_map(|p| p.ai.map(|difficulty| (p.player, difficulty)))
-        .collect();
-    let map_label = &setup.map_label;
-    let army = &setup.army;
-    let mut inputs = crate::skirmish::resolve(
+    let inputs = crate::match_values::inputs(
+        start_value,
         data,
-        &scene.objects,
-        |path| vfs.read(path).ok(),
-        if local_side.is_some() { &[] } else { &players },
-        map_label,
-        campaign_scripts(scene, campaign),
-        scene.map_script_lines.clone(),
-        setup.rules.allow_ring_heroes,
-    )?;
-    inputs.teams = players.iter().map(|p| p.team).collect();
-    let starts: Vec<(u8, PlayerId)> = if local_side.is_some() {
-        Vec::new()
-    } else {
-        players.iter().map(|p| (p.start, p.player)).collect()
-    };
-    let named: Vec<(String, PlayerId)> = local_side
-        .iter()
-        .map(|local| (local.name.clone(), LOCAL_PLAYER))
-        .collect();
-    inputs.map_cast = crate::map_players::cast(
-        &data.templates,
-        &scene.sides,
-        &scene.objects,
-        &starts,
-        &named,
-        &scene.referenced_unit_names,
-    );
-    if local_side.is_none() {
-        let occupied: Vec<PlayerId> = players.iter().map(|p| p.player).collect();
-        inputs.map_cast.rebuild_creep_relations(&occupied);
-    }
-    if let Some(local) = &local_side {
-        let start = campaign_player_start(data, local, &inputs.map_cast, &scene.objects)?;
-        inputs.players.push(start);
-    }
-    inputs.heroes = players
-        .iter()
-        .filter_map(|p| Some((p.player, Arc::clone(&p.hero.as_ref()?.0))))
-        .collect();
-    inputs.handicaps = players
-        .iter()
-        .map(|p| data.handicaps.get(p.handicap))
-        .collect();
-    inputs.starting_money = Some(setup.rules.starting_money);
-    inputs.command_point_factor = Some(setup.rules.command_point_factor);
-    inputs.allow_ring_heroes = setup.rules.allow_ring_heroes;
-    inputs.ai_difficulty = ai_difficulty;
-    inputs.difficulty = match campaign {
-        Some(campaign) => campaign_difficulty(data, campaign, &inputs.map_cast),
-        None => crate::rules::difficulty::DifficultySetup {
-            multiplayer: true,
-            game: crate::lobby::Difficulty::Medium,
-            players: players
-                .iter()
-                .map(|p| crate::rules::difficulty::DifficultyPlayer {
-                    player: p.player,
-                    human: p.ai.is_none(),
-                    playable: data
-                        .players
-                        .iter()
-                        .any(|t| t.name == p.faction && t.playable == Some(true)),
-                    ai: p.ai,
-                })
-                .collect(),
+        crate::match_values::MapFacts {
+            objects: &scene.objects,
+            sides: &scene.sides,
+            scripts: scene.map_scripts.clone(),
+            script_lines: scene.map_script_lines.clone(),
+            referenced_unit_names: &scene.referenced_unit_names,
         },
-    };
-    inputs.test_seeds = [&setup.spawn, &setup.dummies]
-        .into_iter()
-        .flatten()
-        .flat_map(|spec| {
-            crate::spawn::named_templates(spec, |name| data.templates.get(name).is_some())
-        })
-        .collect();
+        |path| vfs.read(path).ok(),
+    )?;
     let mut start = crate::skirmish::build(
         data,
         scene.object_index.as_ref(),
@@ -404,7 +293,10 @@ fn build_skirmish(
                 crate::wall_meshes::has_raised_wall_mesh(vfs, &scene.resolver, index, template)
             })
         },
-        crate::skirmish::SKIRMISH_SEED,
+        start_value
+            .wotr
+            .as_ref()
+            .map_or(crate::skirmish::SKIRMISH_SEED, |battle| battle.seed),
         &ai_players,
     )?;
     for line in &start.lines {
@@ -414,7 +306,7 @@ fn build_skirmish(
         let kind = Kind(u16::try_from(at).unwrap_or(u16::MAX));
         crate::diag::diag!("templates: {}", start.kinds.describe(kind));
     }
-    if let Some(per_side) = *army {
+    if let Some(per_side) = start_value.deploy.army {
         let sides: Vec<crate::army::SideStart> = inputs
             .players
             .iter()
@@ -431,7 +323,7 @@ fn build_skirmish(
     if let (Some(mine), Some(theirs)) = (inputs.players.first(), inputs.players.get(1)) {
         let line = crate::army::Line::towards(mine.at, theirs.at);
         let mut far_depth = 0.0f32;
-        if let Some(spec) = &setup.spawn {
+        if let Some(spec) = &start_value.deploy.spawn {
             let deployed = crate::spawn::deploy_units(
                 &mut start.simulation,
                 mine.player,
@@ -446,7 +338,7 @@ fn build_skirmish(
                 println!("{line}");
             }
         }
-        if let Some(spec) = &setup.spawn_buildings {
+        if let Some(spec) = &start_value.deploy.spawn_buildings {
             let deployed = crate::spawn::deploy_buildings(
                 &mut start.simulation,
                 mine.player,
@@ -459,7 +351,7 @@ fn build_skirmish(
                 println!("{line}");
             }
         }
-        if let Some(spec) = &setup.dummies {
+        if let Some(spec) = &start_value.deploy.dummies {
             let facing = crate::army::Line::towards(theirs.at, mine.at).facing();
             let deployed = crate::spawn::deploy_units(
                 &mut start.simulation,
@@ -468,7 +360,7 @@ fn build_skirmish(
                 crate::spawn::dummy_start_depth(far_depth),
                 facing,
                 spec,
-                if setup.dummies_attack {
+                if start_value.deploy.dummies_attack {
                     crate::rules::SpawnRole::FightingDummy
                 } else {
                     crate::rules::SpawnRole::Dummy
@@ -491,13 +383,23 @@ fn build_skirmish(
     let local_evil = local_player_start
         .and_then(|player_start| player_start.faction.evil)
         .unwrap_or(false);
-    let local_faction_icon = local_player_start
-        .and_then(|player_start| player_start.faction.side.as_deref())
-        .map(faction_icon_image);
+    let local_faction = local_player_start.map(|player_start| {
+        let map_icon = inputs
+            .map_cast
+            .contestants
+            .iter()
+            .find(|side| side.player == LOCAL_PLAYER)
+            .and_then(|side| side.faction_icon.clone());
+        palantir_faction(map_icon, &player_start.faction)
+    });
     let local_heroes = local_player_start
         .map(|player_start| {
             let faction = &player_start.faction;
-            crate::setup_rules::heroes_offered(&setup.rules, &faction.ring_heroes, &faction.heroes)
+            crate::setup_rules::heroes_offered(
+                &start_value.rules,
+                &faction.ring_heroes,
+                &faction.heroes,
+            )
         })
         .unwrap_or_default();
     let local_side = local_player_start.and_then(|p| p.faction.side.clone());
@@ -508,119 +410,12 @@ fn build_skirmish(
         focus: starts.first().copied().unwrap_or(Vec3::ZERO),
         starts,
         local_evil,
-        local_faction_icon,
+        local_faction,
         local_heroes,
         local_side,
         local_template,
-        colours: players.iter().map(|p| p.colour).collect(),
+        colours: start_value.players.iter().map(|p| p.colour).collect(),
     })
-}
-
-fn campaign_scripts(
-    scene: &MatchScene,
-    campaign: Option<&crate::campaign::CampaignMatch>,
-) -> Option<crate::rules::map_scripts::MapScriptEngine> {
-    let engine = scene.map_scripts.clone()?;
-    let Some(campaign) = campaign else {
-        return Some(engine);
-    };
-    let start_name = mint_sage_map::start_waypoint_name(0);
-    let point = |name: &str| {
-        mint_sage_map::named_waypoint(&scene.objects, name).map(|at| [at.x, at.y, 0.0])
-    };
-    Some(
-        engine.with_carryover(crate::rules::carryover::CarryoverStart {
-            carry: campaign.carryover.clone(),
-            delayed: campaign.delayed.clone(),
-            start: point(&start_name),
-            rally: point(&format!("{start_name}_Rally")),
-        }),
-    )
-}
-
-struct CampaignLocal {
-    name: String,
-    faction: String,
-}
-
-fn campaign_local_side(scene: &MatchScene, data: &GameData) -> Result<CampaignLocal, String> {
-    let side = crate::campaign::local_side(&scene.sides)
-        .and_then(|at| scene.sides.get(at))
-        .ok_or("campaign: the map declares no player side")?;
-    let faction = side.text("playerFaction").unwrap_or_default().to_owned();
-    if data.players.get(&faction).is_none() {
-        return Err(format!("campaign: no PlayerTemplate named {faction}"));
-    }
-    Ok(CampaignLocal {
-        name: side.name().unwrap_or_default().to_owned(),
-        faction,
-    })
-}
-
-fn campaign_player_start(
-    data: &GameData,
-    local: &CampaignLocal,
-    cast: &crate::map_players::MapCast,
-    objects: &[mint_sage_map::Object],
-) -> Result<crate::skirmish::PlayerStart, String> {
-    let mut faction = data
-        .players
-        .get(&local.faction)
-        .cloned()
-        .ok_or_else(|| format!("campaign: no PlayerTemplate named {}", local.faction))?;
-    faction.starting_building = None;
-    faction.starting_units.clear();
-    let at = cast
-        .entities
-        .iter()
-        .find(|e| matches!(e.owner, crate::map_players::Relation::Contestant(_)))
-        .map(|e| e.at)
-        .or_else(|| objects.first().map(|o| Vec2::new(o.x, o.y)))
-        .unwrap_or_default();
-    Ok(crate::skirmish::PlayerStart {
-        player: LOCAL_PLAYER,
-        faction,
-        at,
-        castle: None,
-        ai_base_candidates: Vec::new(),
-    })
-}
-
-fn campaign_difficulty(
-    data: &GameData,
-    campaign: &crate::campaign::CampaignMatch,
-    cast: &crate::map_players::MapCast,
-) -> crate::rules::difficulty::DifficultySetup {
-    let playable = |faction: &str| {
-        data.players
-            .iter()
-            .any(|t| t.name == faction && t.playable == Some(true))
-    };
-    let mut players = vec![crate::rules::difficulty::DifficultyPlayer {
-        player: LOCAL_PLAYER,
-        human: true,
-        playable: false,
-        ai: None,
-    }];
-    for (offset, map_player) in cast.players.iter().enumerate() {
-        let Some(id) = u8::try_from(offset)
-            .ok()
-            .and_then(|o| LOCAL_PLAYER.get().checked_add(1)?.checked_add(o))
-        else {
-            break;
-        };
-        players.push(crate::rules::difficulty::DifficultyPlayer {
-            player: PlayerId::new(id),
-            human: false,
-            playable: playable(&map_player.faction),
-            ai: None,
-        });
-    }
-    crate::rules::difficulty::DifficultySetup {
-        multiplayer: false,
-        game: campaign.difficulty,
-        players,
-    }
 }
 
 pub(crate) fn map_grid(
@@ -808,59 +603,53 @@ fn shroud_object_tints(state: &mut MatchState) {
         return;
     };
     let revealed = state.scene.terrain_shading.modulation.shroud == TerrainShroud::Revealed;
-    let scene = &state.scene;
-    let positions: Vec<Vec2> = scene
-        .drawn
-        .get(scene.object_span.clone())
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-        .map(|(offset, instance)| {
-            let slot = scene.object_proxy_slots.get(offset).copied().flatten();
-            shroud_point(instance.transform, slot, &scene.proxies)
-        })
-        .collect();
-
     let viewer = state.shroud_viewer;
-    let (levels, on_grid): (Vec<Option<bool>>, Vec<bool>) = crate::shroud::with_grid(
+    let scene = &mut state.scene;
+    let read = crate::shroud::with_grid(
         state.simulation.state(),
         RotwkRules::shroud_ids(ids),
-        |grid| {
-            positions
-                .iter()
-                .map(|point| {
+        |grid| write_object_tints(scene, Some(grid), viewer, revealed),
+    );
+    if read.is_none() {
+        write_object_tints(scene, None, viewer, revealed);
+    }
+}
+
+fn write_object_tints(
+    scene: &mut MatchScene,
+    grid: Option<&mint_sage_shroud::VisibilityGrid>,
+    viewer: PlayerId,
+    revealed: bool,
+) {
+    let placed = scene
+        .drawn
+        .get(scene.object_span.clone())
+        .map_or(0, <[mint_render::Instance]>::len);
+    for (offset, base) in scene.base_tints.iter().enumerate() {
+        let Some(index) = scene.object_span.start.checked_add(offset) else {
+            break;
+        };
+        let Some(instance) = scene.drawn.get_mut(index) else {
+            break;
+        };
+        let (masked, on_grid) = if offset < placed {
+            let slot = scene.object_proxy_slots.get(offset).copied().flatten();
+            let point = shroud_point(instance.transform, slot, &scene.proxies);
+            match grid {
+                Some(grid) => {
                     let (x, y) = grid.world_to_cell(point.x, point.y);
                     let on_grid = grid.contains(point.x, point.y);
                     (
                         object_shroud(grid.cell_state(viewer, x, y), on_grid, revealed),
                         on_grid,
                     )
-                })
-                .unzip()
-        },
-    )
-    .unwrap_or_else(|| {
-        (
-            vec![Some(false); positions.len()],
-            vec![true; positions.len()],
-        )
-    });
-
-    for (offset, base) in state.scene.base_tints.iter().enumerate() {
-        let Some(index) = state.scene.object_span.start.checked_add(offset) else {
-            break;
+                }
+                None => (Some(false), true),
+            }
+        } else {
+            (Some(false), false)
         };
-        let Some(instance) = state.scene.drawn.get_mut(index) else {
-            break;
-        };
-        let masked = levels.get(offset).copied().unwrap_or(Some(false));
-        let tree = state
-            .scene
-            .object_trees
-            .get(offset)
-            .copied()
-            .unwrap_or(false);
-        let on_grid = on_grid.get(offset).copied().unwrap_or(false);
+        let tree = scene.object_trees.get(offset).copied().unwrap_or(false);
         let (visible, mask) = tree_shroud(masked, tree, on_grid, revealed);
         instance.visible = visible;
         instance.visibility_mask = mask;
@@ -1129,7 +918,7 @@ pub(crate) struct MatchState {
     pub(crate) vfs: Arc<Vfs>,
     pub(crate) kinds: Arc<KindTable>,
     pub(crate) local_evil: bool,
-    pub(crate) local_faction_icon: Option<String>,
+    pub(crate) local_faction: Option<String>,
     pub(crate) local_heroes: Vec<String>,
     pub(crate) local_side: Option<String>,
     pub(crate) local_template: Option<String>,
@@ -1155,6 +944,7 @@ pub(crate) struct MatchState {
     pub(crate) floating: crate::floating_text::FloatingTexts,
     pub(crate) caption_points: f32,
     pub(crate) named_timer_style: crate::named_timer::TimerStyle,
+    pub(crate) downwind_angle: f32,
     pub(crate) fonts: Arc<std::collections::HashMap<String, mint_ui::Font>>,
     pub(crate) strings: Arc<mint_sage_str::StringTable>,
 }
@@ -1234,6 +1024,33 @@ impl PowerTarget {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) struct MatchRemains {
+    units: UnitScene,
+    data: GameData,
+    scene: MatchScene,
+    kinds: Arc<KindTable>,
+    unit_art: Vec<KindArt>,
+    projectile_art: ProjectileArt,
+    visuals: UnitVisuals,
+}
+
+impl MatchRemains {
+    pub(crate) fn free_elsewhere(self) -> Option<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("match teardown".to_owned())
+            .spawn(move || {
+                let began = std::time::Instant::now();
+                drop(self);
+                println!(
+                    "teardown: the last match's art and data freed in {:.0} ms",
+                    began.elapsed().as_secs_f64() * 1000.0
+                );
+            })
+            .ok()
+    }
+}
+
 pub(crate) struct Game {
     mode: Mode,
     state: MatchState,
@@ -1284,6 +1101,7 @@ pub(crate) struct Game {
     load_request: Option<std::path::PathBuf>,
     menu_was_open: bool,
     end_game: crate::end_game::EndGame,
+    hero_stats: Option<crate::hero_stats::HeroMatchStats>,
     victory_screen_seen: u32,
     screen_shake_seen: u32,
     control: ControlSet,
@@ -1332,7 +1150,7 @@ impl GameBuild {
         install_roots: Vec<PathBuf>,
         control: ControlSet,
         ui: Option<crate::ui_resources::UiResources>,
-    ) -> Result<Self, String> {
+    ) -> Result<Box<Self>, String> {
         let setup = build_match(&scene, &data, &vfs, &config, passability_sources)?;
         let shroud_view = if config.shell_game_kind().is_some() {
             scene.terrain_shading.modulation.shroud = TerrainShroud::Revealed;
@@ -1349,7 +1167,7 @@ impl GameBuild {
             setup.kinds.move_only(),
             &setup.colours,
         );
-        Ok(Self {
+        Ok(Box::new(Self {
             scene,
             data,
             viewport,
@@ -1363,7 +1181,7 @@ impl GameBuild {
             visuals,
             art,
             ui,
-        })
+        }))
     }
 
     pub(crate) fn art_progress(&self) -> (usize, usize) {
@@ -1382,13 +1200,13 @@ impl GameBuild {
         self.setup.simulation.state_hash()
     }
 
-    pub(crate) fn finish(self, renderer: &mut Renderer) -> Result<Game, String> {
-        Game::from_build(renderer, self)
+    pub(crate) fn finish(self: Box<Self>, renderer: &mut Renderer) -> Result<Box<Game>, String> {
+        Game::from_build(renderer, *self)
     }
 }
 
 impl Game {
-    fn from_build(renderer: &mut Renderer, build: GameBuild) -> Result<Self, String> {
+    fn from_build(renderer: &mut Renderer, build: GameBuild) -> Result<Box<Self>, String> {
         let GameBuild {
             scene,
             data,
@@ -1491,8 +1309,10 @@ impl Game {
             simulation.rules(),
             &data.macros,
         );
-        let options_defaults =
-            crate::options::OptionsPreferences::from_audio_settings(&audio.settings());
+        let options_defaults = crate::options::OptionsPreferences {
+            health_bars: crate::user_options::UserOptions::load().all_health_bars(),
+            ..crate::options::OptionsPreferences::from_audio_settings(&audio.settings())
+        };
         if let Some(index) = scene.object_index.as_ref() {
             let placed: Vec<_> = scene
                 .objects
@@ -1555,6 +1375,7 @@ impl Game {
                 overlay.set_options_defaults(options_defaults);
                 overlay.set_load_enabled(matches!(config, MatchConfig::Campaign(_)));
                 overlay.set_campaign(matches!(config, MatchConfig::Campaign(_)));
+                overlay.set_skirmish_or_multiplayer(config.game_mode());
                 Some(overlay)
             }
             Err(error) => {
@@ -1579,7 +1400,17 @@ impl Game {
             }
         }
         let placed_scales = placed_scales(&simulation, &scene.objects);
-        Ok(Self {
+        let hero_stats = data.cah_system.clone().and_then(|sys| {
+            crate::hero_stats::HeroMatchStats::open(
+                sys,
+                Arc::clone(&setup.kinds),
+                simulation.rules(),
+                LOCAL_PLAYER,
+                config.game_mode(),
+                crate::setup_heroes::own_dir(),
+            )
+        });
+        Ok(Box::new(Self {
             mode,
             state: MatchState {
                 view_box_z: crate::apt_overlay::average_ground_z(
@@ -1612,7 +1443,7 @@ impl Game {
                 shroud_source: None,
                 kinds: Arc::clone(&setup.kinds),
                 local_evil: setup.local_evil,
-                local_faction_icon: setup.local_faction_icon.clone(),
+                local_faction: setup.local_faction.clone(),
                 local_heroes: setup.local_heroes.clone(),
                 local_side: setup.local_side.clone(),
                 local_template: setup.local_template.clone(),
@@ -1627,6 +1458,7 @@ impl Game {
                 floating: crate::floating_text::FloatingTexts::default(),
                 caption_points: data.drawable_caption_points,
                 named_timer_style: data.named_timer.clone(),
+                downwind_angle: data.downwind_angle,
                 fonts,
                 strings,
             },
@@ -1677,6 +1509,7 @@ impl Game {
             load_request: None,
             menu_was_open: false,
             end_game: crate::end_game::EndGame::default(),
+            hero_stats,
             victory_screen_seen: 0,
             screen_shake_seen: 0,
             control,
@@ -1694,7 +1527,7 @@ impl Game {
             tick_failed: false,
             forced_crash: None,
             live_objects: 0,
-        })
+        }))
     }
 
     pub(crate) fn take_failure(&mut self) -> Option<crate::crash::Failure> {
@@ -1725,15 +1558,62 @@ impl Game {
         self.forced_end.or(self.state.scene.script_view.mission_end)
     }
 
-    pub(crate) fn capture_carryover(&self) -> Option<mint_sage_campaign::Carryover> {
-        self.state
-            .simulation
-            .rules()
-            .capture_carryover(self.state.simulation.state())
+    pub(crate) fn match_result(&self) -> crate::match_values::MatchResult {
+        let simulation = &self.state.simulation;
+        let mut result = simulation.rules().match_result(simulation.state());
+        result.end = self.mission_end();
+        result
+    }
+
+    pub(crate) fn wotr_battle_result(
+        &self,
+        spec: &mint_sage_livingworld::BattleSpec,
+        strategic: &mint_sage_livingworld::Rules,
+    ) -> mint_sage_livingworld::BattleResult {
+        let simulation = &self.state.simulation;
+        let rules = simulation.rules();
+        let world = simulation.state();
+        let standing = |strategic_player: mint_sage_livingworld::PlayerId| {
+            spec.participants
+                .iter()
+                .position(|p| p.player == strategic_player)
+                .and_then(|index| u8::try_from(index).ok())
+                .is_some_and(|index| !rules.defeated(world, PlayerId::new(index)))
+        };
+        let end = match self.forced_end {
+            Some(mint_sage_campaign::MissionEnd::Victory) => crate::wotr_battle::LocalEnd::Won,
+            Some(mint_sage_campaign::MissionEnd::Defeat) => crate::wotr_battle::LocalEnd::Lost,
+            None if self.quit_local => crate::wotr_battle::LocalEnd::Lost,
+            None => crate::wotr_battle::LocalEnd::ByStanding,
+        };
+        let winner = crate::wotr_battle::winning_side(spec, end, &standing);
+        crate::wotr_battle::battle_result(rules, world, spec, strategic, winner)
     }
 
     pub(crate) fn wants_shell(&self) -> bool {
         self.wants_shell
+    }
+
+    pub(crate) fn into_remains(self: Box<Self>) -> MatchRemains {
+        let Game { state, data, .. } = *self;
+        let MatchState {
+            scene,
+            units,
+            unit_art,
+            projectile_art,
+            visuals,
+            kinds,
+            ..
+        } = state;
+        MatchRemains {
+            units,
+            data,
+            scene,
+            kinds,
+            unit_art,
+            projectile_art,
+            visuals,
+        }
     }
 
     pub(crate) fn score_figures(&self) -> Option<Vec<crate::match_stats::PlayerFigures>> {
@@ -2002,6 +1882,14 @@ impl Game {
         let (x, y) = self.last_pointer?;
         let ray = self.ray(x, y)?;
         let entity = pick_unit(units, ray, self.acting_player, self.declared())?;
+        self.object_hover(units, entity)
+    }
+
+    fn object_hover(
+        &self,
+        units: &[UnitView],
+        entity: mint_sim::Entity,
+    ) -> Option<(mint_sim::Entity, crate::help_box::ObjectHelp, Option<f32>)> {
         let unit = units.iter().find(|u| u.entity == entity)?;
         let record = unit.kind.and_then(|k| self.state.kinds.get(Kind(k)));
         let hover_record = unit.hover_kind.and_then(|k| self.state.kinds.get(Kind(k)));
@@ -2159,9 +2047,10 @@ impl Game {
             TargetKind::Confirm => (None, None),
             TargetKind::Object => {
                 let units = self.units();
-                let picked = pick_unit(&units, ray, self.acting_player, self.declared())
-                    .ok_or("no unit under the pointer")?;
-                (Some(picked), None)
+                match pick_unit(&units, ray, self.acting_player, self.declared()) {
+                    Some(picked) => (Some(picked), None),
+                    None => (None, Some(self.map_tree_click(ray)?)),
+                }
             }
             TargetKind::Position | TargetKind::None => {
                 let point = mint_sage_terrain::pick_surface(
@@ -2174,6 +2063,37 @@ impl Game {
             }
         };
         self.power_target_resolve(power_target, target, at)
+    }
+
+    fn map_tree_click(&self, ray: Ray) -> Result<(f32, f32), &'static str> {
+        const NO_UNIT: &str = "no unit under the pointer";
+        let point = mint_sage_terrain::pick_surface(
+            &self.state.scene.height_map,
+            self.state.scene.terrain.vertical_scale,
+            ray,
+        )
+        .ok_or(NO_UNIT)?;
+        let world = self.state.simulation.state();
+        let ids = self.state.simulation.rules().ids().ok_or(NO_UNIT)?;
+        let (tree, _) =
+            RotwkRules::map_tree_at(world, ids, mint_movement::Vec2::new(point.x, point.y))
+                .ok_or(NO_UNIT)?;
+        let revealed =
+            self.state.scene.terrain_shading.modulation.shroud == TerrainShroud::Revealed;
+        let shrouded = !revealed
+            && crate::shroud::with_grid(world, RotwkRules::shroud_ids(ids), |grid| {
+                let half = grid.extent().cell_size * 0.5;
+                let (x, y) = grid.world_to_cell(tree.x - half, tree.y - half);
+                [(0, 0), (1, 0), (0, 1), (1, 1)].iter().all(|(dx, dy)| {
+                    grid.cell_state(self.acting_player, x + dx, y + dy)
+                        == mint_sage_shroud::CellVisibility::Unexplored
+                })
+            })
+            .unwrap_or(false);
+        if shrouded {
+            return Err(NO_UNIT);
+        }
+        Ok((point.x, point.y))
     }
 
     fn power_target_resolve(
@@ -2291,7 +2211,7 @@ impl Game {
             return axes;
         }
         RtsCamera::edge_pan_axes(
-            self.pointer.position(),
+            self.pointer.edge_position(),
             self.viewport,
             DEFAULT_EDGE_SCROLL_MARGIN,
         )
@@ -3287,6 +3207,55 @@ impl Game {
             .unwrap_or_default()
     }
 
+    fn castle_ghosts(
+        &self,
+        ghost: &crate::visuals::PlacementGhost,
+    ) -> Vec<crate::visuals::PlacementGhost> {
+        let kinds = &self.state.kinds;
+        let rules = self.state.simulation.rules();
+        let Some(castle) = kinds
+            .get(Kind(ghost.kind))
+            .and_then(|entry| entry.record.castle.as_ref())
+        else {
+            return Vec::new();
+        };
+        let side = rules
+            .player_sides()
+            .iter()
+            .find(|(player, _)| *player == self.acting_player)
+            .map_or("", |(_, side)| side.as_str());
+        let Some((_, layout)) = crate::castle::layout_for(rules.castle_layouts(), castle, side)
+        else {
+            return Vec::new();
+        };
+        let origin = Vec2::new(ghost.x, ghost.y);
+        let facing = mint_movement::Facing::from_radians(ghost.facing);
+        layout
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let kind = kinds.kind(&entry.template_name)?;
+                let at = crate::templates::rotate(origin, facing, entry.offset);
+                let code = if kinds
+                    .get(kind)
+                    .is_some_and(|piece| piece.record.has_kind("BASE_SITE"))
+                {
+                    self.site_is_legal(kind, at.x, at.y, ghost.facing)
+                } else {
+                    0
+                };
+                Some(crate::visuals::PlacementGhost {
+                    kind: kind.0,
+                    x: at.x,
+                    y: at.y,
+                    facing: ghost.facing,
+                    code,
+                    span_code: None,
+                })
+            })
+            .collect()
+    }
+
     fn formation_drag_anchor(&self) -> Option<(Vec2, Vec2)> {
         let anchor_px = self.pointer.chord_drag_anchor().or_else(|| {
             self.ctrl_held
@@ -4149,6 +4118,10 @@ fn play_effects(
         mint_sage_ini::NuggetWeather::Normal
     };
     let rules = state.simulation.rules();
+    state.visuals.fading_decals.set_clock(seconds);
+    let decal_clock = state.visuals.fading_decals.now();
+    let fading_decals = &mut state.visuals.fading_decals;
+    fading_decals.fire(decal_clock, scene.particle_scene.take_collision_decals());
     let (mut fired, mut systems, mut unknown) = (0u64, 0u64, 0u64);
     let (mut at_bone_pos, mut bone_found, mut bone_missing, mut nested_missing) =
         (0u64, 0u64, 0u64, 0u64);
@@ -4218,6 +4191,7 @@ fn play_effects(
                 }
                 camera_shakes = camera_shakes
                     .saturating_add(u64::try_from(started.camera_shakes.len()).unwrap_or(u64::MAX));
+                fading_decals.fire(decal_clock, started.dynamic_decals);
             }
             None => unknown = unknown.saturating_add(1),
         }
@@ -4507,6 +4481,7 @@ pub(crate) fn compose_and_render(
     selector: PlayerId,
     hovered: Option<mint_sim::Entity>,
     all_health_bars: bool,
+    order_queues: bool,
 ) -> mint_render::Result<()> {
     let mut clock = crate::render_perf::Clock::start();
     crate::snapshot::ensure(
@@ -4728,8 +4703,9 @@ pub(crate) fn compose_and_render(
         };
         let rules = state.simulation.rules();
         let hero_colours = |unit: &UnitView| {
-            unit.kind
-                .and_then(|kind| rules.cah_colours(crate::unit::Kind(kind), unit.owner))
+            rules
+                .ids()
+                .and_then(|ids| rules.cah_colours(world, ids, unit.entity))
         };
         let scales = &state.placed_scales;
         let mut poses = unit_poses(
@@ -4812,6 +4788,47 @@ pub(crate) fn compose_and_render(
                     look: crate::visuals::placement_look(&mut state.units),
                     ride: None,
                 });
+            }
+        }
+        if let (Some(ids), Some(kind)) =
+            (ids, state.kinds.kind(crate::visuals::RALLY_MARKER_TEMPLATE))
+        {
+            if let KindArt::Model(template) = KindArt::of(&state.unit_art, Some(kind.0)) {
+                let world = state.simulation.state();
+                let economy = RotwkRules::economy_ids(ids);
+                let rally = units
+                    .iter()
+                    .filter(|unit| unit.selected && unit.owner == LOCAL_PLAYER)
+                    .find_map(|unit| world.get(economy.producer, unit.entity)?.player_rally);
+                if let Some(point) = rally {
+                    poses.push(UnitPose {
+                        opacity: 1.0,
+                        id: crate::visuals::RALLY_FLAG_ID,
+                        generation: 0,
+                        template,
+                        placement: placement_at(
+                            point.x,
+                            point.y,
+                            ground_at(&state.scene, point.x, point.y),
+                            state.downwind_angle,
+                        ),
+                        conditions: mint_sage_scene::Conditions::NONE,
+                        attack_cycle: 0,
+                        attack_slot: None,
+                        speed: 0.0,
+                        weapon_cycle: 0.0,
+                        house_color: colours.of(LOCAL_PLAYER),
+                        hero_colours: None,
+                        shroud_masked: false,
+                        progress: None,
+                        ghost: None,
+                        casts_shadow: true,
+                        look: state
+                            .units
+                            .intern_look(mint_sage_scene::UnitLook::default()),
+                        ride: None,
+                    });
+                }
             }
         }
         let planted = state.simulation.rules().ids().and_then(|ids| {
@@ -5120,9 +5137,6 @@ pub(crate) fn compose_and_render(
             );
         }
     }
-    renderer
-        .set_bones(state.units.bones())
-        .map_err(|error| error.about("the units' bone palette"))?;
     clock.lap(crate::render_perf::stage!("units"));
     if report_second(seconds) && state.scene.condition_particles.attached() > 0 {
         report.line(format!(
@@ -5172,6 +5186,36 @@ pub(crate) fn compose_and_render(
     state
         .visuals
         .push_streaks(renderer, &streaks, eye, &mut state.scene.drawn);
+    if order_queues {
+        let rules = state.simulation.rules();
+        let strips: Vec<(Vec<[f32; 3]>, Option<usize>)> = ids
+            .map(|ids| rules.selected_queue_strips(state.simulation.state(), ids, selector))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|strip| {
+                let lifted = strip
+                    .points
+                    .iter()
+                    .map(|p| {
+                        [
+                            p.x,
+                            p.y,
+                            rules.ground_height(p.x, p.y) + crate::visuals::QUEUE_LINE_LIFT,
+                        ]
+                    })
+                    .collect();
+                (lifted, strip.loop_from)
+            })
+            .collect();
+        state.visuals.push_order_queues(
+            renderer,
+            (&state.vfs, &state.scene.resolver),
+            &strips,
+            eye,
+            render_clock,
+            &mut state.scene.drawn,
+        );
+    }
     if obstacle_overlay {
         let cell_size = state.simulation.rules().passability().geometry.cell_size();
         let (static_cells, dynamic_cells) =
@@ -5184,10 +5228,24 @@ pub(crate) fn compose_and_render(
         );
     }
     clock.lap(crate::render_perf::stage!("visuals"));
-    state
-        .scene
-        .particle_scene
-        .draw(renderer, &state.camera.camera(), &mut state.scene.drawn);
+    state.scene.particle_scene.draw(
+        renderer,
+        &state.camera.camera(),
+        &mut state.scene.drawn,
+        state.units.bones().len(),
+    );
+    let particle_bones = state.scene.particle_scene.bones();
+    let palette: &[mint_render::Mat4] = if particle_bones.is_empty() {
+        state.units.bones()
+    } else {
+        state.scene.palette.clear();
+        state.scene.palette.extend_from_slice(state.units.bones());
+        state.scene.palette.extend_from_slice(particle_bones);
+        &state.scene.palette
+    };
+    renderer
+        .set_bones(palette)
+        .map_err(|error| error.about("the bone palette"))?;
     let weather_kind = ids.map_or(mint_sage_modules::WeatherKind::None, |ids| {
         crate::rules::RotwkRules::weather_kind(state.simulation.state(), ids)
     });
@@ -5607,6 +5665,7 @@ impl App for Game {
                     overlay.resize(width as f32, height as f32);
                 }
             }
+            InputEvent::PointerLeft => self.pointer.left(),
             InputEvent::PointerMoved { x, y } => {
                 let mut over_ui = false;
                 if let Some(targets) = self.command_bar_targets() {
@@ -5670,6 +5729,7 @@ impl App for Game {
                 let mut claimed = false;
                 let mut resolved = None;
                 let mut pressed_button = None;
+                let mut slot_enabled = false;
                 if let Some(position) = self.pointer.position() {
                     if let Some(targets) = self.command_bar_targets() {
                         let ui_button = ui_pointer_button(button);
@@ -5686,6 +5746,8 @@ impl App for Game {
                                 resolved = self.apt_overlay.as_ref().and_then(|o| o.action_for(id));
                                 pressed_button =
                                     self.apt_overlay.as_ref().and_then(|o| o.button_for(id));
+                                slot_enabled =
+                                    self.apt_overlay.as_ref().is_some_and(|o| o.enabled_for(id));
                             }
                         }
                     }
@@ -5809,7 +5871,7 @@ impl App for Game {
                     if let Some(action) = resolved {
                         if matches!(button, mint_app::PointerButton::Secondary) {
                             self.slot_cancel(&action);
-                        } else {
+                        } else if slot_enabled {
                             if let Some(name) = &pressed_button {
                                 self.state.cinematic.button_flashes.pressed(name);
                             }
@@ -5865,8 +5927,11 @@ impl App for Game {
             }
             self.drive_button_flashes(&mut hud);
             let world_hover = self.world_hover(&units);
+            let portrait_hover = hud
+                .portrait_object
+                .and_then(|entity| self.object_hover(&units, entity));
             if let Some(overlay) = self.apt_overlay.as_mut() {
-                overlay.set_world_hover(world_hover);
+                overlay.set_world_hover(world_hover, portrait_hover);
             }
             let mut events = Vec::new();
             let mut purchases = Vec::new();
@@ -6067,6 +6132,12 @@ impl App for Game {
         }
         self.test_controls
             .after_tick(&self.state.simulation, &self.state.kinds);
+        if let (Some(stats), Some(ticked)) = (
+            self.hero_stats.as_mut(),
+            self.state.simulation.frame().get().checked_sub(1),
+        ) {
+            stats.after_tick(&self.state.simulation, Frame::new(ticked));
+        }
 
         let focus = self.state.camera.camera().target;
         self.audio.set_listener(
@@ -6201,6 +6272,18 @@ impl App for Game {
             self.audio.music_tick(&facts);
             if let Some(frame) = self.state.simulation.frame().get().checked_sub(1) {
                 let announce_frame = Frame::new(frame);
+                for player in self
+                    .state
+                    .simulation
+                    .rules()
+                    .forfeit_warnings(self.state.simulation.state(), frame)
+                {
+                    println!(
+                        "forfeit: player {}: {}",
+                        player.get(),
+                        self.state.strings.fetch("GUI:AIForfeitsInWOTRSkirmishNow")
+                    );
+                }
                 let defeats = self
                     .state
                     .simulation
@@ -6468,7 +6551,11 @@ impl Game {
         self.state.scene.script_view = view;
         self.force_draw_crash(renderer)?;
         self.state.visuals.placement_ghost = self.placement_ghost();
-        self.state.visuals.span_ghosts = self.span_ghosts();
+        let mut pieces_shown = self.span_ghosts();
+        if let Some(ghost) = self.state.visuals.placement_ghost {
+            pieces_shown.extend(self.castle_ghosts(&ghost));
+        }
+        self.state.visuals.span_ghosts = pieces_shown;
         let (preview, arrow) = self.formation_drag_preview();
         if preview.len() != self.state.visuals.formation_preview.len()
             || arrow.len() != self.state.visuals.formation_arrow.len()
@@ -6498,18 +6585,20 @@ impl Game {
             }
         }
         self.state.visuals.claim_share = claim_share;
+        let mut units: Option<Vec<UnitView>> = None;
         let hovered = if extra.is_some() || self.shell_game.is_some() {
             None
         } else {
-            let hover_units = self.units();
-            self.world_hover(&hover_units).map(|(entity, ..)| entity)
+            let units = units.insert(self.units());
+            self.world_hover(units).map(|(entity, ..)| entity)
         };
         let end_screen = self.mode == Mode::Results && self.end_game.started();
         let overlay_draws: Vec<ScreenDraw<'_>> = if let Some(extra) = extra {
             extra.to_vec()
         } else if self.overlay_enabled && (self.mode == Mode::Match || end_screen) {
             let hud_hidden = self.state.scene.script_view.ui_hidden;
-            let dots = crate::hud::minimap_dots(&self.units(), &self.state);
+            let units = units.get_or_insert_with(|| self.units());
+            let dots = crate::hud::minimap_dots(units, &self.state);
             let view_box = minimap_view_box(&self.state, self.viewport);
             match self.apt_overlay.as_mut() {
                 Some(overlay) => overlay.build_and_draw(renderer, &dots, view_box, hud_hidden),
@@ -6536,6 +6625,16 @@ impl Game {
             crate::render_perf::stage!("hud"),
             hud_started.elapsed().as_secs_f64() * 1000.0,
         );
+        let camera = &self.state.camera;
+        self.state.scene.fog_shift = if camera.is_scripted() || camera.is_posed() {
+            0.0
+        } else {
+            let limits = crate::camera_limits::CameraLimits::resolve(
+                self.state.scene.camera_keys,
+                self.data.camera,
+            );
+            crate::scene::fog_shift(camera.distance(), camera.pitch(), limits.max_height())
+        };
         let result = compose_and_render(
             renderer,
             &mut self.state,
@@ -6549,6 +6648,7 @@ impl Game {
             self.acting_player,
             hovered,
             self.preferences.health_bars && self.shell_game.is_none(),
+            self.order_mode_waypoint,
         );
         let post_started = std::time::Instant::now();
         crate::audio::play_animation_sounds(&mut self.audio, &mut self.state.units);
@@ -6565,6 +6665,7 @@ impl Game {
                 crate::render_perf::stage!("post"),
                 post_started.elapsed().as_secs_f64() * 1000.0,
             );
+            crate::render_perf::set_audio(self.audio.hitch_counters());
         }
         result
     }
@@ -6708,6 +6809,7 @@ impl Game {
             }
             crate::in_game_menu::MenuRequest::RestartMission => self.wants_restart = true,
             crate::in_game_menu::MenuRequest::LoadSave(path) => self.load_request = Some(path),
+            crate::in_game_menu::MenuRequest::SaveGame { .. } => {}
             crate::in_game_menu::MenuRequest::ApplyOptions(preferences) => {
                 self.apply_options(preferences);
             }
@@ -6735,6 +6837,7 @@ impl Game {
             preferences.movie_volume,
             preferences.music_volume
         );
+        crate::user_options::store_all_health_bars(preferences.health_bars);
         self.preferences = preferences;
     }
 
@@ -6786,6 +6889,11 @@ impl Game {
         if victory_screen_seq != self.victory_screen_seen && step.is_none() {
             self.victory_screen_seen = victory_screen_seq;
             step = step.or_else(|| self.end_game.show_victory_screen());
+        }
+        if let (Some(crate::end_game::EndStep::Show(screen)), Some(stats)) =
+            (step, self.hero_stats.as_mut())
+        {
+            stats.finish(screen == crate::end_game::EndScreen::Victory, false);
         }
         let Some(overlay) = self.apt_overlay.as_mut() else {
             return;

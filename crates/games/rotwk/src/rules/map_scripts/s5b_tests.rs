@@ -115,6 +115,7 @@ fn real(value: f32) -> Parameter {
 fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -141,6 +142,7 @@ fn script(
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: condition_name.to_owned(),
                 params,
@@ -223,9 +225,9 @@ fn simulate_on(
         ("Lip", (Vec2::new(60.0, 5.0), 0.0)),
         ("Out", (Vec2::new(60.0, 170.0), 0.0)),
         ("WardA", (Vec2::new(500.0, 500.0), 0.0)),
-        ("WardB", (Vec2::new(515.0, 515.0), 0.0)),
-        ("WardC", (Vec2::new(521.0, 500.0), 0.0)),
-        ("WardD", (Vec2::new(530.0, 500.0), 0.0)),
+        ("WardB", (Vec2::new(530.0, 520.0), 0.0)),
+        ("WardC", (Vec2::new(536.0, 505.0), 0.0)),
+        ("WardD", (Vec2::new(540.0, 505.0), 0.0)),
         ("WardLeft", (Vec2::new(400.0, 500.0), 0.0)),
         ("WardRight", (Vec2::new(600.0, 500.0), 0.0)),
         ("PostNear", (Vec2::new(500.0, 520.0), 0.0)),
@@ -1003,9 +1005,9 @@ fn guarder_after_ward_moves(to: &str) -> Vec<(GuardState, Vec2)> {
     let ids = sim.rules().ids().unwrap();
     let (guarder, ward) = (named(&sim, "Guarder"), named(&sim, "Ward"));
     let target = match to {
-        "WardB" => Vec2::new(515.0, 515.0),
-        "WardC" => Vec2::new(521.0, 500.0),
-        _ => Vec2::new(530.0, 500.0),
+        "WardB" => Vec2::new(530.0, 520.0),
+        "WardC" => Vec2::new(536.0, 505.0),
+        _ => Vec2::new(540.0, 505.0),
     };
     let mut seen = Vec::new();
     for _ in 0..900 {
@@ -1022,7 +1024,7 @@ fn guarder_after_ward_moves(to: &str) -> Vec<(GuardState, Vec2)> {
 #[test]
 fn an_object_guard_returns_to_a_ward_that_moved() {
     let seen = guarder_after_ward_moves("WardD");
-    let target = Vec2::new(530.0, 500.0);
+    let target = Vec2::new(540.0, 505.0);
     assert!(
         seen.iter()
             .any(|&(state, goal)| state == GuardState::Return && goal == target),

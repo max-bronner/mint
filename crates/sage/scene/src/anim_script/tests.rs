@@ -5,6 +5,14 @@ use mint_sage_lua::Env;
 
 use super::*;
 
+fn left(state: &str) -> Prev<'_> {
+    Prev {
+        state,
+        animation: "",
+        fraction: 1.0,
+    }
+}
+
 fn state(script: &str) -> AnimationStateDef {
     AnimationStateDef {
         kind: AnimationStateKind::Conditioned,
@@ -77,7 +85,7 @@ fn a_transition_call_and_a_returned_label_are_both_collected() {
     let extras = ExtraTokens::default();
     let run = run(
         &script,
-        "IdleCaptured",
+        left("IdleCaptured"),
         Conditions::NONE,
         &extras,
         1,
@@ -103,7 +111,7 @@ fn the_prev_branch_taken_follows_the_state_left() {
     let extras = ExtraTokens::default();
     let run = run(
         &script,
-        "IdleUncaptured",
+        left("IdleUncaptured"),
         Conditions::NONE,
         &extras,
         1,
@@ -117,7 +125,7 @@ fn the_prev_branch_taken_follows_the_state_left() {
 #[test]
 fn an_unbound_call_is_refused_and_counted_keeping_what_ran_before_it() {
     let script = Script::parse(
-        "CurDrawableSetTransitionAnimState(\"T\")\nCurDrawablePlaySound(\"S\")\nreturn \"X\"",
+        "CurDrawableSetTransitionAnimState(\"T\")\nCurDrawableIsCurrentTargetKindof(\"S\")\nreturn \"X\"",
     )
     .unwrap();
     let mut env = Env::new();
@@ -125,7 +133,7 @@ fn an_unbound_call_is_refused_and_counted_keeping_what_ran_before_it() {
     let extras = ExtraTokens::default();
     let run = run(
         &script,
-        "Prev",
+        left("Prev"),
         Conditions::NONE,
         &extras,
         1,
@@ -137,7 +145,7 @@ fn an_unbound_call_is_refused_and_counted_keeping_what_ran_before_it() {
     assert_eq!(run.label, None, "the script stopped before its return");
     assert_eq!(
         refused.iter().collect::<Vec<_>>(),
-        [("CurDrawablePlaySound", 1u64)]
+        [("CurDrawableIsCurrentTargetKindof", 1u64)]
     );
 }
 
@@ -153,7 +161,7 @@ fn sub_object_calls_including_permanently_are_collected_in_order() {
     let extras = ExtraTokens::default();
     let run = run(
         &script,
-        "Prev",
+        left("Prev"),
         Conditions::NONE,
         &extras,
         1,
@@ -181,7 +189,7 @@ fn model_condition_reads_the_live_bit_by_name() {
     let mut refused = Refusals::default();
     let moving = run(
         &script,
-        "Prev",
+        left("Prev"),
         Conditions::MOVING,
         &extras,
         1,
@@ -191,7 +199,7 @@ fn model_condition_reads_the_live_bit_by_name() {
     );
     let still = run(
         &script,
-        "Prev",
+        left("Prev"),
         Conditions::NONE,
         &extras,
         1,
@@ -201,4 +209,56 @@ fn model_condition_reads_the_live_bit_by_name() {
     );
     assert_eq!(moving.label.as_deref(), Some("Yes"));
     assert_eq!(still.label.as_deref(), Some("No"));
+}
+
+#[test]
+fn a_script_decides_from_the_animation_it_left_and_how_far_through_it_was() {
+    let script = Script::parse(
+        "if CurDrawablePrevAnimation() == \"Bow\" and CurDrawablePrevAnimFraction() > .5 then\n\
+         CurDrawableHideSubObject(\"Part\")\nend\n",
+    )
+    .unwrap();
+    let extras = ExtraTokens::default();
+    let writes = |animation: &str, fraction: f32| {
+        let mut refused = Refusals::default();
+        run(
+            &script,
+            Prev {
+                state: "Any",
+                animation,
+                fraction,
+            },
+            Conditions::NONE,
+            &extras,
+            1,
+            0,
+            &mut Env::new(),
+            &mut refused,
+        )
+        .sub_objects
+        .len()
+    };
+    assert_eq!(writes("Bow", 0.9), 1);
+    assert_eq!(writes("Bow", 0.1), 0);
+    assert_eq!(writes("Sword", 0.9), 0);
+}
+
+#[test]
+fn a_sound_call_does_not_stop_the_writes_behind_it() {
+    let script =
+        Script::parse("CurDrawablePlaySound(\"Sound\")\nCurDrawableHideSubObject(\"Part\")\n")
+            .unwrap();
+    let mut refused = Refusals::default();
+    let run = run(
+        &script,
+        left(""),
+        Conditions::NONE,
+        &ExtraTokens::default(),
+        1,
+        0,
+        &mut Env::new(),
+        &mut refused,
+    );
+    assert_eq!(run.sub_objects.len(), 1);
+    assert!(refused.is_empty());
 }

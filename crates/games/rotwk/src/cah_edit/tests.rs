@@ -89,6 +89,7 @@ pub(crate) fn system_with(
                     stat_name: Some(name.to_owned()),
                     name_tag: Some(format!("{name}Tag")),
                     description_tag: None,
+                    ..mint_sage_ini::ThingStatDef::default()
                 })
                 .to_vec(),
         ),

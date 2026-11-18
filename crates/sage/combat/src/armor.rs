@@ -2,6 +2,9 @@ use mint_sim::StateHasher;
 
 use crate::damage::{DamageTypeId, DamageTypes, DEFAULT_TOKEN};
 
+const HEALING: &str = "HEALING";
+const UNRESISTABLE: &str = "UNRESISTABLE";
+
 pub const UNARMOURED: f32 = 1.0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10,6 +13,8 @@ pub struct ArmorTemplate {
     overrides: Vec<(u16, f32)>,
     flanked_penalty: Option<f32>,
     damage_scalar: Option<f32>,
+    healing: Option<u16>,
+    unresistable: Option<u16>,
 }
 
 impl Default for ArmorTemplate {
@@ -19,6 +24,8 @@ impl Default for ArmorTemplate {
             overrides: Vec::new(),
             flanked_penalty: None,
             damage_scalar: None,
+            healing: None,
+            unresistable: None,
         }
     }
 }
@@ -26,6 +33,9 @@ impl Default for ArmorTemplate {
 impl ArmorTemplate {
     pub fn from_rows(rows: &[(String, f32)], types: &mut DamageTypes) -> Self {
         let mut template = Self::default();
+        let key_of = |id: Option<DamageTypeId>| id.and_then(|id| u16::try_from(id.index()).ok());
+        template.healing = key_of(types.intern(HEALING));
+        template.unresistable = key_of(types.intern(UNRESISTABLE));
         for (token, coefficient) in rows {
             if token.trim().eq_ignore_ascii_case(DEFAULT_TOKEN) {
                 template.default = *coefficient;
@@ -87,13 +97,24 @@ impl ArmorTemplate {
         amount: f32,
         flanked_penalty: f32,
     ) -> f32 {
-        let coefficient = self.coefficient(damage_type);
-        let coefficient = if flanked_penalty.is_finite() && flanked_penalty > 0.0 {
-            1.0 - (1.0 - coefficient) * (1.0 - flanked_penalty)
-        } else {
-            coefficient
+        let key = u16::try_from(damage_type.index()).ok();
+        if key.is_some() && key == self.healing {
+            return if amount.is_finite() { amount } else { 0.0 };
+        }
+        let weaken = |factor: f32| {
+            if flanked_penalty.is_finite() && flanked_penalty > 0.0 {
+                1.0 - (1.0 - factor) * (1.0 - flanked_penalty)
+            } else {
+                factor
+            }
         };
-        let adjusted = amount * coefficient;
+        let scalar = weaken(self.damage_scalar.unwrap_or(1.0));
+        let coefficient = if key.is_some() && key == self.unresistable {
+            1.0
+        } else {
+            weaken(self.coefficient(damage_type))
+        };
+        let adjusted = amount * scalar * coefficient;
         if adjusted.is_finite() && adjusted > 0.0 {
             adjusted
         } else {
@@ -273,6 +294,21 @@ mod tests {
         );
         let full = ArmorTemplate::from_rows(&rows(&[("DEFAULT", 1.0)]), &mut types);
         assert!((full.adjust_damage_flanked(pierce, 100.0, 0.5) - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_armours_own_damage_scalar_multiplies_all_but_healing() {
+        let mut types = DamageTypes::new();
+        let template =
+            ArmorTemplate::from_rows(&rows(&[("DEFAULT", 1.0), ("SLASH", 0.8)]), &mut types)
+                .with_scalars(None, Some(0.5));
+        let slash = types.lookup("SLASH").unwrap();
+        let unresistable = types.lookup("UNRESISTABLE").unwrap();
+        let healing = types.lookup("HEALING").unwrap();
+        assert!((template.adjust_damage(slash, 100.0) - 40.0).abs() < 1e-4);
+        assert!((template.adjust_damage(unresistable, 100.0) - 50.0).abs() < 1e-4);
+        assert!((template.adjust_damage(healing, 100.0) - 100.0).abs() < 1e-4);
+        assert!((template.adjust_damage_flanked(unresistable, 100.0, 0.5) - 75.0).abs() < 1e-4);
     }
 
     #[test]

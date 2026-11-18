@@ -1399,7 +1399,7 @@ impl FxWater {
         engine.insert("viewi".into(), view_i);
         engine.insert("time".into(), vec![seconds]);
         let mut lights = Vec::new();
-        let mut sorted: Vec<&mint_render::DirectionalLight> = rig.lights.iter().collect();
+        let mut sorted: Vec<&mint_render::DirectionalLight> = rig.effect_lights.iter().collect();
         sorted.sort_by(|a, b| {
             let power =
                 |l: &mint_render::DirectionalLight| l.color.iter().map(|c| c * c).sum::<f32>();

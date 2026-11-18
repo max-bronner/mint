@@ -94,6 +94,7 @@ impl RotwkRules {
         min_range: f32,
         max_range: f32,
     ) -> Option<Entity> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("acquire_for"));
         match self.priority_ranking(world, ids, scanner) {
             Some(ranking) => {
                 let mover = self.mover_class_in(world, ids, scanner);
@@ -172,6 +173,7 @@ impl RotwkRules {
         foe: &Foe,
         radius: f32,
     ) -> bool {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("friendly_fire"));
         let max_share = self.attack_priorities.max_friendly_fire;
         let own = world
             .get(ids.health, foe.entity)
@@ -259,14 +261,15 @@ impl RotwkRules {
                 .into_iter()
                 .collect(),
         };
+        let charges = self.owns_charge_attack(world, ids, scanner);
         let arms = weapons
             .into_iter()
             .filter_map(|weapon| self.combat.weapons.get(weapon))
             .map(|template| {
                 (
-                    template.minimum_attack_range,
+                    self.min_range_of(world, scanner, template),
                     self.attack_range_of(world, ids, scanner, template),
-                    template.melee,
+                    template.melee || template.chase_weapon || charges,
                 )
             })
             .collect();
@@ -277,7 +280,7 @@ impl RotwkRules {
         }
     }
 
-    fn has_status_bit(&self, world: &World, entity: Entity, bit: &str) -> bool {
+    pub(super) fn has_status_bit(&self, world: &World, entity: Entity, bit: &str) -> bool {
         self.modules
             .as_ref()
             .and_then(|wiring| world.get(wiring.state, entity))

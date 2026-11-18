@@ -4,11 +4,11 @@ use mint_sage_ini::{BlockTable, Document, MemorySources, Reader};
 use mint_sage_str::{StringRecord, StringTable};
 
 use super::{
-    build_shortcut, command_button_help, help_text_lines, native_help, read_help_box_config,
-    read_object_help, strip_mnemonic, with_language_fonts, world_help, HelpBoxConfig, HelpBoxTimer,
-    HelpText, HoverKey, LineStyle, ObjectHelp, StatKind,
+    build_shortcut, command_button_help, help_text_lines, hero_help, native_help,
+    read_help_box_config, read_object_help, strip_mnemonic, with_language_fonts, world_help,
+    HelpBoxConfig, HelpBoxTimer, HelpText, HoverKey, LineStyle, ObjectHelp, StatKind,
 };
-use crate::command_bar::SlotAction;
+use crate::command_bar::{SlotAction, SlotHero};
 
 fn parse(text: &str) -> Document {
     let mut sources = MemorySources::new();
@@ -119,6 +119,75 @@ fn a_command_button_assembles_its_four_lines() {
     assert_eq!(help.stat.as_deref(), Some("Cost: 250"));
     assert_eq!(help.shortcut.as_deref(), Some("Shortcut: 3"));
     assert_eq!(help.description.as_deref(), Some("Makes a Thing"));
+}
+
+#[test]
+fn a_hero_slot_recruits_or_revives_by_the_heros_own_text() {
+    let strings = table(&[
+        ("CONTROLBAR:GenericReviveHero", "Revive %s"),
+        ("CONTROLBAR:GenericRecruitHero", "Recruit %s"),
+        ("CONTROLBAR:ToolTipGenericReviveHero", "Resurrects Hero"),
+        ("CONTROLBAR:ToolTipGenericRecruitHero", "Recruits Hero"),
+        ("OBJECT:Boromir", "Boromir"),
+        ("CONTROLBAR:BoromirHotkey", "Boro&mir"),
+        ("OBJECT:BoromirRecruit", "Steward's son"),
+        ("APT:RankLabel", "Level: %d"),
+        ("TOOLTIP:Cost", "Cost: %d"),
+        ("TOOLTIP:CommandPoints", "Command Points: %d"),
+    ]);
+    let mut hero = SlotHero {
+        display_name: Some("OBJECT:Boromir".to_owned()),
+        literal_name: None,
+        revive: false,
+        hotkey: None,
+        revive_text: None,
+        recruit_text: None,
+        level: 1,
+        command_points: 0,
+    };
+    let help = hero_help(&hero, Some(1200), &strings);
+    assert_eq!(help.title, "Recruit Boromir");
+    assert_eq!(
+        help.description.as_deref(),
+        Some(
+            "Recruits Hero
+Level: 1"
+        )
+    );
+    assert_eq!(help.stat.as_deref(), Some("Cost: 1200"));
+    hero.hotkey = Some("CONTROLBAR:BoromirHotkey".to_owned());
+    hero.recruit_text = Some("OBJECT:BoromirRecruit".to_owned());
+    hero.command_points = 4;
+    let help = hero_help(&hero, Some(1200), &strings);
+    assert_eq!(help.title, "Recruit Boromir");
+    assert_eq!(
+        help.description.as_deref(),
+        Some(
+            "Steward's son
+Level: 1"
+        )
+    );
+    assert_eq!(
+        help.stat.as_deref(),
+        Some(
+            "Cost: 1200
+Command Points: 4"
+        )
+    );
+    hero.revive = true;
+    hero.level = 5;
+    let help = hero_help(&hero, None, &strings);
+    assert_eq!(help.title, "Revive Boromir");
+    assert_eq!(
+        help.description.as_deref(),
+        Some(
+            "Resurrects Hero
+Level: 5"
+        ),
+        "the recruit text does not describe a revive"
+    );
+    hero.literal_name = Some("Fhaleen".to_owned());
+    assert_eq!(hero_help(&hero, None, &strings).title, "Revive Fhaleen");
 }
 
 #[test]

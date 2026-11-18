@@ -3,6 +3,10 @@ use super::*;
 use crate::combat::GroundOrder;
 use mint_sage_combat::{ShotOutcome, WeaponSlot};
 
+fn position_reach(reach: f32) -> f32 {
+    (reach - mint_sage_combat::weapon::RANGE_TRIM).max(0.0)
+}
+
 enum GroundWeapon {
     Ready(WeaponId),
     Missing,
@@ -83,7 +87,7 @@ impl RotwkRules {
                     continue;
                 }
             }
-            if !self.take_player_order(tick, ids, entity, false, true)? {
+            if !self.take_player_order(tick, ids, entity, false, true, true)? {
                 continue;
             }
             let was_attacking = self.is_attacking_self_or_horde(tick, ids, entity);
@@ -178,8 +182,8 @@ impl RotwkRules {
         let ranges = match self.ground_weapon(tick, ids, horde, order.slot) {
             GroundWeapon::Ready(weapon) => self.combat.weapons.get(weapon).map(|template| {
                 (
-                    template.minimum_attack_range,
-                    self.attack_range_of(tick.state(), ids, horde, template),
+                    self.min_range_of(tick.state(), horde, template),
+                    position_reach(self.attack_range_of(tick.state(), ids, horde, template)),
                 )
             }),
             GroundWeapon::Missing | GroundWeapon::NeedsVictim(_) => None,
@@ -204,6 +208,7 @@ impl RotwkRules {
                     Self::mover_radius(tick, ids, horde),
                     order.at,
                     0.0,
+                    None,
                     (min_range, range),
                     budgets,
                     (spot, 0.0),
@@ -256,11 +261,12 @@ impl RotwkRules {
         if let Some(set) = self.selected_set(tick, ids, entity) {
             self.switch_slot(tick, ids, entity, &mut state, set, usize::from(order.slot))?;
         }
-        let reach = self.attack_range_of(tick.state(), ids, entity, template);
+        let reach = position_reach(self.attack_range_of(tick.state(), ids, entity, template));
+        let minimum = self.min_range_of(tick.state(), entity, template);
         let within = |min: f32| in_range(me.position, me.radius, order.at, 0.0, min, reach);
-        if !within(template.minimum_attack_range) {
+        if !within(minimum) {
             if own_order {
-                let ranges = (template.minimum_attack_range, reach);
+                let ranges = (minimum, reach);
                 let (goal, goal_reach) = match stand_off(me.position, order.at, me.radius, ranges) {
                     Some(spot) => self.los_search_goal(
                         tick,
@@ -271,6 +277,7 @@ impl RotwkRules {
                         me.radius,
                         order.at,
                         0.0,
+                        None,
                         ranges,
                         budgets,
                         (spot, 0.0),
@@ -291,7 +298,7 @@ impl RotwkRules {
             tick.state_mut().insert(ids.armed, entity, state)?;
             return Ok(());
         }
-        self.leave_ranged_approach(tick, ids, entity)?;
+        self.leave_ranged_approach(tick, ids, entity, Some(order.at))?;
         self.stop_to_fire(tick, ids, entity)?;
         let now = tick.frame();
         match super::shooting::after_firing(template, &state, now) {
@@ -336,7 +343,7 @@ impl RotwkRules {
             return Ok(());
         }
         self.note_horde_last_shot(tick, ids, entity);
-        let landing = match template.resolve_shot(tick.rng(), false) {
+        let landing = match template.resolve_shot(tick.rng(), false, false) {
             ShotOutcome::Struck => order.at,
             ShotOutcome::Missed([dx, dy]) => Vec2::new(order.at.x + dx, order.at.y + dy),
         };
@@ -355,7 +362,7 @@ impl RotwkRules {
         let shot = Shot::at_ground(
             weapon,
             entity,
-            self.take_launch(tick, entity, me),
+            self.take_launch(tick, entity, me, None),
             landing,
             self.ground_height(landing.x, landing.y),
         );

@@ -6,7 +6,7 @@ use mint_sage_str::{format_placeholder, Placeholder, StringTable};
 use mint_sim::Entity;
 use mint_vfs::Vfs;
 
-use crate::command_bar::SlotAction;
+use crate::command_bar::{SlotAction, SlotHero};
 
 const INGAMEUI_INI: &str = "data/ini/ingameui.ini";
 
@@ -188,6 +188,17 @@ pub(crate) fn load_help_box_config(vfs: &Vfs) -> Result<HelpBoxConfig, String> {
     }
 }
 
+pub(crate) fn language_font(vfs: &Vfs, field: &str) -> Result<Option<(String, f32, bool)>, String> {
+    Ok(read_one(vfs, LANGUAGE_INI)?.and_then(|document| {
+        document
+            .roots()
+            .iter()
+            .filter(|block| block.keyword.eq_ignore_ascii_case("Language"))
+            .filter_map(|block| block.field(field).and_then(font_desc))
+            .next_back()
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HoverKey {
     Ring(u8),
@@ -195,8 +206,10 @@ pub(crate) enum HoverKey {
     Radial(u8),
     Flyout(u8),
     Hero(u8),
+    Spell(u8),
     Native(&'static str),
     World(Entity),
+    Portrait,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -253,13 +266,30 @@ pub(crate) fn command_button_help(
     cost: Option<i64>,
     strings: &StringTable,
 ) -> HelpText {
+    button_help(
+        text_label,
+        descript_label,
+        build_shortcut(action),
+        cost,
+        strings,
+    )
+}
+
+#[must_use]
+pub(crate) fn button_help(
+    text_label: Option<&str>,
+    descript_label: Option<&str>,
+    shortcut: Option<u8>,
+    cost: Option<i64>,
+    strings: &StringTable,
+) -> HelpText {
     let title = text_label
         .and_then(|k| strings.get(k))
         .map_or_else(String::new, strip_mnemonic);
     let stat = cost
         .filter(|&c| c > 0)
         .map(|c| format_placeholder(&strings.fetch("TOOLTIP:Cost"), Placeholder::Int(c)));
-    let shortcut = build_shortcut(action).map(|n| {
+    let shortcut = shortcut.map(|n| {
         format_placeholder(
             &strings.fetch("TOOLTIP:Shortcut"),
             Placeholder::Int(i64::from(n)),
@@ -273,6 +303,60 @@ pub(crate) fn command_button_help(
         stat,
         stat_kind: StatKind::Cost,
         shortcut,
+        description,
+    }
+}
+
+#[must_use]
+pub(crate) fn hero_help(hero: &SlotHero, cost: Option<i64>, strings: &StringTable) -> HelpText {
+    let (title_key, desc_key, own_text) = if hero.revive {
+        (
+            "CONTROLBAR:GenericReviveHero",
+            "CONTROLBAR:ToolTipGenericReviveHero",
+            &hero.revive_text,
+        )
+    } else {
+        (
+            "CONTROLBAR:GenericRecruitHero",
+            "CONTROLBAR:ToolTipGenericRecruitHero",
+            &hero.recruit_text,
+        )
+    };
+    let text_of = |key: &Option<String>| key.as_deref().and_then(|k| strings.get(k));
+    let name = hero.literal_name.clone().unwrap_or_else(|| {
+        text_of(&hero.hotkey)
+            .or_else(|| text_of(&hero.display_name))
+            .unwrap_or_default()
+            .to_owned()
+    });
+    let description = text_of(own_text)
+        .or_else(|| strings.get(desc_key))
+        .map(|text| {
+            let level = format_placeholder(
+                &strings.fetch("APT:RankLabel"),
+                Placeholder::Int(i64::from(hero.level)),
+            );
+            format!("{text}\n{level}")
+        });
+    let mut stat: Vec<String> = Vec::new();
+    stat.extend(
+        cost.filter(|&c| c > 0)
+            .map(|c| format_placeholder(&strings.fetch("TOOLTIP:Cost"), Placeholder::Int(c))),
+    );
+    if hero.command_points > 0 {
+        stat.push(format_placeholder(
+            &strings.fetch("TOOLTIP:CommandPoints"),
+            Placeholder::Int(hero.command_points),
+        ));
+    }
+    HelpText {
+        title: strip_mnemonic(&format_placeholder(
+            &strings.fetch(title_key),
+            Placeholder::Str(&name),
+        )),
+        stat: (!stat.is_empty()).then(|| stat.join("\n")),
+        stat_kind: StatKind::Cost,
+        shortcut: None,
         description,
     }
 }
@@ -437,13 +521,15 @@ pub(crate) fn help_text_lines(text: &HelpText, config: &HelpBoxConfig) -> Vec<He
         let Some(value) = value.filter(|v| !v.is_empty()) else {
             return;
         };
-        lines.push(HelpLineSpec {
-            text: value.to_owned(),
-            font: style.font.clone(),
-            point_size_bits: style.point_size.to_bits(),
-            bold: style.bold,
-            color: style.color,
-        });
+        for row in value.split('\n').filter(|row| !row.is_empty()) {
+            lines.push(HelpLineSpec {
+                text: row.to_owned(),
+                font: style.font.clone(),
+                point_size_bits: style.point_size.to_bits(),
+                bold: style.bold,
+                color: style.color,
+            });
+        }
     };
     push(Some(text.title.as_str()), &config.name);
     let stat_style = match text.stat_kind {

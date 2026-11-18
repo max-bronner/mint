@@ -75,7 +75,7 @@ fn an_appended_order_starts_only_if_the_queue_was_empty() {
         .get(ids.order_queue, horde)
         .cloned()
         .unwrap();
-    assert_eq!(queue.current.unwrap().point, Vec2::new(600.0, 200.0));
+    assert_eq!(queue.current.unwrap().point, Vec2::new(605.0, 205.0));
     assert_eq!(queue.queued.len(), 1);
     assert_eq!(queue.queued[0].point, Vec2::new(600.0, 600.0));
 }
@@ -141,7 +141,10 @@ fn a_replacing_order_clears_the_waypoint_queue() {
         )
         .unwrap();
     simulation.tick().unwrap();
-    assert!(simulation.state().get(ids.order_queue, horde).is_none());
+    assert!(simulation
+        .state()
+        .get(ids.order_queue, horde)
+        .is_none_or(|queue| queue.queued.is_empty() && queue.loop_start.is_none()));
 }
 
 #[test]
@@ -187,7 +190,7 @@ fn a_leg_ends_within_20_of_its_point_and_the_next_leg_starts() {
     for _ in 0..200 {
         simulation.tick().unwrap();
         if let Some(queue) = simulation.state().get(ids.order_queue, horde) {
-            if queue.current.map(|leg| leg.point) == Some(Vec2::new(600.0, 200.0)) {
+            if queue.current.as_ref().map(|leg| leg.point) == Some(Vec2::new(605.0, 205.0)) {
                 became_current = true;
                 break;
             }
@@ -281,4 +284,103 @@ fn enemy_entity(simulation: &Simulation<RotwkRules>, ids: Ids, owner: PlayerId) 
         })
         .unwrap()
         .unwrap()
+}
+
+fn returns_to_b(third: Vec2, ticks: u32) -> u32 {
+    let (combat, bow, armour) = combat_data();
+    let passability = Passability::build(&flat_map(128, 128), 5.0 / 128.0).unwrap();
+    let rules = single_horde_rules(passability, Vec::new(), bow, armour).with_combat(combat);
+    let mut simulation = Simulation::new(13, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let members = members_of(&simulation, ids);
+    let horde = horde_entity(&simulation, ids).unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: members,
+            },
+        )
+        .unwrap();
+    for at in [Vec2::new(400.0, 200.0), Vec2::new(400.0, 400.0), third] {
+        simulation
+            .submit(
+                PLAYER,
+                RotwkCommand::MoveTo {
+                    x: at.x,
+                    y: at.y,
+                    queue: true,
+                },
+            )
+            .unwrap();
+    }
+    let b = Vec2::new(400.0, 400.0);
+    let (mut visits, mut at_b) = (0, false);
+    for _ in 0..ticks {
+        simulation.tick().unwrap();
+        let near = position(&simulation, ids, horde).minus(b).length() < 60.0;
+        if near && !at_b {
+            visits += 1;
+        }
+        at_b = near;
+    }
+    visits
+}
+
+#[test]
+fn an_alt_click_near_an_earlier_one_loops_the_chain() {
+    assert!(returns_to_b(Vec2::new(405.0, 205.0), 3000) >= 2);
+}
+
+#[test]
+fn an_alt_click_20_away_does_not_loop() {
+    assert_eq!(returns_to_b(Vec2::new(400.0, 220.0), 3000), 1);
+}
+
+#[test]
+fn the_queue_strip_runs_through_every_queued_leg_and_marks_the_loop() {
+    let (combat, bow, armour) = combat_data();
+    let passability = Passability::build(&flat_map(128, 128), 5.0 / 128.0).unwrap();
+    let rules = single_horde_rules(passability, Vec::new(), bow, armour).with_combat(combat);
+    let mut simulation = Simulation::new(13, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let members = members_of(&simulation, ids);
+    let horde = horde_entity(&simulation, ids).unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: members,
+            },
+        )
+        .unwrap();
+    for at in [
+        Vec2::new(400.0, 200.0),
+        Vec2::new(400.0, 400.0),
+        Vec2::new(405.0, 205.0),
+    ] {
+        simulation
+            .submit(
+                PLAYER,
+                RotwkCommand::MoveTo {
+                    x: at.x,
+                    y: at.y,
+                    queue: true,
+                },
+            )
+            .unwrap();
+    }
+    simulation.tick().unwrap();
+    let strip = simulation
+        .rules()
+        .order_queue_strip(simulation.state(), horde)
+        .expect("a queue with legs behind the running one has a strip");
+    assert_eq!(strip.points.len(), 4, "the object, then three legs");
+    assert_eq!(strip.points[2], Vec2::new(400.0, 400.0));
+    assert!(
+        strip.loop_from.is_some(),
+        "the third click closed the chain"
+    );
 }

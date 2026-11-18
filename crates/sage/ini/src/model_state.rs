@@ -26,6 +26,18 @@ pub struct StateDecal {
     pub texture: String,
     pub size_x: f32,
     pub size_y: f32,
+    pub opacity: DecalOpacity,
+    pub override_lod_visibility: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecalOpacity {
+    pub dynamic: bool,
+    pub start: i64,
+    pub fade_in_ms: f32,
+    pub peak: i64,
+    pub fade_out_ms: f32,
+    pub end: i64,
 }
 
 const KNOWN_SHADOW_STYLES: [&str; 11] = [
@@ -42,16 +54,27 @@ const KNOWN_SHADOW_STYLES: [&str; 11] = [
     "SHADOW_MERGE_DECAL",
 ];
 
-#[derive(Debug, Clone, Default)]
-struct DecalFields {
-    style: Option<Option<DecalBlend>>,
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DecalFields {
+    style: Option<Option<(DecalBlend, bool)>>,
     texture: Option<String>,
     size_x: Option<f32>,
     size_y: Option<f32>,
+    opacity_start: Option<i64>,
+    fade_in_ms: Option<f32>,
+    opacity_peak: Option<i64>,
+    fade_out_ms: Option<f32>,
+    opacity_end: Option<i64>,
+    override_lod: Option<bool>,
 }
 
 impl DecalFields {
-    fn read(base: &Self, state: &Block, macros: &MacroTable, errors: &ValueErrors) -> Self {
+    pub(crate) fn read(
+        base: &Self,
+        state: &Block,
+        macros: &MacroTable,
+        errors: &ValueErrors,
+    ) -> Self {
         let context = context_of(state);
         let size = |name: &str| -> Option<f32> {
             let field = state.field(name)?;
@@ -63,18 +86,36 @@ impl DecalFields {
             }
             read
         };
+        let int = |name: &str| -> Option<i64> {
+            let field = state.field(name)?;
+            let read = field.value().and_then(crate::value::parse_int);
+            if read.is_none() {
+                errors.field(&context, field, "an integer");
+            }
+            read
+        };
+        let flag = |name: &str| -> Option<bool> {
+            let field = state.field(name)?;
+            let read = field.value().and_then(crate::value::parse_bool);
+            if read.is_none() {
+                errors.field(&context, field, "Yes or No");
+            }
+            read
+        };
         Self {
             style: state
                 .field("Shadow")
                 .map(|field| {
                     let found = field.args.iter().find_map(|token| {
-                        if token.eq_ignore_ascii_case("SHADOW_ALPHA_DECAL") {
-                            Some(DecalBlend::Alpha)
-                        } else if token.eq_ignore_ascii_case("SHADOW_ADDITIVE_DECAL") {
-                            Some(DecalBlend::Additive)
-                        } else {
-                            None
-                        }
+                        [
+                            ("SHADOW_ALPHA_DECAL", DecalBlend::Alpha, false),
+                            ("SHADOW_ADDITIVE_DECAL", DecalBlend::Additive, false),
+                            ("SHADOW_ALPHA_DECAL_DYNAMIC", DecalBlend::Alpha, true),
+                            ("SHADOW_ADDITIVE_DECAL_DYNAMIC", DecalBlend::Additive, true),
+                        ]
+                        .into_iter()
+                        .find(|(name, _, _)| token.eq_ignore_ascii_case(name))
+                        .map(|(_, blend, dynamic)| (blend, dynamic))
                     });
                     let recognised = found.is_some()
                         || field.args.iter().any(|token| {
@@ -95,23 +136,55 @@ impl DecalFields {
                 .or_else(|| base.texture.clone()),
             size_x: size("ShadowSizeX").or(base.size_x),
             size_y: size("ShadowSizeY").or(base.size_y),
+            opacity_start: int("ShadowOpacityStart").or(base.opacity_start),
+            fade_in_ms: size("ShadowOpacityFadeInTime").or(base.fade_in_ms),
+            opacity_peak: int("ShadowOpacityPeak").or(base.opacity_peak),
+            fade_out_ms: size("ShadowOpacityFadeOutTime").or(base.fade_out_ms),
+            opacity_end: int("ShadowOpacityEnd").or(base.opacity_end),
+            override_lod: flag("ShadowOverrideLODVisibility").or(base.override_lod),
         }
     }
 
-    fn decal(&self) -> Option<StateDecal> {
+    pub(crate) fn overlay(&self, base: &Self) -> Self {
+        Self {
+            style: self.style.or(base.style),
+            texture: self.texture.clone().or_else(|| base.texture.clone()),
+            size_x: self.size_x.or(base.size_x),
+            size_y: self.size_y.or(base.size_y),
+            opacity_start: self.opacity_start.or(base.opacity_start),
+            fade_in_ms: self.fade_in_ms.or(base.fade_in_ms),
+            opacity_peak: self.opacity_peak.or(base.opacity_peak),
+            fade_out_ms: self.fade_out_ms.or(base.fade_out_ms),
+            opacity_end: self.opacity_end.or(base.opacity_end),
+            override_lod: self.override_lod.or(base.override_lod),
+        }
+    }
+
+    pub(crate) fn decal(&self) -> Option<StateDecal> {
         let texture = self
             .texture
             .clone()
             .filter(|name| !name.eq_ignore_ascii_case(NONE_VALUE))?;
         let size_x = self.size_x.filter(|x| x.is_finite() && *x > 0.0)?;
+        let (blend, dynamic) = self.style.flatten()?;
+        let time = |ms: Option<f32>| ms.filter(|ms| ms.is_finite() && *ms > 0.0).unwrap_or(0.0);
         Some(StateDecal {
-            blend: self.style.flatten()?,
+            blend,
             texture,
             size_x,
             size_y: self
                 .size_y
                 .filter(|y| y.is_finite() && *y > 0.0)
                 .unwrap_or(size_x),
+            opacity: DecalOpacity {
+                dynamic,
+                start: self.opacity_start.unwrap_or(0),
+                fade_in_ms: time(self.fade_in_ms),
+                peak: self.opacity_peak.unwrap_or(255),
+                fade_out_ms: time(self.fade_out_ms),
+                end: self.opacity_end.unwrap_or(0),
+            },
+            override_lod_visibility: self.override_lod.unwrap_or(false),
         })
     }
 }
@@ -155,6 +228,8 @@ pub fn draw_model_states_collecting(
         .and_then(Field::value)
         .and_then(parse_bool)
         == Some(true);
+    let check_drawable =
+        crate::object::draw_flag(draw, crate::object::PARTICLE_BONES_CHECK_DRAWABLE_KEYWORD);
     let mut states: Vec<ModelStateDef> = Vec::new();
     let mut default: Option<ModelStateDef> = None;
     let mut default_decal = DecalFields::default();
@@ -217,6 +292,7 @@ pub fn draw_model_states_collecting(
                 .filter_map(|field| parse_particle_sys_bone(&field.args))
                 .map(|mut attachment| {
                     attachment.module_flag = module_flag;
+                    attachment.check_drawable = check_drawable;
                     attachment
                 }),
         );
@@ -469,10 +545,21 @@ End
                 texture: "Ring".to_owned(),
                 size_x: 440.0,
                 size_y: 440.0,
+                opacity: DecalOpacity {
+                    dynamic: false,
+                    start: 0,
+                    fade_in_ms: 0.0,
+                    peak: 255,
+                    fade_out_ms: 0.0,
+                    end: 0,
+                },
+                override_lod_visibility: false,
             })
         );
         assert_eq!(a[0].decal, None);
-        assert_eq!(a[2].decal, None);
+        let dynamic = a[2].decal.clone().unwrap();
+        assert!(dynamic.opacity.dynamic);
+        assert_eq!(dynamic.blend, DecalBlend::Additive);
         assert_eq!(a[3].decal, None);
         let b = read(1);
         let glow = b[0].decal.clone().unwrap();
@@ -491,10 +578,7 @@ End
         assert_eq!(found[1].decal, None, "an unknown style draws nothing");
         assert_eq!(found[2].decal, None, "an unparseable size draws nothing");
         assert_eq!(found[3].decal, None, "an unresolved macro draws nothing");
-        assert_eq!(
-            found[4].decal, None,
-            "_DYNAMIC is recognised but undrawn, not refused"
-        );
+        assert!(found[4].decal.is_some(), "_DYNAMIC is drawn, not refused");
         let refused = errors.take();
         assert_eq!(refused.len(), 3, "{refused:?}");
         assert_eq!(refused[0].context, "BAD_STYLE");

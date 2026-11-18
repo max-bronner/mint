@@ -179,8 +179,9 @@ fn print_script(script: &Script, pad: &str) {
             .iter()
             .map(|c| {
                 format!(
-                    "{}{}({})",
+                    "{}{}{}({})",
                     if c.enabled { "" } else { "DISABLED " },
+                    if c.negates() { "NOT " } else { "" },
                     c.name,
                     params_text(&c.params)
                 )
@@ -199,7 +200,8 @@ fn print_script(script: &Script, pad: &str) {
 fn print_actions(actions: &[ScriptAction], pad: &str, word: &str) {
     for action in actions {
         println!(
-            "{pad}    {word} {}({})",
+            "{pad}    {word} {}{}({})",
+            if action.enabled { "" } else { "(DISABLED) " },
             action.name,
             params_text(&action.params)
         );

@@ -27,10 +27,11 @@ use crate::shadow::{
 use crate::texture::{AddressMode, PixelFormat, TextureData};
 use crate::ui::{ScreenDraw, UiGeometry, UiQuad};
 use crate::{Error, Result};
+use ui_retained::{RetainedRun, RetainedUi};
 
 const BLEND_MODE_COUNT: usize = 9;
 
-const DEPTH_TEST_COUNT: usize = 2;
+const DEPTH_TEST_COUNT: usize = 3;
 
 const DEPTH_DIRECTION_COUNT: usize = 2;
 
@@ -67,17 +68,21 @@ fn grid_keys(
     [DepthDirection::Standard, DepthDirection::Reversed]
         .into_iter()
         .flat_map(move |direction| {
-            [DepthTest::Nearer, DepthTest::NearerOrEqual]
-                .into_iter()
-                .flat_map(move |depth_test| {
-                    blends.iter().map(move |&blend| ColorKey {
-                        cull_mode,
-                        skinned,
-                        direction,
-                        depth_test,
-                        blend,
-                    })
+            [
+                DepthTest::Nearer,
+                DepthTest::NearerOrEqual,
+                DepthTest::Always,
+            ]
+            .into_iter()
+            .flat_map(move |depth_test| {
+                blends.iter().map(move |&blend| ColorKey {
+                    cull_mode,
+                    skinned,
+                    direction,
+                    depth_test,
+                    blend,
                 })
+            })
         })
 }
 
@@ -249,13 +254,13 @@ const UNIFORM_SIZE: u64 = 416;
 
 const UNIFORM_FLOATS: usize = 104;
 
-const FRAME_UNIFORM_SIZE: u64 = 1040;
+const FRAME_UNIFORM_SIZE: u64 = 1264;
 
 const FRAME_SLOT_STRIDE: u64 = frame::slot_stride(FRAME_UNIFORM_SIZE);
 
 const LIGHT_SLOT_STRIDE: u64 = frame::slot_stride(SHADOW_UNIFORM_SIZE);
 
-const FRAME_UNIFORM_FLOATS: usize = 260;
+const FRAME_UNIFORM_FLOATS: usize = 316;
 
 const UI_INSTANCE_SIZE: u64 = 112;
 
@@ -402,7 +407,11 @@ pub struct DirectionalLight {
     pub color: [f32; 3],
 }
 
-pub const LIGHT_SETS: u8 = 2;
+pub const LIGHT_SETS: u8 = 4;
+
+const LIGHT_SET_COUNT: usize = LIGHT_SETS as usize;
+
+const SET_LIGHTS: usize = LIGHT_SET_COUNT * MAX_DIRECTIONAL_LIGHTS;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LightSet {
@@ -453,7 +462,7 @@ pub struct Scene<'a> {
     pub instances: &'a [Instance],
     pub clip_plane: Option<[f32; 4]>,
     pub shadow: Option<ShadowSample>,
-    pub light_sets: [Option<LightSet>; 2],
+    pub light_sets: [Option<LightSet>; LIGHT_SET_COUNT],
     pub light_cookie: Option<LightCookie>,
     pub contact_shadows: Option<ContactShadows>,
     pub ui_quads: &'a [UiQuad],
@@ -485,7 +494,7 @@ impl<'a> Scene<'a> {
             instances: &[],
             clip_plane: None,
             shadow: None,
-            light_sets: [None; 2],
+            light_sets: [None; LIGHT_SET_COUNT],
             light_cookie: None,
             contact_shadows: None,
             ui_quads: &[],
@@ -570,6 +579,13 @@ struct GpuTexture {
 type MaterialKey = (Option<usize>, Option<usize>, Option<usize>);
 
 type MaterialSlot = usize;
+
+#[derive(Debug, Clone, Copy)]
+struct UiTextureMaterial {
+    handle: TextureHandle,
+    slot: MaterialSlot,
+    size: (u32, u32),
+}
 
 struct CustomShaderEntry {
     layout: wgpu::BindGroupLayout,
@@ -690,6 +706,7 @@ pub struct Renderer {
     ui_geometry_textured_transform_bind_group: wgpu::BindGroup,
     ui_geometry_textured_scratch: Vec<u8>,
     ui_geometry_textured_transform_scratch: Vec<u8>,
+    ui_retained: RetainedUi,
 
     custom_shaders: Vec<CustomShaderEntry>,
     custom_materials: Vec<CustomMaterialEntry>,
@@ -1383,6 +1400,14 @@ impl Renderer {
                 &ui_geometry_textured_transform_buffer,
             );
 
+        let ui_retained = RetainedUi::new(
+            &device,
+            &ui_geometry_uniform_layout,
+            &material_layout,
+            color_format,
+            cache,
+        );
+
         let blank = TextureData::rgba8(1, 1, vec![255, 255, 255, 255])
             .ok_or(Error::EmptyTexture)
             .and_then(|data| upload_texture(&device, &queue, &data, info.block_compression))?;
@@ -1477,6 +1502,7 @@ impl Renderer {
             ui_geometry_textured_transform_bind_group,
             ui_geometry_textured_scratch: Vec::new(),
             ui_geometry_textured_transform_scratch: Vec::new(),
+            ui_retained,
             custom_shaders: Vec::new(),
             custom_materials: Vec::new(),
             render_targets: Vec::new(),
@@ -1877,19 +1903,30 @@ impl Renderer {
                 &self.bone_buffer,
             );
         }
-        let mut scratch = std::mem::take(&mut self.bone_scratch);
-        scratch.clear();
-        scratch.reserve(bones.len().saturating_mul(crate::skin::BONE_SIZE));
-        for bone in bones {
-            crate::skin::write_bone(bone, &mut scratch);
-        }
         if grown {
+            let mut scratch = std::mem::take(&mut self.bone_scratch);
+            scratch.clear();
+            scratch.reserve(bones.len().saturating_mul(crate::skin::BONE_SIZE));
+            for bone in bones {
+                crate::skin::write_bone(bone, &mut scratch);
+            }
             self.queue.write_buffer(&self.bone_buffer, 0, &scratch);
-        } else if !scratch.is_empty() {
-            self.frame
-                .write_buffer(&self.device, &self.queue, &self.bone_buffer, 0, &scratch);
+            self.bone_scratch = scratch;
+        } else {
+            self.frame.write_buffer_with(
+                &self.device,
+                &self.queue,
+                &self.bone_buffer,
+                0,
+                bones.len().saturating_mul(crate::skin::BONE_SIZE),
+                |palette| {
+                    let (slots, _) = palette.into_chunks::<{ crate::skin::BONE_SIZE }>();
+                    for (slot, bone) in slots.into_iter().zip(bones) {
+                        slot.write(crate::skin::packed_bone(bone));
+                    }
+                },
+            );
         }
-        self.bone_scratch = scratch;
         self.bone_count = bones.len();
         Ok(())
     }
@@ -2247,6 +2284,30 @@ impl Renderer {
     fn texture_dimensions(&self, handle: TextureHandle) -> Result<(u32, u32)> {
         let texture = self.textures.get(handle.0).ok_or(Error::UnknownHandle)?;
         Ok((texture.width, texture.height))
+    }
+
+    fn ui_texture_material(
+        &mut self,
+        handle: TextureHandle,
+        last: &mut Option<UiTextureMaterial>,
+    ) -> Result<(MaterialSlot, (u32, u32))> {
+        if let Some(UiTextureMaterial {
+            handle: previous,
+            slot,
+            size,
+        }) = *last
+        {
+            if previous == handle {
+                return Ok((slot, size));
+            }
+        }
+        let size = self.texture_dimensions(handle)?;
+        if size.0 == 0 || size.1 == 0 {
+            return Err(Error::EmptyTexture);
+        }
+        let slot = self.ensure_material(Some(handle), None, None)?;
+        *last = Some(UiTextureMaterial { handle, slot, size });
+        Ok((slot, size))
     }
 
     pub fn register_custom_shader(
@@ -3795,8 +3856,17 @@ impl Renderer {
         }
 
         let mut materials = Vec::with_capacity(total);
+        let mut last: Option<(Option<TextureHandle>, MaterialSlot)> = None;
         for quad in scene.ui_quads.iter().chain(ordered_quads.clone()) {
-            materials.push(self.ensure_material(quad.texture, None, None)?);
+            let slot = match last {
+                Some((texture, slot)) if texture == quad.texture => slot,
+                _ => {
+                    let slot = self.ensure_material(quad.texture, None, None)?;
+                    last = Some((quad.texture, slot));
+                    slot
+                }
+            };
+            materials.push(slot);
         }
 
         let mut scratch = std::mem::take(&mut self.ui_scratch);
@@ -3828,19 +3898,37 @@ impl Renderer {
         });
         let entries: Vec<&UiGeometry<'_>> =
             scene.ui_geometry.iter().chain(ordered_geometry).collect();
+        let retain = self.ui_retained.plan(&self.device, &entries);
         let mut runs = Vec::with_capacity(entries.len());
         let mut triangle_vertices = 0usize;
         let mut line_vertices = 0usize;
         let mut textured_vertices = 0usize;
         let mut transform_count = 0usize;
+        let mut last_texture: Option<UiTextureMaterial> = None;
         for geometry in entries {
+            if retain && geometry.retain_key.is_some() {
+                let material = match geometry.texture {
+                    Some(handle) if !geometry.triangles.is_empty() => {
+                        Some(self.ui_texture_material(handle, &mut last_texture)?)
+                    }
+                    _ => None,
+                };
+                if let Some(run) = self.ui_retained.add(geometry, material)? {
+                    if !run.is_empty() {
+                        runs.push(UiGeometryRun {
+                            triangle_range: None,
+                            line_range: None,
+                            textured: None,
+                            retained: Some(run),
+                        });
+                    }
+                    continue;
+                }
+            }
             let textured = match geometry.texture {
                 Some(handle) if !geometry.triangles.is_empty() => {
-                    let (width, height) = self.texture_dimensions(handle)?;
-                    if width == 0 || height == 0 {
-                        return Err(Error::EmptyTexture);
-                    }
-                    let material = self.ensure_material(Some(handle), None, None)?;
+                    let (material, (width, height)) =
+                        self.ui_texture_material(handle, &mut last_texture)?;
                     let textured_first = textured_vertices;
                     for corner in geometry.triangles.chunks_exact(3).flatten() {
                         write_geometry_vertex(
@@ -3916,6 +4004,7 @@ impl Renderer {
                     triangle_range,
                     line_range,
                     textured,
+                    retained: None,
                 });
             }
         }
@@ -3986,6 +4075,9 @@ impl Renderer {
                 );
             self.ui_geometry_textured_transform_capacity = capacity;
         }
+        if retain {
+            self.ui_retained.flush(&self.device, &self.queue);
+        }
         if !triangle_scratch.is_empty() {
             self.queue
                 .write_buffer(&self.ui_geometry_triangle_buffer, 0, &triangle_scratch);
@@ -4018,6 +4110,9 @@ impl Renderer {
     }
 
     fn record_geometry_run(&self, pass: &mut wgpu::RenderPass<'_>, run: &UiGeometryRun) -> u32 {
+        if let Some(retained) = &run.retained {
+            return self.record_retained_run(pass, retained);
+        }
         let mut draw_calls = 0u32;
         if let Some((first, count)) = run.triangle_range {
             pass.set_pipeline(&self.ui_geometry_triangle_pipeline);
@@ -4711,9 +4806,9 @@ struct FrameUniforms {
     shadow_params: [f32; 4],
     shadow_filter: [f32; 4],
     shadow_cascade_params: [[f32; 4]; MAX_SHADOW_CASCADES],
-    set_directions: [[f32; 4]; 6],
-    set_colors: [[f32; 4]; 6],
-    set_ambient: [[f32; 4]; 2],
+    set_directions: [[f32; 4]; SET_LIGHTS],
+    set_colors: [[f32; 4]; SET_LIGHTS],
+    set_ambient: [[f32; 4]; LIGHT_SET_COUNT],
     cookie: [f32; 4],
     cookie_tint: [f32; 4],
     inv_view_proj: [[f32; 4]; 4],
@@ -5172,6 +5267,7 @@ fn build_pipeline_masked(
                 (DepthDirection::Reversed, DepthTest::NearerOrEqual) => {
                     wgpu::CompareFunction::GreaterEqual
                 }
+                (_, DepthTest::Always) => wgpu::CompareFunction::Always,
             }),
             stencil: merge_stencil_state(blend),
             bias: wgpu::DepthBiasState::default(),
@@ -5476,10 +5572,16 @@ fn contact_shadow_block(contact: Option<ContactShadows>) -> [f32; 4] {
 }
 
 #[allow(clippy::type_complexity)]
-fn light_set_block(scene: &Scene<'_>) -> ([[f32; 4]; 6], [[f32; 4]; 6], [[f32; 4]; 2]) {
-    let mut directions = [[0.0f32; 4]; 6];
-    let mut colors = [[0.0f32; 4]; 6];
-    let mut ambient = [[0.0f32; 4]; 2];
+fn light_set_block(
+    scene: &Scene<'_>,
+) -> (
+    [[f32; 4]; SET_LIGHTS],
+    [[f32; 4]; SET_LIGHTS],
+    [[f32; 4]; LIGHT_SET_COUNT],
+) {
+    let mut directions = [[0.0f32; 4]; SET_LIGHTS];
+    let mut colors = [[0.0f32; 4]; SET_LIGHTS];
+    let mut ambient = [[0.0f32; 4]; LIGHT_SET_COUNT];
     for (index, set) in scene.light_sets.iter().enumerate() {
         let (lights, ambient_color, cookie) = match set {
             Some(set) => (set.lights, set.ambient_color, set.cookie),
@@ -5802,6 +5904,7 @@ struct UiGeometryRun {
     triangle_range: Option<(u32, u32)>,
     line_range: Option<(u32, u32)>,
     textured: Option<TexturedTriangleRun>,
+    retained: Option<RetainedRun>,
 }
 
 #[derive(Clone, Copy)]
@@ -6703,3 +6806,4 @@ fn f64_ratio(width: u32, height: u32) -> f32 {
 mod tests;
 
 mod frame;
+mod ui_retained;

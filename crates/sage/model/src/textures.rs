@@ -1,7 +1,7 @@
 use mint_image::dds::{BlockFormat, Dds};
-use mint_image::{jpeg, tga};
+use mint_image::{jpeg, png, tga};
 use mint_render::{MipLevel, PixelFormat, TextureData};
-use mint_sage_asset::Resolver;
+use mint_sage_asset::{alpha_sidecar, Resolver};
 use mint_vfs::{Vfs, VfsPath};
 
 use crate::{Error, Result};
@@ -38,7 +38,11 @@ pub fn load_texture(
     let (data, compressed_upload) = match extension.as_str() {
         "dds" => decode_dds(&bytes, allow_compressed)?,
         "tga" => (decode_rgba(tga::decode(&bytes)?)?, false),
-        "jpg" | "jpeg" => (decode_rgba(jpeg::decode(&bytes)?)?, false),
+        "jpg" | "jpeg" => (
+            with_alpha_sidecar(vfs, &path, jpeg::decode(&bytes)?)?,
+            false,
+        ),
+        "png" => (decode_rgba(png::decode(&bytes)?)?, false),
         other => {
             return Err(Error::UnsupportedTexture {
                 name: name.to_owned(),
@@ -160,6 +164,27 @@ fn decode_dds(bytes: &[u8], allow_compressed: bool) -> Result<(TextureData, bool
     Ok((data, false))
 }
 
+fn with_alpha_sidecar(
+    vfs: &Vfs,
+    path: &VfsPath,
+    image: mint_image::RgbaImage,
+) -> Result<TextureData> {
+    let Some(sidecar) = alpha_sidecar(path).filter(|sidecar| vfs.contains(sidecar.as_str())) else {
+        return decode_rgba(image);
+    };
+    let alpha = png::decode(&vfs.read_path(&sidecar)?)?;
+    let expected = (image.width(), image.height());
+    let found = (alpha.width(), alpha.height());
+    let merged = image
+        .with_alpha_of(&alpha)
+        .ok_or_else(|| Error::AlphaSidecarSize {
+            sidecar: sidecar.as_str().to_owned(),
+            expected,
+            found,
+        })?;
+    decode_rgba(merged)
+}
+
 fn decode_rgba(image: mint_image::RgbaImage) -> Result<TextureData> {
     let mut data = TextureData::rgba8(image.width(), image.height(), image.into_pixels())
         .ok_or(Error::MalformedDecodedImage)?;
@@ -180,6 +205,120 @@ mod tests {
             Some(vec![216, 80, 66, 211, 216, 86, 195, 80, 85, 211, 231, 86])
         );
         assert_eq!(bump_offsets(3, 2, &rgba[..20]), None);
+    }
+
+    struct BytesMount(Vec<(VfsPath, Vec<u8>)>);
+
+    impl mint_vfs::Mount for BytesMount {
+        fn label(&self) -> &str {
+            "bytes"
+        }
+        fn entries(&self) -> Vec<VfsPath> {
+            self.0.iter().map(|(path, _)| path.clone()).collect()
+        }
+        fn read(&self, path: &VfsPath) -> mint_vfs::Result<Vec<u8>> {
+            self.0
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or_else(|| mint_vfs::Error::NotFound { path: path.clone() })
+        }
+    }
+
+    fn tga(width: u16, height: u16, rgba: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&[32, 0x28]);
+        for texel in rgba.chunks_exact(4) {
+            out.extend_from_slice(&[texel[2], texel[1], texel[0], texel[3]]);
+        }
+        out
+    }
+
+    fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+            out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            let crc = crc32(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        }
+        let row = usize::try_from(width).unwrap() * 4;
+        let mut raw = Vec::new();
+        for line in rgba.chunks_exact(row) {
+            raw.push(0);
+            raw.extend_from_slice(line);
+        }
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &raw {
+            a = (a + u32::from(byte)) % 65_521;
+            b = (b + a) % 65_521;
+        }
+        let len = u16::try_from(raw.len()).unwrap();
+        let mut zlib = vec![0x78, 0x01, 1];
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(&raw);
+        zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut out, b"IHDR", &header);
+        chunk(&mut out, b"IDAT", &zlib);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    fn vfs_with(entries: &[(&str, Vec<u8>)]) -> Vfs {
+        let mut vfs = Vfs::new();
+        vfs.mount(std::sync::Arc::new(BytesMount(
+            entries
+                .iter()
+                .map(|(path, bytes)| (VfsPath::new(path), bytes.clone()))
+                .collect(),
+        )));
+        vfs
+    }
+
+    #[test]
+    fn a_jpg_takes_its_alpha_from_the_png_of_the_same_stem() {
+        let colour = [200, 10, 10, 255, 20, 200, 20, 255];
+        let alpha = [255, 255, 255, 0, 255, 255, 255, 90];
+        let jpg_path = VfsPath::new("art/compiledtextures/hc/hc_mask.jpg");
+        let image = || mint_image::tga::decode(&tga(2, 1, &colour)).unwrap();
+        let vfs = vfs_with(&[("art/compiledtextures/hc/hc_mask.png", png(2, 1, &alpha))]);
+        let data = with_alpha_sidecar(&vfs, &jpg_path, image()).unwrap();
+        assert_eq!(data.levels[0].data, [200, 10, 10, 0, 20, 200, 20, 90]);
+
+        let alone = with_alpha_sidecar(&vfs_with(&[]), &jpg_path, image()).unwrap();
+        assert_eq!(alone.levels[0].data, colour);
+
+        let wrong = vfs_with(&[(
+            "art/compiledtextures/hc/hc_mask.png",
+            png(1, 1, &alpha[..4]),
+        )]);
+        assert!(matches!(
+            with_alpha_sidecar(&wrong, &jpg_path, image()),
+            Err(Error::AlphaSidecarSize { .. })
+        ));
     }
 
     #[test]

@@ -428,6 +428,33 @@ mod tests {
         assert!(frames_of(&seen, |effect| matches!(effect, Effect::Halt)).is_empty());
     }
 
+    #[test]
+    fn a_charge_holds_charging_from_its_trigger_to_the_cast_end() {
+        let seen = cast(
+            &[
+                ("ChargeAttackSpeedBoost", "Yes"),
+                ("PreparationTime", "900"),
+                ("PackTime", "300"),
+            ],
+            |_| 10.0,
+            150,
+        );
+        let names = |effect: &Effect, in_add: bool| match effect {
+            Effect::ModelConditions { add, remove } => {
+                let list = if in_add { add } else { remove };
+                list.iter().any(|name| name.as_ref() == "CHARGING")
+            }
+            _ => false,
+        };
+        let raised = frames_of(&seen, |effect| names(effect, true));
+        let cleared = frames_of(&seen, |effect| names(effect, false));
+        assert_eq!(raised.len(), 1, "{seen:?}");
+        assert!(
+            cleared.iter().any(|frame| *frame > raised[0]),
+            "no clear after the raise: {seen:?}"
+        );
+    }
+
     fn is_lose_stealth(effect: &Effect) -> bool {
         matches!(effect, Effect::LoseStealth)
     }

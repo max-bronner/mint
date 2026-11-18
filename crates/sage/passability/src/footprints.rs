@@ -128,6 +128,7 @@ impl TemplateIndex {
         let records: Vec<FootprintRecord> = record
             .geometry
             .shown(&[])
+            .filter(|piece| piece.offset_z <= MAX_STAMPED_OFFSET_Z)
             .map(convert_piece)
             .filter(|record| record.footprint.reach() > 0.0)
             .collect();
@@ -292,6 +293,8 @@ pub fn scaleable_walls(objects: &[Object], templates: &TemplateIndex) -> Vec<Wal
     walls
 }
 
+pub const MAX_STAMPED_OFFSET_Z: f32 = 10.0;
+
 fn convert_piece(piece: &GeometryPiece) -> FootprintRecord {
     let footprint = match piece.shape {
         PieceShape::Box { major, minor } => Footprint::Box { major, minor },
@@ -371,6 +374,44 @@ mod tests {
         assert_eq!(index.lookup("EreborEdge"), None);
         assert_eq!(index.lookup("SiegeTower"), None);
         assert_eq!(index.lookup("MapRock"), None);
+    }
+
+    #[test]
+    fn a_part_raised_past_ten_does_not_stamp() {
+        let documents = tree(
+            "Object Gatehouse\n  KindOf = STRUCTURE IMMOBILE\n  \
+               Geometry = BOX\n  GeometryMajorRadius = 10.0\n  GeometryMinorRadius = 10.0\n  \
+               AdditionalGeometry = BOX\n  GeometryMajorRadius = 6.0\n  GeometryMinorRadius = 6.0\n  \
+                 GeometryOffset = X:0 Y:0 Z:10\n  \
+               AdditionalGeometry = BOX\n  GeometryMajorRadius = 7.0\n  GeometryMinorRadius = 7.0\n  \
+                 GeometryOffset = X:0 Y:0 Z:11\n\
+             End\n\
+             Object Arch\n  KindOf = STRUCTURE IMMOBILE\n  \
+               Geometry = BOX\n  GeometryMajorRadius = 10.0\n  GeometryMinorRadius = 10.0\n  \
+                 GeometryOffset = X:0 Y:0 Z:100\n\
+             End\n",
+        );
+        let index = TemplateIndex::build(&documents);
+        let radii: Vec<Footprint> = index
+            .lookup("Gatehouse")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.footprint)
+            .collect();
+        assert_eq!(
+            radii,
+            [
+                Footprint::Box {
+                    major: 10.0,
+                    minor: 10.0
+                },
+                Footprint::Box {
+                    major: 6.0,
+                    minor: 6.0
+                }
+            ]
+        );
+        assert_eq!(index.lookup("Arch"), None, "nothing left to stamp");
     }
 
     #[test]

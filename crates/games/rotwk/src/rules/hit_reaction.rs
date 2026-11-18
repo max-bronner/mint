@@ -127,7 +127,12 @@ impl RotwkRules {
             state.level = 0;
             state.ends = now;
         }
-        let free = state.level == 0 || module.fast_hits_reset_reaction();
+        let frame_ticks =
+            u64::from(mint_sim::SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ).max(1);
+        let began_running = polled.is_some_and(|held| {
+            held.level > 0 || held.ends.get().saturating_add(frame_ticks) > now.get()
+        });
+        let free = !began_running || module.fast_hits_reset_reaction();
         let willing = module.hits_paralyze() || idle;
         let lost = state.last_health - current;
         if free && willing && lost > 0.0 {

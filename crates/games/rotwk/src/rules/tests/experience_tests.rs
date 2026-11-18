@@ -461,7 +461,11 @@ fn enough_kills_level_the_horde_and_its_members_gain_the_levels_lists() {
     assert!(dead(&simulation, ids, &targets) >= 2, "two kills");
     assert_eq!(rank(&simulation, horde), Some(2), "the horde levelled");
     for member in &members {
-        assert_eq!(rank(&simulation, *member), Some(2), "and every member");
+        assert_eq!(
+            rank(&simulation, *member),
+            Some(1),
+            "a member keeps its own level"
+        );
         let health = simulation.state().get(ids.health, *member).unwrap().0;
         assert_eq!(health.max(), 120.0, "TroopRank2's +20 on the maximum");
         let bonuses = simulation.state().get(ids.bonuses, *member).unwrap().0;
@@ -1012,7 +1016,7 @@ fn a_banner_carrier_from_level_zero_comes_with_the_horde() {
 }
 
 #[test]
-fn a_level_up_upgrade_stops_at_its_cap_and_the_members_follow() {
+fn a_level_up_upgrade_stops_at_its_cap_and_the_members_keep_theirs() {
     let m = load();
     let mut simulation = Simulation::new(18, rules(&m, &[])).unwrap();
     let ids = simulation.rules().ids().unwrap();
@@ -1025,7 +1029,11 @@ fn a_level_up_upgrade_stops_at_its_cap_and_the_members_follow() {
         "the level's own requirement plus the upgrade's completion XP"
     );
     for member in &members {
-        assert_eq!(rank(&simulation, *member), Some(2));
+        assert_eq!(
+            rank(&simulation, *member),
+            Some(1),
+            "a member keeps its own level"
+        );
     }
 }
 

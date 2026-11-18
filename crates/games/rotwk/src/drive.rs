@@ -12,6 +12,8 @@ pub(crate) enum Step {
     Ticks(u64),
     Speed(f64),
     Move(f32, f32),
+    Leave,
+    DoubleClick(PointerButton),
     Click(f32, f32, PointerButton),
     ClickHere(PointerButton),
     Down(f32, f32, PointerButton),
@@ -24,6 +26,8 @@ pub(crate) enum Step {
     Select(String),
     Do(String),
     Try(String, String),
+    Screen(String),
+    Closed(String),
     Shot(PathBuf),
     Time(u32),
     Resize(u32, u32),
@@ -39,6 +43,30 @@ pub(crate) fn parse(script: &str) -> Result<Vec<Step>, String> {
         .filter(|s| !s.is_empty())
         .map(parse_step)
         .collect()
+}
+
+pub(crate) fn named_templates(script: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for step in parse(script).unwrap_or_default() {
+        let (verb, argument) = match step {
+            Step::Do(argument) => ("do", argument),
+            Step::Select(argument) => ("select", argument),
+            Step::Try(verb, argument) => (if verb == "do" { "do" } else { "select" }, argument),
+            _ => continue,
+        };
+        let (word, rest) = argument.split_once(' ').unwrap_or((&argument, ""));
+        let name = match (verb, word) {
+            ("do", "place") | ("select", "near") => rest.rsplit_once(" at ").map(|(name, _)| name),
+            ("do", "build") | ("select", "kind" | "one" | "any") => Some(rest),
+            _ => None,
+        };
+        if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+            if !names.iter().any(|seen| seen == name) {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
 }
 
 fn parse_step(step: &str) -> Result<Step, String> {
@@ -80,6 +108,10 @@ fn parse_step(step: &str) -> Result<Step, String> {
             Ok(Step::Resize(w.max(1.0) as u32, h.max(1.0) as u32))
         }
         "move" => point().map(|(x, y)| Step::Move(x, y)),
+        "leave" => Ok(Step::Leave),
+        "dblclick" => parse_button(rest)
+            .map(Step::DoubleClick)
+            .ok_or_else(|| format!("--drive: {step:?} wants l|r|m")),
         "click" if rest == "here" => Ok(Step::ClickHere(PointerButton::Primary)),
         "rclick" if rest == "here" => Ok(Step::ClickHere(PointerButton::Secondary)),
         "mclick" if rest == "here" => Ok(Step::ClickHere(PointerButton::Middle)),
@@ -130,6 +162,12 @@ fn parse_step(step: &str) -> Result<Step, String> {
             _ => Err(format!("--drive: {step:?} wants try select|do ...")),
         },
         "shot" if !rest.is_empty() => Ok(Step::Shot(PathBuf::from(rest))),
+        "screen" if !rest.is_empty() => Ok(Step::Screen(rest.to_owned())),
+        "closed" => crate::rules::UiPanel::from_name(rest)
+            .map(|_| Step::Closed(rest.to_owned()))
+            .ok_or_else(|| {
+                format!("--drive: {step:?} wants SpellStore, Objectives or StanceSubMenu")
+            }),
         _ => Err(format!("--drive: {step:?} is not a step")),
     }
 }
@@ -154,6 +192,13 @@ fn parse_key(name: &str) -> Option<Key> {
         "left" => Some(Key::ArrowLeft),
         "right" => Some(Key::ArrowRight),
         _ => {
+            if let Some(digit) = name.strip_prefix("kp") {
+                return digit
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|n| *n <= 9)
+                    .map(Key::Numpad);
+            }
             if let Some(digit) = name.strip_prefix('f') {
                 if let Some(n) = digit.parse::<u8>().ok().filter(|n| (1..=12).contains(n)) {
                     return Some(Key::Function(n));
@@ -186,6 +231,24 @@ fn parse_key(name: &str) -> Option<Key> {
 const MAX_SPEED: f64 = 1000.0;
 
 const TICK_STALL_FRAMES: u32 = 200_000;
+
+const SETTLE_FRAMES: u32 = 600;
+
+fn pending_commands<A>(
+    hook: &mut impl FnMut(&mut A, &str, &str) -> Result<String, String>,
+    app: &mut A,
+) -> usize {
+    hook(app, "pending", "")
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+fn reads_command_bar(action: &str) -> bool {
+    matches!(action.split_whitespace().next(), Some("bar" | "press"))
+}
+
+const SCREEN_STALL_FRAMES: u32 = 20_000;
 
 pub(crate) struct Driver {
     clock: FixedTimestep,
@@ -224,6 +287,11 @@ impl Driver {
         while !self.exited && last.is_none_or(|now| now < target) {
             self.frame_until(app, renderer, &reached)?;
             let now = tick(app);
+            if let (Some(left_at), None) = (last, now) {
+                return Err(format!(
+                    "--drive: ticks {target}: the match was left at tick {left_at}"
+                ));
+            }
             idle = if now == last {
                 idle.saturating_add(1)
             } else {
@@ -238,6 +306,20 @@ impl Driver {
         }
         self.running_speed = None;
         self.clock = FixedTimestep::new(SIMULATION_HZ);
+        Ok(())
+    }
+
+    fn settle_commands<A: App>(
+        &mut self,
+        app: &mut A,
+        renderer: &mut Renderer,
+        pending: &mut dyn FnMut(&mut A) -> usize,
+    ) -> Result<(), String> {
+        let mut waited = 0u32;
+        while !self.exited && waited < SETTLE_FRAMES && pending(app) > 0 {
+            self.frame(app, renderer)?;
+            waited = waited.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -343,6 +425,27 @@ pub(crate) fn run<A: App>(
                 app.input(&InputEvent::PointerMoved { x: *x, y: *y });
                 driver.frame(app, renderer)?;
             }
+            Step::Leave => {
+                app.input(&InputEvent::PointerLeft);
+                driver.frame(app, renderer)?;
+            }
+            Step::DoubleClick(button) => {
+                for second in [false, true] {
+                    app.input(&InputEvent::PointerButton {
+                        button: *button,
+                        pressed: true,
+                    });
+                    if second {
+                        app.input(&InputEvent::PointerDoubleClick { button: *button });
+                    }
+                    driver.frame(app, renderer)?;
+                    app.input(&InputEvent::PointerButton {
+                        button: *button,
+                        pressed: false,
+                    });
+                    driver.frame(app, renderer)?;
+                }
+            }
             Step::Click(x, y, button) => {
                 app.input(&InputEvent::PointerMoved { x: *x, y: *y });
                 driver.frame(app, renderer)?;
@@ -422,19 +525,59 @@ pub(crate) fn run<A: App>(
             Step::Select(which) => {
                 let said = hook(app, "select", which)?;
                 println!("drive: select {which} - {said}");
-                driver.frame(app, renderer)?;
+                driver.frame_until(app, renderer, &|_| true)?;
             }
             Step::Do(action) => {
+                if reads_command_bar(action) {
+                    driver.settle_commands(app, renderer, &mut |app| {
+                        pending_commands(&mut hook, app)
+                    })?;
+                }
                 let said = hook(app, "do", action)?;
                 println!("drive: do {action} - {said}");
-                driver.frame(app, renderer)?;
+                driver.frame_until(app, renderer, &|_| true)?;
             }
             Step::Try(verb, argument) => {
+                if verb == "do" && reads_command_bar(argument) {
+                    driver.settle_commands(app, renderer, &mut |app| {
+                        pending_commands(&mut hook, app)
+                    })?;
+                }
                 match hook(app, verb, argument) {
                     Ok(said) => println!("drive: {verb} {argument} - {said}"),
                     Err(error) => println!("drive: try {verb} {argument} - skipped: {error}"),
                 }
-                driver.frame(app, renderer)?;
+                driver.frame_until(app, renderer, &|_| true)?;
+            }
+            Step::Screen(name) => {
+                let mut waited = 0u32;
+                while !driver.exited && hook(app, "screen", name).is_err() {
+                    if waited >= SCREEN_STALL_FRAMES {
+                        return Err(format!(
+                            "--drive: screen {name}: not shown in {waited} frame(s)"
+                        ));
+                    }
+                    driver.frame(app, renderer)?;
+                    waited = waited.saturating_add(1);
+                }
+                println!("drive: screen {name} after {waited} frame(s)");
+            }
+            Step::Closed(name) => {
+                let mut waited = 0u32;
+                let said = loop {
+                    match hook(app, "closed", name) {
+                        Ok(said) => break said,
+                        Err(open) if driver.exited || waited >= SCREEN_STALL_FRAMES => {
+                            return Err(format!(
+                                "--drive: closed {name}: {open} after {waited} frame(s)"
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                    driver.frame(app, renderer)?;
+                    waited = waited.saturating_add(1);
+                };
+                println!("drive: closed {name} {said}, after {waited} frame(s)");
             }
             Step::Shot(path) => {
                 let pixels = renderer.read_pixels().map_err(|e| e.to_string())?;
@@ -487,7 +630,7 @@ pub(crate) fn run<A: App>(
             break;
         }
     }
-    Ok(())
+    driver.frame_until(app, renderer, &|_| true)
 }
 
 #[cfg(test)]
@@ -495,8 +638,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn steps_that_address_a_template_seed_it_once() {
+        let script = "do place Barracks at 10,20; try select any Tower; select near Gate at 1,2; \
+                      do build Farm; select kind Tower; select producer; do buy Heal";
+        assert_eq!(
+            named_templates(script),
+            ["Barracks", "Tower", "Gate", "Farm"]
+        );
+    }
+
+    #[test]
     fn a_script_is_steps_and_a_bad_step_is_an_error() {
-        let steps = parse("wait 3; click 10,20 ;rclick 1.5,2; key c; key esc; key down; scroll -2; select producer; do buy SCIENCE_Heal; shot a.tga; time 4")
+        let steps = parse("wait 3; click 10,20 ;rclick 1.5,2; key c; key esc; key down; scroll -2; select producer; do buy SCIENCE_Heal; screen TimeLine; shot a.tga; time 4")
             .expect("parses");
         assert_eq!(
             steps,
@@ -510,6 +663,7 @@ mod tests {
                 Step::Scroll(-2.0),
                 Step::Select("producer".to_owned()),
                 Step::Do("buy SCIENCE_Heal".to_owned()),
+                Step::Screen("TimeLine".to_owned()),
                 Step::Shot(PathBuf::from("a.tga")),
                 Step::Time(4),
             ]
@@ -701,5 +855,124 @@ mod tests {
             return;
         }
         assert_eq!(runs, [Some(10); 5]);
+    }
+
+    struct Landing {
+        submitted: bool,
+        ticks: u64,
+        landed: Vec<u64>,
+    }
+
+    impl App for Landing {
+        fn input(&mut self, _event: &InputEvent) {}
+        fn update(&mut self, _step: u64) {
+            self.ticks += 1;
+            if std::mem::take(&mut self.submitted) {
+                self.landed.push(self.ticks);
+            }
+        }
+        fn frame(&mut self, _dt: f32) {}
+        fn draw(&mut self, _renderer: &mut Renderer, _blend: f32) -> mint_render::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn landed_ticks(script: &str) -> Option<Vec<u64>> {
+        let mut renderer = match Renderer::offscreen(4, 4) {
+            Ok(renderer) => renderer,
+            Err(mint_render::Error::NoAdapter) => {
+                eprintln!("SKIPPED: no graphics adapter on this machine");
+                return None;
+            }
+            Err(error) => panic!("offscreen renderer: {error}"),
+        };
+        let mut app = Landing {
+            submitted: false,
+            ticks: 0,
+            landed: Vec::new(),
+        };
+        run(
+            &mut app,
+            &mut renderer,
+            (4, 4),
+            Duration::from_micros(16_667),
+            &parse(script).expect("parses"),
+            |app, _, argument| {
+                app.submitted |= argument == "cmd";
+                Ok(String::new())
+            },
+            |app| Some(app.ticks),
+        )
+        .expect("runs");
+        Some(app.landed)
+    }
+
+    #[test]
+    fn a_command_lands_on_the_same_tick_whatever_steps_precede_it() {
+        let bare = landed_ticks("ticks 10; do cmd; ticks 20");
+        let probed = landed_ticks(
+            "ticks 10; do probe; try do probe; select probe; do probe; do cmd; ticks 20",
+        );
+        if bare.is_none() || probed.is_none() {
+            return;
+        }
+        assert_eq!(bare, Some(vec![11]));
+        assert_eq!(probed, bare);
+    }
+
+    struct Queued {
+        queued: u32,
+        ticks: u64,
+    }
+
+    impl App for Queued {
+        fn input(&mut self, _event: &InputEvent) {}
+        fn update(&mut self, _step: u64) {
+            self.ticks += 1;
+            self.queued = 0;
+        }
+        fn frame(&mut self, _dt: f32) {}
+        fn draw(&mut self, _renderer: &mut Renderer, _blend: f32) -> mint_render::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_command_bar_read_waits_for_the_commands_before_it() {
+        let mut renderer = match Renderer::offscreen(4, 4) {
+            Ok(renderer) => renderer,
+            Err(mint_render::Error::NoAdapter) => {
+                eprintln!("SKIPPED: no graphics adapter on this machine");
+                return;
+            }
+            Err(error) => panic!("offscreen renderer: {error}"),
+        };
+        let mut app = Queued {
+            queued: 0,
+            ticks: 0,
+        };
+        let mut seen = Vec::new();
+        run(
+            &mut app,
+            &mut renderer,
+            (4, 4),
+            Duration::from_millis(1),
+            &parse("ticks 3; do queue; do bar; do queue; try do press Command_Any")
+                .expect("parses"),
+            |app, verb, argument| match (verb, argument) {
+                ("pending", _) => Ok(app.queued.to_string()),
+                ("do", "queue") => {
+                    app.queued = 1;
+                    Ok(String::new())
+                }
+                _ => {
+                    seen.push(app.queued);
+                    Ok(String::new())
+                }
+            },
+            |app| Some(app.ticks),
+        )
+        .expect("runs");
+        assert_eq!(seen, [0, 0]);
     }
 }

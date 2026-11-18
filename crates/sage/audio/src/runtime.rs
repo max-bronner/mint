@@ -1,13 +1,14 @@
 use mint_audio::{
-    AudioEngine, EventKey, Listener, MixerConfig, MixerStats, Play, Priority, Rolloff, Spatial,
-    VoiceId,
+    AudioEngine, Clip, EventKey, Listener, MixerConfig, MixerStats, Play, Priority, Rolloff,
+    Spatial, VoiceId,
 };
 use mint_sage_ini::audio::{
     AudioEventDef, AudioEventKind, AudioPriority, ControlFlags, Submix, TypeFlags,
 };
 use mint_vfs::Vfs;
+use std::sync::Arc;
 
-use crate::bank::{BankStats, SoundBank};
+use crate::bank::{BankStats, Lookup, SoundBank};
 use crate::library::AudioLibrary;
 use crate::music::{Context, MusicEvent, MusicRequest, MusicSystem};
 use crate::rng::ClientRng;
@@ -205,12 +206,18 @@ pub struct SageAudio {
     listener: Listener,
     music: MusicSystem,
     disabled: std::collections::BTreeSet<String>,
+    placeholder: Arc<Clip>,
 }
 
 impl SageAudio {
     #[must_use]
     pub fn open(library: AudioLibrary) -> Self {
-        let engine = AudioEngine::open(mixer_config(&library));
+        Self::open_named(library, "engine")
+    }
+
+    #[must_use]
+    pub fn open_named(library: AudioLibrary, name: &str) -> Self {
+        let engine = AudioEngine::open_named(mixer_config(&library), name);
         Self::with_engine(engine, library)
     }
 
@@ -240,6 +247,7 @@ impl SageAudio {
             rolloff: Rolloff::default(),
             listener: Listener::default(),
             disabled: std::collections::BTreeSet::new(),
+            placeholder: Arc::new(Clip::empty()),
         }
     }
 
@@ -270,6 +278,11 @@ impl SageAudio {
     #[must_use]
     pub fn mixer_stats(&self) -> MixerStats {
         self.engine.stats()
+    }
+
+    #[must_use]
+    pub fn device_stats(&self) -> mint_audio::DeviceStats {
+        self.engine.device_stats()
     }
 
     #[must_use]
@@ -407,6 +420,31 @@ impl SageAudio {
             return (Outcome::Queued, None);
         }
         self.play_nested(vfs, request, 0)
+    }
+
+    pub fn decoded_duration_ms(&mut self, vfs: &Vfs, name: &str) -> Option<u64> {
+        let mut names = vec![name.to_owned()];
+        if self.library.get(name).is_none() {
+            names = self
+                .library
+                .multisound(name)?
+                .subsounds
+                .iter()
+                .map(|sub| sub.name.clone())
+                .collect();
+        }
+        let mut longest = None;
+        for event in names {
+            let Some(def) = self.library.get(&event).cloned() else {
+                continue;
+            };
+            for path in self.library.variant_paths(&def) {
+                if let Some(clip) = self.bank.get_or_load(vfs, &path) {
+                    longest = longest.max(Some(clip.duration_ms()));
+                }
+            }
+        }
+        longest
     }
 
     pub fn fade_out(&self, id: VoiceId, ms: u32) {
@@ -650,9 +688,13 @@ impl SageAudio {
             return (Outcome::NoVariants, None);
         };
 
-        let Some(clip) = self.bank.get_or_load(vfs, &path) else {
-            self.stats.missing = self.stats.missing.saturating_add(1);
-            return (Outcome::MissingFile, None);
+        let (clip, pending) = match self.bank.request(vfs, &path) {
+            Lookup::Ready(clip) => (clip, None),
+            Lookup::Pending(pending) => (Arc::clone(&self.placeholder), Some(pending)),
+            Lookup::Absent => {
+                self.stats.missing = self.stats.missing.saturating_add(1);
+                return (Outcome::MissingFile, None);
+            }
         };
 
         let mut play = Play::new(clip, key);
@@ -694,7 +736,10 @@ impl SageAudio {
             }
         }
 
-        let id = self.engine.play(play);
+        let id = match pending {
+            Some(pending) => self.engine.play_pending(play, pending),
+            None => self.engine.play(play),
+        };
         self.stats.queued = self.stats.queued.saturating_add(1);
         (Outcome::Queued, Some(id))
     }
@@ -722,12 +767,13 @@ impl SageAudio {
     #[must_use]
     pub fn readout(&self) -> String {
         format!(
-            "audio: {} | rolloff {} | {} | {} | {}",
+            "audio: {} | rolloff {} | {} | {} | {} | {}",
             self.engine.describe(),
             self.rolloff.label(),
             self.stats.summary(),
             self.engine.stats().summary(),
             self.bank.stats().summary(),
+            self.engine.device_stats().summary(),
         )
     }
 

@@ -1,4 +1,4 @@
-use crate::grid::{Cell, GridExtent, MoverClass, Passability};
+use crate::grid::{Cell, GridExtent, MoverClass, Passability, PortalLink, PortalPass};
 use crate::search::offset;
 
 const NEIGHBOURS: [(i32, i32); 8] = [
@@ -106,6 +106,33 @@ impl Reachability {
         }
     }
 
+    #[must_use]
+    pub fn joined_by(&self, a: Cell, b: Cell, links: &[PortalLink], pass: PortalPass) -> bool {
+        let (Some(from), Some(to)) = (self.component_of(a), self.component_of(b)) else {
+            return false;
+        };
+        let mut reached = vec![from];
+        loop {
+            let before = reached.len();
+            for link in links.iter().filter(|link| pass.has(link.slot)) {
+                let (Some(entry), Some(exit)) =
+                    (self.component_of(link.entry), self.component_of(link.exit))
+                else {
+                    continue;
+                };
+                if reached.contains(&entry) && !reached.contains(&exit) {
+                    reached.push(exit);
+                }
+            }
+            if reached.contains(&to) {
+                return true;
+            }
+            if reached.len() == before {
+                return false;
+            }
+        }
+    }
+
     fn component_of(&self, cell: Cell) -> Option<u32> {
         let index = self.extent.index(cell)?;
         let at = usize::try_from(index).ok()?;
@@ -192,6 +219,27 @@ mod tests {
         }
         let free = Reachability::build(&grid, MoverClass::new(CellFlags::NONE));
         assert!(free.same_component(Cell::new(0, 0), Cell::new(7, 7)));
+    }
+
+    #[test]
+    fn a_portal_link_joins_two_regions_only_for_a_mover_admitted_to_it() {
+        let mut grid = CostGrid::new(GridExtent::new(8, 8).unwrap());
+        for y in 0..8 {
+            grid.set_flags(Cell::new(4, y), WALL).unwrap();
+        }
+        let reach = Reachability::build(&grid, mover());
+        let link = PortalLink {
+            entry: Cell::new(3, 3),
+            exit: Cell::new(5, 3),
+            slot: 2,
+            nodes: Vec::new(),
+            after: None,
+        };
+        let (a, b) = (Cell::new(0, 0), Cell::new(7, 7));
+        let links = [link];
+        assert!(reach.joined_by(a, b, &links, PortalPass::NONE.with(2)));
+        assert!(!reach.joined_by(a, b, &links, PortalPass::NONE));
+        assert!(!reach.joined_by(a, b, &links, PortalPass::NONE.with(3)));
     }
 
     #[test]

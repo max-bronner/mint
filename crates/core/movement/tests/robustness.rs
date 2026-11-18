@@ -91,6 +91,9 @@ fn degenerate_grids_and_requests_are_answered_rather_than_survived() {
         let request = PathRequest {
             corner_radius: 0.0,
             departure: None,
+            approach: None,
+            prune: false,
+            final_goal: true,
             start,
             goal,
             mover: MOVER,
@@ -122,6 +125,9 @@ fn a_blocked_start_or_goal_is_reported_unreachable_not_searched_for() {
             &PathRequest {
                 corner_radius: 0.0,
                 departure: None,
+                approach: None,
+                prune: false,
+                final_goal: true,
                 start: Cell::new(0, 0),
                 goal: Cell::new(7, 7),
                 mover: MOVER,
@@ -163,6 +169,9 @@ fn every_path_a_random_sweep_produces_is_a_walk_the_grid_permits() {
         let request = PathRequest {
             corner_radius: 0.0,
             departure: None,
+            approach: None,
+            prune: false,
+            final_goal: true,
             start: Cell::new(
                 u16::try_from(rng.below(u32::from(width))).unwrap(),
                 u16::try_from(rng.below(u32::from(height))).unwrap(),

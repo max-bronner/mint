@@ -129,6 +129,7 @@ mod tests {
             moving: false,
             health: Some(1.0),
             dying: false,
+            created: 0,
             visibility,
             speed: 0.0,
             weapon_cycle: 0.0,

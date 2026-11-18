@@ -191,6 +191,10 @@ fn only_fast_hits_reset_reaction_carries_a_flinch_past_its_first_hit() {
         gaps(&stoic).iter().all(|gap| *gap >= 60),
         "a stoic flincher only takes a new reaction once the last one ended: {stoic:?}"
     );
+    assert!(
+        gaps(&stoic).iter().all(|gap| *gap >= 66),
+        "a reaction that ends on a frame blocks a new one that frame: {stoic:?}"
+    );
 }
 
 #[test]

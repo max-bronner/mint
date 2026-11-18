@@ -120,6 +120,7 @@ pub struct HordeContainDef {
     pub payload_entries: u32,
     pub banner_carrier_position: Option<(f32, f32)>,
     pub banner_carriers_allowed: Option<String>,
+    pub living_world_overload_template: Option<String>,
     pub banner_carrier_min_level: Option<u32>,
     pub banner_carrier_destroy_horde_on_death: Option<bool>,
     pub leaders_allowed: Vec<String>,
@@ -457,6 +458,13 @@ pub fn read_horde_contain(
             def.banner_carriers_allowed = field
                 .value()
                 .filter(|name| !name.eq_ignore_ascii_case("NONE"))
+                .map(str::to_owned);
+            continue;
+        }
+        if keyword.eq_ignore_ascii_case("LivingWorldOverloadTemplate") {
+            def.living_world_overload_template = field
+                .value()
+                .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("NONE"))
                 .map(str::to_owned);
             continue;
         }

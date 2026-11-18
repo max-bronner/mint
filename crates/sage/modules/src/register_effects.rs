@@ -2,9 +2,12 @@ use mint_sage_ini::value::parse_bool;
 use mint_sim::module::{
     Capability, CapabilityMask, DieContext, ModuleKind, ModuleRegistry, ModuleSlot, UpgradeMask,
 };
-use mint_sim::{Component, FieldError, Frame, ModuleFieldSource, StateHasher, World};
+use mint_sim::{Component, FieldError, Frame, LogicFrames, ModuleFieldSource, StateHasher, World};
 
 use crate::die_mux::DieMuxData;
+
+const UNDER_CONSTRUCTION: &str = "UNDER_CONSTRUCTION";
+const BUILD_BEING_CANCELED: &str = "BUILD_BEING_CANCELED";
 use crate::effects::{CreateLocation, Effect, EffectLog, Name, OclFrom, PowerPlace};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -96,12 +99,20 @@ pub fn create_object_die_from_fields(
 pub struct FireWeaponWhenDeadBehavior {
     starts_active: bool,
     death_weapon: Option<String>,
+    delay: LogicFrames,
+    offset: (f32, f32, f32),
+    active_during_construction: bool,
     mux: DieMuxData,
 }
 
 impl Component for FireWeaponWhenDeadBehavior {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_bool(self.starts_active);
+        self.delay.hash_into(hasher);
+        hasher.write_f32(self.offset.0);
+        hasher.write_f32(self.offset.1);
+        hasher.write_f32(self.offset.2);
+        hasher.write_bool(self.active_during_construction);
         match &self.death_weapon {
             Some(name) => {
                 hasher.write_bool(true);
@@ -131,16 +142,19 @@ impl ModuleKind for FireWeaponWhenDeadBehavior {
             {
                 continue;
             }
+            let building = ctx.death.status.contains(&UNDER_CONSTRUCTION);
+            if ctx.death.status.contains(&BUILD_BEING_CANCELED)
+                || (building && !slot.state.active_during_construction)
+            {
+                continue;
+            }
             if let Some(weapon) = &slot.state.death_weapon {
                 log.push(
                     ctx.entity,
-                    Effect::FireWeapon {
+                    Effect::FireWeaponAtDeath {
                         weapon: weapon.as_str().into(),
-                        at: PowerPlace::Source,
-                        offset: (0.0, 0.0),
-                        repeat: None,
-                        alive_only: false,
-                        reload_slot: None,
+                        offset: slot.state.offset,
+                        delay: slot.state.delay,
                     },
                 );
             }
@@ -157,9 +171,21 @@ pub fn fire_weapon_when_dead_behavior_from_fields(
         Some(raw) => parse_bool(raw)
             .ok_or_else(|| FieldError::new(format!("StartsActive '{raw}' is not Yes/No")))?,
     };
+    let offset = fields.field_args("WeaponOffset");
     Ok(FireWeaponWhenDeadBehavior {
         starts_active,
         death_weapon: fields.field("DeathWeapon").map(str::to_owned),
+        delay: crate::fire_weapon_update::milliseconds(fields, "DelayTime"),
+        offset: (
+            crate::fire_weapon_update::tagged(&offset, "X"),
+            crate::fire_weapon_update::tagged(&offset, "Y"),
+            crate::fire_weapon_update::tagged(&offset, "Z"),
+        ),
+        active_during_construction: crate::fire_weapon_update::flag(
+            fields,
+            "ActiveDuringConstruction",
+        )
+        .unwrap_or(false),
         mux: DieMuxData::from_fields(fields)?,
     })
 }
@@ -439,7 +465,7 @@ mod tests {
                 FireWeaponWhenDeadBehavior {
                     starts_active: false,
                     death_weapon: Some(String::from("StandardWallDeath")),
-                    mux: DieMuxData::default(),
+                    ..FireWeaponWhenDeadBehavior::default()
                 },
             )
             .unwrap();
@@ -473,7 +499,7 @@ mod tests {
                 FireWeaponWhenDeadBehavior {
                     starts_active: true,
                     death_weapon: Some(String::from("StandardWallDeath")),
-                    mux: DieMuxData::default(),
+                    ..FireWeaponWhenDeadBehavior::default()
                 },
             )
             .unwrap();
@@ -496,16 +522,55 @@ mod tests {
             entries[0],
             (
                 entity,
-                Effect::FireWeapon {
+                Effect::FireWeaponAtDeath {
                     weapon: "StandardWallDeath".into(),
-                    at: PowerPlace::Source,
-                    offset: (0.0, 0.0),
-                    repeat: None,
-                    alive_only: false,
-                    reload_slot: None,
+                    offset: (0.0, 0.0, 0.0),
+                    delay: LogicFrames::ZERO,
                 }
             )
         );
+    }
+
+    #[test]
+    fn a_death_weapon_waits_for_the_building_unless_active_during_construction() {
+        let fired = |active_during_construction: bool| {
+            let mut world = World::new();
+            let mut registry = ModuleRegistry::new(&mut world);
+            registry
+                .register::<FireWeaponWhenDeadBehavior>(&mut world, "FireWeaponWhenDeadBehavior");
+            let entity = world.spawn().unwrap();
+            registry
+                .attach(
+                    &mut world,
+                    entity,
+                    Frame::ZERO,
+                    FireWeaponWhenDeadBehavior {
+                        starts_active: true,
+                        death_weapon: Some(String::from("StandardWallDeath")),
+                        active_during_construction,
+                        ..FireWeaponWhenDeadBehavior::default()
+                    },
+                )
+                .unwrap();
+            let mut rng = mint_sim::Pcg32::new(1);
+            let mut destroy = mint_sim::module::DestroyRequests::new();
+            let mut log = EffectLog::new();
+            registry.broadcast_die_into(
+                &mut world,
+                entity,
+                Frame::ZERO,
+                &mut rng,
+                &mut destroy,
+                mint_sim::Effects::into_sink(&mut log),
+                mint_sim::module::Death {
+                    status: &["UNDER_CONSTRUCTION"],
+                    ..mint_sim::module::Death::NONE
+                },
+            );
+            log.drain().len()
+        };
+        assert_eq!(fired(false), 0);
+        assert_eq!(fired(true), 1);
     }
 
     #[test]

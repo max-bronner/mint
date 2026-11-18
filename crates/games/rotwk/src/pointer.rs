@@ -39,11 +39,24 @@ pub(crate) struct Pointer {
     middle: Option<Press>,
     pending: Option<Pending>,
     chord_anchor: Option<(f32, f32)>,
+    outside: bool,
 }
 
 impl Pointer {
     pub(crate) const fn position(&self) -> Option<(f32, f32)> {
         self.at
+    }
+
+    pub(crate) const fn edge_position(&self) -> Option<(f32, f32)> {
+        if self.outside {
+            None
+        } else {
+            self.at
+        }
+    }
+
+    pub(crate) fn left(&mut self) {
+        self.outside = true;
     }
 
     pub(crate) fn drag_rect(&self) -> Option<ScreenRect> {
@@ -83,6 +96,7 @@ impl Pointer {
 
     pub(crate) fn moved(&mut self, x: f32, y: f32) {
         self.at = Some((x, y));
+        self.outside = false;
         for press in [&mut self.primary, &mut self.secondary, &mut self.middle] {
             if let Some(press) = press.as_mut() {
                 if !press.dragging && past_tolerance(press.anchor, (x, y)) {

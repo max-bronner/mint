@@ -227,9 +227,9 @@ pub(crate) fn blend_tile_payload(version: u16, params: &ShapeParams) -> Vec<u8> 
             out.extend_from_slice(&v.to_le_bytes());
         }
     };
-    let push_index = |out: &mut Vec<u8>, arr: &[u32]| {
+    let push_index = |out: &mut Vec<u8>, arr: &[u32], wide_from: u32| {
         for v in arr {
-            if bytes_per_cell >= 14 {
+            if bytes_per_cell >= wide_from {
                 out.extend_from_slice(&v.to_le_bytes());
             } else {
                 let narrowed = u16::try_from(*v).expect("test blend indices fit a u16");
@@ -238,9 +238,9 @@ pub(crate) fn blend_tile_payload(version: u16, params: &ShapeParams) -> Vec<u8> 
         }
     };
     push_u16(&mut out, &params.tile);
-    push_index(&mut out, &params.blend);
-    push_index(&mut out, &params.extra);
-    push_index(&mut out, &params.cliff);
+    push_index(&mut out, &params.blend, 12);
+    push_index(&mut out, &params.extra, 12);
+    push_index(&mut out, &params.cliff, 14);
 
     let row_stride = params.width.saturating_add(7).checked_div(8).unwrap_or(0);
     let plane_len = usize::try_from(row_stride.saturating_mul(params.height)).unwrap_or(0);

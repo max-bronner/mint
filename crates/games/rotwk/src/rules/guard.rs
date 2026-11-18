@@ -130,8 +130,8 @@ impl Component for LastAttacker {
 }
 
 const RETURN_ARRIVED: f32 = 5.0;
-const STRUCTURE_FIRST_RECHECK: LogicFrames = LogicFrames::from_milliseconds(3_000);
-const STRUCTURE_RECHECK: LogicFrames = LogicFrames::from_milliseconds(1_000);
+const STRUCTURE_FIRST_RECHECK: LogicFrames = LogicFrames::from_engine_milliseconds(3_000);
+const STRUCTURE_RECHECK: LogicFrames = LogicFrames::from_engine_milliseconds(1_000);
 const WARD_MOVED_SQUARED: f32 = 400.0;
 const MAX_TRANSITIONS: usize = 4;
 
@@ -221,6 +221,7 @@ impl RotwkRules {
                 .get(ids.path, unit)
                 .is_some_and(|path| matches!(path.kind, PathKind::Ordered | PathKind::Ability))
             || Self::emotion_holds(world, ids, unit)
+            || world.contains(ids.ai_busy, unit)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -247,15 +248,18 @@ impl RotwkRules {
         }
         units.sort_unstable_by_key(|entity| entity.index());
         units.dedup();
+        units.retain(|unit| !self.ai_disabled(tick.state(), ids, *unit, now));
         let scan = GuardScan {
             grid,
             living,
             global_max_radius,
         };
+        let decide_perf = crate::perf::sub(crate::perf::sub_row!("decide_guards"));
         let decided: Vec<GuardDecision> = units
             .iter()
             .map(|&unit| self.decide_guard(tick.state(), ids, unit))
             .collect();
+        drop(decide_perf);
         for (unit, decision) in units.into_iter().zip(decided) {
             debug_assert_eq!(
                 decision,
@@ -299,7 +303,7 @@ impl RotwkRules {
                 GuardDecision::Pass
             };
         }
-        if Self::emotion_holds(world, ids, unit) {
+        if Self::emotion_holds(world, ids, unit) || world.contains(ids.ai_busy, unit) {
             return GuardDecision::Pass;
         }
         if Self::guard_displaced(world, ids, unit) {
@@ -731,9 +735,13 @@ impl RotwkRules {
                             return None;
                         }
                     }
+                    let relation = relation.to(foe.entity).victim();
+                    if !crate::combat::auto_acquirable(relation) {
+                        return None;
+                    }
                     mint_sage_combat::can_target(
                         mint_sage_combat::Attacker {
-                            relation: relation.to(foe.entity).victim(),
+                            relation,
                             class_allowed: target_allowed(mask, foe),
                             scans_structures: structures,
                         },
@@ -934,7 +942,7 @@ impl RotwkRules {
                 planned: false,
                 horde,
                 guard: true,
-                forced: false,
+                relation_free: false,
                 order_owner: None,
             },
         )?;

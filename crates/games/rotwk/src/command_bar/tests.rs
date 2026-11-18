@@ -485,6 +485,7 @@ fn resolve_toggled(
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| raised,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     resolve_command_bar(
@@ -532,6 +533,7 @@ fn resolve_with_sell_refusal(name: &str, sell_refusal: Option<&'static str>) -> 
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     resolve_command_bar(
@@ -583,6 +585,7 @@ fn resolve_under_construction(name: &str, cancel_refusal: Option<&'static str>) 
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     resolve_command_bar(
@@ -630,6 +633,14 @@ fn hero(name: &str, fielded: bool, affordable: bool) -> Hero {
         fielded,
         affordable,
         allowed: true,
+        display_name: None,
+        literal_name: None,
+        revive: false,
+        hotkey: None,
+        revive_text: None,
+        recruit_text: None,
+        level: 1,
+        command_points: 0,
     }
 }
 
@@ -879,6 +890,7 @@ fn a_recharging_special_power_button_is_not_ready_and_carries_its_clock() {
         power_clock: &power_clock,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     let bar = resolve_command_bar(
@@ -940,6 +952,7 @@ fn only_the_auto_cast_holders_own_button_carries_the_marker() {
         power_clock: &|_| None,
         auto_cast_on: &auto_cast_on,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     let bar = resolve_command_bar(
@@ -1005,6 +1018,7 @@ fn an_upgrade_in_production_is_held() {
             power_clock: &|_| None,
             auto_cast_on: &|_| false,
             weapon_set_raised: &|_| false,
+            model_condition_gate: &|_, _| true,
             foreign_owner: false,
         };
         resolve_command_bar(
@@ -1060,6 +1074,7 @@ fn a_castle_upgrade_holds_on_the_castles_own_held_upgrade_not_the_objects() {
             power_clock: &|_| None,
             auto_cast_on: &|_| false,
             weapon_set_raised: &|_| false,
+            model_condition_gate: &|_, _| true,
             foreign_owner: false,
         };
         resolve_command_bar(
@@ -1130,6 +1145,7 @@ fn an_unaffordable_upgrade_button_shows_cant_afford_not_enabled() {
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     let bar = resolve_command_bar(
@@ -1181,6 +1197,7 @@ fn held_ctx<'a>(
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner,
     }
 }
@@ -1430,6 +1447,14 @@ fn a_forbidden_revive_hero_shows_extra_disabled() {
         fielded: false,
         affordable: true,
         allowed: false,
+        display_name: None,
+        literal_name: None,
+        revive: false,
+        hotkey: None,
+        revive_text: None,
+        recruit_text: None,
+        level: 1,
+        command_points: 0,
     }];
     let bar = resolve_with("Fortress", &["Upgrade_RingHero"], &heroes);
     let slot = bar.radial.iter().find(|(n, _)| *n == 10).map(|(_, s)| s);
@@ -1476,6 +1501,7 @@ fn a_forbidden_build_target_shows_extra_disabled() {
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     let bar = resolve_command_bar(
@@ -1526,6 +1552,7 @@ fn no_selection_shows_nothing() {
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     let bar = resolve_command_bar(
@@ -1588,6 +1615,7 @@ fn resolve_container(name: &str, passengers: &[Option<String>], capacity: u32) -
         power_clock: &|_| None,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     resolve_command_bar(
@@ -1717,6 +1745,7 @@ fn slot(label: &str, action: SlotAction, enabled: bool) -> ResolvedSlot {
         progress: None,
         count: 0,
         auto_cast: false,
+        hero: None,
     }
 }
 

@@ -200,14 +200,33 @@ impl HeroStore {
 impl HeroStore {
     #[must_use]
     pub fn stats(&self, id: &str) -> BTreeMap<String, i32> {
-        let plain = !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', ':']);
-        if !plain {
-            return BTreeMap::new();
-        }
-        read_capped(&self.own_dir.join(id))
-            .map(|bytes| stats::parse(&String::from_utf8_lossy(&bytes)))
-            .unwrap_or_default()
+        read_stats(&self.own_dir, id)
     }
+}
+
+fn is_plain_name(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', ':'])
+}
+
+#[must_use]
+pub fn read_stats(dir: &Path, id: &str) -> BTreeMap<String, i32> {
+    if !is_plain_name(id) {
+        return BTreeMap::new();
+    }
+    read_capped(&dir.join(id))
+        .map(|bytes| stats::parse(&String::from_utf8_lossy(&bytes)))
+        .unwrap_or_default()
+}
+
+pub fn write_stats(dir: &Path, id: &str, counters: &BTreeMap<String, i32>) -> io::Result<()> {
+    if !is_plain_name(id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a plain file name",
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(id), stats::write(counters))
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {

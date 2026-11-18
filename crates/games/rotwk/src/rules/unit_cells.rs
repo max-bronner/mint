@@ -32,6 +32,12 @@ pub(super) enum GoalVerdict {
     Refused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Enemies {
+    Unread,
+    Listed,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Held {
     ally_goals: u32,
@@ -41,6 +47,8 @@ struct Held {
     destination_allies: u32,
     destination_refused: bool,
     goals: u32,
+    infantry_goals: u32,
+    infantry_positions: u32,
     heavy_goals: u32,
     enemy_positions: u32,
     settled: u32,
@@ -93,6 +101,13 @@ impl UnitCells {
             return None;
         }
         self.cells.get(usize::try_from(dy * self.side + dx).ok()?)
+    }
+
+    fn touches(&self, rect: Option<CellRect>) -> bool {
+        rect.is_some_and(|rect| {
+            let (x0, y0, x1, y1) = rect.span();
+            x0 < self.x0 + self.side && x1 > self.x0 && y0 < self.y0 + self.side && y1 > self.y0
+        })
     }
 
     fn mark(&mut self, rect: CellRect, mut f: impl FnMut(&mut Held)) {
@@ -170,6 +185,30 @@ impl UnitCells {
         })
     }
 
+    pub(super) fn footprint_free(
+        &self,
+        mut cells: impl Iterator<Item = (i32, i32)>,
+        through_infantry: bool,
+    ) -> bool {
+        cells.all(|(x, y)| {
+            self.at(x, y).is_none_or(|held| {
+                let (goals, bodies) = if through_infantry {
+                    (
+                        held.goals.saturating_sub(held.infantry_goals),
+                        (held.ally_positions.saturating_add(held.other_positions))
+                            .saturating_sub(held.infantry_positions),
+                    )
+                } else {
+                    (
+                        held.goals,
+                        held.ally_positions.saturating_add(held.other_positions),
+                    )
+                };
+                goals == 0 && bodies == 0
+            })
+        })
+    }
+
     pub(super) fn destination_clear(&self, cells: impl Iterator<Item = (i32, i32)>) -> bool {
         self.allied_goals(cells) == Some(0)
     }
@@ -198,6 +237,20 @@ impl RotwkRules {
         ignored: Option<Entity>,
         centre: Vec2,
         reach: f32,
+    ) -> UnitCells {
+        self.unit_cells_reading(tick, ids, asker, ignored, centre, reach, Enemies::Unread)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn unit_cells_reading(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        asker: Entity,
+        ignored: Option<Entity>,
+        centre: Vec2,
+        reach: f32,
+        enemies: Enemies,
     ) -> UnitCells {
         let _perf = crate::perf::sub(crate::perf::sub_row!("unit_cells"));
         let world = tick.state();
@@ -254,7 +307,7 @@ impl RotwkRules {
                 walked.iter().collect()
             }
         };
-        self.fill_unit_cells(tick, ids, &mut map, me, asker, ignored, &near);
+        self.fill_unit_cells(tick, ids, &mut map, me, asker, ignored, enemies, &near);
         map
     }
 
@@ -284,8 +337,11 @@ impl RotwkRules {
         me: DestinationAsker,
         asker: Entity,
         ignored: Option<Entity>,
+        enemies: Enemies,
         near: &[&BodyRecord],
     ) {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("fill_unit_cells"));
+        crate::perf::count(crate::perf::sub_row!("fill_bodies"), near.len());
         let world = tick.state();
         let geometry = self.passability.geometry;
         let size = geometry.cell_size();
@@ -324,6 +380,17 @@ impl RotwkRules {
                     })
                 })
                 .unwrap_or(position);
+            let goal_rect = if goal == position {
+                record.body_rect
+            } else {
+                super::unit_index::square(self, goal, record.footprint)
+            };
+            if enemies == Enemies::Unread
+                && !map.touches(goal_rect)
+                && !map.touches(record.body_rect)
+            {
+                continue;
+            }
             let relation = relation.to_owned_by(entity, record.holder.owner);
             let ally = relation == super::map_scripts::Relation::Allies;
             let at_goal = goal.minus(position).length() <= size;
@@ -337,11 +404,6 @@ impl RotwkRules {
             if enemy {
                 map.enemies.push((position, record.radius));
             }
-            let goal_rect = if goal == position {
-                record.body_rect
-            } else {
-                super::unit_index::square(self, goal, record.footprint)
-            };
             if let Some(rect) = goal_rect {
                 map.mark(rect, |held| {
                     if ally {
@@ -357,6 +419,9 @@ impl RotwkRules {
                         GoalVerdict::Refused => held.destination_refused = true,
                     }
                     held.goals = held.goals.saturating_add(1);
+                    held.infantry_goals = held
+                        .infantry_goals
+                        .saturating_add(u32::from(holder.infantry));
                     held.heavy_goals = held.heavy_goals.saturating_add(heavy);
                     if at_goal {
                         held.settled = held.settled.saturating_add(1);
@@ -372,8 +437,45 @@ impl RotwkRules {
                         held.other_positions = held.other_positions.saturating_add(1);
                     }
                     held.enemy_positions = held.enemy_positions.saturating_add(u32::from(enemy));
+                    held.infantry_positions = held
+                        .infantry_positions
+                        .saturating_add(u32::from(holder.infantry));
                 });
             }
+        }
+    }
+
+    pub(super) fn footprint_accepts<'a>(
+        &'a self,
+        tick: &'a Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+    ) -> impl Fn(mint_movement::Cell) -> bool + 'a {
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        let footprint = goal_cells::footprint_of(
+            tick.state(),
+            Self::horde_ids(ids),
+            &self.kinds,
+            entity,
+            geometry,
+        );
+        let through_infantry = self
+            .kind_facts(tick.state(), ids, entity)
+            .path_through_infantry;
+        move |cell| {
+            let anchor = (i32::from(cell.x), i32::from(cell.y));
+            let Some(rect) = goal_cells::rect(extent, anchor, footprint) else {
+                return false;
+            };
+            let centre = goal_cells::anchor_point(geometry, anchor, footprint);
+            let reach = f32::from(footprint.side()) * geometry.cell_size();
+            let map = self.unit_cells(tick, ids, entity, None, centre, reach);
+            let (x0, y0, x1, y1) = rect.span();
+            map.footprint_free(
+                (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))),
+                through_infantry,
+            )
         }
     }
 

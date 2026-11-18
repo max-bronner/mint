@@ -306,6 +306,7 @@ fn a_horde_drops_a_victim_handed_to_a_non_enemy() {
     };
     let act = |name: &str, params: Vec<Parameter>| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     };
@@ -325,6 +326,7 @@ fn a_horde_drops_a_victim_handed_to_a_non_enemy() {
             or_conditions: vec![OrCondition {
                 conditions: vec![Condition {
                     condition_type: 0,
+                    inverted: false,
                     enabled: true,
                     name: condition.0.to_owned(),
                     params: condition.1,

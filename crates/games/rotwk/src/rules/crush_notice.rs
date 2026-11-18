@@ -167,7 +167,21 @@ impl RotwkRules {
                 continue;
             };
             if victim.entity == crusher
-                || !self.object_hostile(tick.state(), crusher, victim.entity)
+                || tick.state().contains(ids.doomed, victim.entity)
+                || tick
+                    .state()
+                    .get(ids.health, victim.entity)
+                    .is_some_and(|health| health.0.is_dead())
+            {
+                continue;
+            }
+            let hostile = self.object_hostile(tick.state(), crusher, victim.entity);
+            if !(self.is_rampaging(tick.state(), crusher)
+                || self.carries_object_status(tick.state(), crusher, "FLEE_OFF_MAP")
+                || self.charging_with_horde(tick, ids, crusher)
+                || hostile
+                    && (!self.has_a_weapon(tick, ids, crusher)
+                        || self.has_melee_weapon(tick, ids, crusher)))
             {
                 continue;
             }

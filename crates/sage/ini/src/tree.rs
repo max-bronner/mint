@@ -192,6 +192,23 @@ impl Document {
         &self.roots
     }
 
+    #[must_use]
+    pub fn retaining_roots(&self, keep: impl Fn(&Block) -> bool) -> Document {
+        Document {
+            roots: self
+                .roots
+                .iter()
+                .filter(|block| keep(block))
+                .cloned()
+                .collect(),
+            name: Arc::clone(&self.name),
+            diagnostics: Vec::new(),
+            files: Vec::new(),
+            statements: 0,
+            defines: Vec::new(),
+        }
+    }
+
     pub fn roots_named<'a>(&'a self, keyword: &'a str) -> impl Iterator<Item = &'a Block> + 'a {
         self.roots.iter().filter(move |b| b.keyword == keyword)
     }

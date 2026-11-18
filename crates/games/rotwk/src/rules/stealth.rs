@@ -150,6 +150,10 @@ pub(crate) struct Stealth {
 }
 
 impl Stealth {
+    pub(crate) fn detected_at(&self, now: Frame) -> bool {
+        self.marked != 0 && self.marked_until > now
+    }
+
     fn revealed_to(self, player: PlayerId) -> bool {
         slot_bit(player).is_some_and(|bit| (self.revealed | self.marked) & bit != 0)
     }

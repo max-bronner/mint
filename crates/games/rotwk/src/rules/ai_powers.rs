@@ -25,6 +25,10 @@ const GIVEXP_AOE_MIN_COUNT: u32 = 1;
 
 const ENEMY_TYPE_KILLER_KINDS: [&str; 4] = ["HERO", "CREATE_A_HERO", "BIG_MONSTER", "MONSTER"];
 
+const MORGUL_BLADE_KINDS: [&str; 3] = ["INFANTRY", "HERO", "CREATE_A_HERO"];
+
+const GOBLIN_POISON_EXCLUDED_KINDS: [&str; 3] = ["STRUCTURE", "MACHINE", "SHIP"];
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AiPowerRefire(pub(crate) Vec<Frame>);
 
@@ -194,6 +198,17 @@ impl RotwkRules {
         );
         let (victim_distance, weapon_is_melee) =
             self.ai_power_weapon_state(tick.state(), ids, entity, position);
+        let victim_excluded = type_name.eq_ignore_ascii_case("AI_SPECIAL_POWER_GOBLIN_POISON")
+            && self
+                .ai_power_victim(tick.state(), ids, entity)
+                .is_some_and(|victim| {
+                    self.entity_has_any_kind(
+                        tick.state(),
+                        ids,
+                        victim,
+                        &GOBLIN_POISON_EXCLUDED_KINDS,
+                    )
+                });
         if tick.rng().next_f32() <= 0.5 {
             return Ok(());
         }
@@ -211,6 +226,7 @@ impl RotwkRules {
             rng_unit,
             victim_distance,
             weapon_is_melee,
+            victim_excluded,
         };
         if !kind.should_activate(ctx, &candidates) {
             return Ok(());
@@ -640,6 +656,13 @@ impl RotwkRules {
         found
     }
 
+    fn ai_power_victim(&self, world: &World, ids: Ids, entity: Entity) -> Option<Entity> {
+        world
+            .get(ids.attack_order, entity)
+            .map(|order| order.target)
+            .or_else(|| world.get(ids.armed, entity).and_then(|armed| armed.target))
+    }
+
     fn ai_power_weapon_state(
         &self,
         world: &World,
@@ -655,11 +678,8 @@ impl RotwkRules {
             .weapons
             .get(armed.weapon)
             .is_some_and(|template| template.melee);
-        let victim = world
-            .get(ids.attack_order, entity)
-            .map(|order| order.target)
-            .or(armed.target);
-        let victim_distance = victim
+        let victim_distance = self
+            .ai_power_victim(world, ids, entity)
             .and_then(|victim| world.get(ids.body, victim))
             .map(|body| {
                 let (dx, dy) = (
@@ -699,6 +719,17 @@ impl RotwkRules {
                 radius,
                 0.0,
                 &ENEMY_TYPE_KILLER_KINDS,
+                living,
+                grid,
+            ),
+            "AI_SPECIAL_POWER_MORGUL_BLADE" => self.scan_enemies(
+                world,
+                ids,
+                caster,
+                position,
+                radius,
+                0.0,
+                &MORGUL_BLADE_KINDS,
                 living,
                 grid,
             ),

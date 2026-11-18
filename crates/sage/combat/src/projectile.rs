@@ -184,6 +184,23 @@ fn point_on(points: &[Point3; 4], t: f32) -> Point3 {
     d.lerp(e, t)
 }
 
+#[must_use]
+pub fn bezier_length(points: &[Point3; 4]) -> f32 {
+    approximate_length(points, 0)
+}
+
+#[must_use]
+pub fn bezier_points(points: &[Point3; 4], count: u32) -> Vec<Point3> {
+    if count < 2 {
+        return vec![points[0]];
+    }
+    let last = count.saturating_sub(1);
+    #[allow(clippy::cast_precision_loss)]
+    (0..count)
+        .map(|i| point_on(points, i as f32 / last as f32))
+        .collect()
+}
+
 fn approximate_length(points: &[Point3; 4], depth: u32) -> f32 {
     let [p0, p1, p2, p3] = *points;
     let leg = |a: Point3, b: Point3| a.distance_squared_3d(b).sqrt();

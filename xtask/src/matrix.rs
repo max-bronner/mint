@@ -61,7 +61,7 @@ const RENDER_TREES: [&str; 5] = [
     "crates/sage/particle",
 ];
 
-const RENDER_LOCK_PACKAGES: [&str; 3] = ["wgpu", "jpeg-decoder", "winit"];
+const RENDER_LOCK_PACKAGES: [&str; 3] = ["wgpu", "zune-jpeg", "winit"];
 
 pub(crate) fn run(root: &Path) -> bool {
     let args: Vec<String> = std::env::args().skip(2).collect();

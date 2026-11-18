@@ -13,9 +13,9 @@ use mint_sage_map::{BlendTileData, HeightMapData, MAP_XY_FACTOR};
 
 pub use footprints::{
     scaleable_ids, scaleable_walls, Footprint, FootprintRecord, Obstacle, TemplateIndex,
-    WallGeometry,
+    WallGeometry, MAX_STAMPED_OFFSET_Z,
 };
-pub use water::{WaterDepths, WetGrid, Wetness};
+pub use water::{WaterDepths, WaterSurfaces, WetGrid, Wetness};
 
 pub const CLIFF: CellFlags = CellFlags::bit(0);
 
@@ -47,6 +47,19 @@ pub const RAMP_SIDE: CellFlags = CellFlags::bit(13);
 
 pub const SCALEABLE: CellFlags = CellFlags::bit(14);
 
+pub const DEEP_BAND: CellFlags = CellFlags::bit(15);
+
+pub const EXTRA_PASSABLE: CellFlags = CellFlags::bit(16);
+
+#[must_use]
+pub fn halved_when_extra_passable(flags: CellFlags, cost: u32) -> u32 {
+    if flags.intersects(EXTRA_PASSABLE) {
+        cost / 2
+    } else {
+        cost
+    }
+}
+
 pub const GROUND: MoverClass = MoverClass::new(
     CLIFF
         .union(WATER)
@@ -56,10 +69,13 @@ pub const GROUND: MoverClass = MoverClass::new(
         .union(BOUNDARY)
         .union(WALL_RIM)
         .union(RAMP_SIDE),
-);
+)
+.line_barring(LINE_BARRED);
+
+const LINE_BARRED: CellFlags = PINCHED.union(DEEP_BAND);
 
 pub const GROUND_PLAYER: MoverClass =
-    MoverClass::new(GROUND.blocked_by.union(IMPASSABLE_TO_PLAYERS));
+    MoverClass::new(GROUND.blocked_by.union(IMPASSABLE_TO_PLAYERS)).line_barring(LINE_BARRED);
 
 const SURFACE_FLAGS: CellFlags = CLIFF
     .union(WATER)
@@ -102,7 +118,9 @@ pub fn mover_class(surfaces: &[String], scales_walls: bool) -> Option<MoverClass
     if !crosses_layers {
         blocked = blocked.union(RAMP_SIDE);
     }
-    let mover = MoverClass::new(blocked);
+    let mover = MoverClass::new(blocked)
+        .line_barring(LINE_BARRED)
+        .object_stamped(OBSTACLE.union(RUBBLE).union(WALL_RIM));
     let mover = if climbs_obstacle {
         mover.excused(SCALEABLE)
     } else {
@@ -122,9 +140,21 @@ pub fn mover_class(surfaces: &[String], scales_walls: bool) -> Option<MoverClass
 
 pub const CLIFF_SLOPE_LIMIT: f32 = 9.8;
 
-const PINCHED_COST: u16 = 10;
+pub const CLIFF_SLOPE_LIMIT_RAW: f32 = 250.88;
 
-const FORD_COST: u16 = 10;
+const PAINTED_CLIFF_VERSION: u16 = 9;
+
+fn recomputed_cliff(height_map: &HeightMapData, x: u32, y: u32) -> Option<bool> {
+    corner_range(height_map, x, y).map(|range| f32::from(range) > CLIFF_SLOPE_LIMIT_RAW)
+}
+
+const PINCHED_COST: u16 = 14;
+
+const PINCHED_FAR_COST: u32 = 10;
+
+const NEAR_GOAL: u32 = 3;
+
+const DEEP_BAND_STEPS: u32 = 6;
 
 pub const ESCAPE_RINGS: u16 = 5;
 
@@ -138,6 +168,9 @@ pub struct Passability {
     boundary_cells: Vec<(u16, u16)>,
     obstacle_ids: Vec<u32>,
     rivers: Vec<bool>,
+    underwater: Vec<bool>,
+    surfaces: WaterSurfaces,
+    pub water_depths: WaterDepths,
     counts: Counts,
 }
 
@@ -319,6 +352,7 @@ impl Passability {
         let mut extra_passable_mask =
             vec![false; usize::try_from(extent.cell_count()).unwrap_or(0)];
         let mut rivers: Vec<bool> = Vec::new();
+        let mut underwater: Vec<bool> = Vec::new();
 
         for y in 0..height {
             for x in 0..width {
@@ -329,6 +363,8 @@ impl Passability {
                     .and_then(|bt| bt.extra_passable(cx, cy))
                     .unwrap_or(false);
                 if extra_passable {
+                    grid.add_flags(cell, EXTRA_PASSABLE)
+                        .map_err(|e| e.to_string())?;
                     counts.extra_passable = counts.extra_passable.saturating_add(1);
                     if let Some(slot) = extra_passable_mask.get_mut(
                         usize::from(y)
@@ -338,11 +374,15 @@ impl Passability {
                         *slot = true;
                     }
                 }
+                let painted = spec.blend_tile.and_then(|bt| {
+                    if bt.version < PAINTED_CLIFF_VERSION {
+                        recomputed_cliff(height_map, cx, cy).or_else(|| bt.impassable(cx, cy))
+                    } else {
+                        bt.impassable(cx, cy)
+                    }
+                });
                 let cliff = !extra_passable
-                    && spec
-                        .blend_tile
-                        .and_then(|bt| bt.impassable(cx, cy))
-                        .unwrap_or_else(|| is_cliff(height_map, scale, cx, cy));
+                    && painted.unwrap_or_else(|| is_cliff(height_map, scale, cx, cy));
                 if cliff {
                     grid.add_flags(cell, CLIFF).map_err(|e| e.to_string())?;
                     counts.cliff = counts.cliff.saturating_add(1);
@@ -363,7 +403,7 @@ impl Passability {
                         .map_err(|e| e.to_string())?;
                     counts.narrow_passage = counts.narrow_passage.saturating_add(1);
                 }
-                let wetness = wettest_corner(&wet, cx, cy);
+                let wetness = last_deep_corner(&wet, cx, cy);
                 if [(0, 0), (1, 0), (0, 1), (1, 1)]
                     .iter()
                     .any(|(dx, dy)| wet.in_river(cx.saturating_add(*dx), cy.saturating_add(*dy)))
@@ -379,7 +419,19 @@ impl Passability {
                         *slot = true;
                     }
                 }
-                match wetness {
+                if wetness != Wetness::Dry {
+                    let cells = usize::try_from(extent.cell_count()).unwrap_or(0);
+                    if underwater.is_empty() {
+                        underwater = vec![false; cells];
+                    }
+                    let index = usize::from(y)
+                        .saturating_mul(usize::from(width))
+                        .saturating_add(usize::from(x));
+                    if let Some(slot) = underwater.get_mut(index) {
+                        *slot = true;
+                    }
+                }
+                match if cliff { Wetness::Dry } else { wetness } {
                     Wetness::Dry => {}
                     Wetness::Ford => {
                         grid.add_flags(cell, FORD).map_err(|e| e.to_string())?;
@@ -415,11 +467,7 @@ impl Passability {
         }
         counts.dilated = dilated;
 
-        let second_ring = ring_around(&grid, extent, |cell| grid.flags(cell).intersects(CLIFF));
-        for cell in &second_ring {
-            grid.add_flags(*cell, PINCHED).map_err(|e| e.to_string())?;
-        }
-        counts.pinched = u32::try_from(second_ring.len()).unwrap_or(u32::MAX);
+        deep_band(&mut grid, extent)?;
 
         let mut obstacle_ids = Vec::new();
         if !spec.obstacles.is_empty() {
@@ -459,9 +507,6 @@ impl Passability {
                 if flags.intersects(PINCHED) {
                     cost = cost.saturating_add(PINCHED_COST);
                 }
-                if flags.intersects(FORD) {
-                    cost = cost.saturating_add(FORD_COST);
-                }
                 if cost != 0 {
                     grid.set_extra_cost(cell, cost).map_err(|e| e.to_string())?;
                 }
@@ -477,6 +522,12 @@ impl Passability {
             boundary_cells,
             obstacle_ids,
             rivers,
+            underwater,
+            surfaces: match spec.water {
+                Some(water) => WaterSurfaces::build(water),
+                None => WaterSurfaces::default(),
+            },
+            water_depths: spec.depths,
             counts,
         })
     }
@@ -490,6 +541,38 @@ impl Passability {
             .saturating_mul(usize::from(self.grid.extent().width))
             .saturating_add(usize::from(cell.x));
         self.rivers.get(index).copied().unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn underwater(&self, point: Vec2) -> bool {
+        let Some(cell) = self.cell_at(point) else {
+            return false;
+        };
+        let index = usize::from(cell.y)
+            .saturating_mul(usize::from(self.grid.extent().width))
+            .saturating_add(usize::from(cell.x));
+        self.underwater.get(index).copied().unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn has_water(&self) -> bool {
+        !self.surfaces.is_empty()
+    }
+
+    #[must_use]
+    pub fn water_surface_at(&self, point: Vec2) -> Option<f32> {
+        self.surfaces.surface_at([point.x, point.y])
+    }
+
+    #[must_use]
+    pub fn water_depth(&self, point: Vec2) -> f32 {
+        let (Some(surface), Some(ground)) = (
+            self.water_surface_at(point),
+            self.heights.triangle_height_at(point.x, point.y),
+        ) else {
+            return 0.0;
+        };
+        (surface - ground).max(0.0)
     }
 
     #[must_use]
@@ -519,7 +602,7 @@ impl Passability {
 
     #[must_use]
     pub fn costly_cells(&self) -> u32 {
-        self.counts.pinched.saturating_add(self.counts.ford)
+        self.counts.pinched
     }
 
     #[must_use]
@@ -845,6 +928,26 @@ impl mint_movement::Passability for DynamicView<'_> {
         self.grid.extra_cost(cell)
     }
 
+    fn goal_extra_cost(&self, cell: Cell, goal: Option<Cell>) -> u32 {
+        let flags = self.flags(cell);
+        if !flags.intersects(PINCHED.union(DEEP_BAND)) {
+            return 0;
+        }
+        let near = goal.is_some_and(|goal| {
+            u32::from(cell.x.abs_diff(goal.x)).saturating_add(u32::from(cell.y.abs_diff(goal.y)))
+                <= NEAR_GOAL
+        });
+        if near {
+            0
+        } else {
+            halved_when_extra_passable(flags, PINCHED_FAR_COST)
+        }
+    }
+
+    fn tail_clear(&self, cell: Cell, _mover: mint_movement::MoverClass) -> bool {
+        self.tag_at(cell) == GROUND_TAG
+    }
+
     fn admits_step(&self, from: Cell, to: Cell, mover: mint_movement::MoverClass) -> bool {
         if mover.crosses_layers {
             return true;
@@ -861,15 +964,7 @@ impl mint_movement::Passability for DynamicView<'_> {
 #[derive(Debug, Clone, Copy)]
 pub struct GatedView<'a> {
     pub ground: DynamicView<'a>,
-    pub portals: &'a [u32],
-    pub tags: &'a [u32],
-}
-
-impl GatedView<'_> {
-    fn admitted_at(&self, cell: Cell) -> Option<u32> {
-        let index = usize::try_from(self.ground.extent().index(cell)?).ok()?;
-        self.portals.get(index).copied().filter(|bits| *bits != 0)
-    }
+    pub links: &'a [mint_movement::PortalLink],
 }
 
 impl mint_movement::Passability for GatedView<'_> {
@@ -878,42 +973,33 @@ impl mint_movement::Passability for GatedView<'_> {
     }
 
     fn flags(&self, cell: Cell) -> CellFlags {
-        let flags = self.ground.flags(cell);
-        match self.admitted_at(cell) {
-            Some(_) => flags.union(PORTAL).union(GATE_RESTRICTED),
-            None => flags,
-        }
+        self.ground.flags(cell)
     }
 
     fn extra_cost(&self, cell: Cell) -> u32 {
         self.ground.extra_cost(cell)
     }
 
-    fn admits(&self, cell: Cell, asker: mint_movement::Asker) -> bool {
-        self.admitted_at(cell)
-            .is_none_or(|admitted| admitted & asker_bit(asker) != 0)
+    fn goal_extra_cost(&self, cell: Cell, goal: Option<Cell>) -> u32 {
+        self.ground.goal_extra_cost(cell, goal)
     }
 
-    fn portal_at(&self, cell: Cell) -> Option<mint_movement::Portal> {
-        let index = usize::try_from(self.ground.extent().index(cell)?).ok()?;
-        let packed = self.tags.get(index).copied().filter(|tag| *tag != 0)?;
-        let id = (packed & 0x00FF_FFFF).wrapping_sub(1) & 0x00FF_FFFF;
-        let kind = packed.to_be_bytes()[0];
-        Some(mint_movement::Portal { id, kind })
+    fn tail_clear(&self, cell: Cell, mover: mint_movement::MoverClass) -> bool {
+        self.ground.tail_clear(cell, mover)
     }
 
     fn admits_step(&self, from: Cell, to: Cell, mover: mint_movement::MoverClass) -> bool {
         self.ground.admits_step(from, to, mover)
     }
-}
 
-#[must_use]
-pub const fn asker_bit(asker: mint_movement::Asker) -> u32 {
-    let id = asker.get();
-    if id >= 32 {
-        0
-    } else {
-        1u32 << id
+    fn portal_links(&self, cell: Cell) -> &[mint_movement::PortalLink] {
+        let first = self.links.partition_point(|link| link.entry < cell);
+        let count = self.links.get(first..).map_or(0, |rest| {
+            rest.iter().take_while(|link| link.entry == cell).count()
+        });
+        self.links
+            .get(first..first.saturating_add(count))
+            .unwrap_or(&[])
     }
 }
 
@@ -973,16 +1059,68 @@ fn corner_range(height_map: &HeightMapData, x: u32, y: u32) -> Option<u16> {
     Some(high.saturating_sub(low))
 }
 
-fn wettest_corner(wet: &WetGrid, x: u32, y: u32) -> Wetness {
+fn last_deep_corner(wet: &WetGrid, x: u32, y: u32) -> Wetness {
     let (nx, ny) = (x.saturating_add(1), y.saturating_add(1));
-    let mut worst = Wetness::Dry;
-    for (cx, cy) in [(x, y), (nx, y), (x, ny), (nx, ny)] {
-        let here = wet.at(cx, cy);
-        if water::deeper(here, worst) {
-            worst = here;
+    let mut result = Wetness::Dry;
+    for (cx, cy) in [(x, y), (x, ny), (nx, ny), (nx, y)] {
+        match wet.at(cx, cy) {
+            Wetness::Dry => {}
+            Wetness::Ford => {
+                if result == Wetness::Dry {
+                    result = Wetness::Ford;
+                }
+            }
+            deeper => result = deeper,
         }
     }
-    worst
+    result
+}
+
+fn deep_band(grid: &mut CostGrid, extent: GridExtent) -> Result<(), String> {
+    const ORTHOGONAL: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+    let neighbours = |cell: Cell| {
+        ORTHOGONAL.iter().filter_map(move |(dx, dy)| {
+            let nx = u16::try_from(i32::from(cell.x).saturating_add(*dx)).ok()?;
+            let ny = u16::try_from(i32::from(cell.y).saturating_add(*dy)).ok()?;
+            let neighbour = Cell::new(nx, ny);
+            extent.contains(neighbour).then_some(neighbour)
+        })
+    };
+    let water = WATER.union(DEEP_WATER);
+    let mut band = Vec::new();
+    for y in 0..extent.height {
+        for x in 0..extent.width {
+            let cell = Cell::new(x, y);
+            if grid.flags(cell).intersects(DEEP_WATER)
+                && neighbours(cell).any(|n| !grid.flags(n).intersects(DEEP_WATER))
+            {
+                band.push(cell);
+            }
+        }
+    }
+    for cell in &band {
+        grid.add_flags(*cell, DEEP_BAND)
+            .map_err(|e| e.to_string())?;
+    }
+    for _ in 0..DEEP_BAND_STEPS {
+        let mut grown = Vec::new();
+        for y in 0..extent.height {
+            for x in 0..extent.width {
+                let cell = Cell::new(x, y);
+                if grid.flags(cell).intersects(water)
+                    && !grid.flags(cell).intersects(DEEP_BAND)
+                    && neighbours(cell).any(|n| grid.flags(n).intersects(DEEP_BAND))
+                {
+                    grown.push(cell);
+                }
+            }
+        }
+        for cell in &grown {
+            grid.add_flags(*cell, DEEP_BAND)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn ring_around(grid: &CostGrid, extent: GridExtent, marked: impl Fn(Cell) -> bool) -> Vec<Cell> {
@@ -990,7 +1128,10 @@ fn ring_around(grid: &CostGrid, extent: GridExtent, marked: impl Fn(Cell) -> boo
     for y in 0..extent.height {
         for x in 0..extent.width {
             let cell = Cell::new(x, y);
-            if grid.flags(cell).intersects(CLIFF) {
+            if grid
+                .flags(cell)
+                .intersects(CLIFF.union(WATER).union(DEEP_WATER).union(OBSTACLE))
+            {
                 continue;
             }
             let touches = (-1i32..=1).any(|dy| {

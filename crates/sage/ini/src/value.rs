@@ -327,6 +327,80 @@ pub fn parse_float_or_expression(token: &str, macros: &MacroTable) -> Option<f32
     value.is_finite().then_some(value)
 }
 
+const MAX_EXPRESSION_DEPTH: usize = 64;
+
+fn expression_atoms(text: &str) -> Vec<String> {
+    let mut atoms = Vec::new();
+    let mut word = String::new();
+    for c in text.chars() {
+        if c.is_whitespace() || matches!(c, '(' | ')' | ',') {
+            if !word.is_empty() {
+                atoms.push(std::mem::take(&mut word));
+            }
+            if c == '(' || c == ')' {
+                atoms.push(c.to_string());
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if !word.is_empty() {
+        atoms.push(word);
+    }
+    atoms
+}
+
+fn evaluate_atoms(
+    atoms: &[String],
+    at: &mut usize,
+    macros: &MacroTable,
+    depth: usize,
+) -> Option<f32> {
+    if depth > MAX_EXPRESSION_DEPTH {
+        return None;
+    }
+    let atom = atoms.get(*at)?;
+    *at = at.saturating_add(1);
+    if let Some(operation) = atom.strip_prefix('#') {
+        if atoms.get(*at).map(String::as_str) != Some("(") {
+            return None;
+        }
+        *at = at.saturating_add(1);
+        let a = evaluate_atoms(atoms, at, macros, depth.saturating_add(1))?;
+        let b = evaluate_atoms(atoms, at, macros, depth.saturating_add(1))?;
+        if atoms.get(*at).map(String::as_str) != Some(")") {
+            return None;
+        }
+        *at = at.saturating_add(1);
+        let value = match operation.to_ascii_uppercase().as_str() {
+            "ADD" => a + b,
+            "SUBTRACT" => a - b,
+            "MULTIPLY" => a * b,
+            "DIVIDE" if b != 0.0 => a / b,
+            _ => return None,
+        };
+        return value.is_finite().then_some(value);
+    }
+    if let Some(named) = macros.get(atom) {
+        return Some(named);
+    }
+    if let Some(body) = macros.tokens(atom) {
+        let inner = expression_atoms(&body.join(" "));
+        let mut inner_at = 0usize;
+        let value = evaluate_atoms(&inner, &mut inner_at, macros, depth.saturating_add(1))?;
+        return (inner_at == inner.len()).then_some(value);
+    }
+    parse_float(atom)
+}
+
+#[must_use]
+pub fn evaluate_expression(args: &[String], macros: &MacroTable) -> Option<f32> {
+    let atoms = expression_atoms(&args.join(" "));
+    let mut at = 0usize;
+    let value = evaluate_atoms(&atoms, &mut at, macros, 0)?;
+    (at == atoms.len()).then_some(value)
+}
+
 #[must_use]
 pub fn field_expression(field: &Field, macros: &MacroTable) -> Option<f32> {
     let first = field.value()?;

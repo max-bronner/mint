@@ -10,8 +10,10 @@ use mint_sim::{Entity, PlayerId, Result, StateHasher, Tick, World};
 
 use super::{Ids, RotwkRules};
 use crate::diag::diag;
-use crate::economy::{PlayerUpgrades, Purse};
+use crate::economy::PlayerUpgrades;
 use crate::game::LOCAL_PLAYER;
+use crate::match_values::{MatchResult, PlayerResult};
+use crate::sciences::PlayerScience;
 
 const WALK_ON_TEMPLATE: &str = "WalkOnTemplate";
 
@@ -52,7 +54,8 @@ impl CarryoverRun {
             hasher.write_i32(record.count);
             hasher.write_f32(record.experience);
         }
-        hasher.write_f32(self.carry.money());
+        hasher.write_f32(self.carry.skill_points());
+        hasher.write_f32(self.carry.cash_bounty());
         hasher.write_usize(self.marks.len());
         for mark in &self.marks {
             mark.entity.hash_into(hasher);
@@ -125,7 +128,8 @@ impl RotwkRules {
                 instances.push((record, *kind));
             }
         }
-        let places = self.walk_on_places(&instances, origin, facing);
+        let kinds: Vec<crate::unit::Kind> = instances.iter().map(|(_, kind)| *kind).collect();
+        let places = self.walk_on_places(&kinds, origin, facing);
         for ((record, kind), at) in instances.iter().zip(places) {
             let made = self.spawn_template(tick, ids, LOCAL_PLAYER, *kind, at, facing)?;
             let Some(&container) = made.last() else {
@@ -152,9 +156,9 @@ impl RotwkRules {
         Ok(())
     }
 
-    fn walk_on_places(
+    pub(super) fn walk_on_places(
         &self,
-        instances: &[(&CarryoverUnit, crate::unit::Kind)],
+        instances: &[crate::unit::Kind],
         origin: Vec2,
         facing: Facing,
     ) -> Vec<Vec2> {
@@ -169,7 +173,7 @@ impl RotwkRules {
         };
         let units: Vec<DragUnit> = instances
             .iter()
-            .map(|(_, kind)| {
+            .map(|kind| {
                 let record = self.kinds.get(*kind).map(|entry| &entry.record);
                 let class = record
                     .and_then(|record| self.drag_formation.classify(&record.kind_of, &record.name));
@@ -220,12 +224,11 @@ impl RotwkRules {
         else {
             return Ok(());
         };
-        #[allow(clippy::cast_possible_truncation)]
-        let amount = carry.money().max(0.0) as i64;
-        tick.state_mut().insert(
-            ids.purse,
+        crate::spell_state::restore_bounty(
+            tick.state_mut(),
+            ids.cash_bounty,
             player_entity,
-            Purse(mint_sage_economy::Money::new(amount)),
+            carry.cash_bounty(),
         )?;
         let mask = self.upgrade_bits.mask(carry.upgrades());
         if !mask.is_empty() {
@@ -240,7 +243,25 @@ impl RotwkRules {
             )?;
         }
         let mut granted = Vec::new();
-        if let Some(state) = tick.state_mut().get_mut(ids.player_science, player_entity) {
+        let held = tick
+            .state()
+            .get(ids.player_science, player_entity)
+            .map(|held| (held.book, held.unavailable.clone()));
+        let mut skill_points = 0;
+        if let Some((book, unavailable)) = held {
+            let ranks = self.ranks_of(LOCAL_PLAYER);
+            let plan = self.spell_plans.get(usize::from(LOCAL_PLAYER.get()));
+            let mut state = PlayerScience::start(
+                plan.map_or(&[][..], |plan| plan.intrinsic.as_slice()),
+                ranks,
+                plan.and_then(|plan| plan.rank_cap),
+                plan.map_or(0, |plan| plan.intrinsic_purchase_points),
+            );
+            state.book = book;
+            state.unavailable = unavailable;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let points = carry.skill_points().max(0.0) as u32;
+            granted.extend(state.add_skill_points(points, ranks));
             for name in carry.sciences() {
                 if let Some(id) = self.sciences.id(name) {
                     if state.add(id) {
@@ -248,7 +269,18 @@ impl RotwkRules {
                     }
                 }
             }
+            skill_points = state.skill_points;
+            tick.state_mut()
+                .insert(ids.player_science, player_entity, state)?;
         }
+        diag!(
+            "carryover: player skill points {skill_points} (carried {}), cash bounty {}, upgrades [{}], {} of {} science(s) granted",
+            carry.skill_points(),
+            carry.cash_bounty(),
+            carry.upgrades().join(" "),
+            granted.len(),
+            carry.sciences().len()
+        );
         self.sciences_acquired(tick, ids, LOCAL_PLAYER, &granted)
     }
 
@@ -268,24 +300,36 @@ impl RotwkRules {
         }
     }
 
-    pub(crate) fn capture_carryover(&self, world: &World) -> Option<Carryover> {
-        let ids = self.ids()?;
-        let anchor = state_entity(world, ids)?;
-        let run = world
-            .get(ids.map_script_state, anchor)?
-            .carryover
-            .as_ref()?;
-        let mut carry = run.carry.clone();
-        let objects: Vec<CapturedObject> = run
-            .marks
-            .iter()
-            .filter(|mark| world.is_live(mark.entity) && !world.contains(ids.doomed, mark.entity))
-            .filter_map(|mark| self.captured_object(world, ids, mark))
-            .collect();
-        let revivals = self.revival_objects(world, ids);
-        let player = self.player_capture(world, ids);
-        carry.capture(&objects, &revivals, player.as_ref());
-        Some(carry)
+    pub(crate) fn match_result(&self, world: &World) -> MatchResult {
+        let Some(ids) = self.ids() else {
+            return MatchResult::default();
+        };
+        let state =
+            state_entity(world, ids).and_then(|anchor| world.get(ids.map_script_state, anchor));
+        let run = state.and_then(|state| state.carryover.as_ref());
+        MatchResult {
+            end: state.and_then(|state| state.mission_end),
+            roster: run.map(|run| run.carry.clone()),
+            survivors: run
+                .map(|run| {
+                    run.marks
+                        .iter()
+                        .filter(|mark| {
+                            world.is_live(mark.entity) && !world.contains(ids.doomed, mark.entity)
+                        })
+                        .filter_map(|mark| self.captured_object(world, ids, mark))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            players: (0..self.player_count())
+                .map(PlayerId::new)
+                .map(|player| PlayerResult {
+                    player,
+                    fallen_heroes: self.revival_objects(world, ids, player),
+                    state: self.player_capture(world, ids, player),
+                })
+                .collect(),
+        }
     }
 
     fn captured_object(&self, world: &World, ids: Ids, mark: &Mark) -> Option<CapturedObject> {
@@ -311,8 +355,13 @@ impl RotwkRules {
         })
     }
 
-    fn revival_objects(&self, world: &World, ids: Ids) -> Vec<CapturedObject> {
-        let Some(roster) = self.roster_of(world, ids, LOCAL_PLAYER) else {
+    pub(super) fn revival_objects(
+        &self,
+        world: &World,
+        ids: Ids,
+        player: PlayerId,
+    ) -> Vec<CapturedObject> {
+        let Some(roster) = self.roster_of(world, ids, player) else {
             return Vec::new();
         };
         roster
@@ -342,9 +391,18 @@ impl RotwkRules {
             .collect()
     }
 
-    fn player_capture(&self, world: &World, ids: Ids) -> Option<PlayerCapture> {
-        let player = crate::economy::player_entity(world, Self::economy_ids(ids), LOCAL_PLAYER)?;
-        let money = world.get(ids.purse, player)?.0.amount() as f32;
+    pub(super) fn player_capture(
+        &self,
+        world: &World,
+        ids: Ids,
+        player: PlayerId,
+    ) -> Option<PlayerCapture> {
+        let player = crate::economy::player_entity(world, Self::economy_ids(ids), player)?;
+        #[allow(clippy::cast_precision_loss)]
+        let skill_points = world
+            .get(ids.player_science, player)
+            .map_or(0.0, |state| state.skill_points as f32);
+        let cash_bounty = world.get(ids.cash_bounty, player).map_or(0.0, |b| b.0);
         let sciences = world
             .get(ids.player_science, player)
             .map(|state| {
@@ -373,10 +431,10 @@ impl RotwkRules {
             })
             .unwrap_or_default();
         Some(PlayerCapture {
-            money,
+            skill_points,
             sciences,
             upgrades,
-            cost_multiplier: 0.0,
+            cash_bounty,
         })
     }
 
@@ -412,8 +470,15 @@ impl RotwkRules {
             return Err(error);
         }
         let Some((entity, record)) = made else {
+            diag!("carryover: delayed {name:?} - no waiting record spawned");
             return Ok(None);
         };
+        diag!(
+            "carryover: delayed {name:?} spawned at ({:.0}, {:.0}) experience {}",
+            at.x,
+            at.y,
+            record.experience
+        );
         run.marks.push(Mark {
             entity,
             missions: record.carried.missions,

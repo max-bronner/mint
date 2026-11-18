@@ -398,6 +398,11 @@ impl RotwkRules {
             progress.wave = None;
             return Ok(());
         }
+        let team = wave.hordes.clone();
+        self.cohere_move_speed_banded(tick, ids, &team)?;
+        let Some(wave) = &mut progress.wave else {
+            return Ok(());
+        };
 
         match wave.phase {
             crate::skirmish_ai::AttackPhase::EnRoute { .. } => {

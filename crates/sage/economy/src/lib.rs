@@ -11,14 +11,14 @@ pub use command_points::{
     Alignment, CommandPointPool, EVIL_COMMAND_POINT_LIMIT, GOOD_COMMAND_POINT_LIMIT,
 };
 pub use cost::{
-    cost_to_build, kind_of_modifier_for, time_to_build, CostModifierStacking, CostModifiers,
-    TimeModifiers,
+    cost_to_build, kind_of_modifier_for, reduce_frames, time_to_build, upgrade_time_to_build,
+    CostModifierStacking, CostModifiers, TimeModifiers,
 };
 pub use income::AutoDeposit;
 pub use money::{Money, DEFAULT_STARTING_CASH, REFUND_PERCENT};
 pub use production::{
-    Cancellation, Delivery, EntryKind, ItemId, ProductionEntry, ProductionId, ProductionQueue,
-    Progress, QueueRequest, Refusal, MAX_QUEUE_ENTRIES_CAP,
+    Cancellation, Delivery, EntryKind, ItemId, ItemTable, ProductionEntry, ProductionId,
+    ProductionQueue, Progress, QueueRequest, Refusal, MAX_QUEUE_ENTRIES_CAP,
 };
 
 pub type Result<T> = core::result::Result<T, Refusal>;
@@ -32,7 +32,7 @@ mod tests {
     fn a_structure_earns_queues_and_produces_and_does_it_identically_twice() {
         fn run() -> (u64, Vec<u32>) {
             let mut purse = Money::new(300);
-            let mut income = AutoDeposit::new(LogicFrames::from_milliseconds(1_000), 40);
+            let mut income = AutoDeposit::new(LogicFrames::from_engine_milliseconds(1_000), 40);
             let mut queue = ProductionQueue::new(5);
             let pool = CommandPointPool::for_alignment(Alignment::Good);
             let cost = cost_to_build(500, &CostModifiers::default());
@@ -49,7 +49,7 @@ mod tests {
                     command_points: 60,
                     kind: EntryKind::Unit { builder: false },
                 };
-                let _ = queue.queue(request, &mut purse, &pool);
+                let _ = queue.queue(request, &mut purse);
                 if let Progress::Ready { .. } = queue.advance() {
                     if let Some(delivery) = queue.deliver_one() {
                         assert_eq!(delivery.item, ItemId::new(3));
@@ -83,7 +83,6 @@ mod tests {
     fn a_player_can_never_spend_more_than_it_has_over_a_long_run() {
         let mut purse = Money::new(1_000);
         let mut queue = ProductionQueue::new(6);
-        let pool = CommandPointPool::new(10_000);
         let mut ids = Vec::new();
         let mut spent = 0i64;
 
@@ -97,7 +96,7 @@ mod tests {
                 kind: EntryKind::Unit { builder: false },
             };
             let before = purse.amount();
-            if let Ok(id) = queue.queue(request, &mut purse, &pool) {
+            if let Ok(id) = queue.queue(request, &mut purse) {
                 spent = spent.saturating_add(before.saturating_sub(purse.amount()));
                 ids.push(id);
             }

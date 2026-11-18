@@ -1094,6 +1094,92 @@ fn back_away_keeps_going_once_a_spell_book_scarer_is_dead() {
     );
 }
 
+const TAUNT_DATA: &str = "\
+Locomotor ZFeet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\
+EmotionNugget ZTaunt\n  Type = TAUNT\n  Duration = 1000\nEnd\n\
+Object ZTaunter\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE IMMOBILE\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+  Behavior = EmotionTrackerUpdate Tag_Emotion\n    \
+    TauntAndPointUpdateDelay = 1000\n    TauntAndPointDistance = 100\n    AddEmotion = ZTaunt\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object ZFoe\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+  LocomotorSet\n    Locomotor = ZFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
+
+fn taunts_at(distance: f32) -> bool {
+    let doc = mint_sage_ini::Document::parse(
+        "t.ini",
+        TAUNT_DATA,
+        &mint_sage_ini::BlockTable::corpus_path(),
+    )
+    .unwrap();
+    assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
+    let errors = mint_sage_ini::ValueErrors::new();
+    let mut emotions = mint_sage_ini::EmotionIndex::new();
+    emotions.insert_document(&doc, &errors);
+    let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
+    let roots = ["ZTaunter".to_owned(), "ZFoe".to_owned()];
+    let (kinds, missing) = KindTable::closure(&data, &roots);
+    assert!(missing.is_empty(), "{missing:?}");
+    let kinds = Arc::new(kinds);
+    let spawns = [
+        (&roots[0], Vec2::new(300.0, 300.0), PLAYER),
+        (&roots[1], Vec2::new(300.0 + distance, 300.0), OTHER),
+    ]
+    .into_iter()
+    .map(|(name, at, owner)| {
+        kinds
+            .spawn(
+                &data.combat,
+                kinds.kind(name).unwrap(),
+                at,
+                Facing::EAST,
+                owner,
+            )
+            .unwrap()
+    })
+    .collect();
+    let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
+    let rules = RotwkRules::new(passability, spawns)
+        .with_combat(data.combat.clone())
+        .with_emotions(Arc::new(emotions))
+        .with_construction(Arc::clone(&kinds), kinds.production(&data))
+        .with_upgrades(kinds.upgrades(&data), Arc::clone(&data.upgrade_bits));
+    let mut simulation = Simulation::new(5, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let taunter = simulation.state().store(ids.body).unwrap().entities()[0];
+    (0..70).any(|_| {
+        simulation.tick().unwrap();
+        simulation
+            .state()
+            .get(ids.emotion, taunter)
+            .is_some_and(|emotion| emotion.kind == mint_sage_ini::EmotionType::Taunt.code())
+    })
+}
+
+#[test]
+fn the_taunt_scan_measures_centre_to_centre() {
+    assert!(
+        taunts_at(95.0),
+        "an enemy inside the distance was not taunted"
+    );
+    assert!(!taunts_at(105.0), "an enemy outside by centre was taunted");
+}
+
+#[test]
+fn the_ground_line_walk_includes_both_ends() {
+    use crate::rules::emotions::ground_line_clear;
+    let blocked = |at: (i32, i32)| move |cell: (i32, i32)| cell != at;
+    assert!(ground_line_clear((0, 0), (4, 0), |_| true));
+    assert!(!ground_line_clear((0, 0), (4, 0), blocked((2, 0))));
+    assert!(!ground_line_clear((0, 0), (4, 0), blocked((4, 0))));
+    assert!(!ground_line_clear((0, 0), (4, 0), blocked((0, 0))));
+    assert!(ground_line_clear((0, 0), (4, 0), blocked((2, 1))));
+    assert!(!ground_line_clear((0, 0), (6, 3), blocked((3, 2))));
+    assert!(ground_line_clear((2, 2), (2, 2), |_| true));
+}
+
 fn list_data() -> String {
     String::from(
         "EmotionNugget ZFearIdle\n  \

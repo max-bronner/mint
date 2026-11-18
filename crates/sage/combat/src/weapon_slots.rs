@@ -143,11 +143,15 @@ pub struct SlotArm {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SlotFitness {
     pub class_allowed: bool,
-    pub damage: f32,
+    pub valid: bool,
     pub unresistable: bool,
-    pub ready: bool,
-    pub inside_minimum: bool,
+    pub ready_status: bool,
     pub out_of_ammo: bool,
+    pub range: f32,
+    pub distance: f32,
+    pub minimum: f32,
+    pub melee: bool,
+    pub grab: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -157,6 +161,45 @@ pub struct SlotCandidate {
 }
 
 const HUGE_DAMAGE: f32 = 1e10;
+const ONLY_AGAINST_DAMAGE: f32 = 1e5;
+const HUGE_MOVE: f32 = 1e10;
+
+#[derive(Clone, Copy)]
+struct Score {
+    damage: f32,
+    range: f32,
+    movement: f32,
+    draw: f32,
+    ready: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Best {
+    value: f32,
+    index: Option<usize>,
+}
+
+impl Score {
+    fn hit(&mut self, value: f32, usable: bool) {
+        *self = Self {
+            damage: value,
+            range: value,
+            movement: 0.0,
+            draw: self.draw + 1.0,
+            ready: usable,
+        };
+    }
+
+    fn miss(&mut self) {
+        *self = Self {
+            damage: -1.0,
+            range: -1.0,
+            movement: HUGE_MOVE,
+            draw: self.draw - 1.0,
+            ready: false,
+        };
+    }
+}
 
 #[must_use]
 pub fn choose_slot(
@@ -164,56 +207,122 @@ pub fn choose_slot(
     victim_kinds: ConditionMask,
     source: CommandSource,
     active_conditions: ConditionMask,
+    criteria: WeaponChoiceCriteria,
+    draw: &mut dyn FnMut() -> f32,
 ) -> Option<WeaponSlot> {
-    let mut best: Option<(f32, usize)> = None;
-    let mut backup: Option<(f32, usize)> = None;
+    let initial = if criteria == WeaponChoiceCriteria::PreferLeastMovement {
+        HUGE_MOVE
+    } else {
+        0.0
+    };
+    let mut ready_best = Best {
+        value: initial,
+        index: None,
+    };
+    let mut backup_best = ready_best;
+    let matches = |mask: ConditionMask| {
+        mask != ConditionMask::NONE && victim_kinds.intersection_count(mask) > 0
+    };
     for index in (0..SLOT_COUNT).rev() {
         let Some(Some(candidate)) = slots.get(index) else {
             continue;
         };
-        if !candidate.arm.sources.allows(source) {
-            continue;
-        }
-        if candidate.fitness.out_of_ammo {
-            continue;
-        }
-        if !candidate.fitness.class_allowed {
-            continue;
-        }
-        if !active_conditions.contains(candidate.arm.only_in_condition) {
-            continue;
-        }
-        let matches = |mask: ConditionMask| {
-            mask != ConditionMask::NONE && victim_kinds.intersection_count(mask) > 0
-        };
-        if candidate.arm.only_against != ConditionMask::NONE && !matches(candidate.arm.only_against)
+        let fitness = &candidate.fitness;
+        if !candidate.arm.sources.allows(source)
+            || fitness.out_of_ammo
+            || !fitness.class_allowed
+            || (!fitness.valid && !fitness.unresistable)
         {
             continue;
         }
-        let preferred =
-            matches(candidate.arm.preferred_against) || matches(candidate.arm.only_against);
-        let hurts = candidate.fitness.damage > 0.0;
-        if !preferred && !hurts && !candidate.fitness.unresistable {
-            continue;
-        }
-        let (score, ready) = if preferred {
-            (HUGE_DAMAGE, !candidate.fitness.inside_minimum)
+        let movement = if fitness.melee {
+            fitness.distance
+        } else if fitness.distance < fitness.minimum {
+            fitness.minimum - fitness.distance
+        } else if fitness.distance > fitness.range {
+            fitness.distance - fitness.range
         } else {
-            (if hurts { 1.0 } else { 0.0 }, candidate.fitness.ready)
+            0.0
         };
-        let slate = if ready { &mut best } else { &mut backup };
-        if slate.is_none_or(|(best_score, _)| score >= best_score) {
-            *slate = Some((score, index));
+        let mut score = Score {
+            damage: if fitness.valid { 1.0 } else { 0.0 },
+            range: fitness.range,
+            movement,
+            draw: draw(),
+            ready: fitness.ready_status && fitness.distance >= fitness.minimum,
+        };
+        let usable = fitness.distance >= fitness.minimum;
+        let arm = &candidate.arm;
+        if arm.only_against != ConditionMask::NONE {
+            if matches(arm.only_against) {
+                score.hit(ONLY_AGAINST_DAMAGE, usable);
+            } else {
+                score.miss();
+            }
+        }
+        if matches(arm.preferred_against) {
+            score.hit(HUGE_DAMAGE, usable);
+        }
+        if arm.only_in_condition != ConditionMask::NONE {
+            if active_conditions.contains(arm.only_in_condition) {
+                score.hit(HUGE_DAMAGE, usable);
+            } else {
+                score.miss();
+            }
+        }
+        let (value, better): (f32, fn(f32, f32) -> bool) = match criteria {
+            WeaponChoiceCriteria::PreferGrabOverDamage if fitness.grab => {
+                return WeaponSlot::from_index(index);
+            }
+            WeaponChoiceCriteria::PreferMostDamage | WeaponChoiceCriteria::PreferGrabOverDamage => {
+                (score.damage, |new, best| new >= best)
+            }
+            WeaponChoiceCriteria::PreferLongestRange => (score.range, |new, best| new > best),
+            WeaponChoiceCriteria::PreferLeastMovement => (score.movement, |new, best| new <= best),
+            WeaponChoiceCriteria::SelectAtRandom => (score.draw, |new, best| new > best),
+            WeaponChoiceCriteria::UseWeaponSetDefaultCriteria => return None,
+        };
+        let best = if score.ready {
+            &mut ready_best
+        } else {
+            &mut backup_best
+        };
+        if better(value, best.value) {
+            *best = Best {
+                value,
+                index: Some(index),
+            };
         }
     }
-    let chosen = best.or(backup).map(|(_, index)| index)?;
-    WeaponSlot::from_index(chosen)
+    ready_best
+        .index
+        .or(backup_best.index)
+        .and_then(WeaponSlot::from_index)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoVictimSlot {
+    pub out_of_ammo: bool,
+    pub melee: bool,
+    pub no_victim_needed: bool,
+}
+
+#[must_use]
+pub fn choose_slot_without_victim(
+    slots: &[Option<NoVictimSlot>; SLOT_COUNT],
+) -> Option<WeaponSlot> {
+    slots
+        .iter()
+        .position(|slot| {
+            slot.is_some_and(|slot| !slot.out_of_ammo && !slot.melee && slot.no_victim_needed)
+        })
+        .and_then(WeaponSlot::from_index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeaponChoiceCriteria {
     PreferMostDamage,
-    PreferLongestDamage,
+    PreferLongestRange,
     PreferGrabOverDamage,
     PreferLeastMovement,
     SelectAtRandom,
@@ -223,21 +332,30 @@ pub enum WeaponChoiceCriteria {
 impl WeaponChoiceCriteria {
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
-        if token.eq_ignore_ascii_case("PREFER_MOST_DAMAGE") {
-            Some(Self::PreferMostDamage)
-        } else if token.eq_ignore_ascii_case("PREFER_LONGEST_DAMAGE") {
-            Some(Self::PreferLongestDamage)
-        } else if token.eq_ignore_ascii_case("PREFER_GRAB_OVER_DAMAGE") {
-            Some(Self::PreferGrabOverDamage)
-        } else if token.eq_ignore_ascii_case("PREFER_LEAST_MOVEMENT") {
-            Some(Self::PreferLeastMovement)
-        } else if token.eq_ignore_ascii_case("SELECT_AT_RANDOM") {
-            Some(Self::SelectAtRandom)
-        } else if token.eq_ignore_ascii_case("USE_WEAPON_SET_DEFAULT_CRITERIA") {
-            Some(Self::UseWeaponSetDefaultCriteria)
-        } else {
-            None
-        }
+        const NAMES: [(&str, WeaponChoiceCriteria); 6] = [
+            ("PREFER_MOST_DAMAGE", WeaponChoiceCriteria::PreferMostDamage),
+            (
+                "PREFER_LONGEST_RANGE",
+                WeaponChoiceCriteria::PreferLongestRange,
+            ),
+            (
+                "PREFER_GRAB_OVER_DAMAGE",
+                WeaponChoiceCriteria::PreferGrabOverDamage,
+            ),
+            (
+                "PREFER_LEAST_MOVEMENT",
+                WeaponChoiceCriteria::PreferLeastMovement,
+            ),
+            ("SELECT_AT_RANDOM", WeaponChoiceCriteria::SelectAtRandom),
+            (
+                "USE_WEAPONSET_DEFAULT_CRITERIA",
+                WeaponChoiceCriteria::UseWeaponSetDefaultCriteria,
+            ),
+        ];
+        NAMES
+            .iter()
+            .find(|(name, _)| token.eq_ignore_ascii_case(name))
+            .map(|(_, criteria)| *criteria)
     }
 }
 

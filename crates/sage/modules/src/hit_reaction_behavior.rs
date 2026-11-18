@@ -113,7 +113,7 @@ pub fn hit_reaction_behavior_from_fields(
             *slot = threshold;
         }
         if let Some(slot) = timers.get_mut(at) {
-            *slot = LogicFrames::from_milliseconds(timer_ms);
+            *slot = crate::special_ability_update::retail_duration_ticks(timer_ms);
         }
     }
     Ok(HitReactionBehavior {

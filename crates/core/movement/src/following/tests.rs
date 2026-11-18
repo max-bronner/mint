@@ -38,6 +38,8 @@ fn limits() -> MotionLimits {
     MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -193,6 +195,43 @@ fn a_mover_on_clear_ground_still_refuses_to_enter_a_blocked_cell() {
     }
     assert_eq!(status, MotionStatus::Blocked);
     assert!(state.position.x < 25.0, "stopped at {:?}", state.position);
+}
+
+#[test]
+fn an_unsearched_route_crosses_terrain_but_stops_at_an_object_footprint() {
+    const TERRAIN: CellFlags = CellFlags::from_bits(2);
+    const OBJECT: CellFlags = CellFlags::from_bits(4);
+    let mover = MoverClass::new(TERRAIN.union(OBJECT)).object_stamped(OBJECT);
+    let run = |flag: CellFlags| {
+        let mut grid = CostGrid::new(GridExtent::new(16, 16).unwrap());
+        for x in 4..16u16 {
+            grid.set_flags(Cell::new(x, 0), flag).unwrap();
+        }
+        let context = MoveContext {
+            grid: &grid,
+            geometry: geometry(),
+            mover,
+            layer: 0,
+        };
+        let mut route = Route::to_point(geometry().centre_of(Cell::new(9, 0)));
+        route.unsearched = true;
+        let mut state = MoverState::new(geometry().centre_of(Cell::new(0, 0)), Facing::EAST);
+        let mut status = MotionStatus::Moving;
+        for _ in 0..400 {
+            let motion = SlidingFollower.step(&context, state, &route, &limits(), 1.0 / 30.0);
+            state = motion.state;
+            status = motion.status;
+            if status != MotionStatus::Moving {
+                break;
+            }
+        }
+        (status, state.position)
+    };
+    let (status, at) = run(TERRAIN);
+    assert_eq!(status, MotionStatus::Arrived, "stopped at {at:?}");
+    let (status, at) = run(OBJECT);
+    assert_eq!(status, MotionStatus::Blocked);
+    assert!(at.x < 45.0, "walked into the footprint: {at:?}");
 }
 
 #[test]
@@ -418,7 +457,8 @@ fn a_mover_turns_at_half_rate_and_publishes_no_turn_pose_at_a_portal() {
     let route = Route {
         points: vec![Vec2::new(5.0, 155.0)],
         extra_distance: 0.0,
-        portals: vec![Some(Portal { id: 1, kind: 2 })],
+        unsearched: false,
+        portals: vec![Some(Portal::new(1, 2))],
     };
     let state = MoverState::new(Vec2::new(5.0, 5.0), Facing::EAST);
     let dt = 1.0 / 30.0;
@@ -436,6 +476,8 @@ fn orbiting_limits() -> MotionLimits {
     MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -496,6 +538,7 @@ fn an_intermediate_waypoint_inside_the_turning_circle_is_not_orbited() {
     let route = Route {
         points: vec![Vec2::new(100.0, 105.0), Vec2::new(400.0, 105.0)],
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     let state = MoverState {
@@ -525,6 +568,7 @@ fn a_waypoint_the_mover_has_gone_past_is_retired_rather_than_turned_back_to() {
             Vec2::new(300.0, 100.0),
         ],
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     let state = MoverState {
@@ -586,6 +630,8 @@ fn the_destination_keeps_its_declared_arrival_radius() {
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -844,6 +890,8 @@ fn winged_limits() -> MotionLimits {
     MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -945,6 +993,7 @@ fn a_mover_placed_on_its_route_stays_on_the_polyline_through_a_corner() {
     let route = Route {
         points: points.clone(),
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     let mut state = MoverState::new(points[0], Facing::EAST);
@@ -1015,6 +1064,7 @@ fn a_mover_that_does_not_turn_while_moving_keeps_its_facing_round_a_bend() {
             Vec2::new(300.0, 157.7),
         ],
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     let start = MoverState::new(Vec2::new(100.0, 100.0), Facing::EAST);
@@ -1072,6 +1122,7 @@ fn a_right_angle_corner_is_rounded_by_a_tangent_arc() {
             Vec2::new(100.0, 100.0),
         ],
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     round_corners(&mut route, 20.0, |_| true);
@@ -1096,6 +1147,7 @@ fn the_corner_angle_decides_whether_and_how_widely_it_is_rounded() {
                 Vec2::new(200.0 + 200.0 * cos, 200.0 * sin),
             ],
             extra_distance: 0.0,
+            unsearched: false,
             portals: Vec::new(),
         };
         round_corners(&mut route, 20.0, |_| true);
@@ -1116,14 +1168,12 @@ fn a_portal_corner_is_never_rounded() {
             Vec2::new(100.0, 100.0),
         ],
         extra_distance: 0.0,
-        portals: vec![None, Some(Portal { id: 7, kind: 3 }), None],
+        unsearched: false,
+        portals: vec![None, Some(Portal::new(7, 3)), None],
     };
     round_corners(&mut route, 20.0, |_| true);
     assert_eq!(route.points.len(), 3, "the portal's corner stayed sharp");
-    assert_eq!(
-        route.portals,
-        vec![None, Some(Portal { id: 7, kind: 3 }), None]
-    );
+    assert_eq!(route.portals, vec![None, Some(Portal::new(7, 3)), None]);
 }
 
 #[test]
@@ -1167,14 +1217,17 @@ fn a_route_curves_out_of_the_facing_only_between_the_two_gates() {
         let mut route = Route {
             points: vec![start, first],
             extra_distance: 0.0,
+            unsearched: false,
             portals: Vec::new(),
         };
         let departure = crate::Departure {
             heading,
             radius: 20.0,
             max_turn,
+            pass_first: false,
+            backing: None,
         };
-        crate::depart(&mut route, departure, |_| true);
+        crate::depart(&mut route, departure, |_| true, |_, _| true);
         assert_eq!(route.points.len() > 2, curves, "heading {heading:?}");
         if curves {
             let out = route.points[1].minus(start);
@@ -1195,14 +1248,17 @@ fn the_departure_arc_tops_up_its_sweep_to_the_true_tangent() {
     let mut route = Route {
         points: vec![start, first],
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     let departure = crate::Departure {
         heading: Facing::EAST,
         radius: 20.0,
         max_turn: core::f32::consts::PI,
+        pass_first: false,
+        backing: None,
     };
-    crate::depart(&mut route, departure, |_| true);
+    crate::depart(&mut route, departure, |_| true, |_, _| true);
     let last = route.points[route.points.len() - 2];
     let uncorrected = Vec2::new(120.0, 120.0);
     assert!(
@@ -1222,14 +1278,17 @@ fn n_less_than_two_takes_no_curve_rather_than_retrying_at_a_bigger_radius() {
     let mut route = Route {
         points: vec![start, first],
         extra_distance: 0.0,
+        unsearched: false,
         portals: Vec::new(),
     };
     let departure = crate::Departure {
         heading: Facing::EAST,
         radius: 2.0,
         max_turn: core::f32::consts::PI,
+        pass_first: false,
+        backing: None,
     };
-    crate::depart(&mut route, departure, |_| true);
+    crate::depart(&mut route, departure, |_| true, |_, _| true);
     assert_eq!(
         route.points,
         vec![start, first],
@@ -1248,6 +1307,8 @@ fn a_backing_mover_faces_away_from_where_it_goes() {
     };
     let limits = MotionLimits {
         backs: true,
+        backing_speed: None,
+        wheel_backing: None,
         ..limits()
     };
     let route = Route::to_point(Vec2::new(600.0, 300.0));
@@ -1270,4 +1331,434 @@ fn a_backing_mover_faces_away_from_where_it_goes() {
         "turned to {:?}",
         state.facing
     );
+}
+
+#[test]
+fn a_backing_mover_is_held_to_its_backing_speed() {
+    let grid = open_grid();
+    let context = MoveContext {
+        grid: &grid,
+        geometry: geometry(),
+        mover: MOVER,
+        layer: 0,
+    };
+    let top = |backs: bool| {
+        let limits = MotionLimits {
+            backs,
+            backing_speed: Some(limits().max_speed / 3.0),
+            wheel_backing: None,
+            ..limits()
+        };
+        let route = Route::to_point(Vec2::new(600.0, 300.0));
+        let mut state = MoverState::new(
+            Vec2::new(300.0, 300.0),
+            Facing::from_radians(core::f32::consts::PI),
+        );
+        let mut fastest = 0.0_f32;
+        for _ in 0..60 {
+            state = SteeringFollower
+                .step(&context, state, &route, &limits, 1.0 / 30.0)
+                .state;
+            fastest = fastest.max(state.speed);
+        }
+        (fastest, limits.max_speed)
+    };
+    let (backing, max) = top(true);
+    assert!(backing <= max / 3.0 + 0.01, "{backing} of {max}");
+    assert!(backing > 0.0);
+    let (forward, _) = top(false);
+    assert!(forward > max / 3.0 + 1.0, "{forward}");
+}
+
+fn walk_with_flag(mut state: MoverState, stops_dead: bool, backs: bool, ticks: u32) -> MoverState {
+    let grid = open_grid();
+    let context = MoveContext {
+        grid: &grid,
+        geometry: geometry(),
+        mover: MOVER,
+        layer: 0,
+    };
+    let limits = MotionLimits {
+        backs,
+        stops_dead,
+        ..limits()
+    };
+    let route = Route::to_point(Vec2::new(600.0, 300.0));
+    for _ in 0..ticks {
+        state = SteeringFollower
+            .step(&context, state, &route, &limits, 1.0 / 30.0)
+            .state;
+    }
+    state
+}
+
+#[test]
+fn only_a_legs_mover_starts_backing_mid_move() {
+    for (stops_dead, backs_after) in [(true, true), (false, false)] {
+        let walking = walk_with_flag(
+            MoverState::new(Vec2::new(300.0, 300.0), Facing::EAST),
+            stops_dead,
+            false,
+            15,
+        );
+        assert!(walking.speed > 0.0);
+        let after = walk_with_flag(walking, stops_dead, true, 30);
+        assert_eq!(
+            after.facing.to_vector().x < 0.0,
+            backs_after,
+            "stops_dead {stops_dead}: facing {:?}",
+            after.facing
+        );
+    }
+}
+
+#[test]
+fn backing_ends_the_tick_its_flag_fails() {
+    for stops_dead in [true, false] {
+        let backing = walk_with_flag(
+            MoverState::new(
+                Vec2::new(300.0, 300.0),
+                Facing::from_radians(core::f32::consts::PI),
+            ),
+            stops_dead,
+            true,
+            20,
+        );
+        assert!(backing.speed > 0.0 && backing.facing.to_vector().x < -0.99);
+        let after = walk_with_flag(backing, stops_dead, false, 30);
+        assert!(
+            after.facing.to_vector().x > 0.0,
+            "stops_dead {stops_dead}: facing {:?}",
+            after.facing
+        );
+    }
+}
+
+#[test]
+fn a_wheeled_mover_backs_only_when_the_path_is_short_or_the_order_is_fresh() {
+    let grid = open_grid();
+    let context = MoveContext {
+        grid: &grid,
+        geometry: geometry(),
+        mover: MOVER,
+        layer: 0,
+    };
+    let backs_towards = |goal_x: f32, moved_since_order: f32| {
+        let limits = MotionLimits {
+            wheel_backing: Some(WheelBacking {
+                distance_min: 50.0,
+                distance_max: 400.0,
+                angle: core::f32::consts::FRAC_PI_2,
+                stop_when_turning: false,
+                moved_since_order,
+                turning: false,
+            }),
+            ..limits()
+        };
+        let route = Route::to_point(Vec2::new(goal_x, 300.0));
+        let mut motion = SteeringFollower.step(
+            &context,
+            MoverState::new(
+                Vec2::new(300.0, 300.0),
+                Facing::from_radians(core::f32::consts::PI),
+            ),
+            &route,
+            &limits,
+            1.0 / 30.0,
+        );
+        for _ in 0..4 {
+            motion = SteeringFollower.step(&context, motion.state, &route, &limits, 1.0 / 30.0);
+        }
+        motion.phase.contains(MotionPhase::BACKING_UP)
+    };
+    assert!(backs_towards(600.0, 100.0), "300 to go backs");
+    assert!(
+        !backs_towards(1300.0, 100.0),
+        "1000 to go, 100 from the order, turns"
+    );
+    assert!(
+        backs_towards(1300.0, 10.0),
+        "1000 to go, 10 from the order, backs"
+    );
+}
+
+#[test]
+fn a_climb_leg_scales_the_step_by_its_slope() {
+    let mut grid = CostGrid::new(GridExtent::new(16, 16).unwrap());
+    grid.set_flags(Cell::new(0, 0), WALL).unwrap();
+    let context = MoveContext {
+        grid: &grid,
+        geometry: geometry(),
+        mover: MOVER,
+        layer: 0,
+    };
+    let climb = Portal {
+        id: 1,
+        kind: 3,
+        leg: Leg::Climb,
+        rise: 40.0,
+    };
+    let route = Route {
+        points: vec![Vec2::new(5.0, 5.0), Vec2::new(15.0, 5.0)],
+        extra_distance: 0.0,
+        unsearched: false,
+        portals: vec![None, Some(climb)],
+    };
+    let mut state = MoverState::new(Vec2::new(5.0, 5.0), Facing::EAST);
+    state.waypoint = 1;
+    let dt = 1.0 / 30.0;
+    let motion = SteeringFollower.step(&context, state, &route, &limits(), dt);
+    let step = limits().acceleration * dt * dt;
+    let expected = step * (10.0 / 41.0) * 0.85;
+    let moved = motion.state.position.x - 5.0;
+    assert!(
+        (moved - expected).abs() < 1e-5,
+        "moved {moved}, expected {expected}"
+    );
+    assert!(motion.phase.contains(MotionPhase::WALKING));
+    assert!(motion.phase.contains(MotionPhase::CLIMBING));
+    assert_ne!(motion.status, MotionStatus::Blocked);
+}
+
+#[test]
+fn a_steep_descent_backs_down_the_slope() {
+    let grid = CostGrid::new(GridExtent::new(16, 16).unwrap());
+    let context = MoveContext {
+        grid: &grid,
+        geometry: geometry(),
+        mover: MOVER,
+        layer: 0,
+    };
+    let climb = Portal {
+        id: 1,
+        kind: 3,
+        leg: Leg::Climb,
+        rise: -40.0,
+    };
+    let route = Route {
+        points: vec![Vec2::new(5.0, 5.0), Vec2::new(5.0, 15.0)],
+        extra_distance: 0.0,
+        unsearched: false,
+        portals: vec![None, Some(climb)],
+    };
+    let mut state = MoverState::new(
+        Vec2::new(5.0, 5.0),
+        Facing::from_radians(core::f32::consts::FRAC_PI_2),
+    );
+    state.waypoint = 1;
+    state.speed = 5.0;
+    let motion = SteeringFollower.step(&context, state, &route, &limits(), 1.0 / 30.0);
+    assert!(motion.phase.contains(MotionPhase::BACKING_UP));
+    assert!(motion.phase.contains(MotionPhase::CLIMBING));
+    let turned = state.facing.delta_to(motion.state.facing).abs();
+    assert!(turned > 0.0, "it turns away from the slope it descends");
+}
+
+#[test]
+fn a_climb_leg_with_no_run_does_not_strand_the_mover() {
+    let grid = CostGrid::new(GridExtent::new(200, 200).unwrap());
+    let context = MoveContext {
+        grid: &grid,
+        geometry: geometry(),
+        mover: MOVER,
+        layer: 0,
+    };
+    let tag = |rise: f32, leg: Leg| {
+        Some(Portal {
+            id: 1,
+            kind: 3,
+            leg,
+            rise,
+        })
+    };
+    let route = Route {
+        points: vec![
+            Vec2::new(930.0, 2000.0),
+            Vec2::new(955.0, 2005.0),
+            Vec2::new(952.2, 2000.1),
+            Vec2::new(970.5, 2000.0),
+            Vec2::new(970.5, 2000.0),
+            Vec2::new(992.3, 1994.7),
+            Vec2::new(1000.0, 2000.0),
+        ],
+        extra_distance: 0.0,
+        unsearched: false,
+        portals: vec![
+            None,
+            None,
+            None,
+            tag(0.0, Leg::Walk),
+            tag(53.0, Leg::Climb),
+            tag(-0.2, Leg::Climb),
+            tag(0.0, Leg::Climb),
+        ],
+    };
+    let mut state = MoverState::new(route.points[4], Facing::from_radians(-2.63));
+    state.speed = 50.0;
+    state.waypoint = 4;
+    let mut limits = limits();
+    limits.max_speed = 50.0;
+    limits.desired_speed = 50.0;
+    for tick in 0..400 {
+        let motion = SlidingFollower.step(&context, state, &route, &limits, 1.0 / 30.0);
+        state = motion.state;
+        if motion.status == MotionStatus::Arrived {
+            return;
+        }
+        assert!(
+            tick < 399,
+            "stranded at {:?} on waypoint {}",
+            state.position,
+            state.waypoint
+        );
+    }
+}
+
+#[test]
+fn a_steep_climb_leg_is_crossed_in_rise_over_step_frames() {
+    let climb = Portal {
+        id: 1,
+        kind: 3,
+        leg: Leg::Climb,
+        rise: 53.0,
+    };
+    let route = Route {
+        points: vec![Vec2::new(1000.0, 2000.0), Vec2::new(1000.1, 2000.0)],
+        extra_distance: 0.0,
+        unsearched: false,
+        portals: vec![None, Some(climb)],
+    };
+    let mut at = route.points[0];
+    let mut frames = 0;
+    while at != route.points[1] && frames < 100 {
+        let look = super::path::walk(&route, at, 1, 5.0);
+        at = look.point;
+        frames += 1;
+    }
+    assert_eq!(frames, 13);
+}
+
+#[test]
+fn a_wheeled_mover_doubles_its_error_before_it_ignores_it_at_speed() {
+    let wheels = crate::following::TurnSlowdown {
+        cap: 1.0,
+        unhindered_above: Some(0.25),
+        pivot_below: 1.0,
+        ..crate::following::TurnSlowdown::PROPORTIONAL
+    };
+    let error = 15.0_f32.to_radians();
+    let kept = wheels.keep(error, 10.0, 10.0, 1.0);
+    assert!((kept - (1.0 - 2.0 * error / core::f32::consts::FRAC_PI_4)).abs() < 1e-5);
+    let three_frames = crate::following::TurnSlowdown {
+        pivot_below: 1.0 / 3.0,
+        ..wheels
+    };
+    assert!((three_frames.keep(error, 10.0, 10.0, 1.0) - 1.0).abs() < 1e-6);
+    assert!((three_frames.keep(error, 3.0, 10.0, 1.0) - kept).abs() < 1e-5);
+}
+
+#[test]
+fn a_ships_slowdown_follows_the_current_turn_rate() {
+    let ship = crate::following::TurnSlowdown {
+        cap: 0.9,
+        full_at_turn_steps: 3.5,
+        turn_step_seconds: 0.2,
+        ..crate::following::TurnSlowdown::PROPORTIONAL
+    };
+    let fast = ship.keep(0.35, 1.0, 10.0, 1.0);
+    let slow = ship.keep(0.35, 1.0, 10.0, 0.5);
+    assert!(slow < fast);
+}
+
+fn departing(first: Vec2, pass_first: bool, clear: impl Fn(Vec2) -> bool) -> Vec<Vec2> {
+    let start = Vec2::new(100.0, 100.0);
+    let mut route = Route {
+        points: vec![start, first],
+        extra_distance: 0.0,
+        unsearched: false,
+        portals: Vec::new(),
+    };
+    let departure = crate::Departure {
+        heading: Facing::EAST,
+        radius: 20.0,
+        max_turn: core::f32::consts::PI,
+        pass_first,
+        backing: None,
+    };
+    crate::depart(&mut route, departure, clear, |_, _| true);
+    route.points
+}
+
+#[test]
+fn the_radius_five_arc_is_committed_untested() {
+    let start = Vec2::new(100.0, 100.0);
+    let route = departing(Vec2::new(100.0, 200.0), false, |p| {
+        p.minus(start).length() < 6.0
+    });
+    assert!(route.len() > 2, "started straight: {route:?}");
+    assert!(route[1].minus(start).length() < 10.0, "{route:?}");
+}
+
+#[test]
+fn a_sharp_turn_tries_the_other_way_round_before_radius_five() {
+    let route = departing(Vec2::new(60.0, 110.0), false, |p| p.y <= 100.5);
+    assert!(route.len() > 2, "started straight: {route:?}");
+    assert!(route[1].y < 100.0, "first point {:?}", route[1]);
+}
+
+#[test]
+fn a_backing_departure_starts_behind_the_mover() {
+    let start = Vec2::new(100.0, 100.0);
+    let mut route = Route {
+        points: vec![start, Vec2::new(-200.0, 100.0)],
+        extra_distance: 0.0,
+        unsearched: false,
+        portals: Vec::new(),
+    };
+    let departure = crate::Departure {
+        heading: Facing::EAST,
+        radius: 5.0,
+        max_turn: core::f32::consts::PI,
+        pass_first: false,
+        backing: Some(20.0),
+    };
+    crate::depart(&mut route, departure, |_| false, |_, _| false);
+    assert!(route.points.len() > 3, "{:?}", route.points);
+    assert!(route.points[1].x < 100.0, "{:?}", route.points);
+}
+
+#[test]
+fn a_short_backing_departure_uses_the_ordinary_radius() {
+    let start = Vec2::new(100.0, 100.0);
+    let leg_to = Vec2::new(60.0, 160.0);
+    let build = |heading, backing| {
+        let mut route = Route {
+            points: vec![start, leg_to],
+            extra_distance: 0.0,
+            unsearched: false,
+            portals: Vec::new(),
+        };
+        let departure = crate::Departure {
+            heading,
+            radius: 10.0,
+            max_turn: core::f32::consts::PI,
+            pass_first: false,
+            backing,
+        };
+        crate::depart(&mut route, departure, |_| true, |_, _| true);
+        route.points
+    };
+    let backing = build(Facing::EAST, Some(100.0));
+    let ordinary = build(Facing::from_radians(core::f32::consts::PI), None);
+    assert!(ordinary.len() > 2);
+    assert_eq!(backing, ordinary);
+}
+
+#[test]
+fn a_floating_departure_commits_its_first_arc_untested() {
+    let start = Vec2::new(100.0, 100.0);
+    let refused = |_: Vec2| false;
+    let asked = departing(Vec2::new(100.0, 200.0), true, refused);
+    let retry = departing(Vec2::new(100.0, 200.0), false, refused);
+    assert!(asked[1].minus(start).length() > retry[1].minus(start).length());
 }

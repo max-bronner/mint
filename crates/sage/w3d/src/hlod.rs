@@ -106,6 +106,12 @@ impl HLod {
                 _ => {}
             }
         }
+        if usize::try_from(out.header.lod_count).map_or(true, |n| out.lods.len() < n) {
+            return Err(crate::Error::MissingLodArrays {
+                stated: out.header.lod_count,
+                found: out.lods.len(),
+            });
+        }
         Ok(out)
     }
 
@@ -117,7 +123,8 @@ impl HLod {
 
     #[must_use]
     pub fn finest_lod(&self) -> Option<&HLodArray> {
-        self.lods.last()
+        let read = usize::try_from(self.header.lod_count).unwrap_or(usize::MAX);
+        self.lods.get(..read.min(self.lods.len()))?.last()
     }
 }
 
@@ -193,6 +200,53 @@ mod tests {
             !lod.counts_agree(),
             "the header claims two sub-objects and one followed"
         );
+    }
+
+    fn hlod_with(stated: u32, arrays: &[(&str, u32)]) -> Vec<u8> {
+        let mut header = vec![0u8; 40];
+        header[4..8].copy_from_slice(&stated.to_le_bytes());
+        let mut kids = vec![chunk(ChunkType::HLOD_HEADER, false, &header)];
+        for (name, bone) in arrays {
+            let mut sub = vec![0u8; 36];
+            sub[0..4].copy_from_slice(&bone.to_le_bytes());
+            for (slot, byte) in sub[4..].iter_mut().zip(name.bytes()) {
+                *slot = byte;
+            }
+            kids.push(chunk(
+                ChunkType::HLOD_LOD_ARRAY,
+                true,
+                &chunk(ChunkType::HLOD_SUB_OBJECT, false, &sub),
+            ));
+        }
+        chunk(ChunkType::HLOD, true, &concat(&kids))
+    }
+
+    fn parse_hlod(file: &[u8]) -> Result<HLod> {
+        let top = Chunks::new(file)
+            .next()
+            .and_then(Result::ok)
+            .expect("one chunk");
+        HLod::parse(&top)
+    }
+
+    #[test]
+    fn only_the_stated_number_of_lod_arrays_is_read() {
+        let file = hlod_with(1, &[("A.A", 1), ("B.B", 2)]);
+        let hlod = parse_hlod(&file).expect("valid");
+        let lod = hlod.finest_lod().expect("one array read");
+        assert_eq!(lod.sub_objects.first().map(|s| s.bone_index), Some(1));
+    }
+
+    #[test]
+    fn a_stated_lod_array_that_is_missing_is_an_error() {
+        let file = hlod_with(2, &[("A.A", 1)]);
+        assert!(matches!(
+            parse_hlod(&file),
+            Err(crate::Error::MissingLodArrays {
+                stated: 2,
+                found: 1
+            })
+        ));
     }
 
     #[test]

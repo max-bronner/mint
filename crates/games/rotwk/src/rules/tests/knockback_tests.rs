@@ -263,7 +263,44 @@ fn a_landed_object_lies_stunned_for_its_own_shock_times_before_it_takes_an_order
         }
     }
     let (landed, up) = (landed.expect("never landed"), up.expect("never got up"));
-    assert_eq!(up - landed, 45, "landed on {landed}, up on {up}");
+    assert_eq!(up - landed, 48, "landed on {landed}, up on {up}");
+}
+
+#[test]
+fn a_fling_s_speed_counts_the_vertical_part_of_its_distance() {
+    let speed = crate::rules::knockback::fling_speed(
+        mint_sage_combat::Point3::new(3.0, 0.0, 4.0),
+        4.0,
+        10.0,
+        10.0,
+        0.0,
+    );
+    assert!((speed - (13.0f32.sqrt() + 2.0)).abs() < 1e-4, "{speed}");
+}
+
+#[test]
+fn a_flung_body_lands_two_retail_frames_after_its_flight_runs() {
+    let (mut simulation, ids, entities) = scene();
+    let peon = entities[2];
+    let mut first: Option<(u64, u16, u16)> = None;
+    let mut landed: Option<u64> = None;
+    for _ in 0..240 {
+        simulation.tick().unwrap();
+        let frame = simulation.frame().get();
+        let Some(knocked) = simulation.state().get(ids.knocked, peon) else {
+            continue;
+        };
+        if first.is_none() && knocked.phase == crate::rules::knockback::Phase::Airborne {
+            let frames = knocked.flight.map_or(0, |flight| flight.frames());
+            first = Some((frame, knocked.age, frames));
+        }
+        if knocked.phase == crate::rules::knockback::Phase::Stunned {
+            landed = Some(frame);
+            break;
+        }
+    }
+    let ((seen, age, frames), landed) = (first.expect("never flew"), landed.expect("never landed"));
+    assert_eq!(landed - seen, u64::from(frames) + 12 - u64::from(age));
 }
 
 #[test]

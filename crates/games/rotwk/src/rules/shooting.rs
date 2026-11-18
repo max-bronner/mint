@@ -4,11 +4,16 @@ use mint_sage_modules::object_filter::ObjectFilter;
 use mint_sage_modules::Effect;
 
 use super::charge_pass::ChargeStep;
+use super::fire_gate::FireGate;
 use super::loose_melee::LooseStep;
 
 const CLOSE_RANGE: &str = "CLOSE_RANGE";
 
+const APPROACH_COST_WEIGHT: f32 = 0.0005;
+
 const ATTACK_NEEDS_LINE_OF_SIGHT: &str = "ATTACK_NEEDS_LINE_OF_SIGHT";
+
+const CAN_SHOOT_OVER_WALLS: &str = "CAN_SHOOT_OVER_WALLS";
 
 #[cfg(test)]
 thread_local! {
@@ -26,6 +31,13 @@ enum ReplanCadence {
     Boarding,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteEnd {
+    Reach,
+    Closest,
+    Spot,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ArmedFacts {
     pub(super) me: Foe,
@@ -34,6 +46,13 @@ pub(super) struct ArmedFacts {
     pub(super) slots: Option<(usize, super::upgrades::SlotSet)>,
     pub(super) span: Option<(f32, f32, mint_sage_combat::AntiMask)>,
     pub(super) stands: bool,
+}
+
+pub(super) struct ShotRoll {
+    pub(super) outcome: ShotOutcome,
+    pub(super) dodged: bool,
+    pub(super) infantry: bool,
+    pub(super) passenger_roll: Option<bool>,
 }
 
 impl RotwkRules {
@@ -50,6 +69,7 @@ impl RotwkRules {
             || world.contains(ids.using_ability, entity)
             || world.contains(ids.no_auto_acquire, entity)
             || Self::emotion_holds(world, ids, entity)
+            || Self::ai_busy(world, ids, entity, tick.frame())
             || Self::deploy_transition(world, ids, entity)
             || self
                 .contained_status(world, ids, entity)
@@ -79,7 +99,7 @@ impl RotwkRules {
         let slots = self.armed_slots(tick, ids, entity);
         let span = self.combat.weapons.get(state.weapon).map(|template| {
             let own = (
-                template.minimum_attack_range,
+                self.min_range_of(world, entity, template),
                 self.attack_range_of(world, ids, entity, template),
                 template.anti_mask,
             );
@@ -92,12 +112,12 @@ impl RotwkRules {
                         .flatten()
                         .fold(own, |(min, max, mask), arm| {
                             match self.combat.weapons.get(arm.weapon) {
-                                Some(template) => (
-                                    min.min(template.minimum_attack_range),
+                                Some(template) if !template.bombard_type => (
+                                    min.min(self.min_range_of(world, entity, template)),
                                     max.max(self.attack_range_of(world, ids, entity, template)),
                                     mask.union(template.anti_mask),
                                 ),
-                                None => (min, max, mask),
+                                _ => (min, max, mask),
                             }
                         })
                 }
@@ -132,7 +152,14 @@ impl RotwkRules {
         let armed: Vec<Entity> = tick
             .state()
             .store(ids.armed)
-            .map(|store| store.entities().to_vec())
+            .map(|store| {
+                store
+                    .entities()
+                    .iter()
+                    .copied()
+                    .filter(|entity| !self.ai_disabled(tick.state(), ids, *entity, now))
+                    .collect()
+            })
             .unwrap_or_default();
         if armed.is_empty() {
             return Ok(());
@@ -148,11 +175,14 @@ impl RotwkRules {
         let mut aim_effects: Vec<(Entity, Effect)> = Vec::new();
 
         let _perf = crate::perf::sub(crate::perf::sub_row!("armed_loop"));
+        let decide_perf = crate::perf::sub(crate::perf::sub_row!("decide_armed"));
         let decided: Vec<Option<ArmedFacts>> = armed
             .iter()
             .map(|&entity| self.decide_armed(tick, ids, entity, living, formations_on))
             .collect();
+        drop(decide_perf);
         for (entity, decision) in armed.into_iter().zip(decided) {
+            let choosing = crate::perf::sub(crate::perf::sub_row!("armed_choose"));
             debug_assert_eq!(
                 format!("{decision:?}"),
                 format!(
@@ -177,6 +207,7 @@ impl RotwkRules {
                 stands,
             } = decided;
             let previous_next_acquire = state.next_acquire;
+            let part = crate::perf::sub(crate::perf::sub_row!("choose_bird_ground"));
             let engagement = self.giant_bird_engagement(tick, ids, entity);
             let bird_strike = match engagement {
                 Some(super::giant_bird::Engagement::Busy { target }) => {
@@ -202,6 +233,7 @@ impl RotwkRules {
                 )?;
                 continue;
             }
+            drop(part);
             let Some((min_range, max_range, anti_mask)) = span else {
                 continue;
             };
@@ -221,8 +253,27 @@ impl RotwkRules {
                     after_firing(template, &state, now) == AfterFiring::Holding
                 });
 
+            let finishing = self.finishing_victim(tick, ids, &state, living);
+            let flagged = self
+                .combat
+                .weapons
+                .get(state.weapon)
+                .is_some_and(|template| template.finish_attack_once_started);
+            if state.winding && !flagged {
+                let abandoned = state.target.is_some_and(|victim| {
+                    self.carries_object_status(tick.state(), victim, "FLEE_OFF_MAP")
+                });
+                if abandoned {
+                    state.retarget(None);
+                    tick.state_mut().remove(ids.attack_order, entity);
+                    tick.state_mut().insert(ids.armed, entity, state)?;
+                    continue;
+                }
+            }
+
+            let part = crate::perf::sub(crate::perf::sub_row!("choose_order"));
             let mut ordered = tick.state().get(ids.attack_order, entity).copied();
-            if let Some(order) = ordered.filter(|order| order.forced) {
+            if let Some(order) = ordered.filter(|order| order.relation_free) {
                 let now_owner = tick
                     .state()
                     .get(ids.owner, order.target)
@@ -234,14 +285,14 @@ impl RotwkRules {
                     ordered = None;
                 }
             }
-            let forced = ordered.is_some_and(|order| order.forced);
+            let relation_free = ordered.is_some_and(|order| order.relation_free);
             let ordered_foe = |world: &mint_sim::World, target: Entity| {
                 living
                     .binary_search_by_key(&target, |(foe, _)| foe.entity)
                     .ok()
                     .and_then(|at| living.get(at))
                     .filter(|(foe, _)| {
-                        (forced || self.object_hostile(world, entity, foe.entity))
+                        (relation_free || self.object_hostile(world, entity, foe.entity))
                             && !foe.unattackable
                     })
                     .map(|(foe, _)| *foe)
@@ -278,6 +329,7 @@ impl RotwkRules {
                 .filter(|_| ordered_target.is_none())
                 .map(|order| order.target)
                 .or(state.target.filter(|_| ordered.is_none()))
+                .filter(|_| finishing.is_none())
                 .and_then(|victim| {
                     self.continued_victim(
                         tick, ids, &state, entity, victim, my_player, anti_mask, living,
@@ -296,7 +348,9 @@ impl RotwkRules {
             if ordered.is_some() && ordered_target.is_none() {
                 tick.state_mut().remove(ids.attack_order, entity);
             }
+            drop(part);
 
+            let part = crate::perf::sub(crate::perf::sub_row!("choose_idle_scan"));
             let moving_under_order = tick
                 .state()
                 .get(ids.path, entity)
@@ -318,6 +372,8 @@ impl RotwkRules {
                 None
             };
             let pursues = scan.is_some_and(|scan| scan.pursues);
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("choose_reacquire"));
             let previous_reacquire_ready = state.reacquire_ready;
             let quick_reacquire = if let Some(ready) = state.reacquire_ready {
                 now >= ready
@@ -365,7 +421,10 @@ impl RotwkRules {
             if state.reacquire_ready != previous_reacquire_ready {
                 tick.state_mut().insert(ids.armed, entity, state)?;
             }
-            let chosen = if let Some(victim) = bird_strike {
+            drop(part);
+            let chosen = if let Some(foe) = finishing {
+                Some(foe)
+            } else if let Some(victim) = bird_strike {
                 living
                     .binary_search_by_key(&victim, |(foe, _)| foe.entity)
                     .ok()
@@ -384,9 +443,10 @@ impl RotwkRules {
                 if melee_horde {
                     self.member_attack_victim(tick, ids, &me, living, max_range, now)?
                 } else {
-                    self.ranged_member_victim(tick, ids, &me, max_range, state.target)?
+                    self.ranged_member_victim(tick, ids, &me, max_range, state.target, living)?
                 }
             } else {
+                let part = crate::perf::sub(crate::perf::sub_row!("choose_sticky_common"));
                 let keep = scan
                     .filter(|scan| scan.pursues)
                     .map_or(max_range, |scan| scan.reach.max(max_range));
@@ -435,6 +495,7 @@ impl RotwkRules {
                                 stands,
                             )
                     });
+                drop(part);
                 match (sticky, scan) {
                     (Some(foe), _) => Some(foe),
                     (None, None) => None,
@@ -450,6 +511,7 @@ impl RotwkRules {
                         self.last_damager(tick.state(), ids, entity, living)
                     }
                     (None, Some(scan)) => {
+                        let _perf = crate::perf::sub(crate::perf::sub_row!("acquire_scan"));
                         let reach = if quick_reacquire {
                             self.melee_placement.approach_dist
                                 * if state.squish_reacquire { 1.0 } else { 2.0 }
@@ -496,15 +558,18 @@ impl RotwkRules {
                                         })
                                 }
                             }) {
-                                if mint_sage_combat::can_target(
-                                    mint_sage_combat::Attacker {
-                                        relation: relation.to(foe.entity).victim(),
-                                        class_allowed: target_allowed(anti_mask, foe),
-                                        scans_structures: scan.structures,
-                                    },
-                                    self.scanned_victim(tick.state(), ids, my_player, foe),
-                                    mint_sage_combat::Mode::AutoAcquire,
-                                ) {
+                                let relation = relation.to(foe.entity).victim();
+                                if crate::combat::auto_acquirable(relation)
+                                    && mint_sage_combat::can_target(
+                                        mint_sage_combat::Attacker {
+                                            relation,
+                                            class_allowed: target_allowed(anti_mask, foe),
+                                            scans_structures: scan.structures,
+                                        },
+                                        self.scanned_victim(tick.state(), ids, my_player, foe),
+                                        mint_sage_combat::Mode::AutoAcquire,
+                                    )
+                                {
                                     candidates.push(*foe);
                                 }
                             }
@@ -526,7 +591,10 @@ impl RotwkRules {
                 }
             };
             let chosen = chosen.filter(|target| target_allowed(anti_mask, target));
+            drop(choosing);
+            let _engaging = crate::perf::sub(crate::perf::sub_row!("armed_engage"));
             let Some(target) = chosen else {
+                let _part = crate::perf::sub(crate::perf::sub_row!("engage_no_target"));
                 if !engaged_member
                     && (tick.state().contains(ids.loose_melee, entity)
                         || crate::goal_cells::layer(tick.state(), ids.goal_cells)
@@ -565,7 +633,10 @@ impl RotwkRules {
                 }
                 continue;
             };
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_uncohere"));
             self.attack_state_uncohere(tick, ids, entity, my_player, target.entity);
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_weapon_choice"));
 
             let (min_range, max_range) = match slots {
                 None => (min_range, max_range),
@@ -576,24 +647,43 @@ impl RotwkRules {
                         CommandSource::Ai
                     };
                     let was_melee = is_melee(state.weapon);
-                    self.aim_weapon(tick, ids, entity, &mut state, set, target.entity, source)?;
+                    let aiming = crate::perf::sub(crate::perf::sub_row!("engage_aim_weapon"));
+                    let answered =
+                        self.aim_weapon(tick, ids, entity, &mut state, set, target.entity, source)?;
+                    drop(aiming);
+                    if !answered {
+                        state.retarget(None);
+                        tick.state_mut().remove(ids.attack_order, entity);
+                        tick.state_mut().insert(ids.armed, entity, state)?;
+                        aim_effects.extend(self.aim_cleared(tick, entity).map(|e| (entity, e)));
+                        continue;
+                    }
                     if is_melee(state.weapon) != was_melee {
                         self.rebuild_attack(tick, ids, entity, &mut state);
                     }
                     match self.combat.weapons.get(state.weapon) {
                         Some(template) => (
-                            template.minimum_attack_range,
+                            self.min_range_of(tick.state(), entity, template),
                             self.attack_range_of(tick.state(), ids, entity, template),
                         ),
                         None => (min_range, max_range),
                     }
                 }
             };
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_after_firing"));
             let target = living
                 .binary_search_by_key(&target.entity, |(foe, _)| foe.entity)
                 .ok()
                 .and_then(|at| living.get(at))
                 .map_or(target, |(foe, _)| *foe);
+            let max_range = self
+                .combat
+                .weapons
+                .get(state.weapon)
+                .map_or(max_range, |template| {
+                    self.attack_range_at(tick.state(), ids, entity, template, me.z - target.z)
+                });
             if bird_strike.is_none() && state.target == Some(target.entity) {
                 let after = self
                     .combat
@@ -608,6 +698,9 @@ impl RotwkRules {
                         continue;
                     }
                     AfterFiring::EndsAttack => {
+                        if self.holds_temporary_weapon_lock(tick, entity) {
+                            aim_effects.push((entity, Effect::ReleaseTemporaryWeaponLock));
+                        }
                         state.retarget(None);
                         tick.state_mut().remove(ids.attack_order, entity);
                         tick.state_mut().insert(ids.armed, entity, state)?;
@@ -673,6 +766,8 @@ impl RotwkRules {
                     continue;
                 }
             }
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_reach"));
             let melee = self
                 .combat
                 .weapons
@@ -682,6 +777,11 @@ impl RotwkRules {
                 && charge.is_none()
                 && !engaged_member
                 && self.should_pursue(tick, ids, entity, &me, &target);
+            let walking_attack_path = !melee
+                && charge.is_none()
+                && !engaged_member
+                && !pursuing
+                && self.walking_attack_path(tick, ids, entity, target.entity);
             let reach = if melee && charge.is_none() {
                 self.claim_contact(tick, ids, entity, &me, target, (min_range, max_range))?
             } else {
@@ -696,11 +796,27 @@ impl RotwkRules {
                 && !target.is_structure
                 && reach.position == target.position
                 && (ordered_target.is_some() || pursues);
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_close"));
             let mut running_down = false;
             if placed {
                 let step =
                     self.loose_melee_step(tick, ids, entity, &me, &target, max_range, budgets)?;
                 running_down = step == LooseStep::Strike;
+                if step == LooseStep::Fail {
+                    if tick
+                        .state()
+                        .get(ids.path, entity)
+                        .is_some_and(|path| path.kind == PathKind::Closing)
+                    {
+                        tick.state_mut().remove(ids.path, entity);
+                    }
+                    self.end_loose_attack(tick, ids, entity);
+                    state.retarget(None);
+                    tick.state_mut().remove(ids.attack_order, entity);
+                    tick.state_mut().insert(ids.armed, entity, state)?;
+                    continue;
+                }
                 if step == LooseStep::Walk {
                     if stands {
                         if tick
@@ -741,8 +857,10 @@ impl RotwkRules {
             } else if !locked
                 && charge.is_none()
                 && !(if melee && reach.position == target.position {
-                    self.melee_in_reach(tick, ids, &me, &target, max_range)
+                    let _gate = crate::perf::sub(crate::perf::sub_row!("engage_range_gate"));
+                    self.melee_in_reach(tick, ids, &me, &target)
                 } else {
+                    let _gate = crate::perf::sub(crate::perf::sub_row!("engage_range_gate"));
                     in_range(
                         me.position,
                         me.radius,
@@ -751,9 +869,10 @@ impl RotwkRules {
                         min_range,
                         max_range,
                     ) && (melee || !self.fire_view_blocked(tick, ids, entity, &me, &reach))
+                        && !walking_attack_path
                 })
             {
-                if stands {
+                if stands || self.chase_forbidden(tick, ids, entity, my_player, ordered, &state) {
                     state.retarget(None);
                     tick.state_mut().remove(ids.attack_order, entity);
                     tick.state_mut().insert(ids.armed, entity, state)?;
@@ -770,6 +889,7 @@ impl RotwkRules {
                 }
                 let due = melee || self.ranged_replan_due(tick, ids, entity, &me, &reach)?;
                 if (ordered_target.is_some() || pursues) && due {
+                    let _approach = crate::perf::sub(crate::perf::sub_row!("engage_approach"));
                     if melee {
                         let (goal, goal_reach) = match stand_off(
                             me.position,
@@ -833,26 +953,17 @@ impl RotwkRules {
                 continue;
             }
             tick.state_mut().remove(ids.approach_wait, entity);
-
-            let swoops = self
-                .combat
-                .weapons
-                .get(state.weapon)
-                .is_some_and(|template| template.can_swoop);
-            if swoops && bird_strike.is_none() && !self.down_from_dive(tick, ids, entity) {
-                if state.target != Some(target.entity) {
-                    state.retarget(Some(target.entity));
-                    tick.state_mut().insert(ids.armed, entity, state)?;
-                }
-                self.fly_on_past(tick, ids, entity, &me, target.position, budgets)?;
-                continue;
-            }
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_settle"));
 
             if pursuing {
                 self.pursue_in_range(tick, ids, entity, &me, &target, budgets)?;
             } else if bird_strike.is_none() && !running_down && charge.is_none() {
                 if !melee && !engaged_member {
-                    self.leave_ranged_approach(tick, ids, entity)?;
+                    let goal = tick.state().get(ids.path, entity).and_then(|path| {
+                        self.ranged_plan_victim_at(tick, ids, entity, path.goal, target.entity)
+                    });
+                    self.leave_ranged_approach(tick, ids, entity, goal)?;
                 }
                 self.stop_to_fire(tick, ids, entity)?;
                 if !engaged_member {
@@ -871,10 +982,25 @@ impl RotwkRules {
             if new_target {
                 self.diag_contact_engagement(tick, ids, entity, me.position, target.entity);
             }
+            drop(part);
+            let part = crate::perf::sub(crate::perf::sub_row!("engage_aim"));
             let rate = tick
                 .state()
                 .get(ids.bonuses, entity)
                 .map_or(1.0, |bonuses| bonuses.0.rate_of_fire);
+            let gate = if state.winding || bird_strike.is_some() || running_down || charge.is_some()
+            {
+                FireGate::Open
+            } else {
+                self.fire_gate(tick, ids, entity, target.entity)
+            };
+            if gate == FireGate::Refused {
+                state.retarget(None);
+                tick.state_mut().remove(ids.attack_order, entity);
+                tick.state_mut().insert(ids.armed, entity, state)?;
+                aim_effects.extend(self.aim_cleared(tick, entity).map(|e| (entity, e)));
+                continue;
+            }
             let aimed = if bird_strike.is_some() || running_down || charge.is_some() {
                 true
             } else if state.winding {
@@ -896,6 +1022,7 @@ impl RotwkRules {
                     me.position,
                     target.position,
                 )? && !self.moving_blocks_fire(tick, ids, entity, state.weapon)
+                    && gate == FireGate::Open
             };
             let shot = if aimed {
                 tick_weapon(
@@ -913,8 +1040,14 @@ impl RotwkRules {
             };
             let weapon = state.weapon;
             tick.state_mut().insert(ids.armed, entity, state)?;
+            drop(part);
+            let _part = crate::perf::sub(crate::perf::sub_row!("engage_fire"));
             if shot == crate::combat::ShotEvent::WindUpStarted {
                 self.emit_weapon_pre_attack_fx(tick, ids, weapon, me.position, entity);
+                aim_effects.extend(
+                    self.lock_when_using(tick, ids, entity, weapon)
+                        .map(|effect| (entity, effect)),
+                );
             }
             if shot == crate::combat::ShotEvent::WindUpStarted || shot.fired() {
                 self.note_common_target(tick, ids, entity, target.entity);
@@ -923,6 +1056,10 @@ impl RotwkRules {
             if !fired {
                 continue;
             }
+            aim_effects.extend(
+                self.after_shot_lock(tick, ids, entity, weapon)
+                    .map(|effect| (entity, effect)),
+            );
             self.note_horde_last_shot(tick, ids, entity);
             if bird_strike.is_some() {
                 self.giant_bird_fired(tick, ids, entity)?;
@@ -933,45 +1070,12 @@ impl RotwkRules {
                         .map(|effect| (entity, effect)),
                 );
             }
-            let target_entry = tick
-                .state()
-                .get(ids.kind, target.entity)
-                .and_then(|kind| self.kinds.get(*kind));
-            let infantry = target_entry
-                .is_some_and(|entry| entry.record.kind_of.iter().any(|flag| flag == "INFANTRY"));
-            let dodge_percent = target_entry
-                .and_then(|entry| entry.record.dodge_percent)
-                .unwrap_or(0.0);
-            let template = self
-                .combat
-                .weapons
-                .get(weapon)
-                .filter(|template| !template.damage_at_self);
-            let outcome = template.map_or(ShotOutcome::Struck, |template| {
-                template.resolve_shot(tick.rng(), infantry)
-            });
-            let dodged = matches!(outcome, ShotOutcome::Struck)
-                && dodge_percent > 0.0
-                && template.is_some_and(|template| template.can_be_dodged)
-                && tick.rng().next_f32() < dodge_percent;
-            let outcome = if dodged {
-                mint_sage_combat::scatter_landing(
-                    tick.rng(),
-                    template.map_or(0.0, |t| t.scatter_radius),
-                )
-            } else {
-                outcome
-            };
-            let passenger_roll = template
-                .filter(|template| template.hit_passenger_chance > 0.0)
-                .filter(|template| template.launches_projectile())
-                .map(|template| {
-                    matches!(outcome, ShotOutcome::Struck)
-                        && self
-                            .first_passenger(tick.state(), ids, target.entity)
-                            .is_some()
-                        && tick.rng().next_f32() < template.hit_passenger_chance
-                });
+            let ShotRoll {
+                outcome,
+                dodged,
+                infantry,
+                passenger_roll,
+            } = self.roll_shot(tick, ids, weapon, &target);
             if crate::diag::wants("shot") {
                 let kind = tick.state().get(ids.kind, entity).copied();
                 let slot = tick
@@ -1018,7 +1122,7 @@ impl RotwkRules {
                 }
                 aim_effects.push((entity, aim_condition(Some(pitch), distance)));
             }
-            let origin = self.take_launch(tick, entity, &me);
+            let origin = self.take_launch(tick, entity, &me, None);
             let shot = match outcome {
                 _ if charge.is_some() => Shot::at_ground(
                     weapon,
@@ -1027,25 +1131,7 @@ impl RotwkRules {
                     me.position,
                     self.ground_height(me.position.x, me.position.y),
                 ),
-                ShotOutcome::Struck => Shot::at_victim(
-                    &self.combat,
-                    weapon,
-                    entity,
-                    origin,
-                    (target.entity, target.position, target.aim_point().z),
-                    target.z,
-                ),
-                ShotOutcome::Missed([dx, dy]) => {
-                    let landing = Vec2::new(target.position.x + dx, target.position.y + dy);
-                    Shot::missing(
-                        weapon,
-                        entity,
-                        origin,
-                        target.entity,
-                        landing,
-                        self.ground_height(landing.x, landing.y),
-                    )
-                }
+                _ => self.shot_at_foe(weapon, entity, origin, &target, outcome),
             };
             let melee = self
                 .combat
@@ -1094,12 +1180,42 @@ impl RotwkRules {
         if cooling {
             return Ok(false);
         }
-        if super::movement::goal_moved(me.position, planned, victim.position) {
+        let stood = self
+            .ranged_plan_victim_at(tick, ids, entity, planned, victim.entity)
+            .unwrap_or(planned);
+        if super::movement::goal_moved(me.position, stood, victim.position) {
             return Ok(true);
         }
         tick.state_mut()
             .insert(ids.replanned_at, entity, super::movement::ReplannedAt(now))?;
         Ok(false)
+    }
+
+    fn chase_forbidden(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        player: PlayerId,
+        order: Option<AttackOrder>,
+        state: &Armed,
+    ) -> bool {
+        if self.computer_controlled(player) || order.is_some_and(|order| !order.guard) {
+            return false;
+        }
+        let Some(template) = self.combat.weapons.get(state.weapon) else {
+            return false;
+        };
+        if template.melee
+            || template.chase_weapon
+            || self.owns_charge_attack(tick.state(), ids, entity)
+        {
+            return false;
+        }
+        !tick
+            .state()
+            .get(ids.guard, entity)
+            .is_some_and(|guard| guard.state == super::guard::GuardState::AttackAggressor)
     }
 
     fn should_pursue(
@@ -1111,15 +1227,42 @@ impl RotwkRules {
         victim: &Foe,
     ) -> bool {
         if tick.state().contains(ids.member, entity)
-            || self
-                .ai_table_of(tick, ids, entity)
-                .is_none_or(|ai| ai.turret.is_none())
+            || !self.turret_carries_current_weapon(tick, ids, entity)
         {
             return false;
         }
         let Some(body) = tick.state().get(ids.body, victim.entity).map(|body| body.0) else {
             return false;
         };
+        let owner = tick.state().get(ids.owner, entity).map(|owner| owner.0);
+        if self.guard_ranges.crushes_infantry
+            && owner.is_some_and(|owner| self.computer_controlled(owner))
+            && self.can_crush_instead(tick, ids, entity, victim.entity)
+        {
+            return true;
+        }
+        let too_close = tick
+            .state()
+            .get(ids.armed, entity)
+            .and_then(|armed| self.combat.weapons.get(armed.weapon))
+            .map(|template| self.min_range_of(tick.state(), entity, template))
+            .is_some_and(|minimum| {
+                minimum > 0.0
+                    && minimum * minimum
+                        > mint_sage_combat::surface_distance_squared_2d(
+                            mint_sage_combat::Point3::new(me.position.x, me.position.y, 0.0),
+                            me.radius,
+                            mint_sage_combat::Point3::new(
+                                victim.position.x,
+                                victim.position.y,
+                                0.0,
+                            ),
+                            victim.radius,
+                        )
+            });
+        if too_close {
+            return false;
+        }
         let top = self.mover_limits(tick, ids, entity).max_speed;
         let speed = body.speed;
         if !(top > 0.0 && speed >= top / 10.0 && speed < top) {
@@ -1177,18 +1320,18 @@ impl RotwkRules {
         tick: &mut Tick<'_>,
         ids: Ids,
         entity: Entity,
+        goal: Option<Vec2>,
     ) -> Result<()> {
+        let approaching = tick
+            .state()
+            .get(ids.path, entity)
+            .is_some_and(|path| path.kind == PathKind::Closing);
+        let Some(goal) = goal.filter(|_| approaching) else {
+            return Ok(());
+        };
         if tick.state().contains(ids.flight, entity) {
             return Ok(());
         }
-        let Some(goal) = tick
-            .state()
-            .get(ids.path, entity)
-            .filter(|path| path.kind == PathKind::Closing)
-            .and_then(|path| path.route.points.last().copied())
-        else {
-            return Ok(());
-        };
         let Some(mut body) = tick.state().get(ids.body, entity).copied() else {
             return Ok(());
         };
@@ -1211,6 +1354,95 @@ impl RotwkRules {
         Ok(())
     }
 
+    pub(super) fn roll_shot(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        weapon: WeaponId,
+        target: &Foe,
+    ) -> ShotRoll {
+        let target_entry = tick
+            .state()
+            .get(ids.kind, target.entity)
+            .and_then(|kind| self.kinds.get(*kind));
+        let infantry = target_entry
+            .is_some_and(|entry| entry.record.kind_of.iter().any(|flag| flag == "INFANTRY"));
+        let dodge_percent = target_entry
+            .and_then(|entry| entry.record.dodge_percent)
+            .unwrap_or(0.0);
+        let on_wall = tick
+            .state()
+            .get(ids.layer, target.entity)
+            .is_some_and(|layer| layer.is_wall_top());
+        let template = self
+            .combat
+            .weapons
+            .get(weapon)
+            .filter(|template| !template.damage_at_self);
+        let outcome = template.map_or(ShotOutcome::Struck, |template| {
+            template.resolve_shot(tick.rng(), infantry, on_wall)
+        });
+        let dodged = matches!(outcome, ShotOutcome::Struck)
+            && dodge_percent > 0.0
+            && template.is_some_and(|template| template.can_be_dodged)
+            && tick.rng().next_f32() < dodge_percent;
+        let outcome = if dodged {
+            mint_sage_combat::scatter_landing(
+                tick.rng(),
+                template.map_or(0.0, |t| t.scatter_radius),
+            )
+        } else {
+            outcome
+        };
+        let passenger_roll = template
+            .filter(|template| template.hit_passenger_chance > 0.0)
+            .filter(|template| template.launches_projectile())
+            .map(|template| {
+                matches!(outcome, ShotOutcome::Struck)
+                    && self
+                        .first_passenger(tick.state(), ids, target.entity)
+                        .is_some()
+                    && tick.rng().next_f32() <= template.hit_passenger_chance
+            });
+        ShotRoll {
+            outcome,
+            dodged,
+            infantry,
+            passenger_roll,
+        }
+    }
+
+    pub(super) fn shot_at_foe(
+        &self,
+        weapon: WeaponId,
+        attacker: Entity,
+        origin: mint_sage_combat::Point3,
+        target: &Foe,
+        outcome: ShotOutcome,
+    ) -> Shot {
+        match outcome {
+            ShotOutcome::Struck => Shot::at_victim(
+                &self.combat,
+                weapon,
+                attacker,
+                origin,
+                (target.entity, target.position, target.aim_point().z),
+                target.z,
+            ),
+            ShotOutcome::Missed([dx, dy]) => {
+                let landing = Vec2::new(target.position.x + dx, target.position.y + dy);
+                Shot::missing(
+                    weapon,
+                    attacker,
+                    origin,
+                    target.entity,
+                    landing,
+                    self.ground_height(landing.x, landing.y),
+                )
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn release_shot(
         &self,
@@ -1226,6 +1458,30 @@ impl RotwkRules {
         if self.deploy_holds_fire(tick.state(), ids, shot.attacker) {
             return Ok(());
         }
+        self.launch_shot(
+            tick,
+            ids,
+            shot,
+            fx,
+            aimed_at,
+            passenger_roll,
+            living,
+            events,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn launch_shot(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        shot: &Shot,
+        fx: Entity,
+        aimed_at: Vec2,
+        passenger_roll: Option<bool>,
+        living: &[(Foe, PlayerId)],
+        events: &mut Vec<DamageEvent>,
+    ) -> Result<()> {
         let filter = self
             .combat
             .weapons
@@ -1248,6 +1504,7 @@ impl RotwkRules {
             }
         }
         let mut result = self.fire_shot(tick, ids, shot, living)?;
+        Self::defer_self_hits(shot.attacker, &mut result);
         if let Some(at) = Self::fx_point_of(tick.state(), ids, fx) {
             self.emit_weapon_fx(
                 tick,
@@ -1262,8 +1519,17 @@ impl RotwkRules {
         }
         let projectiles = core::mem::take(&mut result.projectiles);
         self.apply_fire_result(tick, ids, shot.weapon, shot, result, events)?;
+        let thrown_self = self
+            .combat
+            .weapons
+            .get(shot.weapon)
+            .is_some_and(|template| template.projectile_self);
         for pending in projectiles {
             let carried = match &filter {
+                None if thrown_self => tick
+                    .state()
+                    .get(ids.kind, shot.attacker)
+                    .map(|kind| (shot.attacker, *kind)),
                 None => None,
                 Some(filter) => {
                     let world = tick.state();
@@ -1276,14 +1542,30 @@ impl RotwkRules {
                     Some(thrown)
                 }
             };
+            let pending = self.aim_at_always_offset(tick, ids, shot.attacker, pending);
+            let pending = match (carried, pending.launch_slot) {
+                (None, Some(slot)) => crate::combat::PendingProjectile {
+                    from: self
+                        .module_launch(tick, ids, shot.attacker, Some(slot.index()))
+                        .unwrap_or(pending.from),
+                    ..pending
+                },
+                _ => pending,
+            };
             crate::perf::note_projectile_spawned();
             let projectile = tick.state_mut().spawn()?;
             let flight = Flight {
                 passenger_roll,
                 ..self.launch_flight(&pending, shot.attacker, carried)
             };
-            if let Some((thrown, _)) = carried {
-                self.launch_passenger(tick, ids, shot.attacker, thrown, &flight)?;
+            match carried {
+                Some((thrown, _)) if thrown == shot.attacker => {
+                    self.launch_carried(tick, ids, shot.attacker, thrown, &flight)?;
+                }
+                Some((thrown, _)) => {
+                    self.launch_passenger(tick, ids, shot.attacker, thrown, &flight)?;
+                }
+                None => {}
             }
             tick.state_mut().insert(ids.flight, projectile, flight)?;
             self.apply_weather_to_new_object(tick, ids, projectile)?;
@@ -1462,7 +1744,7 @@ impl RotwkRules {
         entity: Entity,
         me: &Foe,
     ) -> mint_sage_combat::Point3 {
-        self.launch_from(world, entity, me, 0)
+        self.launch_from(world, entity, me, 0, None)
     }
 
     pub(super) fn take_launch(
@@ -1470,15 +1752,16 @@ impl RotwkRules {
         tick: &mut Tick<'_>,
         entity: Entity,
         me: &Foe,
+        slot: Option<usize>,
     ) -> mint_sage_combat::Point3 {
-        let count = self.barrels_of(tick.state(), entity).len();
+        let count = self.barrels_in(tick.state(), entity, slot).len();
         let barrel = if count > 1 {
             let drawn = tick.rng().below(u32::try_from(count).unwrap_or(u32::MAX));
             usize::try_from(drawn).unwrap_or(0)
         } else {
             0
         };
-        let from = self.launch_from(tick.state(), entity, me, barrel);
+        let from = self.launch_from(tick.state(), entity, me, barrel, slot);
         crate::diag::diag!(
             "shot: entity {} leaves from ({:.1}, {:.1}), {:.1} above its feet",
             entity.index(),
@@ -1490,12 +1773,23 @@ impl RotwkRules {
     }
 
     pub(super) fn barrels_of(&self, world: &World, entity: Entity) -> &[crate::perches::Perch] {
+        self.barrels_in(world, entity, None)
+    }
+
+    fn barrels_in(
+        &self,
+        world: &World,
+        entity: Entity,
+        slot: Option<usize>,
+    ) -> &[crate::perches::Perch] {
         let Some(ids) = self.ids else {
             return &[];
         };
-        let slot = world
-            .get(ids.weapon_slots, entity)
-            .map_or(0, |slots| usize::from(slots.current));
+        let slot = slot.unwrap_or_else(|| {
+            world
+                .get(ids.weapon_slots, entity)
+                .map_or(0, |slots| usize::from(slots.current))
+        });
         let Some(launch) = world
             .get(ids.kind, entity)
             .and_then(|kind| self.launch_bones.get(usize::from(kind.0)))
@@ -1528,19 +1822,20 @@ impl RotwkRules {
         entity: Entity,
         me: &Foe,
         barrel: usize,
+        slot: Option<usize>,
     ) -> mint_sage_combat::Point3 {
         let enclosed = self
             .ids
             .and_then(|ids| self.contained_status(world, ids, entity))
             .is_some_and(|status| status.has(super::contain::ContainStatus::ENCLOSED));
         if enclosed {
-            return launch_point(me.position, me.z, 0.0);
+            return launch_point(me.position, me.z);
         }
         let facing = self
             .ids
             .and_then(|ids| world.get(ids.body, entity))
             .map(|body| body.0.facing);
-        match (self.barrels_of(world, entity).get(barrel), facing) {
+        match (self.barrels_in(world, entity, slot).get(barrel), facing) {
             (Some(bone), Some(facing)) => {
                 let at = crate::templates::rotate(
                     me.position,
@@ -1549,7 +1844,7 @@ impl RotwkRules {
                 );
                 mint_sage_combat::Point3::new(at.x, at.y, me.z + bone.position[2])
             }
-            _ => launch_point(me.position, me.z, me.height),
+            _ => launch_point(me.position, me.z),
         }
     }
 
@@ -1700,6 +1995,10 @@ impl RotwkRules {
         let Some(template) = self.combat.weapons.get(weapon) else {
             return false;
         };
+        if let Some(held) = tick.state().get(ids.contained, entity) {
+            return self.container_moving(tick, ids, held.container)
+                && !self.carried_fire_permitted(tick, ids, entity, template.can_fire_while_moving);
+        }
         if template.melee || template.can_fire_while_moving || Self::is_immobile(tick, ids, entity)
         {
             return false;
@@ -1709,6 +2008,120 @@ impl RotwkRules {
                 .state()
                 .get(ids.body, entity)
                 .is_some_and(|body| body.0.speed > 0.0)
+    }
+
+    fn container_moving(&self, tick: &Tick<'_>, ids: Ids, container: Entity) -> bool {
+        tick.state().contains(ids.path, container)
+            || tick
+                .state()
+                .get(ids.body, container)
+                .is_some_and(|body| body.0.speed > 0.0)
+    }
+
+    fn carried_fire_permitted(&self, tick: &Tick<'_>, ids: Ids, entity: Entity, own: bool) -> bool {
+        let horde_weapon = tick
+            .state()
+            .get(ids.member, entity)
+            .and_then(|member| self.selected_set(tick, ids, member.horde))
+            .and_then(|(_, slots)| slots.first_weapon())
+            .and_then(|(_, weapon)| self.combat.weapons.get(weapon));
+        horde_weapon.map_or(own, |template| template.can_fire_while_moving)
+    }
+
+    pub(super) fn abort_wind_up(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+    ) -> Result<()> {
+        let Some(mut armed) = tick.state().get(ids.armed, entity).copied() else {
+            return Ok(());
+        };
+        if !armed.winding {
+            return Ok(());
+        }
+        armed.winding = false;
+        armed.state.abort_wind_up();
+        tick.state_mut().insert(ids.armed, entity, armed)?;
+        Ok(())
+    }
+
+    fn current_slot(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        weapon: WeaponId,
+    ) -> Option<u8> {
+        if let Some(held) = tick.state().get(ids.weapon_slots, entity) {
+            return Some(held.current);
+        }
+        let (_, slots) = self.selected_set(tick, ids, entity)?;
+        let at = slots
+            .arms
+            .iter()
+            .position(|arm| arm.is_some_and(|arm| arm.weapon == weapon))?;
+        u8::try_from(at).ok()
+    }
+
+    fn lock_when_using(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        weapon: WeaponId,
+    ) -> Option<Effect> {
+        if !self.combat.weapons.get(weapon)?.lock_when_using {
+            return None;
+        }
+        let slot = self.current_slot(tick, ids, entity, weapon)?;
+        Some(Effect::LockWeaponSlotTemporarily(slot))
+    }
+
+    fn after_shot_lock(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        weapon: WeaponId,
+    ) -> Option<Effect> {
+        let template = self.combat.weapons.get(weapon)?;
+        if template.idle_after_firing.is_none() {
+            return self
+                .holds_temporary_weapon_lock(tick, entity)
+                .then_some(Effect::ReleaseTemporaryWeaponLock);
+        }
+        self.lock_when_using(tick, ids, entity, weapon)
+    }
+
+    fn finishing_victim(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        state: &Armed,
+        living: &[(Foe, PlayerId)],
+    ) -> Option<Foe> {
+        if !state.winding
+            || !self
+                .combat
+                .weapons
+                .get(state.weapon)
+                .is_some_and(|template| template.finish_attack_once_started)
+        {
+            return None;
+        }
+        let victim = state.target?;
+        if living
+            .binary_search_by_key(&victim, |(foe, _)| foe.entity)
+            .is_ok()
+            || !tick
+                .state()
+                .get(ids.health, victim)
+                .is_some_and(|health| health.0.is_dead())
+        {
+            return None;
+        }
+        self.foe_unchecked(tick, ids, victim)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1723,6 +2136,7 @@ impl RotwkRules {
         anti_mask: mint_sage_combat::AntiMask,
         living: &[(Foe, PlayerId)],
     ) -> Option<Entity> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("continued_victim"));
         let range = self.combat.weapons.get(state.weapon)?.continue_attack_range;
         if range <= 0.0
             || living
@@ -1777,7 +2191,8 @@ impl RotwkRules {
         victim.airborne.is_none()
             && self.airborne_category(tick.state(), ids, entity).is_none()
             && self.needs_line_of_sight(tick, ids, entity)
-            && self.view_blocked(tick, ids, me.position, victim.position, victim.radius)
+            && (self.view_blocked(tick, ids, me.position, victim.position, victim.radius)
+                || self.terrain_blocks_fire(tick, ids, entity, me, victim))
     }
 
     pub(super) fn view_blocked(
@@ -1872,7 +2287,7 @@ impl RotwkRules {
                     let recenter_ms = turret
                         .recenter_time_ms
                         .map_or(TURRET_RECENTER_DEFAULT_MS, |ms| ms.max(0.0) as u32);
-                    let recenter_after = LogicFrames::from_milliseconds(recenter_ms);
+                    let recenter_after = mint_sage_modules::retail_duration_ticks(recenter_ms);
                     let due = now
                         .since(held_since)
                         .is_some_and(|elapsed| elapsed >= recenter_after);
@@ -2019,6 +2434,7 @@ impl RotwkRules {
 
     pub(super) fn needs_line_of_sight(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
         self.has_kind_bit(tick.state(), ids, entity, ATTACK_NEEDS_LINE_OF_SIGHT)
+            || self.has_kind_bit(tick.state(), ids, entity, CAN_SHOOT_OVER_WALLS)
     }
 
     fn ranged_close_goal(
@@ -2030,7 +2446,7 @@ impl RotwkRules {
         victim: &Foe,
         ranges: (f32, f32),
         budgets: &mut PathBudgets,
-    ) -> (Vec2, f32) {
+    ) -> (Vec2, f32, bool) {
         let too_close = stand_off(
             me.position,
             victim.position,
@@ -2038,14 +2454,26 @@ impl RotwkRules {
             ranges,
         );
         let straight = too_close.map_or((victim.position, victim.radius), |spot| (spot, 0.0));
+        if self.fleeing(tick, ids, me.position, victim.entity) {
+            return (straight.0, straight.1, false);
+        }
+        if let Some(at) = self.attack_shortcut(
+            tick,
+            ids,
+            entity,
+            (me.position, me.radius),
+            (victim.position, victim.radius),
+            ranges,
+            |_| true,
+        ) {
+            return (at, 0.0, true);
+        }
         let search = if self.needs_line_of_sight(tick, ids, entity) {
             AttackSpot::InRangeInView
-        } else if too_close.is_some() {
-            AttackSpot::InRange
         } else {
-            AttackSpot::Straight
+            AttackSpot::InRange
         };
-        self.los_search_goal(
+        let (goal, reach) = self.los_search_goal(
             tick,
             ids,
             entity,
@@ -2054,10 +2482,12 @@ impl RotwkRules {
             me.radius,
             victim.position,
             victim.radius,
+            Some((entity, victim.z + victim.height * 0.5)),
             ranges,
             budgets,
             straight,
-        )
+        );
+        (goal, reach, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2071,6 +2501,7 @@ impl RotwkRules {
         me_radius: f32,
         victim_position: Vec2,
         victim_radius: f32,
+        aim: Option<(Entity, f32)>,
         (min_range, max_range): (f32, f32),
         budgets: &mut PathBudgets,
         straight: (Vec2, f32),
@@ -2092,6 +2523,8 @@ impl RotwkRules {
         let cost_per_unit = mint_movement::COST_ORTHOGONAL as f32 / geometry.cell_size();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let floor = ((max_range * 0.5).max(0.0) * cost_per_unit) as u32;
+        let terrain =
+            aim.and_then(|(shooter, z)| Some((self.terrain_sight_height(tick, ids, shooter)?, z)));
         let serves = |cell| {
             in_range(
                 geometry.centre_of(cell),
@@ -2101,13 +2534,21 @@ impl RotwkRules {
                 min_range,
                 max_range,
             ) && (search == AttackSpot::InRange
-                || !self.view_blocked(
+                || (!self.view_blocked(
                     tick,
                     ids,
                     geometry.centre_of(cell),
                     victim_position,
                     victim_radius,
-                ))
+                ) && !terrain.is_some_and(|(top, aim_z)| {
+                    let at = geometry.centre_of(cell);
+                    let feet = self
+                        .passability
+                        .heights
+                        .height_at(at.x, at.y)
+                        .unwrap_or(0.0);
+                    self.terrain_blocked(tick, ids, top, (at, feet), (victim_position, aim_z))
+                })))
         };
         if !budgets.is_head(mover) {
             let planned = tick.state().get(ids.path, mover);
@@ -2200,21 +2641,57 @@ impl RotwkRules {
                 self.set_approach_wait(tick, ids, entity, victim.entity, APPROACH_WAIT_NO_ROUTE)?;
                 return Ok(false);
             }
-            let (goal, goal_reach) =
+            if !self.fleeing(tick, ids, me.position, victim.entity)
+                && in_range(
+                    me.position,
+                    me.radius,
+                    victim.position,
+                    victim.radius,
+                    ranges.0,
+                    ranges.1,
+                )
+                && (victim.airborne.is_some()
+                    || self.airborne_category(tick.state(), ids, entity).is_some()
+                    || !(self.view_blocked(tick, ids, me.position, victim.position, victim.radius)
+                        || self.terrain_blocks_fire(tick, ids, entity, me, victim)))
+            {
+                if tick
+                    .state()
+                    .get(ids.path, entity)
+                    .is_some_and(|path| path.kind == PathKind::Closing)
+                {
+                    tick.state_mut().remove(ids.path, entity);
+                }
+                return Ok(false);
+            }
+            let (goal, goal_reach, attack_path) =
                 self.ranged_close_goal(tick, ids, entity, me, victim, ranges, budgets);
-            self.close_on_target(
+            let spot = attack_path && goal_reach == 0.0;
+            if spot {
+                self.close_on_attack_spot(tick, ids, entity, me.position, goal, budgets)?;
+            } else {
+                self.close_on_target(
+                    tick,
+                    ids,
+                    entity,
+                    me.position,
+                    goal,
+                    goal_reach,
+                    PathKind::Closing,
+                    budgets,
+                )?;
+            }
+            self.note_ranged_plan(
                 tick,
                 ids,
                 entity,
-                me.position,
                 goal,
-                goal_reach,
-                PathKind::Closing,
-                budgets,
+                (victim.entity, victim.position),
+                spot,
             )?;
             return Ok(false);
         }
-        if let Some(spot) = self.approach_spot_search(tick, ids, entity, me, victim) {
+        if let Some(spot) = self.engage_fallback_point(tick, ids, me, victim) {
             self.close_on_target(
                 tick,
                 ids,
@@ -2294,81 +2771,6 @@ impl RotwkRules {
         self.reachable(mover, start, goal)
     }
 
-    fn approach_spot_search(
-        &self,
-        tick: &Tick<'_>,
-        ids: Ids,
-        entity: Entity,
-        me: &Foe,
-        victim: &Foe,
-    ) -> Option<Vec2> {
-        let delta = victim.position.minus(me.position);
-        let dist0 = delta.length();
-        let toward_victim = delta.normalised()?;
-        let mover = self.mover_class(tick, ids, entity);
-        let own = self.passable_cell_for(tick, ids, me.position, mover)?;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let steps = ((dist0 / APPROACH_SEARCH_STEP).trunc() - 1.0).max(0.0) as u32;
-        let mut candidate = victim.position;
-        let mut reached = None;
-        for _ in 0..steps {
-            candidate = candidate.minus(toward_victim.scale(APPROACH_SEARCH_STEP));
-            if self
-                .passable_cell_for(tick, ids, candidate, mover)
-                .is_some_and(|cell| self.reachable(mover, own, cell))
-            {
-                reached = Some(candidate);
-                break;
-            }
-        }
-        let reached = reached?;
-        let pulled =
-            reached.minus(toward_victim.scale(me.radius + self.castle_siege_stand_back_distance));
-        if victim.position.minus(pulled).length() + APPROACH_SEARCH_STEP > dist0 {
-            return None;
-        }
-        let cell = self.passable_cell_for(tick, ids, pulled, mover)?;
-        Some(self.passability.geometry.centre_of(cell))
-    }
-
-    fn fly_on_past(
-        &self,
-        tick: &mut Tick<'_>,
-        ids: Ids,
-        entity: Entity,
-        me: &Foe,
-        target_at: Vec2,
-        budgets: &mut PathBudgets,
-    ) -> Result<()> {
-        let limits = self.mover_limits(tick, ids, entity);
-        if limits.turn_circle.is_none() {
-            return Ok(());
-        }
-        let capture = limits.capture_radius();
-        let closing = tick
-            .state()
-            .get(ids.path, entity)
-            .is_none_or(|path| path.goal.minus(target_at).length() <= capture);
-        if !closing {
-            return Ok(());
-        }
-        let Some(facing) = tick.state().get(ids.body, entity).map(|body| body.0.facing) else {
-            return Ok(());
-        };
-        let ahead = facing.to_vector().scale(capture * 4.0);
-        let goal = Vec2::new(me.position.x + ahead.x, me.position.y + ahead.y);
-        self.close_on_target(
-            tick,
-            ids,
-            entity,
-            me.position,
-            goal,
-            me.radius,
-            PathKind::Closing,
-            budgets,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn close_on_target(
         &self,
@@ -2388,8 +2790,32 @@ impl RotwkRules {
             (from, to, target_reach),
             kind,
             budgets,
-            false,
+            RouteEnd::Reach,
             ReplanCadence::Normal,
+            true,
+        )
+        .map(|_| ())
+    }
+
+    pub(super) fn close_on_attack_spot(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        from: Vec2,
+        spot: Vec2,
+        budgets: &mut PathBudgets,
+    ) -> Result<()> {
+        self.route_toward(
+            tick,
+            ids,
+            entity,
+            (from, spot, 0.0),
+            PathKind::Closing,
+            budgets,
+            RouteEnd::Spot,
+            ReplanCadence::Normal,
+            true,
         )
         .map(|_| ())
     }
@@ -2402,6 +2828,7 @@ impl RotwkRules {
         from: Vec2,
         to: Vec2,
         budgets: &mut PathBudgets,
+        final_goal: bool,
     ) -> Result<Option<Vec2>> {
         self.route_toward(
             tick,
@@ -2410,8 +2837,9 @@ impl RotwkRules {
             (from, to, 0.0),
             PathKind::Closing,
             budgets,
-            true,
+            RouteEnd::Closest,
             ReplanCadence::Normal,
+            final_goal,
         )
     }
 
@@ -2431,8 +2859,9 @@ impl RotwkRules {
             (from, to, 0.0),
             PathKind::Ordered,
             budgets,
-            false,
+            RouteEnd::Reach,
             ReplanCadence::Boarding,
+            true,
         )
         .map(|_| ())
     }
@@ -2445,6 +2874,7 @@ impl RotwkRules {
         from: Vec2,
         to: Vec2,
         budgets: &mut PathBudgets,
+        final_goal: bool,
     ) -> Result<Option<Vec2>> {
         self.route_toward(
             tick,
@@ -2453,8 +2883,9 @@ impl RotwkRules {
             (from, to, 0.0),
             PathKind::Ordered,
             budgets,
-            true,
+            RouteEnd::Closest,
             ReplanCadence::Normal,
+            final_goal,
         )
     }
 
@@ -2467,10 +2898,14 @@ impl RotwkRules {
         (from, to, target_reach): (Vec2, Vec2, f32),
         kind: PathKind,
         budgets: &mut PathBudgets,
-        closest: bool,
+        end: RouteEnd,
         cadence: ReplanCadence,
+        final_goal: bool,
     ) -> Result<Option<Vec2>> {
         if self.move_refused(tick, ids, entity).is_some() {
+            return Ok(None);
+        }
+        if kind != PathKind::Ability && Self::on_portal_leg(tick.state(), ids, entity) {
             return Ok(None);
         }
         let now = tick.frame();
@@ -2506,6 +2941,7 @@ impl RotwkRules {
         }
         let modes = self.modes(tick, ids);
         let mover = self.mover_class(tick, ids, entity);
+        let closest = end == RouteEnd::Closest;
         let goal_cell = if closest {
             self.order_goal_cell(tick, ids, to, mover)
         } else {
@@ -2517,11 +2953,7 @@ impl RotwkRules {
         ) else {
             return Ok(None);
         };
-        let reachable = self.reachable(mover, start, goal_cell);
-        if !reachable && !closest {
-            self.note_path_failure(tick, ids, entity)?;
-            return Ok(None);
-        }
+        let prune = !self.reachable(mover, start, goal_cell);
         let request = PathRequest {
             start,
             goal: goal_cell,
@@ -2530,28 +2962,34 @@ impl RotwkRules {
             origin: Some(from),
             corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
             departure: self.departure(tick, ids, entity),
+            prune,
+            final_goal,
+            approach: if kind == PathKind::Closing {
+                tick.state()
+                    .get(ids.body, entity)
+                    .map(|body| body.0.facing.to_vector())
+            } else {
+                None
+            },
         };
         let ground = self.dynamic_view(tick, ids);
-        let costs = self
-            .unit_cost_view(tick, ids, entity, &ground)
-            .exempting(&[goal_cell]);
         let costs = if kind == PathKind::Closing {
-            costs.for_attack_path()
+            self.attack_cost_view(tick, ids, entity, &ground)
         } else {
-            costs
-        };
+            self.unit_cost_view(tick, ids, entity, &ground)
+        }
+        .exempting(&[goal_cell]);
         let view = self.footprint_view(tick, ids, entity, mover, &costs, &ground);
         crate::perf::note_plan_call();
         let planning_error = |e| mint_sim::Error::Rules {
             frame: tick.frame().get(),
             reason: format!("planning an attack path for entity {}: {e}", entity.index()),
         };
-        let mut outcome = if reachable {
-            self.plan_path(modes.config(), &view, &request, budget)
-                .map_err(planning_error)?
-        } else {
-            PlanOutcome::Unreachable
-        };
+        let site = crate::perf::sub(crate::perf::sub_row!("path_site_attack"));
+        let mut outcome = self
+            .plan_path(modes.config(), &view, &request, budget)
+            .map_err(planning_error)?;
+        drop(site);
         let failed = match outcome {
             PlanOutcome::Unreachable => true,
             PlanOutcome::BudgetExhausted => is_head,
@@ -2560,7 +2998,18 @@ impl RotwkRules {
         if closest && failed {
             let mut whole = NodeBudget::new(super::movement::PATH_NODE_BUDGET);
             outcome = Pipeline::new(modes.config())
-                .plan_closest(&view, self.passability.geometry, &request, &mut whole)
+                .plan_closest_accepting(
+                    &view,
+                    self.passability.geometry,
+                    &self.stepped_back(&request),
+                    &mut whole,
+                    &self.footprint_accepts(tick, ids, entity),
+                    if kind == PathKind::Closing {
+                        APPROACH_COST_WEIGHT
+                    } else {
+                        0.0
+                    },
+                )
                 .map_err(planning_error)?;
         }
         let mut short_of = None;
@@ -2572,6 +3021,13 @@ impl RotwkRules {
                 } else {
                     plan.route.points.last().copied().unwrap_or(from)
                 };
+                let mut route = plan.route;
+                if exact && end == RouteEnd::Spot && self.passability.cell_at(to) == Some(goal_cell)
+                {
+                    if let Some(last) = route.points.last_mut() {
+                        *last = to;
+                    }
+                }
                 if !exact {
                     short_of = Some(goal);
                 }
@@ -2594,16 +3050,19 @@ impl RotwkRules {
                     body.0.waypoint = 0;
                     tick.state_mut().insert(ids.body, entity, body)?;
                 }
+                let points = route.points.clone();
                 tick.state_mut().insert(
                     ids.path,
                     entity,
                     Path {
-                        route: plan.route,
+                        route,
                         goal,
                         kind,
                         facing: None,
                     },
                 )?;
+                let mut pipeline = Pipeline::new(modes.config());
+                self.move_allies(tick, ids, &mut pipeline, entity, &points)?;
             }
             PlanOutcome::BudgetExhausted => {
                 if is_head {
@@ -2632,9 +3091,9 @@ impl Component for ApproachWait {
     }
 }
 
-const APPROACH_WAIT_CANNOT_MOVE: LogicFrames = LogicFrames::from_milliseconds(2_000);
+const APPROACH_WAIT_CANNOT_MOVE: LogicFrames = LogicFrames::from_engine_milliseconds(2_000);
 
-const APPROACH_WAIT_NO_ROUTE: LogicFrames = LogicFrames::from_milliseconds(10_000);
+const APPROACH_WAIT_NO_ROUTE: LogicFrames = LogicFrames::from_engine_milliseconds(10_000);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TurretState {
@@ -2662,8 +3121,6 @@ const TURRET_RECENTER_RATE_SCALE: f32 = 0.5;
 const TURRET_ROTATE: &str = "TURRET_ROTATE";
 
 const APPROACH_CANNOT_MOVE_SPEED: f32 = 0.1;
-
-const APPROACH_SEARCH_STEP: f32 = 20.0;
 
 const PURSUE_IN_RANGE_SPEED: f32 = 0.95;
 

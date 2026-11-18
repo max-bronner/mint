@@ -365,7 +365,7 @@ pub(crate) fn box_select(
 ) -> Vec<Entity> {
     let height_px = f32::from(u16::try_from(viewport.1).unwrap_or(u16::MAX));
     let focal = camera.projection(1.0).get(1, 1);
-    let mut hits = Vec::new();
+    let mut hits: Vec<(u64, Entity)> = Vec::new();
     for unit in units {
         if !can_select(unit, true, local) {
             continue;
@@ -389,11 +389,11 @@ pub(crate) fn box_select(
             }
         };
         if inside {
-            hits.push(unit.entity);
+            hits.push((unit.created, unit.entity));
         }
     }
-    hits.sort_unstable_by_key(|entity| entity.index());
-    hits
+    hits.sort_unstable_by_key(|(created, entity)| core::cmp::Reverse((*created, entity.index())));
+    hits.into_iter().map(|(_, entity)| entity).collect()
 }
 
 #[cfg(test)]

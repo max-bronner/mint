@@ -2,13 +2,19 @@ use super::*;
 use crate::combat::{Foe, TargetGrid};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct AnimalOrigin(pub(crate) Vec2);
+pub(crate) struct AnimalOrigin(pub(crate) Vec2, pub(crate) f32);
 
 impl Component for AnimalOrigin {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_u32(self.0.x.to_bits());
         hasher.write_u32(self.0.y.to_bits());
+        hasher.write_u32(self.1.to_bits());
     }
+}
+
+fn beyond_wander_radius(origin: (Vec2, f32), at: (Vec2, f32), radius: f32) -> bool {
+    super::movement::octagonal_length_3d(origin.0.x - at.0.x, origin.0.y - at.0.y, origin.1 - at.1)
+        > radius
 }
 
 const WANDER_ANGLE_DRAWS: u32 = 31;
@@ -48,12 +54,18 @@ impl RotwkRules {
             self.advance_emotion_state(tick, ids, animal, frame_due, &mut effects)?;
             return self.apply_effects(tick, ids, effects);
         }
-        let (Some(origin), Some(body)) = (
-            tick.state().get(ids.animal_origin, animal).map(|o| o.0),
+        let (Some((origin, origin_z)), Some(body)) = (
+            tick.state()
+                .get(ids.animal_origin, animal)
+                .map(|o| (o.0, o.1)),
             tick.state().get(ids.body, animal).map(|b| b.0),
         ) else {
             return Ok(());
         };
+        let z = tick
+            .state()
+            .get(ids.elevation, animal)
+            .map_or(0.0, |elevation| elevation.0);
         let Some(wander) = tick
             .state()
             .get(ids.kind, animal)
@@ -63,10 +75,15 @@ impl RotwkRules {
         else {
             return Ok(());
         };
+        let ticks_per_frame = u64::from(super::emotions::TICKS_PER_FRAME.max(1));
+        if tick.frame().get() % ticks_per_frame != 0 {
+            return Ok(());
+        }
+        let retail_frame = tick.frame().get() / ticks_per_frame;
         let owner = tick.state().get(ids.owner, animal).map(|o| o.0);
         if wander.update_timer > 0 {
             let period = u64::from(u32::try_from(wander.update_timer).unwrap_or(1).max(1));
-            if tick.frame().get() % period == 0 {
+            if retail_frame % period == 0 {
                 if let Some(enemy) = self.animal_flee_target(
                     tick,
                     ids,
@@ -96,7 +113,11 @@ impl RotwkRules {
                 self.walk_animal(tick, ids, animal, lick)?;
                 return Ok(());
             }
-        } else if origin.minus(body.position).length() > wander.max_wander_radius {
+        } else if beyond_wander_radius(
+            (origin, origin_z),
+            (body.position, z),
+            wander.max_wander_radius,
+        ) {
             self.walk_animal(tick, ids, animal, origin)?;
             return Ok(());
         }
@@ -224,22 +245,59 @@ impl RotwkRules {
             flee_distance.max(0.0),
             &mut effects,
         )?;
+        if let Some(state) = tick
+            .state_mut()
+            .get_mut(ids.emotion, animal)
+            .and_then(|emotion| emotion.state.as_mut())
+        {
+            state.mark_animal_flee();
+        }
         self.apply_effects(tick, ids, effects)
     }
 
     fn walk_animal(&self, tick: &mut Tick<'_>, ids: Ids, animal: Entity, to: Vec2) -> Result<()> {
         let to = self.adjust_to_possible_destination(tick, ids, animal, to);
-        crate::unit::give_path(
-            tick.state_mut(),
-            (ids.body, ids.path),
-            animal,
-            Path {
-                route: Route::to_point(to),
-                goal: to,
-                kind: PathKind::Animal,
-                facing: None,
-            },
-        )?;
-        Ok(())
+        diag!(
+            "animal: frame {} entity {} walks to ({:.0}, {:.0})",
+            tick.frame().get(),
+            animal.index(),
+            to.x,
+            to.y
+        );
+        Self::ai_move_with(tick, ids, (animal, animal), |tick| {
+            crate::unit::give_path(
+                tick.state_mut(),
+                (ids.body, ids.path),
+                animal,
+                Path {
+                    route: Route::to_point(to),
+                    goal: to,
+                    kind: PathKind::Animal,
+                    facing: None,
+                },
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wander_tether_uses_the_approximate_three_d_length() {
+        let (origin, radius) = ((Vec2::ZERO, 0.0), 30.0);
+        let diagonal = 1.05 * radius / std::f32::consts::SQRT_2;
+        assert!(!beyond_wander_radius(
+            origin,
+            (Vec2::new(diagonal, diagonal), 0.0),
+            radius
+        ));
+        assert!(beyond_wander_radius(
+            origin,
+            (Vec2::new(31.5, 0.0), 0.0),
+            radius
+        ));
+        assert!(beyond_wander_radius(origin, (Vec2::ZERO, 31.5), radius));
     }
 }

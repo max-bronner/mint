@@ -41,11 +41,11 @@ Object Aimer\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 200\
   WeaponSet\n    Conditions = None\n    Weapon = PRIMARY AimedBow\n  End\n  \
   Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes\n    \
     MoodAttackCheckRate = 500\n  End\n  \
-  Behavior = AimWeaponBehavior Tag_Aim\n    AimHighThreshold = 0.15\n    \
+  Behavior = AimWeaponBehavior Tag_Aim\n    AimHighThreshold = 0.2\n    \
     AimLowThreshold = -0.15\n    AimNearDistance = 40\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 ChildObject CloseAimer Aimer\n  \
-  Behavior = AimWeaponBehavior Tag_Aim\n    AimHighThreshold = 0.15\n    \
+  Behavior = AimWeaponBehavior Tag_Aim\n    AimHighThreshold = 0.2\n    \
     AimLowThreshold = -0.15\n    AimNearDistance = 9\n  End\nEnd\n\
 Weapon LeechSword\n  AttackRange = 20\n  LeechRangeWeapon = Yes\n  DelayBetweenShots = 500\n  \
   DamageNugget\n    Damage = 100\n    DamageType = SLASH\n  End\nEnd\n\

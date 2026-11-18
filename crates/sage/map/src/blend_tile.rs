@@ -7,7 +7,10 @@ const BLEND_RECORD_MARKER: u32 = 0x7ADA_0000;
 const BLEND_LAYOUT: &[(u16, u32, u32)] = &[
     (8, 8, 1),
     (9, 8, 1),
+    (10, 8, 2),
     (11, 8, 3),
+    (12, 12, 3),
+    (13, 12, 4),
     (14, 14, 4),
     (15, 14, 5),
     (16, 15, 5),
@@ -90,13 +93,20 @@ impl Flammability {
     }
 }
 
+const PLANE_GATES: [u16; 6] = [7, 11, 10, 13, 15, 17];
+
 fn plane_index_for(version: u16, threshold: u16) -> Option<usize> {
     if version < threshold {
         return None;
     }
-    [7u16, 10, 11, 14, 15, 17]
-        .iter()
-        .position(|&t| t == threshold)
+    let position = PLANE_GATES.iter().position(|&gate| gate == threshold)?;
+    Some(
+        PLANE_GATES
+            .iter()
+            .take(position)
+            .filter(|&&gate| gate <= version)
+            .count(),
+    )
 }
 
 fn plane_row_stride(width: u32) -> Result<u32> {
@@ -265,6 +275,11 @@ pub(crate) fn read_blend_tile_data(
             extra_blend_index = read_u16_as_u32_array(&mut r, cell_count)?;
             cliff_info_index = read_u16_as_u32_array(&mut r, cell_count)?;
         }
+        12 => {
+            blend_index = read_u32_array(&mut r, cell_count)?;
+            extra_blend_index = read_u32_array(&mut r, cell_count)?;
+            cliff_info_index = read_u16_as_u32_array(&mut r, cell_count)?;
+        }
         14 | 15 => {
             blend_index = read_u32_array(&mut r, cell_count)?;
             extra_blend_index = read_u32_array(&mut r, cell_count)?;
@@ -349,17 +364,17 @@ impl BlendTileData {
 
     #[must_use]
     pub fn impassable_to_players(&self, x: u32, y: u32) -> Option<bool> {
-        self.plane_bit(plane_index_for(self.version, 10)?, x, y)
-    }
-
-    #[must_use]
-    pub fn passage_width_narrow(&self, x: u32, y: u32) -> Option<bool> {
         self.plane_bit(plane_index_for(self.version, 11)?, x, y)
     }
 
     #[must_use]
+    pub fn passage_width_narrow(&self, x: u32, y: u32) -> Option<bool> {
+        self.plane_bit(plane_index_for(self.version, 10)?, x, y)
+    }
+
+    #[must_use]
     pub fn not_taintable(&self, x: u32, y: u32) -> Option<bool> {
-        self.plane_bit(plane_index_for(self.version, 14)?, x, y)
+        self.plane_bit(plane_index_for(self.version, 13)?, x, y)
     }
 
     #[must_use]
@@ -537,6 +552,12 @@ mod tests {
         assert!(bt11.passage_width_narrow(0, 0).is_some());
         assert!(bt11.not_taintable(0, 0).is_none());
 
+        let payload13 = blend_tile_payload(13, &ShapeParams::minimal(2, 2));
+        let (body13, chunk13) = one_blend_tile_chunk(13, &payload13);
+        let bt13 = read_blend_tile_data(&body13, &chunk13, 2, 2).expect("valid v13 chunk");
+        assert!(bt13.not_taintable(0, 0).is_some());
+        assert!(bt13.extra_passable(0, 0).is_none());
+
         let params18 = ShapeParams::minimal(2, 2);
         let payload18 = blend_tile_payload(18, &params18);
         let (body18, chunk18) = one_blend_tile_chunk(18, &payload18);
@@ -551,9 +572,9 @@ mod tests {
     fn unknown_version_is_an_error() {
         let params = ShapeParams::minimal(2, 2);
         let payload = blend_tile_payload(8, &params);
-        let (body, chunk) = one_blend_tile_chunk(13, &payload);
+        let (body, chunk) = one_blend_tile_chunk(19, &payload);
         let err = read_blend_tile_data(&body, &chunk, 2, 2).unwrap_err();
-        assert!(matches!(err, Error::UnknownBlendVersion { version: 13 }));
+        assert!(matches!(err, Error::UnknownBlendVersion { version: 19 }));
     }
 
     #[test]

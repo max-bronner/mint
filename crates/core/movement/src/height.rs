@@ -60,6 +60,36 @@ impl HeightField {
     }
 
     #[must_use]
+    pub fn triangle_height_at(&self, x: f32, y: f32) -> Option<f32> {
+        let size = self.geometry.cell_size();
+        let origin = self.geometry.origin();
+        let gx = (x - origin.x) / size;
+        let gy = (y - origin.y) / size;
+        if !gx.is_finite() || !gy.is_finite() || gx < 0.0 || gy < 0.0 {
+            return None;
+        }
+        let (fx, fy) = (gx - gx.floor(), gy - gy.floor());
+        let x0 = node_index(gx, self.extent.width)?;
+        let y0 = node_index(gy, self.extent.height)?;
+        let last_x = self.extent.width.saturating_sub(1);
+        let last_y = self.extent.height.saturating_sub(1);
+        let sample = |dx: u16, dy: u16| {
+            self.sample(
+                x0.saturating_add(dx).min(last_x),
+                y0.saturating_add(dy).min(last_y),
+            )
+        };
+        let (p0, p2) = (sample(0, 0)?, sample(1, 1)?);
+        if fy > fx {
+            let p3 = sample(0, 1)?;
+            Some(p3 + (1.0 - fy) * (p0 - p3) + fx * (p2 - p3))
+        } else {
+            let p1 = sample(1, 0)?;
+            Some(p1 + fy * (p2 - p1) + (1.0 - fx) * (p0 - p1))
+        }
+    }
+
+    #[must_use]
     pub fn height_at_point(&self, point: Vec2) -> Option<f32> {
         self.height_at(point.x, point.y)
     }
@@ -176,6 +206,70 @@ pub fn step_level(current: f32, goal: f32, max_step: f32) -> f32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttackPhase {
+    #[default]
+    Cruise,
+    Descending,
+    Climbing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttackHeightInput {
+    pub preferred: f32,
+    pub attack: f32,
+    pub circling_radius: f32,
+    pub distance: f32,
+    pub above: f32,
+    pub armed: bool,
+    pub attacking: bool,
+    pub fired: bool,
+}
+
+#[must_use]
+pub fn attack_height(phase: AttackPhase, input: AttackHeightInput) -> (AttackPhase, f32) {
+    let AttackHeightInput {
+        preferred,
+        attack,
+        circling_radius,
+        distance,
+        above,
+        armed,
+        attacking,
+        fired,
+    } = input;
+    if !armed || circling_radius <= 0.0 {
+        return (AttackPhase::Cruise, preferred);
+    }
+    let blend = |share: f32| attack + (preferred - attack) * share.min(1.0);
+    match phase {
+        AttackPhase::Cruise => {
+            let next = if distance < circling_radius && attacking {
+                AttackPhase::Descending
+            } else {
+                AttackPhase::Cruise
+            };
+            (next, preferred)
+        }
+        AttackPhase::Descending => {
+            let next = if fired || !attacking {
+                AttackPhase::Climbing
+            } else {
+                AttackPhase::Descending
+            };
+            (next, blend(distance / circling_radius))
+        }
+        AttackPhase::Climbing => {
+            let next = if above >= preferred {
+                AttackPhase::Cruise
+            } else {
+                AttackPhase::Climbing
+            };
+            (next, blend(2.0 * distance / circling_radius))
+        }
+    }
+}
+
 fn node_index(value: f32, limit: u16) -> Option<u16> {
     let floored = value.floor();
     if floored >= f32::from(u16::MAX) {
@@ -215,6 +309,49 @@ mod tests {
         assert_eq!(field.height_at(-0.5, 0.0), None);
         assert_eq!(field.height_at(0.0, 30.0), None);
         assert_eq!(field.height_at(f32::NAN, 0.0), None);
+    }
+
+    fn input(distance: f32, armed: bool, attacking: bool, fired: bool) -> AttackHeightInput {
+        AttackHeightInput {
+            preferred: 100.0,
+            attack: 10.0,
+            circling_radius: 200.0,
+            distance,
+            above: 100.0,
+            armed,
+            attacking,
+            fired,
+        }
+    }
+
+    #[test]
+    fn an_attacking_flier_blends_down_over_its_circling_radius_and_climbs_back_twice_as_fast() {
+        let (phase, level) = attack_height(AttackPhase::Cruise, input(100.0, true, true, false));
+        assert_eq!((phase, level), (AttackPhase::Descending, 100.0));
+        let (phase, level) = attack_height(phase, input(100.0, true, true, false));
+        assert_eq!((phase, level), (AttackPhase::Descending, 55.0));
+        let (phase, level) = attack_height(phase, input(100.0, true, true, true));
+        assert_eq!((phase, level), (AttackPhase::Climbing, 55.0));
+        let (_, level) = attack_height(phase, input(50.0, true, true, true));
+        assert_eq!(level, 55.0);
+        let mut back = input(100.0, true, true, true);
+        back.above = 100.0;
+        assert_eq!(attack_height(phase, back).0, AttackPhase::Cruise);
+    }
+
+    #[test]
+    fn a_flier_without_a_weapon_or_a_circling_radius_holds_its_preferred_height() {
+        let unarmed = input(100.0, false, true, false);
+        assert_eq!(
+            attack_height(AttackPhase::Descending, unarmed),
+            (AttackPhase::Cruise, 100.0)
+        );
+        let mut straight = input(100.0, true, true, false);
+        straight.circling_radius = 0.0;
+        assert_eq!(
+            attack_height(AttackPhase::Cruise, straight),
+            (AttackPhase::Cruise, 100.0)
+        );
     }
 
     #[test]

@@ -73,21 +73,36 @@ impl RotwkRules {
         let reach = module.scan_range();
         let world = tick.state();
         let mut best: Option<(f32, Entity)> = None;
-        for (foe, owner) in living {
-            if foe.entity == entity
-                || world.contains(ids.doomed, foe.entity)
+        let hordes = world
+            .store(ids.horde)
+            .map(|store| store.entities())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|&entity| {
+                let position = world.get(ids.body, entity)?.0.position;
+                let owner = world.get(ids.owner, entity)?.0;
+                Some((entity, position, owner))
+            });
+        let candidates = living
+            .iter()
+            .map(|(foe, owner)| (foe.entity, foe.position, *owner))
+            .chain(hordes);
+        for (candidate, position, owner) in candidates {
+            if candidate == entity
+                || world.contains(ids.doomed, candidate)
                 || world
-                    .get(ids.health, foe.entity)
+                    .get(ids.health, candidate)
                     .is_some_and(|health| health.0.is_dead())
             {
                 continue;
             }
-            let distance = distance_squared(pos, foe.position);
-            if distance > reach * reach || best.is_some_and(|(nearest, _)| distance >= nearest) {
+            let gap =
+                distance_squared(pos, position).sqrt() - self.pusher_radius(world, ids, candidate);
+            if gap > reach || best.is_some_and(|(nearest, _)| gap >= nearest) {
                 continue;
             }
             let Some(record) = world
-                .get(ids.kind, foe.entity)
+                .get(ids.kind, candidate)
                 .and_then(|kind| self.kinds.get(*kind))
                 .map(|entry| &entry.record)
             else {
@@ -97,7 +112,7 @@ impl RotwkRules {
                 continue;
             }
             let (same, allied, hostile) = own_owner.map_or((false, false, false), |player| {
-                super::spell_effects::standing(self, player, Some(*owner))
+                super::spell_effects::standing(self, player, Some(owner))
             });
             if !module
                 .object_filter()
@@ -105,7 +120,7 @@ impl RotwkRules {
             {
                 continue;
             }
-            best = Some((distance, foe.entity));
+            best = Some((gap, candidate));
         }
         let Some((_, candidate)) = best else {
             return Ok(());

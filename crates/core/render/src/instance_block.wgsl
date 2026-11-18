@@ -11,9 +11,9 @@ struct Frame {
     shadow_params: vec4<f32>,
     shadow_filter: vec4<f32>,
     shadow_cascade_params: array<vec4<f32>, 4>,
-    set_directions: array<vec4<f32>, 6>,
-    set_colors: array<vec4<f32>, 6>,
-    set_ambient: array<vec4<f32>, 2>,
+    set_directions: array<vec4<f32>, 12>,
+    set_colors: array<vec4<f32>, 12>,
+    set_ambient: array<vec4<f32>, 4>,
     cookie: vec4<f32>,
     cookie_tint: vec4<f32>,
     inv_view_proj: mat4x4<f32>,
@@ -31,25 +31,25 @@ fn mint_light_direction(rig: i32, i: i32) -> vec3<f32> {
     if (rig <= 0) {
         return frame.light_directions[i].xyz;
     }
-    return frame.set_directions[min((rig - 1) * 3 + i, 5)].xyz;
+    return frame.set_directions[min((rig - 1) * 3 + i, 11)].xyz;
 }
 
 fn mint_light_color(rig: i32, i: i32) -> vec3<f32> {
     if (rig <= 0) {
         return frame.light_colors[i].rgb;
     }
-    return frame.set_colors[min((rig - 1) * 3 + i, 5)].rgb;
+    return frame.set_colors[min((rig - 1) * 3 + i, 11)].rgb;
 }
 
 fn mint_ambient(rig: i32) -> vec3<f32> {
     if (rig <= 0) {
         return frame.ambient_color.rgb;
     }
-    return frame.set_ambient[min(rig - 1, 1)].rgb;
+    return frame.set_ambient[min(rig - 1, 3)].rgb;
 }
 
 fn mint_cookie(rig: i32, world_position: vec3<f32>) -> vec3<f32> {
-    if (rig <= 0 || frame.set_ambient[min(rig - 1, 1)].w < 0.5) {
+    if (rig <= 0 || frame.set_ambient[min(rig - 1, 3)].w < 0.5) {
         return vec3<f32>(1.0);
     }
     let uv = world_position.xy * frame.cookie.x + frame.cookie.yz;

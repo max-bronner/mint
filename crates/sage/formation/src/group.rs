@@ -24,15 +24,21 @@ pub struct GroupMember {
     pub depth: u32,
 }
 
+fn squad_count(size_total: u32, columns: i32) -> u32 {
+    let capacity = u32::try_from(columns.max(1))
+        .unwrap_or(1)
+        .saturating_mul(12);
+    size_total.div_ceil(capacity).clamp(1, MAX_SQUADS)
+}
+
 #[must_use]
 pub fn lay_out(members: &[GroupMember], from: Vec2, to: Vec2, spacing: GroupSpacing) -> Vec<Vec2> {
     let mut slots = vec![Vec2::ZERO; members.len()];
     let width = u32::try_from(spacing.columns.saturating_mul(2).clamp(2, 6)).unwrap_or(2);
-    let capacity = width.saturating_mul(6);
     let size_total = members.iter().fold(0u32, |sum, member| {
         sum.saturating_add(member.depth.saturating_mul(member.width).max(1))
     });
-    let squad_count = size_total.div_ceil(capacity).clamp(1, MAX_SQUADS);
+    let squad_count = squad_count(size_total, spacing.columns);
 
     let mut order: Vec<usize> = (0..members.len()).collect();
     order.sort_by(|a, b| {

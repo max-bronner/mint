@@ -790,6 +790,8 @@ impl ParticleScene {
                 fires,
                 height_offset: event.height_offset.midpoint(),
                 kill_after: event.kill_after_event,
+                follow_up: None,
+                orient: event.orient_to_terrain,
             }
         });
         self.world.link(handle, slave, attached, event);

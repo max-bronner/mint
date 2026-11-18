@@ -218,10 +218,31 @@ Object Mover\n  KindOf = SELECTABLE INFANTRY\n  \
         .to_vec();
     let (gate, mover_a, mover_b) = (entities[0], entities[1], entities[2]);
 
-    simulation.tick().unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![mover_a],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::MoveTo {
+                x: 70.0,
+                y: 55.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
     assert!(
         door_condition(&simulation, gate, "DOOR_1_OPENING"),
-        "mover_a starts in the box: the gate opens"
+        "mover_a moves in the box: the gate opens"
     );
     for _ in 0..90 {
         simulation.tick().unwrap();
@@ -451,69 +472,196 @@ fn a_shut_gate_rests_on_door_closing_and_greys_its_buttons_mid_move() {
     );
 }
 
-#[test]
-fn an_open_map_players_gate_admits_its_owner_and_neutral_players_but_not_enemies() {
-    let owner = PlayerId::new(1);
+const NAMED_GATE: &str = "\
+Object Gate\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE WALL_SEGMENT\n  \
+  Behavior = FakePathfindPortalBehaviour Tag_Portal\n  End\n  \
+  Behavior = AIGateUpdate Tag_Trigger\n    TriggerWidthX = 10\n    TriggerWidthY = 10\n  End\n  \
+  Behavior = GateOpenAndCloseBehavior Tag_Cycle\n    OpenByDefault = OPEN\n    \
+    ResetTimeInMilliseconds = 1000\n  End\n  \
+  Geometry = BOX\n  GeometryName = Closed\n  GeometryMajorRadius = 10\n  GeometryMinorRadius = 20\n  \
+  GeometryHeight = 20\n  \
+  AdditionalGeometry = BOX\n  GeometryName = OpenLeft\n  GeometryActive = No\n  \
+  GeometryMajorRadius = 10\n  GeometryMinorRadius = 3\n  GeometryHeight = 20\n  \
+  GeometryOffset = X:0 Y:30 Z:0\nEnd\n\
+Object Foot\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\nEnd\n";
+
+fn named_gate(
+    open_by_default: bool,
+    computer: bool,
+) -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
+    let text = NAMED_GATE.replace("OPEN", if open_by_default { "Yes" } else { "No" });
     let doc =
-        mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
+        mint_sage_ini::Document::parse("t.ini", &text, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
     let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
-    let (kinds, _) = KindTable::closure(&data, &["Gate".to_owned()]);
+    let (kinds, missing) = KindTable::closure(&data, &["Gate".to_owned(), "Foot".to_owned()]);
+    assert!(missing.is_empty(), "{missing:?}");
     let kinds = Arc::new(kinds);
     let production = kinds.production(&data);
     let gate = kinds
         .spawn(
             &data.combat,
             kinds.kind("Gate").unwrap(),
-            Vec2::new(50.0, 50.0),
+            Vec2::new(100.0, 100.0),
             Facing::EAST,
-            owner,
+            PLAYER,
         )
         .unwrap();
+    let foot = kinds
+        .spawn(
+            &data.combat,
+            kinds.kind("Foot").unwrap(),
+            Vec2::new(60.0, 100.0),
+            Facing::EAST,
+            OTHER,
+        )
+        .unwrap();
+    let records = crate::construction::shown_footprint(
+        &kinds.get(kinds.kind("Gate").unwrap()).unwrap().record,
+        &[],
+    );
     let passability = Passability::build(&flat_map(60, 60), 5.0 / 128.0).unwrap();
-    let relations = |enemies: Vec<PlayerId>| crate::alliance::MapRelations {
-        enemies,
-        ..Default::default()
-    };
-    let mut simulation = Simulation::new(
-        71,
-        RotwkRules::new(passability, vec![gate])
-            .with_players(1)
-            .with_teams(vec![None])
-            .with_map_players(
-                1,
-                vec![String::from("Civ"), String::from("Foe")],
-                vec![relations(vec![PlayerId::new(2)]), relations(Vec::new())],
-            )
-            .with_combat(data.combat.clone())
-            .with_construction(Arc::clone(&kinds), production),
-    )
-    .unwrap();
+    let mut rules = RotwkRules::new(passability, vec![gate, foot])
+        .with_players(2)
+        .with_teams(vec![Some(0), Some(0)])
+        .with_combat(data.combat.clone())
+        .with_construction(Arc::clone(&kinds), production)
+        .with_structure_footprints(vec![(0, records)]);
+    if computer {
+        rules = rules.with_skirmish_ai(
+            vec![crate::skirmish_ai::AiSeed {
+                player: PLAYER,
+                candidates: Vec::new(),
+            }],
+            crate::combat::AiTiming::default(),
+            Vec::new(),
+        );
+    }
+    let mut simulation = Simulation::new(71, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
-    let gate_entity = simulation.state().store(ids.body).unwrap().entities()[0];
+    let entities = simulation
+        .state()
+        .store(ids.body)
+        .unwrap()
+        .entities()
+        .to_vec();
+    simulation.tick().unwrap();
+    (simulation, ids, entities[0], entities[1])
+}
+
+fn gate_cells_blocked(simulation: &Simulation<RotwkRules>, ids: Ids) -> bool {
+    let rules = simulation.rules();
+    let cell = rules
+        .passability
+        .geometry
+        .cell_at(Vec2::new(100.0, 100.0), 0, rules.passability.grid.extent())
+        .unwrap();
+    let index = usize::try_from(rules.passability.grid.extent().index(cell).unwrap()).unwrap();
+    crate::obstacles::counts_of(simulation.state(), ids.obstacles)[index] > 0
+}
+
+#[test]
+fn an_open_gate_clears_the_cells_its_closed_part_blocked() {
+    let (mut simulation, ids, gate, _) = named_gate(false, false);
+    assert!(gate_cells_blocked(&simulation, ids), "shut gate blocks");
     simulation
         .submit(
-            owner,
+            PLAYER,
             RotwkCommand::SetSelection {
                 replace: true,
-                units: vec![gate_entity],
+                units: vec![gate],
             },
         )
         .unwrap();
     simulation.tick().unwrap();
     simulation
         .submit(
-            owner,
+            PLAYER,
             RotwkCommand::GateCommand {
-                action: crate::rules::GateAction::Toggle,
+                action: crate::rules::GateAction::Open,
             },
         )
         .unwrap();
-    for _ in 0..60 {
+    for _ in 0..5 {
         simulation.tick().unwrap();
     }
-    let stamped = crate::portals::masks_of(simulation.state(), ids.portals)
-        .iter()
-        .fold(0, |all, mask| all | mask);
-    assert_eq!(stamped, 0b011);
+    assert!(!gate_cells_blocked(&simulation, ids), "open gate is clear");
+}
+
+#[test]
+fn a_gate_link_exists_for_a_skirmish_ai_while_the_gate_is_not_open_and_admits_ai_units() {
+    let links = |open: bool, computer: bool| {
+        let (mut simulation, ids, _, _) = named_gate(open, computer);
+        simulation.tick().unwrap();
+        simulation.tick().unwrap();
+        crate::portals::links_of(simulation.state(), ids.portals).len()
+    };
+    assert_eq!(links(false, true), 2, "an AI's shut gate links both ways");
+    assert_eq!(links(false, false), 0, "a human's gate never does");
+    assert_eq!(
+        links(true, true),
+        2,
+        "an AI gate that began open is shut by its empty box and links again"
+    );
+
+    let (mut simulation, ids, gate, human_ally) = named_gate(false, true);
+    simulation.tick().unwrap();
+    let rules = simulation.rules();
+    let world = simulation.state();
+    let slot = crate::portals::links_of(world, ids.portals)
+        .first()
+        .unwrap()
+        .slot;
+    assert!(rules.portal_pass_in(world, ids, gate).has(slot));
+    assert!(!rules.portal_pass_aside(world, ids, gate).has(slot));
+    assert!(!rules.portal_pass_in(world, ids, human_ally).has(slot));
+}
+
+#[test]
+fn an_ally_dying_inside_an_ai_gates_box_leaves_the_gate_open() {
+    let gate_open_after = |dies: bool| {
+        let (mut simulation, ids, _gate, foot) = named_gate(false, true);
+        let kind = simulation.state().get(ids.kind, foot).unwrap().0;
+        let near = crate::rules::debug::DebugTarget::Near {
+            kind,
+            x: 100.0,
+            y: 100.0,
+        };
+        let debug = |simulation: &mut Simulation<RotwkRules>, command| {
+            simulation
+                .submit(PLAYER, RotwkCommand::Debug(command))
+                .unwrap();
+            for _ in 0..2 {
+                simulation.tick().unwrap();
+            }
+        };
+        let teleport = |target, x| crate::rules::debug::DebugCommand::Teleport {
+            target,
+            x,
+            y: 100.0,
+        };
+        debug(&mut simulation, teleport(near.clone(), 100.0));
+        for _ in 0..120 {
+            simulation.tick().unwrap();
+        }
+        assert!(
+            !gate_cells_blocked(&simulation, ids),
+            "the ally in the box did not open the gate"
+        );
+        if dies {
+            debug(
+                &mut simulation,
+                crate::rules::debug::DebugCommand::Kill { target: near },
+            );
+        } else {
+            debug(&mut simulation, teleport(near, 400.0));
+        }
+        for _ in 0..300 {
+            simulation.tick().unwrap();
+        }
+        !gate_cells_blocked(&simulation, ids)
+    };
+    assert!(!gate_open_after(false), "the control gate never shut");
+    assert!(gate_open_after(true), "the death shut the gate");
 }

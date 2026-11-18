@@ -23,6 +23,7 @@ pub(crate) struct UnitView {
     pub(crate) moving: bool,
     pub(crate) health: Option<f32>,
     pub(crate) dying: bool,
+    pub(crate) created: u64,
     pub(crate) speed: f32,
     pub(crate) weapon_cycle: f32,
     pub(crate) visibility: mint_sage_shroud::ObjectVisibility,
@@ -608,6 +609,10 @@ impl<'a> RenderState<'a> {
                     .filter(|_| !shape.kind_of.contains(KindOf::UNATTACKABLE))
                     .map(|health| health.0.fraction()),
                 dying: self.world.contains(ids.doomed, entity),
+                created: self
+                    .world
+                    .get(ids.created, entity)
+                    .map_or(0, |created| created.0),
                 visibility: self
                     .world
                     .get(ids.seen, entity)

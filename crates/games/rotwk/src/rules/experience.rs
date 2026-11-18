@@ -3,6 +3,8 @@ use mint_sage_combat::{
 };
 use mint_sim::{Entity, Frame, PlayerId, Result, Tick, UpgradeMask, World};
 
+use crate::unit::Kind;
+
 use super::{Ids, RotwkRules};
 use crate::diag::diag;
 use crate::experience::{
@@ -257,7 +259,8 @@ impl RotwkRules {
         Self::insert_spawn(tick, ids, banner, &spawn, &self.combat)?;
         self.attach_upgrade_state(tick, ids, banner, Some(plan.kind))?;
         crate::horde::enlist_banner(tick, Self::horde_ids(ids), horde_entity, banner, offset)?;
-        self.note_banner(tick, ids, horde_entity, banner, plan.kind)
+        self.note_banner(tick, ids, horde_entity, banner, plan.kind)?;
+        self.raise_member_to_horde(tick, ids, horde_entity, banner)
     }
 
     pub(super) fn award_kills(
@@ -267,11 +270,20 @@ impl RotwkRules {
         kills: &[(Entity, Entity)],
     ) -> Result<()> {
         for &(victim, killer) in kills {
+            let scored = tick
+                .state_mut()
+                .get_mut(ids.health, victim)
+                .is_some_and(|health| health.0.score_kill());
+            if scored {
+                continue;
+            }
             let world = tick.state();
             let owner = |entity: Entity| world.get(ids.owner, entity).map(|owner| owner.0);
             let (Some(killer_owner), Some(victim_owner)) = (owner(killer), owner(victim)) else {
                 continue;
             };
+            self.credit_hero_kill(tick, ids, killer, victim);
+            let world = tick.state();
             if killer_owner == victim_owner {
                 self.award_own_guys(tick, ids, killer)?;
                 continue;
@@ -288,6 +300,7 @@ impl RotwkRules {
                 .and_then(|(index, _)| self.level_table_of(world, ids, victim)?.level(index))
                 .map_or(0, |level| level.award);
             self.note_carryover_kill(tick, ids, killer);
+            self.note_wotr_kill(tick, ids, killer);
             self.award_skill_points(tick, ids, killer_owner, award)?;
             self.pay_bounty(tick, ids, killer, killer_owner, victim)?;
             let world = tick.state();
@@ -421,7 +434,7 @@ impl RotwkRules {
             .get(ids.bonuses, killer)
             .and_then(|bonuses| bonuses.0.bounty)
             .unwrap_or(0.0);
-        let fraction = if own > cash { own } else { cash };
+        let fraction = crate::spell_state::bounty_fraction(own, cash);
         if fraction.is_nan() || fraction <= 0.0 {
             return Ok(());
         }
@@ -491,6 +504,96 @@ impl RotwkRules {
             }
         }
         let points = points.saturating_add(amount);
+        let new = table.index_for(points).max(old);
+        self.set_experience(tick, ids, entity, points, old, new)
+    }
+
+    pub(super) fn grant_horde_pools(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        horde: Entity,
+        experience: u32,
+    ) -> Result<bool> {
+        let world = tick.state();
+        let Some(members) = world.get(ids.horde, horde).map(|held| held.members.clone()) else {
+            return Ok(false);
+        };
+        let living: Vec<(Entity, Kind)> = members
+            .into_iter()
+            .filter(|member| world.is_live(*member) && !world.contains(ids.doomed, *member))
+            .filter_map(|member| world.get(ids.kind, member).map(|kind| (member, *kind)))
+            .collect();
+        if living.is_empty() {
+            return Ok(false);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let share = experience as f32 / living.len() as f32;
+        for &(member, kind) in &living {
+            let seed = self.pool_seed(tick.state(), ids, member);
+            let Some(mut held) = tick.state().get(ids.horde, horde).cloned() else {
+                return Ok(true);
+            };
+            let pool = pool_add(&mut held.pools, kind, seed, share);
+            tick.state_mut().insert(ids.horde, horde, held)?;
+            for &(other, of) in &living {
+                if of == kind {
+                    self.set_points_from_pool(tick, ids, other, pool)?;
+                }
+            }
+            let horde_points = self.experience_of(tick.state(), ids, horde).map(|(_, p)| p);
+            #[allow(clippy::cast_precision_loss)]
+            if horde_points.is_some_and(|points| pool > points as f32) {
+                self.set_points_from_pool(tick, ids, horde, pool)?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn seat_from_pool(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        horde: Entity,
+        member: Entity,
+    ) -> Result<()> {
+        let Some(kind) = tick.state().get(ids.kind, member).copied() else {
+            return Ok(());
+        };
+        let seed = self.pool_seed(tick.state(), ids, member);
+        let Some(mut held) = tick.state().get(ids.horde, horde).cloned() else {
+            return Ok(());
+        };
+        let pool = pool_add(&mut held.pools, kind, seed, 0.0);
+        tick.state_mut().insert(ids.horde, horde, held)?;
+        self.set_points_from_pool(tick, ids, member, pool)
+    }
+
+    fn pool_seed(&self, world: &World, ids: Ids, member: Entity) -> f32 {
+        #[allow(clippy::cast_precision_loss)]
+        self.level_table_of(world, ids, member)
+            .and_then(|table| table.level(table.created_at))
+            .map_or(1.0, |level| level.required as f32)
+    }
+
+    fn set_points_from_pool(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        pool: f32,
+    ) -> Result<()> {
+        let Some((old, _)) = self.experience_of(tick.state(), ids, entity) else {
+            return Ok(());
+        };
+        let Some(table) = self.level_table_of(tick.state(), ids, entity) else {
+            return Ok(());
+        };
+        if !table.trainable {
+            return Ok(());
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let points = pool.max(0.0) as u32;
         let new = table.index_for(points).max(old);
         self.set_experience(tick, ids, entity, points, old, new)
     }
@@ -609,7 +712,7 @@ impl RotwkRules {
             }
         }
         self.enlist_banner_if_due(tick, ids, entity, Some(old), new)?;
-        self.propagate_rank(tick, ids, entity)?;
+        self.forward_horde_level(tick, ids, entity, old, new)?;
         self.offer_upgrades(tick, ids, entity)
     }
 
@@ -650,8 +753,70 @@ impl RotwkRules {
         else {
             return Ok(());
         };
-        let Some(rank) = self.rank_of(tick.state(), horde) else {
+        members.sort_unstable_by_key(|member| member.index());
+        for member in members {
+            self.raise_member_to_horde(tick, ids, horde, member)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn raise_member_to_horde(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        horde: Entity,
+        member: Entity,
+    ) -> Result<()> {
+        let world = tick.state();
+        if !world.is_live(member) || world.contains(ids.doomed, member) {
             return Ok(());
+        }
+        let Some((horde_level, _)) = self.experience_of(world, ids, horde) else {
+            return Ok(());
+        };
+        let (Some(table), Some((old, _))) = (
+            self.level_table_of(world, ids, member),
+            self.experience_of(world, ids, member),
+        ) else {
+            return Ok(());
+        };
+        let new = horde_level.min(table.top());
+        if new <= old {
+            return Ok(());
+        }
+        let points = table.level(new).map_or(0, |level| level.required);
+        self.set_experience(tick, ids, member, points, old, new)
+    }
+
+    fn forward_horde_level(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        horde: Entity,
+        old: usize,
+        new: usize,
+    ) -> Result<()> {
+        let Some(mut members) = tick
+            .state()
+            .get(ids.horde, horde)
+            .map(|h| h.members.clone())
+        else {
+            return Ok(());
+        };
+        let lists: Vec<ModifierId> = if new > old {
+            self.level_table_of(tick.state(), ids, horde)
+                .map(|table| {
+                    table
+                        .levels
+                        .iter()
+                        .skip(old.saturating_add(1))
+                        .take(new.saturating_sub(old))
+                        .flat_map(|level| level.modifiers.iter().copied())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
         members.sort_unstable_by_key(|member| member.index());
         for member in members {
@@ -659,22 +824,64 @@ impl RotwkRules {
             if !world.is_live(member) || world.contains(ids.doomed, member) {
                 continue;
             }
-            let (Some(table), Some((old, points))) = (
-                self.level_table_of(world, ids, member),
-                self.experience_of(world, ids, member),
-            ) else {
-                continue;
-            };
-            let Some(index) = table.index_at_rank(rank) else {
-                continue;
-            };
-            if index <= old {
-                continue;
-            }
-            let needed = table.level(index).map_or(points, |level| level.required);
-            self.set_experience(tick, ids, member, points.max(needed), old, index)?;
+            self.gain_lists(tick, ids, member, &lists)?;
+            self.recompute_bonuses(tick, ids, member)?;
+            self.offer_upgrades(tick, ids, member)?;
         }
         Ok(())
+    }
+
+    fn forwarded_level_lists(&self, world: &World, ids: Ids, entity: Entity) -> Vec<ModifierId> {
+        let Some(horde) = world
+            .get(ids.member, entity)
+            .map(|member| member.horde)
+            .filter(|horde| world.is_live(*horde) && world.contains(ids.horde, *horde))
+        else {
+            return Vec::new();
+        };
+        let (Some(table), Some((index, _))) = (
+            self.level_table_of(world, ids, horde),
+            self.experience_of(world, ids, horde),
+        ) else {
+            return Vec::new();
+        };
+        let own: Vec<ModifierId> = match (
+            self.level_table_of(world, ids, entity),
+            self.experience_of(world, ids, entity),
+        ) {
+            (Some(own), Some((at, _))) => own
+                .levels
+                .iter()
+                .take(at.saturating_add(1))
+                .flat_map(|level| level.modifiers.iter().copied())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut out: Vec<ModifierId> = Vec::new();
+        for id in table
+            .levels
+            .iter()
+            .take(index.saturating_add(1))
+            .flat_map(|level| level.modifiers.iter().copied())
+        {
+            if !own.contains(&id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    pub(super) fn forwarded_level_upgrades(
+        &self,
+        world: &World,
+        ids: Ids,
+        entity: Entity,
+    ) -> Option<&UpgradeMask> {
+        let horde = world
+            .get(ids.member, entity)
+            .map(|member| member.horde)
+            .filter(|horde| world.is_live(*horde) && world.contains(ids.horde, *horde))?;
+        self.level_upgrades(world, ids, horde)
     }
 
     fn gain_lists(
@@ -728,6 +935,11 @@ impl RotwkRules {
                 }
             }
         }
+        for id in self.forwarded_level_lists(world, ids, entity) {
+            if let Some(list) = self.combat.modifiers.get(id).filter(|l| counts(l)) {
+                total.fold(list);
+            }
+        }
         if let Some(state) = self
             .modules
             .as_ref()
@@ -751,6 +963,9 @@ impl RotwkRules {
                     total.fold(list);
                 }
             }
+        }
+        if let Some(list) = self.wotr_player_list(world, ids, entity) {
+            total.fold(&list);
         }
         if let Some(list) = self
             .stance_list_of(world, ids, entity)
@@ -869,4 +1084,18 @@ impl RotwkRules {
         }
         lines
     }
+}
+
+fn pool_add(pools: &mut Vec<(u16, f32)>, kind: Kind, seed: f32, add: f32) -> f32 {
+    let at = match pools.binary_search_by_key(&kind.0, |(held, _)| *held) {
+        Ok(at) => at,
+        Err(at) => {
+            pools.insert(at, (kind.0, seed));
+            at
+        }
+    };
+    pools.get_mut(at).map_or(seed, |(_, pool)| {
+        *pool += add;
+        *pool
+    })
 }

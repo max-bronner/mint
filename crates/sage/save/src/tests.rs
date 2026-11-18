@@ -43,10 +43,10 @@ fn campaign() -> CampaignBlock {
                 mission_ended: true,
                 hero_record_count: 1,
                 used: vec![],
-                money: 250.0,
+                skill_points: 250.0,
                 sciences: vec![s("ScienceA")],
                 player_upgrades: UpgradeList(vec![s("UpgradeC")]),
-                cost_multiplier_b0: 0.0,
+                cash_bounty: 0.0,
             },
         }),
     }
@@ -175,8 +175,8 @@ fn every_state_version_reads_with_the_defaults_of_its_missing_fields() {
         );
         assert_eq!(st.index_advanced, version >= 6, "v{version}");
         assert_eq!(st.hero_record_count, if version >= 2 { 3 } else { 0 });
-        assert_eq!(st.money, if version >= 3 { 75.0 } else { 0.0 });
-        assert_eq!(st.cost_multiplier_b0, if version >= 5 { 0.5 } else { 0.0 });
+        assert_eq!(st.skill_points, if version >= 3 { 75.0 } else { 0.0 });
+        assert_eq!(st.cash_bounty, if version >= 5 { 0.5 } else { 0.0 });
     }
 }
 

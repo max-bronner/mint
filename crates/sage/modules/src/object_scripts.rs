@@ -6,7 +6,8 @@ use mint_sim::Entity;
 use crate::effects::{Effect, Name, Names};
 use crate::script_events::{ScriptEvents, ScriptEventsError};
 
-const BOUND: [&str; 12] = [
+const BOUND: [&str; 13] = [
+    "ObjectSetGeometryActive",
     "ObjectHideSubObjectPermanently",
     "ObjectPlayerSide",
     "ObjectCapturingObjectPlayerSide",
@@ -239,7 +240,7 @@ struct EventHost<'a, 'b> {
 }
 
 impl EventHost<'_, '_> {
-    fn sub_object(&mut self, args: &[Value], hide: bool) -> Result<Value, HostError> {
+    fn sub_object(&mut self, args: &[Value], permanent: bool) -> Result<Value, HostError> {
         let Some(name) = args.get(1).and_then(Value::as_str) else {
             return Err(HostError::new("a sub-object name is needed"));
         };
@@ -255,16 +256,11 @@ impl EventHost<'_, '_> {
         };
         let name: Names = [Name::from(name)].into();
         let empty: Names = [].into();
-        self.effects.push(if hide == on {
-            Effect::SubObjects {
-                show: empty,
-                hide: name,
-            }
-        } else {
-            Effect::SubObjects {
-                show: name,
-                hide: empty,
-            }
+        let (show, hide) = if on { (empty, name) } else { (name, empty) };
+        self.effects.push(Effect::SubObjects {
+            show,
+            hide,
+            permanent,
         });
         Ok(Value::Nil)
     }
@@ -298,7 +294,23 @@ impl Host for EventHost<'_, '_> {
     fn call(&mut self, name: &str, args: &[Value]) -> Result<Value, HostError> {
         match name {
             "ObjectHideSubObjectPermanently" => self.sub_object(args, true),
-            "ObjectHideSubObject" => self.sub_object(args, true),
+            "ObjectHideSubObject" => self.sub_object(args, false),
+            "ObjectSetGeometryActive" => {
+                let (Some(name), Some(Value::Bool(active))) =
+                    (args.get(1).and_then(Value::as_str), args.get(2))
+                else {
+                    return Err(HostError::new("a geometry name and a boolean are needed"));
+                };
+                let name: Names = [Name::from(name)].into();
+                let empty: Names = [].into();
+                let (show, hide) = if *active {
+                    (name, empty)
+                } else {
+                    (empty, name)
+                };
+                self.effects.push(Effect::Geometry { show, hide });
+                Ok(Value::Nil)
+            }
             "ObjectPlayerSide" => Ok(side(self.facts.side)),
             "ObjectCapturingObjectPlayerSide" => Ok(side(self.facts.capturing_side)),
             "ObjectGrantUpgrade" => {

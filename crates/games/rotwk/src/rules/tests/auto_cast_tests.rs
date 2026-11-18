@@ -104,6 +104,20 @@ Object AutoCasterGated\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandS
   Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
   Behavior = ModelConditionUpgrade Tag_Boost\n    TriggeredBy = Upgrade_Boost\n    \
     AddConditionFlags = BOOSTED\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object LockArmed\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Stick\n    Weapon = SECONDARY Stick\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n    LockWeaponSlot = SECONDARY\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object LockUnarmed\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Stick\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n    LockWeaponSlot = SECONDARY\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 struct Match {
@@ -130,6 +144,8 @@ fn load() -> Match {
         "AutoCasterDamaged",
         "DamageableTarget",
         "AutoCasterGated",
+        "LockArmed",
+        "LockUnarmed",
         "Nearby",
     ]
     .into_iter()
@@ -681,4 +697,71 @@ fn enable_on_model_condition_gates_the_scan_until_the_upgrade_sets_it() {
         (damage_mult(&simulation, ids, caster) - 1.5).abs() < 1e-6,
         "once BOOSTED is held the auto-cast must fire"
     );
+}
+
+#[test]
+fn one_held_flag_of_several_opens_enable_and_closes_disable() {
+    let m = load();
+    let kind = m.kinds.kind("AutoCasterGated").unwrap();
+    let mut simulation = simulation(&m, &[("AutoCasterGated", 100.0, 100.0, PLAYER)]);
+    let ids = simulation.rules().ids().unwrap();
+    let caster = only_of(&simulation, ids, kind);
+    let flags = ["USER_1".to_owned(), "BOOSTED".to_owned()];
+    let gate = |simulation: &Simulation<RotwkRules>, enable: &[String], disable: &[String]| {
+        simulation
+            .rules()
+            .model_condition_gate(simulation.state(), caster, enable, disable)
+    };
+    simulation.tick().unwrap();
+    assert!(!gate(&simulation, &flags, &[]), "nothing held yet");
+    assert!(gate(&simulation, &[], &flags));
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![caster],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(PLAYER, RotwkCommand::ObjectUpgrade { button: 0 })
+        .unwrap();
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+    }
+    assert!(gate(&simulation, &flags, &[]), "BOOSTED alone opens it");
+    assert!(!gate(&simulation, &[], &flags), "BOOSTED alone closes it");
+}
+
+#[test]
+fn a_weapon_lock_closes_its_condition_gate_only_on_an_armed_slot() {
+    let m = load();
+    let armed = m.kinds.kind("LockArmed").unwrap();
+    let unarmed = m.kinds.kind("LockUnarmed").unwrap();
+    let mut simulation = simulation(
+        &m,
+        &[
+            ("LockArmed", 100.0, 100.0, PLAYER),
+            ("LockUnarmed", 100.0, 200.0, PLAYER),
+            ("Nearby", 150.0, 100.0, PLAYER),
+            ("Nearby", 150.0, 200.0, PLAYER),
+        ],
+    );
+    let ids = simulation.rules().ids().unwrap();
+    let armed = only_of(&simulation, ids, armed);
+    let unarmed = only_of(&simulation, ids, unarmed);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    let lock = ["WEAPONLOCK_SECONDARY".to_owned()];
+    let open = |entity: Entity| {
+        simulation
+            .rules()
+            .model_condition_gate(simulation.state(), entity, &[], &lock)
+    };
+    assert!((damage_mult(&simulation, ids, armed) - 1.5).abs() < 1e-6);
+    assert!(!open(armed), "the locked slot's condition closes the gate");
+    assert!((damage_mult(&simulation, ids, unarmed) - 1.5).abs() < 1e-6);
+    assert!(open(unarmed), "an empty slot refuses the lock");
 }

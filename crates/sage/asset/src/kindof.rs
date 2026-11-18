@@ -34,6 +34,7 @@ impl KindOf {
     pub const DEFENSIVE_WALL: Self = Self(1 << 28);
     pub const PROJECTILE: Self = Self(1 << 29);
     pub const LINKED_TO_FLAG: Self = Self(1 << 30);
+    pub const INERT: Self = Self(1 << 31);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -83,6 +84,7 @@ impl KindOf {
                 "DEFENSIVE_WALL" => Self::DEFENSIVE_WALL,
                 "PROJECTILE" => Self::PROJECTILE,
                 "LINKED_TO_FLAG" => Self::LINKED_TO_FLAG,
+                "INERT" => Self::INERT,
                 _ => {
                     unknown = unknown.saturating_add(1);
                     continue;

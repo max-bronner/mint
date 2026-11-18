@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mint_movement::Passability as _;
 use mint_movement::{
     Cell, CellGeometry, CostGrid, Facing, HeightField, MotionPhase, MoverClass, MoverId,
-    MoverState, Reachability, Stagger, Vec2,
+    MoverState, Stagger, Vec2,
 };
 use mint_sage_formation::{assign_slots, FormationBasis, FormationTable};
 use mint_sage_passability::{DynamicView, GROUND};
@@ -22,7 +22,7 @@ const OATH_FULLFILLED: &str = "OATH_FULLFILLED";
 const AOD_JUST_BUILT: &str = "JUST_BUILT";
 
 pub(crate) const JOIN_FADE_DURATION: mint_sim::LogicFrames =
-    mint_sim::LogicFrames::from_milliseconds(5_000);
+    mint_sim::LogicFrames::from_engine_milliseconds(5_000);
 
 const CATCH_UP_STEPS: f32 = 4.0;
 
@@ -70,6 +70,10 @@ pub(crate) struct Horde {
     pub(crate) centre: Vec2,
     pub(crate) climb_wall: Option<Entity>,
     pub(crate) climb_quiet: u8,
+    pub(crate) climb_gap: f32,
+    pub(crate) scaled_wall: bool,
+    pub(crate) rangefinder: Option<mint_sage_combat::WeaponState>,
+    pub(crate) pools: Vec<(u16, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,6 +140,43 @@ impl Component for Horde {
             None => hasher.write_u8(0),
         }
         hasher.write_u8(self.climb_quiet);
+        if self.climb_gap != 0.0 {
+            hasher.write_f32(self.climb_gap);
+        }
+        hasher.write_bool(self.scaled_wall);
+        match &self.rangefinder {
+            Some(state) => {
+                hasher.write_u8(1);
+                state.hash_into(hasher);
+            }
+            None => hasher.write_u8(0),
+        }
+        if !self.pools.is_empty() {
+            hasher.write_usize(self.pools.len());
+            for (kind, pool) in &self.pools {
+                hasher.write_u16(*kind);
+                hasher.write_f32(*pool);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PortalWalk {
+    pub(crate) points: Vec<Vec2>,
+    pub(crate) next: usize,
+    pub(crate) until: Option<mint_sim::Frame>,
+}
+
+impl Component for PortalWalk {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_usize(self.points.len());
+        for point in &self.points {
+            hasher.write_f32(point.x);
+            hasher.write_f32(point.y);
+        }
+        hasher.write_usize(self.next);
+        hasher.write_u64(self.until.map_or(u64::MAX, mint_sim::Frame::get));
     }
 }
 
@@ -158,6 +199,13 @@ impl Component for Member {
         }
         hasher.write_bool(self.parked);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdleAsk;
+
+impl Component for IdleAsk {
+    fn hash_into(&self, _hasher: &mut StateHasher) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +268,7 @@ pub(crate) struct HordeIds {
     pub(crate) member_mark: mint_sim::ComponentId<HordeMemberMark>,
     pub(crate) body: mint_sim::ComponentId<Body>,
     pub(crate) path: mint_sim::ComponentId<crate::unit::Path>,
+    pub(crate) path_queue: mint_sim::ComponentId<crate::rules::PathQueue>,
     pub(crate) doomed: mint_sim::ComponentId<crate::combat::Doomed>,
     pub(crate) health: mint_sim::ComponentId<crate::combat::Health>,
     pub(crate) shape: mint_sim::ComponentId<crate::unit::Shape>,
@@ -228,7 +277,6 @@ pub(crate) struct HordeIds {
     pub(crate) locomotion: mint_sim::ComponentId<crate::unit::Locomotion>,
     pub(crate) motive: mint_sim::ComponentId<crate::unit::Motive>,
     pub(crate) owner: mint_sim::ComponentId<crate::unit::Owner>,
-    pub(crate) portals: mint_sim::ComponentId<crate::portals::PortalLayer>,
     pub(crate) wall_layer: mint_sim::ComponentId<crate::wall_layer::WallLayer>,
     pub(crate) horde_melee: mint_sim::ComponentId<crate::melee::HordeMelee>,
     pub(crate) member_melee: mint_sim::ComponentId<crate::melee::MemberMelee>,
@@ -236,11 +284,14 @@ pub(crate) struct HordeIds {
     pub(crate) goal_cells: mint_sim::ComponentId<crate::goal_cells::GoalCells>,
     pub(crate) horde_trail: mint_sim::ComponentId<crate::horde_trail::HordeTrail>,
     pub(crate) glided: mint_sim::ComponentId<crate::horde_trail::Glided>,
+    pub(crate) idle_ask: mint_sim::ComponentId<IdleAsk>,
     pub(crate) human_barred: mint_sim::ComponentId<crate::rules::border::HumanBarred>,
     pub(crate) layer: mint_sim::ComponentId<crate::wall_layer::Layer>,
     pub(crate) aod_crusher: mint_sim::ComponentId<crate::rules::AodCrusher>,
     pub(crate) using_ability: mint_sim::ComponentId<crate::rules::UsingAbility>,
+    pub(crate) running_down: mint_sim::ComponentId<crate::rules::RunningDown>,
     pub(crate) join_fade: mint_sim::ComponentId<JoinFade>,
+    pub(crate) portal_walk: mint_sim::ComponentId<PortalWalk>,
     pub(crate) elevation: mint_sim::ComponentId<crate::unit::Elevation>,
     pub(crate) scaleable_walls: mint_sim::ComponentId<crate::obstacles::ScaleableWalls>,
     pub(crate) combat_facts: mint_sim::ComponentId<crate::combat_facts::CombatFacts>,
@@ -302,7 +353,6 @@ fn gated_view<'a>(
     tick: &'a Tick<'_>,
     grid: &'a CostGrid,
     obstacles: ComponentId<ObstacleLayer>,
-    portals: mint_sim::ComponentId<crate::portals::PortalLayer>,
     wall_layer: mint_sim::ComponentId<crate::wall_layer::WallLayer>,
     human_barred: mint_sim::ComponentId<crate::rules::border::HumanBarred>,
 ) -> mint_sage_passability::GatedView<'a> {
@@ -321,8 +371,7 @@ fn gated_view<'a>(
             scaleable: crate::obstacles::scaleable_of(tick.state(), obstacles),
             barred: crate::rules::border::barred_of(tick.state(), human_barred),
         },
-        portals: crate::portals::masks_of(tick.state(), portals),
-        tags: &[],
+        links: &[],
     }
 }
 
@@ -364,27 +413,11 @@ const SLOT_CLAMP_HEIGHT_SPREAD: f32 = 10.0;
 
 const SLOT_CLAMP_CANDIDATES: u32 = 15;
 
-fn reachability_for<'a>(
-    ground: &'a Reachability,
-    extra: &'a [(MoverClass, Reachability)],
-    mover: MoverClass,
-) -> &'a Reachability {
-    let terrain = mover.terrain();
-    if terrain == ground.mover() {
-        return ground;
-    }
-    extra
-        .iter()
-        .find(|(class, _)| *class == terrain)
-        .map_or(ground, |(_, oracle)| oracle)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn clamp_member_slot(
     view: &mint_sage_passability::GatedView<'_>,
     geometry: CellGeometry,
     heights: &HeightField,
-    reachability: &Reachability,
     mover: MoverClass,
     footprint: crate::goal_cells::Footprint,
     horde_cell: Option<Cell>,
@@ -394,18 +427,8 @@ fn clamp_member_slot(
     let Some(horde_cell) = horde_cell else {
         return slot;
     };
-    let fits = |at: Vec2| {
-        slot_footprint_fits(
-            view,
-            geometry,
-            heights,
-            reachability,
-            mover,
-            footprint,
-            horde_cell,
-            at,
-        )
-    };
+    let fits =
+        |at: Vec2| slot_footprint_fits(view, geometry, heights, mover, footprint, horde_cell, at);
     if fits(slot) {
         return slot;
     }
@@ -420,14 +443,24 @@ fn clamp_member_slot(
             return candidate;
         }
     }
-    geometry.centre_of(horde_cell)
+    crate::goal_cells::answer_point(
+        geometry,
+        (i32::from(horde_cell.x), i32::from(horde_cell.y)),
+        footprint,
+    )
 }
+
+const SLOT_LINE_BARRED: mint_movement::CellFlags = mint_sage_passability::CLIFF
+    .union(mint_sage_passability::OBSTACLE)
+    .union(mint_sage_passability::RUBBLE)
+    .union(mint_sage_passability::WALL_RIM)
+    .union(mint_sage_passability::RAMP_SIDE)
+    .union(mint_sage_passability::PINCHED);
 
 fn slot_footprint_fits(
     view: &mint_sage_passability::GatedView<'_>,
     geometry: CellGeometry,
     heights: &HeightField,
-    reachability: &Reachability,
     mover: MoverClass,
     footprint: crate::goal_cells::Footprint,
     horde_cell: Cell,
@@ -438,31 +471,60 @@ fn slot_footprint_fits(
         return false;
     };
     let (x0, y0, x1, y1) = rect.span();
-    let mut low = f32::INFINITY;
-    let mut high = f32::NEG_INFINITY;
+    let mut first: Option<f32> = None;
     for y in y0..y1 {
         for x in x0..x1 {
             let (Ok(cx), Ok(cy)) = (u16::try_from(x), u16::try_from(y)) else {
                 return false;
             };
             let cell = Cell::new(cx, cy);
-            if !view.is_passable(cell, mover) {
+            if !view.is_passable(cell, mover)
+                || view.flags(cell).intersects(mint_sage_passability::PINCHED)
+            {
                 return false;
             }
             let Some(height) = heights.height_at_point(geometry.centre_of(cell)) else {
                 return false;
             };
-            low = low.min(height);
-            high = high.max(height);
+            let reference = *first.get_or_insert(height);
+            if (height - reference).abs() > SLOT_CLAMP_HEIGHT_SPREAD {
+                return false;
+            }
         }
-    }
-    if high - low > SLOT_CLAMP_HEIGHT_SPREAD {
-        return false;
     }
     let Some(candidate_cell) = geometry.cell_at(at, 0, view.extent()) else {
         return false;
     };
-    reachability.same_component(candidate_cell, horde_cell)
+    cell_line_clear(view, candidate_cell, horde_cell)
+}
+
+fn cell_line_clear(view: &mint_sage_passability::GatedView<'_>, from: Cell, to: Cell) -> bool {
+    let (mut x, mut y) = (i32::from(from.x), i32::from(from.y));
+    let (end_x, end_y) = (i32::from(to.x), i32::from(to.y));
+    let (dx, dy) = ((end_x - x).abs(), -(end_y - y).abs());
+    let (step_x, step_y) = (
+        if x < end_x { 1 } else { -1 },
+        if y < end_y { 1 } else { -1 },
+    );
+    let mut error = dx + dy;
+    while (x, y) != (end_x, end_y) {
+        let (Ok(cx), Ok(cy)) = (u16::try_from(x), u16::try_from(y)) else {
+            return false;
+        };
+        if view.flags(Cell::new(cx, cy)).intersects(SLOT_LINE_BARRED) {
+            return false;
+        }
+        let doubled = error * 2;
+        if doubled >= dy {
+            error += dy;
+            x += step_x;
+        }
+        if doubled <= dx {
+            error += dx;
+            y += step_y;
+        }
+    }
+    true
 }
 
 fn holds_condition(
@@ -480,7 +542,20 @@ fn holds_condition(
     })
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FormationOrder {
+    pub(crate) face_point: Option<Vec2>,
+    pub(crate) members: BTreeMap<Entity, MemberOrder>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MemberOrder {
+    pub(crate) slot: Option<Vec2>,
+    pub(crate) face: Option<Vec2>,
+}
+
 pub(crate) struct PassInputs<'a> {
+    pub(crate) orders: &'a BTreeMap<Entity, FormationOrder>,
     pub(crate) held_elsewhere: &'a BTreeSet<Entity>,
     pub(crate) touched: &'a BTreeSet<Entity>,
     pub(crate) kinds: &'a crate::templates::KindTable,
@@ -488,10 +563,9 @@ pub(crate) struct PassInputs<'a> {
     pub(crate) extent: mint_movement::GridExtent,
     pub(crate) attacking: &'a BTreeSet<Entity>,
     pub(crate) heights: &'a HeightField,
-    pub(crate) reachability: &'a Reachability,
-    pub(crate) reachability_extra: &'a [(MoverClass, Reachability)],
     pub(crate) model_conditions: Option<ComponentId<mint_sage_modules::effects::UpgradeState>>,
     pub(crate) restriction: crate::rules::border::Restriction<'a>,
+    pub(crate) backing: &'a BTreeSet<Entity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -500,6 +574,7 @@ enum Act {
     TurnStep(Facing),
     Snap(Facing),
     Stand,
+    Aligned,
     Settle(Option<Vec2>),
     Glide(crate::horde_trail::TrailPlace),
 }
@@ -511,6 +586,8 @@ struct HordeMotion {
     slow_movement: bool,
     horse: bool,
     horse_slow: bool,
+    backing: bool,
+    scaled_wall: bool,
 }
 
 fn hub(
@@ -521,7 +598,7 @@ fn hub(
     dt: f32,
 ) -> Act {
     let offset = slot.minus(state.position);
-    if horde.moving && horde.slow_movement && horde.facing.to_vector().dot(offset) < 0.0 {
+    if ahead_stand(horde, offset) {
         return Act::Stand;
     }
     let gap = offset.length();
@@ -553,10 +630,19 @@ fn hub(
         return Act::Snap(horde.facing);
     }
     if horde.moving {
-        Act::Stand
+        Act::Aligned
     } else {
         Act::Settle(Some(slot))
     }
+}
+
+fn ahead_stand(horde: HordeMotion, offset: Vec2) -> bool {
+    !horde.horse
+        && horde.slow_movement
+        && horde.moving
+        && !horde.scaled_wall
+        && !horde.backing
+        && horde.facing.to_vector().dot(offset) < 0.0
 }
 
 fn slot_arrive(limits: &mint_movement::MotionLimits, slot_moving: bool, dt: f32) -> f32 {
@@ -665,7 +751,7 @@ fn large_unit_lift(
 ) -> f32 {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let timeout =
-        mint_sim::LogicFrames::from_milliseconds(sway.large_unit_timeout_ms.max(0.0) as u32);
+        mint_sage_modules::retail_duration_ticks(sway.large_unit_timeout_ms.max(0.0) as u32);
     if timeout.is_zero() || sway.large_unit_tail_off <= 0.0 {
         return 0.0;
     }
@@ -780,10 +866,17 @@ pub(crate) fn advance_members(
                     .is_some_and(|motive| motive.0.contains(MotionPhase::DECELERATING)));
         let motion = HordeMotion {
             facing: body.0.facing,
-            moving,
+            moving: moving
+                || crate::rules::movement::awaiting_path(
+                    tick.state(),
+                    ids.path_queue,
+                    horde_entity,
+                ),
             slow_movement: settings.is_some_and(|settings| settings.use_slow_horde_movement),
             horse,
             horse_slow,
+            backing: inputs.backing.contains(&horde_entity),
+            scaled_wall: horde.scaled_wall,
         };
         let poses = slot_poses(&horde, &body.0);
         let horde_cell = geometry.cell_at(body.0.position, 0, inputs.extent);
@@ -804,6 +897,7 @@ pub(crate) fn advance_members(
         let pace = if top > 0.0 { body.0.speed / top } else { 0.0 };
         #[allow(clippy::cast_precision_loss)]
         let retail_frame = tick.frame().get() as f32 * dt / RETAIL_FRAME_SECONDS;
+        let order = inputs.orders.get(&horde_entity);
         let mut unsettled = false;
         for member in horde.members.iter().copied() {
             let stale = tick.state().get(ids.path, member).is_some_and(|path| {
@@ -817,7 +911,10 @@ pub(crate) fn advance_members(
             if stale {
                 tick.state_mut().remove(ids.path, member);
             }
-            if tick.state().contains(ids.path, member) || inputs.held_elsewhere.contains(&member) {
+            if tick.state().contains(ids.path, member)
+                || tick.state().contains(ids.portal_walk, member)
+                || inputs.held_elsewhere.contains(&member)
+            {
                 unsettled = true;
                 continue;
             }
@@ -849,8 +946,10 @@ pub(crate) fn advance_members(
                         .is_some_and(|health| !health.0.is_dead())
                 });
             let fighting = attack.is_some();
+            let runs_down = moving && fighting && tick.state().contains(ids.running_down, member);
             let engage = attack
                 .and_then(|attack| attack.spot)
+                .filter(|_| !runs_down)
                 .filter(|spot| spot.minus(state.position).length() >= arrive(&limits, dt));
             let record = if in_melee {
                 tick.state().get(ids.member_melee, member).copied()
@@ -867,14 +966,29 @@ pub(crate) fn advance_members(
                 unsettled = true;
                 continue;
             }
-            let slot = entry
-                .slot
-                .and_then(|slot| poses.get(usize::from(slot)).copied());
+            let member_order = order
+                .and_then(|order| order.members.get(&member))
+                .copied()
+                .unwrap_or_default();
+            let slot = member_order.slot.or_else(|| {
+                entry
+                    .slot
+                    .and_then(|slot| poses.get(usize::from(slot)).copied())
+            });
             let facing = match slot {
                 Some(slot) if porcupine => porcupine_facing(body.0.position, slot, motion.facing),
                 _ => motion.facing,
             };
-            let mut skip_move = false;
+            let facing = member_order
+                .face
+                .or_else(|| order.and_then(|order| order.face_point))
+                .filter(|_| slot.is_some())
+                .map_or(facing, |point| {
+                    facing_towards(point, state.position, state.facing)
+                });
+            let mut skip_move = horde.climb_wall.is_some()
+                && is_climber(tick, ids, member)
+                && climbs_by_placement(tick, ids, inputs.kinds, member);
             let member_oath = if oath_sway.is_some() {
                 let member_oath =
                     holds_condition(tick, inputs.model_conditions, member, OATH_FULLFILLED);
@@ -918,7 +1032,9 @@ pub(crate) fn advance_members(
             } else {
                 false
             };
-            let (mut act, rescue) = if fighting || (!moving && inputs.attacking.contains(&member)) {
+            let (mut act, rescue) = if (fighting && !runs_down)
+                || (!moving && inputs.attacking.contains(&member))
+            {
                 (Act::Stand, false)
             } else if in_melee {
                 match record {
@@ -988,34 +1104,33 @@ pub(crate) fn advance_members(
                     member,
                     geometry,
                 );
-                let view = gated_view(
-                    tick,
-                    grid,
-                    obstacles,
-                    ids.portals,
-                    ids.wall_layer,
-                    ids.human_barred,
-                );
-                let reachability =
-                    reachability_for(inputs.reachability, inputs.reachability_extra, mover);
-                let slot = clamp_member_slot(
-                    &view,
-                    geometry,
-                    inputs.heights,
-                    reachability,
-                    mover,
-                    footprint,
-                    horde_cell,
-                    body.0.position,
-                    slot,
-                );
-                (
-                    hub(state, slot, HordeMotion { facing, ..motion }, &limits, dt),
-                    true,
-                )
+                let climb = climbing_walker_point(tick, ids, inputs, &horde, member, state);
+                let view = gated_view(tick, grid, obstacles, ids.wall_layer, ids.human_barred);
+                let slot = climb.unwrap_or_else(|| {
+                    clamp_member_slot(
+                        &view,
+                        geometry,
+                        inputs.heights,
+                        mover,
+                        footprint,
+                        horde_cell,
+                        body.0.position,
+                        slot,
+                    )
+                });
+                let motion = HordeMotion { facing, ..motion };
+                (hub(state, slot, motion, &limits, dt), true)
             };
             if skip_move {
                 act = Act::Stand;
+            }
+            let asks = matches!(act, Act::Settle(_) | Act::Aligned);
+            if asks != tick.state().contains(ids.idle_ask, member) {
+                if asks {
+                    tick.state_mut().insert(ids.idle_ask, member, IdleAsk)?;
+                } else {
+                    tick.state_mut().remove(ids.idle_ask, member);
+                }
             }
             if matches!(act, Act::Glide(_)) {
                 if !tick.state().contains(ids.glided, member) {
@@ -1034,7 +1149,8 @@ pub(crate) fn advance_members(
                 Act::Glide(place) => {
                     leave_goal(tick, ids, inputs, geometry, member, place.position);
                 }
-                Act::Snap(_) | Act::TurnStep(_) | Act::Stand | Act::Settle(None) => {}
+                Act::Snap(_) | Act::TurnStep(_) | Act::Stand | Act::Aligned | Act::Settle(None) => {
+                }
             }
             if !matches!(act, Act::Settle(_)) {
                 unsettled = true;
@@ -1064,14 +1180,7 @@ pub(crate) fn advance_members(
                     if horde_pulling_up && (gap < step || was_pulling_up) {
                         phase = MotionPhase::DECELERATING;
                     }
-                    let view = gated_view(
-                        tick,
-                        grid,
-                        obstacles,
-                        ids.portals,
-                        ids.wall_layer,
-                        ids.human_barred,
-                    );
+                    let view = gated_view(tick, grid, obstacles, ids.wall_layer, ids.human_barred);
                     let passable = step_valid(&view, geometry, mover, (state.position, to, goal));
                     if passable {
                         next.position = to;
@@ -1168,7 +1277,7 @@ pub(crate) fn advance_members(
                         next.speed = gap.min(step) / dt;
                     }
                 }
-                Act::Stand | Act::Settle(None) => {}
+                Act::Stand | Act::Aligned | Act::Settle(None) => {}
                 Act::Settle(Some(slot)) => next.position = slot,
             }
             if next != state {
@@ -1194,13 +1303,144 @@ const RAPPELLING: &str = "RAPPELLING";
 const SCALING_WALL: &str = "SCALING_WALL";
 const SCALING_WALL_HORDE: &str = "SCALING_WALL_HORDE";
 
-const CLIMB_RATE_SHARE: f32 = 0.6;
-
 const CLIMB_GROUNDED_TOLERANCE: f32 = 0.01;
 
-const CLIMB_CLEAR_SLOT_DISTANCE: f32 = 0.5;
-
 const CLIMB_CLEAR_QUIET_CHECKS: u8 = 4;
+
+fn is_climber(tick: &Tick<'_>, ids: HordeIds, member: Entity) -> bool {
+    tick.state().get(ids.shape, member).is_some_and(|shape| {
+        shape
+            .kind_of
+            .contains(mint_sage_asset::KindOf::CAN_CLIMB_WALLS)
+    })
+}
+
+fn climbing_walker_point(
+    tick: &Tick<'_>,
+    ids: HordeIds,
+    inputs: &PassInputs<'_>,
+    horde: &Horde,
+    member: Entity,
+    state: MoverState,
+) -> Option<Vec2> {
+    let wall_entity = horde.climb_wall?;
+    if !is_climber(tick, ids, member) || climbs_by_placement(tick, ids, inputs.kinds, member) {
+        return None;
+    }
+    let all = crate::obstacles::scaleable_walls_of(tick.state(), ids.scaleable_walls)?;
+    let wall = all
+        .iter()
+        .find(|(entity, _)| *entity == wall_entity)
+        .map(|(_, wall)| *wall)?;
+    let walls: Vec<mint_sage_passability::WallGeometry> = all
+        .iter()
+        .filter(|(entity, _)| !tick.state().contains(ids.doomed, *entity))
+        .map(|(_, wall)| *wall)
+        .collect();
+    let ground = inputs
+        .heights
+        .height_at_point(state.position)
+        .unwrap_or(0.0);
+    let z = tick
+        .state()
+        .get(ids.elevation, member)
+        .map_or(ground, |elevation| elevation.0);
+    member_climb_point(
+        tick,
+        ids,
+        (inputs.heights, inputs.kinds, inputs.model_conditions),
+        (horde, &wall, &walls),
+        member,
+        (state.position, z),
+    )
+    .map(|point| point.position)
+}
+
+const TICKS_PER_FRAME: u32 = mint_sim::SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ;
+
+fn climbs_by_placement(
+    tick: &Tick<'_>,
+    ids: HordeIds,
+    kinds: &crate::templates::KindTable,
+    member: Entity,
+) -> bool {
+    tick.state()
+        .get(ids.locomotion, member)
+        .map(|locomotion| locomotion.0)
+        .or_else(|| {
+            let kind = tick.state().get(ids.kind, member)?;
+            kinds.get(*kind)?.limits
+        })
+        .is_some_and(|kinematics| kinematics.scaling_walls)
+}
+
+fn member_climb_point(
+    tick: &Tick<'_>,
+    ids: HordeIds,
+    (heights, kinds, model_conditions): (
+        &HeightField,
+        &crate::templates::KindTable,
+        Option<ComponentId<mint_sage_modules::effects::UpgradeState>>,
+    ),
+    (horde, wall, walls): (
+        &Horde,
+        &mint_sage_passability::WallGeometry,
+        &[mint_sage_passability::WallGeometry],
+    ),
+    member: Entity,
+    (position, z): (Vec2, f32),
+) -> Option<crate::horde_climb::ClimbPoint> {
+    let entry = tick.state().get(ids.member, member)?;
+    let slot = member_slot_pose(tick.state(), ids, member)?;
+    let horde_body = tick.state().get(ids.body, entry.horde)?.0;
+    let horde_limits = crate::unit::current_limits(
+        tick.state(),
+        kinds,
+        (ids.kind, ids.locomotion, ids.health),
+        entry.horde,
+        None,
+        1.0,
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let horde_speed = horde_limits.map_or(0.0, |limits| limits.max_speed)
+        / crate::game_data::RETAIL_LOGIC_HZ as f32;
+    let horde_radius = crate::construction::object_bounding_radius(
+        tick.state(),
+        kinds,
+        (ids.kind, model_conditions),
+        entry.horde,
+    );
+    let member_height = tick
+        .state()
+        .get(ids.kind, member)
+        .and_then(|kind| kinds.get(*kind))
+        .and_then(|entry| entry.record.geometry.height)
+        .unwrap_or(0.0);
+    let ground = heights.height_at_point(position).unwrap_or(0.0);
+    let horde_ground = heights.height_at_point(horde_body.position).unwrap_or(0.0);
+    let offset = position.minus(horde_body.position);
+    let horde_distance =
+        crate::rules::movement::octagonal_length_3d(offset.x, offset.y, z - horde_ground);
+    let wall_under = |point: Vec2| walls.iter().any(|wall| wall_contains(point, wall));
+    Some(crate::horde_climb::climb_point(
+        &crate::horde_climb::ClimbInput {
+            member: position,
+            member_z: z,
+            member_height,
+            ground,
+            slot,
+            horde_speed,
+            horde_radius,
+            horde_distance,
+            banner: horde.banner_slot.is_some() && horde.banner_slot == entry.slot,
+            climbing_or_rappelling: holds_condition(tick, model_conditions, member, CLIMBING)
+                || holds_condition(tick, model_conditions, member, RAPPELLING),
+            wall,
+            wall_ground: heights.height_at_point(wall.centre).unwrap_or(0.0),
+            wall_under: &wall_under,
+        },
+    ))
+}
 
 fn wall_contains(point: Vec2, wall: &mint_sage_passability::WallGeometry) -> bool {
     let (sin, cos) = mint_math::f32::sin_cos(wall.angle);
@@ -1373,6 +1613,7 @@ pub(crate) fn advance_wall_climbers(
             };
             horde.climb_wall = Some(wall_entity);
             horde.climb_quiet = 0;
+            horde.scaled_wall = true;
             note_conditions(
                 tick,
                 model_conditions,
@@ -1411,8 +1652,21 @@ pub(crate) fn advance_wall_climbers(
             tick.state_mut().insert(ids.horde, horde_entity, horde)?;
             continue;
         };
+        if tick.frame().get() % u64::from(TICKS_PER_FRAME) != 0 {
+            tick.state_mut().insert(ids.horde, horde_entity, horde)?;
+            continue;
+        }
         let wall_ground = heights.height_at_point(wall.centre).unwrap_or(0.0);
-        let top = wall_ground + wall.height;
+        let walls: Vec<mint_sage_passability::WallGeometry> =
+            crate::obstacles::scaleable_walls_of(tick.state(), ids.scaleable_walls)
+                .map(|walls| {
+                    walls
+                        .iter()
+                        .filter(|(entity, _)| !tick.state().contains(ids.doomed, *entity))
+                        .map(|(_, wall)| *wall)
+                        .collect()
+                })
+                .unwrap_or_default();
         let mut any_climbing = false;
         for member in horde.members.clone() {
             let Some(shape) = tick.state().get(ids.shape, member).copied() else {
@@ -1436,6 +1690,27 @@ pub(crate) fn advance_wall_climbers(
                 .state()
                 .get(ids.elevation, member)
                 .map_or(ground_here, |elevation| elevation.0);
+            let Some(point) = member_climb_point(
+                tick,
+                ids,
+                (heights, kinds, model_conditions),
+                (&horde, &wall, &walls),
+                member,
+                (position, current_z),
+            ) else {
+                continue;
+            };
+            horde.climb_gap = crate::horde_climb::record_gap(horde.climb_gap, point.gap);
+            if !climbs_by_placement(tick, ids, kinds, member) {
+                any_climbing |= wall_contains(position, &wall);
+                continue;
+            }
+            let place = crate::horde_climb::placement(position, current_z, &point);
+            let ground_there = heights
+                .height_at_point(point.position)
+                .unwrap_or(ground_here);
+            let next_z = point.z.max(ground_there);
+            write_elevation(tick, ids, member, next_z)?;
             let limits = crate::unit::current_limits(
                 tick.state(),
                 kinds,
@@ -1444,13 +1719,26 @@ pub(crate) fn advance_wall_climbers(
                 None,
                 1.0,
             );
-            #[allow(clippy::cast_precision_loss)]
-            let speed =
-                limits.map_or(0.0, |limits| limits.max_speed) / mint_sim::SIMULATION_HZ as f32;
-            let inside = wall_contains(position, &wall);
-            if inside {
-                let next_z = (current_z + speed * CLIMB_RATE_SHARE).min(top);
-                write_elevation(tick, ids, member, next_z)?;
+            let horde_facing = tick
+                .state()
+                .get(ids.body, horde_entity)
+                .map_or(Facing::EAST, |body| body.0.facing);
+            if let Some(body) = tick.state_mut().get_mut(ids.body, member) {
+                body.0.position = point.position;
+                body.0.facing = if wall_contains(point.position, &wall) {
+                    let along = Facing::from_radians(wall.angle);
+                    if horde_facing.to_vector().dot(along.to_vector()) < 0.0 {
+                        Facing::from_radians(wall.angle + core::f32::consts::PI)
+                    } else {
+                        along
+                    }
+                } else {
+                    let turn = limits.map_or(0.0, |limits| limits.turn_rate) * RETAIL_FRAME_SECONDS;
+                    body.0.facing.turned_towards(horde_facing, turn)
+                };
+            }
+            let grounded = current_z <= ground_here + CLIMB_GROUNDED_TOLERANCE;
+            if place.rising {
                 note_conditions(
                     tick,
                     model_conditions,
@@ -1460,39 +1748,27 @@ pub(crate) fn advance_wall_climbers(
                     &[RAPPELLING],
                 );
                 push_wall_climb(tick, ids, member, wall_entity);
-                any_climbing = true;
-                continue;
-            }
-            if current_z > ground_here + CLIMB_GROUNDED_TOLERANCE {
-                let next_z = (current_z - speed * CLIMB_RATE_SHARE).max(ground_here);
-                write_elevation(tick, ids, member, next_z)?;
+            } else if place.descending {
                 note_conditions(
                     tick,
                     model_conditions,
                     member,
                     &mut effects,
-                    &[CLIMBING, SCALING_WALL_HORDE],
                     &[RAPPELLING],
+                    &[CLIMBING],
                 );
-                push_wall_climb(tick, ids, member, wall_entity);
-                any_climbing = true;
-                continue;
+            } else {
+                let drop: &[&str] = if grounded && place.horizontal {
+                    &[CLIMBING, RAPPELLING, SCALING_WALL_HORDE]
+                } else {
+                    &[CLIMBING, RAPPELLING]
+                };
+                note_conditions(tick, model_conditions, member, &mut effects, &[], drop);
             }
-            if current_z != ground_here {
-                write_elevation(tick, ids, member, ground_here)?;
-            }
-            let distance_to_slot = member_slot_pose(tick.state(), ids, member)
-                .map_or(f32::INFINITY, |slot| slot.minus(position).length());
-            if distance_to_slot > CLIMB_CLEAR_SLOT_DISTANCE {
-                note_conditions(
-                    tick,
-                    model_conditions,
-                    member,
-                    &mut effects,
-                    &[],
-                    &[CLIMBING, RAPPELLING, SCALING_WALL_HORDE],
-                );
-            }
+            any_climbing |= place.rising
+                || place.descending
+                || next_z > ground_there + CLIMB_GROUNDED_TOLERANCE
+                || wall_contains(point.position, &wall);
         }
         if any_climbing {
             horde.climb_quiet = 0;
@@ -1525,6 +1801,10 @@ pub(crate) fn advance_wall_climbers(
         tick.state_mut().insert(ids.horde, horde_entity, horde)?;
     }
     Ok(effects)
+}
+
+fn facing_towards(point: Vec2, from: Vec2, current: Facing) -> Facing {
+    Facing::from_vector(point.minus(from)).unwrap_or(current)
 }
 
 fn porcupine_facing(centre: Vec2, slot: Vec2, horde: Facing) -> Facing {
@@ -2035,7 +2315,11 @@ pub(crate) fn spawn_horde(
         dirty: true,
         centre,
         climb_wall: None,
+        scaled_wall: false,
         climb_quiet: 0,
+        climb_gap: 0.0,
+        rangefinder: None,
+        pools: Vec::new(),
     };
     let held: Vec<u16> = held.into_iter().flatten().collect();
     horde.free = free_slots(&horde, &held);
@@ -2156,7 +2440,11 @@ pub(crate) fn spawn_horde_shell(
         dirty: true,
         centre,
         climb_wall: None,
+        scaled_wall: false,
         climb_quiet: 0,
+        climb_gap: 0.0,
+        rangefinder: None,
+        pools: Vec::new(),
     };
     horde.free = free_slots(&horde, &[]);
     tick.state_mut().insert(ids.horde, horde_entity, horde)?;
@@ -2449,6 +2737,18 @@ pub(crate) fn report(world: &World, ids: HordeIds) -> Vec<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    #[test]
+    fn a_member_faces_an_order_point_from_where_it_stands() {
+        let a = Vec2::new(0.0, 0.0);
+        let slot = Vec2::new(55.0, 0.0);
+        let at = Vec2::new(55.0, 3.0);
+        let facing = facing_towards(a, at, Facing::EAST);
+        let exact = Facing::from_vector(a.minus(at)).unwrap();
+        assert!(facing.delta_to(exact).abs() < 1e-6);
+        assert!(facing.delta_to(facing_towards(a, slot, Facing::EAST)).abs() > 0.05);
+        assert_eq!(facing_towards(at, at, Facing::EAST), Facing::EAST);
+    }
+
     use super::*;
     use mint_sage_formation::{HordeContainDef, RankLine, SlotPosition};
 
@@ -2569,7 +2869,11 @@ mod tests {
             banner_slot: None,
             centre: Vec2::ZERO,
             climb_wall: None,
+            scaled_wall: false,
             climb_quiet: 0,
+            climb_gap: 0.0,
+            rangefinder: None,
+            pools: Vec::new(),
         };
         let mut other_formation = base.clone();
         other_formation.formation = 1;
@@ -2706,8 +3010,7 @@ mod tests {
                 scaleable: &[],
                 barred: &[],
             },
-            portals: &[],
-            tags: &[],
+            links: &[],
         };
         let geometry = passability.geometry;
         let centre = |x: u16| geometry.centre_of(mint_movement::Cell::new(x, 2));
@@ -2761,10 +3064,8 @@ mod tests {
                 scaleable: &[],
                 barred: &[],
             },
-            portals: &[],
-            tags: &[],
+            links: &[],
         };
-        let reachability = Reachability::build(&view.ground, GROUND);
         let footprint = crate::goal_cells::Footprint::of(2.0, false, geometry.cell_size(), None);
         let slot = geometry.centre_of(obstacle_cell);
         let horde_pos = geometry.centre_of(Cell::new(2, 5));
@@ -2774,15 +3075,7 @@ mod tests {
             "the stamped cell must start blocked"
         );
         let clamped = clamp_member_slot(
-            &view,
-            geometry,
-            &heights,
-            &reachability,
-            GROUND,
-            footprint,
-            horde_cell,
-            horde_pos,
-            slot,
+            &view, geometry, &heights, GROUND, footprint, horde_cell, horde_pos, slot,
         );
         assert_ne!(clamped, slot, "the raw slot sits on the obstacle");
         assert_ne!(
@@ -2793,6 +3086,52 @@ mod tests {
         assert!(
             clamped.x < slot.x,
             "the clamp slides toward the horde centre, west of the slot"
+        );
+    }
+
+    #[test]
+    fn a_slot_whose_footprint_touches_a_pinched_cell_clamps_off_it() {
+        let (grid, geometry, extent, heights) = flat_grid(10, 10);
+        let mut pinched = vec![0u8; usize::from(extent.width) * usize::from(extent.height)];
+        for y in [3usize, 4, 6, 7] {
+            for x in 4..=7usize {
+                pinched[y * usize::from(extent.width) + x] = 1;
+            }
+        }
+        for x in [6usize, 7] {
+            pinched[5 * usize::from(extent.width) + x] = 1;
+        }
+        let view = mint_sage_passability::GatedView {
+            ground: DynamicView {
+                grid: &grid,
+                counts: &[],
+                rubble: &[],
+                wall_rim: &[],
+                tags: &[],
+                connect: &[],
+                released: &[],
+                closed: &[],
+                obstacle_pinched: &pinched,
+                ramp_side: &[],
+                scaleable: &[],
+                barred: &[],
+            },
+            links: &[],
+        };
+        let footprint = crate::goal_cells::Footprint::of(20.0, false, geometry.cell_size(), None);
+        let slot = geometry.centre_of(Cell::new(5, 5));
+        let horde_pos = geometry.centre_of(Cell::new(1, 5));
+        let horde_cell = geometry.cell_at(horde_pos, 0, extent);
+        assert!(
+            view.is_passable(Cell::new(6, 5), GROUND),
+            "a pinched cell is a cost flag, still passable"
+        );
+        let clamped = clamp_member_slot(
+            &view, geometry, &heights, GROUND, footprint, horde_cell, horde_pos, slot,
+        );
+        assert_ne!(
+            clamped, slot,
+            "the raw slot's footprint touches a pinched cell"
         );
     }
 
@@ -2824,24 +3163,14 @@ mod tests {
                 scaleable: &[],
                 barred: &[],
             },
-            portals: &[],
-            tags: &[],
+            links: &[],
         };
-        let reachability = Reachability::build(&view.ground, GROUND);
         let footprint = crate::goal_cells::Footprint::of(20.0, false, geometry.cell_size(), None);
         let slot = Vec2::new(50.0, 25.0);
         let horde_pos = Vec2::new(20.0, 25.0);
         let horde_cell = geometry.cell_at(horde_pos, 0, extent);
         let clamped = clamp_member_slot(
-            &view,
-            geometry,
-            &heights,
-            &reachability,
-            GROUND,
-            footprint,
-            horde_cell,
-            horde_pos,
-            slot,
+            &view, geometry, &heights, GROUND, footprint, horde_cell, horde_pos, slot,
         );
         assert_ne!(clamped, slot, "the raw slot's footprint straddles the step");
         assert!(
@@ -2869,24 +3198,14 @@ mod tests {
                 scaleable: &[],
                 barred: &[],
             },
-            portals: &[],
-            tags: &[],
+            links: &[],
         };
-        let reachability = Reachability::build(&view.ground, GROUND);
         let footprint = crate::goal_cells::Footprint::of(2.0, false, geometry.cell_size(), None);
         let slot = geometry.centre_of(Cell::new(6, 6));
         let horde_pos = geometry.centre_of(Cell::new(2, 2));
         let horde_cell = geometry.cell_at(horde_pos, 0, extent);
         let clamped = clamp_member_slot(
-            &view,
-            geometry,
-            &heights,
-            &reachability,
-            GROUND,
-            footprint,
-            horde_cell,
-            horde_pos,
-            slot,
+            &view, geometry, &heights, GROUND, footprint, horde_cell, horde_pos, slot,
         );
         assert_eq!(
             clamped,
@@ -2896,12 +3215,13 @@ mod tests {
     }
 
     #[test]
-    fn a_climbing_movers_own_terrain_decides_reachability_across_a_cliff() {
-        let passability = wall_grid(12, 5, 6);
+    fn an_even_footprint_falls_back_to_the_horde_cells_low_corner() {
+        let (grid, geometry, extent, heights) = flat_grid(8, 8);
+        let counts = vec![1u8; usize::from(extent.width) * usize::from(extent.height)];
         let view = mint_sage_passability::GatedView {
             ground: DynamicView {
-                grid: &passability.grid,
-                counts: &[],
+                grid: &grid,
+                counts: &counts,
                 rubble: &[],
                 wall_rim: &[],
                 tags: &[],
@@ -2913,51 +3233,52 @@ mod tests {
                 scaleable: &[],
                 barred: &[],
             },
-            portals: &[],
-            tags: &[],
+            links: &[],
         };
-        let geometry = passability.geometry;
-        let extent = view.extent();
-        let ground = Reachability::build(&view.ground, GROUND);
-        let climber = mint_sage_passability::mover_class(
-            &[String::from("GROUND"), String::from("CLIFF")],
-            false,
-        )
-        .unwrap();
-        let wide = Reachability::build(&view.ground, climber);
-        let extra = vec![(climber.terrain(), wide)];
-        let reachability = reachability_for(&ground, &extra, climber);
-        assert_eq!(
-            reachability.mover(),
-            climber.terrain(),
-            "the lookup must hand back the climbing oracle built for it, not GROUND's own"
-        );
-        let footprint = crate::goal_cells::Footprint::of(2.0, false, geometry.cell_size(), None);
-        let slot = geometry.centre_of(Cell::new(2, 2));
-        let horde_pos = geometry.centre_of(Cell::new(9, 2));
+        let footprint = crate::goal_cells::Footprint::RADIUS_ONE;
+        let slot = geometry.centre_of(Cell::new(6, 6));
+        let horde_pos = geometry.centre_of(Cell::new(2, 2));
         let horde_cell = geometry.cell_at(horde_pos, 0, extent);
-        assert!(
-            !ground.same_component(
-                geometry.cell_at(slot, 0, extent).unwrap(),
-                horde_cell.unwrap()
-            ),
-            "the cliff wall must split the grid for GROUND"
-        );
         let clamped = clamp_member_slot(
-            &view,
-            geometry,
-            &passability.heights,
-            reachability,
-            climber,
-            footprint,
-            horde_cell,
-            horde_pos,
-            slot,
+            &view, geometry, &heights, GROUND, footprint, horde_cell, horde_pos, slot,
         );
+        assert_eq!(clamped, Vec2::new(20.5, 20.5));
+    }
+
+    #[test]
+    fn a_slot_behind_a_rock_slides_in_until_the_line_to_the_horde_clears() {
+        let (grid, geometry, extent, heights) = flat_grid(12, 12);
+        let mut counts = vec![0u8; usize::from(extent.width) * usize::from(extent.height)];
+        counts[5 * usize::from(extent.width) + 5] = 1;
+        let view = mint_sage_passability::GatedView {
+            ground: DynamicView {
+                grid: &grid,
+                counts: &counts,
+                rubble: &[],
+                wall_rim: &[],
+                tags: &[],
+                connect: &[],
+                released: &[],
+                closed: &[],
+                obstacle_pinched: &[],
+                ramp_side: &[],
+                scaleable: &[],
+                barred: &[],
+            },
+            links: &[],
+        };
+        let footprint = crate::goal_cells::Footprint::of(2.0, false, geometry.cell_size(), None);
+        let slot = geometry.centre_of(Cell::new(8, 5));
+        let horde_pos = geometry.centre_of(Cell::new(2, 5));
+        let horde_cell = geometry.cell_at(horde_pos, 0, extent);
+        let clamped = clamp_member_slot(
+            &view, geometry, &heights, GROUND, footprint, horde_cell, horde_pos, slot,
+        );
+        assert_ne!(clamped, slot, "the rock stands on the line to the horde");
         assert_eq!(
-            clamped, slot,
-            "a mover that can climb the cliff must keep the raw slot - it is reachable under its \
-             own terrain even though GROUND's view would have clamped it away"
+            geometry.cell_at(clamped, 0, extent),
+            Some(Cell::new(4, 5)),
+            "the first candidate whose line is clear, not the horde's own cell: {clamped:?}"
         );
     }
 
@@ -2975,6 +3296,8 @@ mod tests {
             slow_movement: false,
             horse: true,
             horse_slow: false,
+            backing: false,
+            scaled_wall: false,
         };
         let standing = MoverState::new(Vec2::new(-3.0, 0.0), Facing::EAST);
         let mut walking = standing;
@@ -2983,6 +3306,39 @@ mod tests {
             hub(standing, Vec2::ZERO, horse, &limits, 1.0 / 30.0),
             matches!(
                 hub(walking, Vec2::ZERO, horse, &limits, 1.0 / 30.0),
+                Act::Step { .. }
+            ),
+        );
+        assert_eq!(acts, (Act::Settle(None), true));
+    }
+
+    #[test]
+    fn only_a_cavalry_member_at_rest_holds_inside_one_acceleration_step() {
+        let limits = mint_movement::MotionLimits {
+            max_speed: 45.0,
+            acceleration: 90.0,
+            turn_rate: 3.0,
+            ..crate::unit::PLACEHOLDER_LIMITS
+        };
+        let infantry = HordeMotion {
+            facing: Facing::EAST,
+            moving: false,
+            slow_movement: false,
+            horse: false,
+            horse_slow: false,
+            backing: false,
+            scaled_wall: false,
+        };
+        let cavalry = HordeMotion {
+            horse: true,
+            ..infantry
+        };
+        let at_rest = MoverState::new(Vec2::new(-2.7, 0.0), Facing::EAST);
+        let dt = 1.0 / 30.0;
+        let acts = (
+            hub(at_rest, Vec2::ZERO, cavalry, &limits, dt),
+            matches!(
+                hub(at_rest, Vec2::ZERO, infantry, &limits, dt),
                 Act::Step { .. }
             ),
         );
@@ -3004,6 +3360,8 @@ mod tests {
             slow_movement: false,
             horse: false,
             horse_slow: false,
+            backing: false,
+            scaled_wall: false,
         };
         let marching = HordeMotion {
             moving: true,
@@ -3014,7 +3372,7 @@ mod tests {
         };
         let slot = Vec2::ZERO;
         let step = 45.0 * dt;
-        let rows: [(&str, MoverState, HordeMotion, Act); 9] = [
+        let rows: [(&str, MoverState, HordeMotion, Act); 12] = [
             (
                 "far: a full step at the slot",
                 at(-10.0, 0.0),
@@ -3043,7 +3401,7 @@ mod tests {
                 "near while the horde moves: stands, not settled",
                 at(0.0, 0.0),
                 marching,
-                Act::Stand,
+                Act::Aligned,
             ),
             (
                 "1 behind a moving slot: past a tick's share of the frame's distance, a step",
@@ -3061,13 +3419,42 @@ mod tests {
                 },
             ),
             (
-                "ahead of its slot with UseSlowHordeMovement: stands",
+                "ahead of a standing slot, the horde standing: walks to its slot",
+                at(10.0, 0.0),
+                HordeMotion {
+                    slow_movement: true,
+                    ..standing
+                },
+                Act::Step { goal: slot, step },
+            ),
+            (
+                "ahead of a moving slot, the horde moving: stands",
                 at(10.0, 0.0),
                 HordeMotion {
                     slow_movement: true,
                     ..marching
                 },
                 Act::Stand,
+            ),
+            (
+                "ahead of a moving slot, the horde having scaled a wall: never stands",
+                at(10.0, 0.0),
+                HordeMotion {
+                    slow_movement: true,
+                    scaled_wall: true,
+                    ..marching
+                },
+                Act::Step { goal: slot, step },
+            ),
+            (
+                "ahead of a moving slot, the horde's emotion state backing members away: never stands",
+                at(10.0, 0.0),
+                HordeMotion {
+                    slow_movement: true,
+                    backing: true,
+                    ..marching
+                },
+                Act::Step { goal: slot, step },
             ),
             (
                 "a horse closes at its gap per retail frame",
@@ -3098,7 +3485,11 @@ mod tests {
             banner_slot: None,
             centre: Vec2::ZERO,
             climb_wall: None,
+            scaled_wall: false,
             climb_quiet: 0,
+            climb_gap: 0.0,
+            rangefinder: None,
+            pools: Vec::new(),
         };
         let east = slot_poses(
             &horde,

@@ -9,6 +9,13 @@ Object ZBarracks\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
   Behavior = QueueProductionExitUpdate Tag_Exit\n    UnitCreatePoint = X:20 Y:0 Z:0\n    \
     NaturalRallyPoint = X:150 Y:0 Z:0\n    ExitDelay = 10\n    PlacementViewAngle = 180\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 30\n  GeometryHeight = 30\nEnd\n\
+Object ZGateless\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+  CommandSet = ZBarracksSet\n  \
+  Body = StructureBody Tag_01\n    MaxHealth = 3000\n  End\n  \
+  Behavior = ProductionUpdate Tag_02\n    MaxQueueEntries = 3\n  End\n  \
+  Behavior = QueueProductionExitUpdate Tag_Exit\n    UnitCreatePoint = X:20 Y:0 Z:0\n    \
+    NaturalRallyPoint = X:150 Y:0 Z:0\n    ExitDelay = 10\n    NoExitPath = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 30\n  GeometryHeight = 30\nEnd\n\
 CommandSet ZBarracksSet\n  1 = Build_ZSoldierHorde\n  2 = Build_ZFarHorde\n  3 = Build_ZMixedHorde\nEnd\n\
 CommandButton Build_ZSoldierHorde\n  Command = UNIT_BUILD\n  Object = ZSoldierHorde\n  Radial = Yes\nEnd\n\
 Object ZSoldier\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n  BuildTime = 1\n  \
@@ -44,6 +51,7 @@ fn load() -> Match {
     let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
     let seeds: Vec<String> = [
         "ZBarracks",
+        "ZGateless",
         "ZSoldierHorde",
         "ZFarHorde",
         "ZSoldier",
@@ -115,9 +123,13 @@ fn placed(simulation: &Simulation<RotwkRules>, ids: Ids, m: &Match, name: &str) 
 }
 
 fn produce_horde(m: &Match) -> (Simulation<RotwkRules>, Ids, Vec2, Entity) {
-    let mut simulation = Simulation::new(41, rules(m, &[("ZBarracks", 0.0, 0.0, PLAYER)])).unwrap();
+    produce_horde_at(m, "ZBarracks")
+}
+
+fn produce_horde_at(m: &Match, structure: &str) -> (Simulation<RotwkRules>, Ids, Vec2, Entity) {
+    let mut simulation = Simulation::new(41, rules(m, &[(structure, 0.0, 0.0, PLAYER)])).unwrap();
     let ids = simulation.rules().ids().unwrap();
-    let barracks = placed(&simulation, ids, m, "ZBarracks")[0];
+    let barracks = placed(&simulation, ids, m, structure)[0];
     let home = position(&simulation, ids, barracks);
     simulation
         .submit(
@@ -526,5 +538,122 @@ fn an_unjoined_member_walks_on_to_the_hordes_own_slot_zero() {
     assert!(
         goal.minus(slot_zero).length() < 1e-3,
         "goal {goal:?}, expected slot-0 pose {slot_zero:?}"
+    );
+}
+
+const LEAVING: &str = "IS_LEAVING_FACTORY";
+
+#[test]
+fn production_marks_what_it_makes_leaving_the_factory_until_the_exit_ends() {
+    let m = load();
+    let (mut simulation, ids, _home, horde) = produce_horde(&m);
+    let carries = |simulation: &Simulation<RotwkRules>, entity| {
+        simulation
+            .rules()
+            .carries_object_status(simulation.state(), entity, LEAVING)
+    };
+    assert!(carries(&simulation, horde), "the shell is marked");
+    for _ in 0..8 {
+        simulation.tick().unwrap();
+    }
+    let member = simulation.state().get(ids.horde, horde).unwrap().members[0];
+    assert!(
+        simulation.state().contains(ids.path, member),
+        "still walking"
+    );
+    assert!(carries(&simulation, member), "the member is marked");
+    for _ in 0..200 {
+        simulation.tick().unwrap();
+    }
+    assert!(!simulation.state().contains(ids.path, member));
+    assert!(!carries(&simulation, member), "its walk ended");
+}
+
+#[test]
+fn under_no_exit_path_a_streamed_member_gets_no_route_and_no_mark() {
+    let m = load();
+    let (mut simulation, ids, _home, horde) = produce_horde_at(&m, "ZGateless");
+    for _ in 0..8 {
+        simulation.tick().unwrap();
+    }
+    let member = simulation.state().get(ids.horde, horde).unwrap().members[0];
+    assert!(!simulation.state().contains(ids.path, member));
+    assert!(!simulation
+        .rules()
+        .carries_object_status(simulation.state(), member, LEAVING));
+    assert!(!simulation
+        .rules()
+        .carries_object_status(simulation.state(), horde, LEAVING));
+}
+
+#[test]
+fn a_horde_shell_keeps_leaving_the_factory_while_a_member_still_walks_out() {
+    let m = load();
+    let (mut simulation, ids, _home, horde) = produce_horde(&m);
+    let carries = |simulation: &Simulation<RotwkRules>, entity| {
+        simulation
+            .rules()
+            .carries_object_status(simulation.state(), entity, LEAVING)
+    };
+    let made = simulation.state().get(ids.factory_exit, horde).unwrap().0;
+    let second = mint_sim::LogicFrames::from_engine_milliseconds(1000);
+    let mut walked_past_a_second = false;
+    for _ in 0..300 {
+        simulation.tick().unwrap();
+        let members = simulation
+            .state()
+            .get(ids.horde, horde)
+            .map(|contain| contain.members.clone())
+            .unwrap_or_default();
+        let walking = members.iter().any(|member| carries(&simulation, *member));
+        let old_enough = made
+            .checked_add(second)
+            .is_some_and(|due| simulation.frame() > due);
+        if walking && old_enough {
+            walked_past_a_second = true;
+            assert!(carries(&simulation, horde), "the shell cleared early");
+        }
+    }
+    assert!(walked_past_a_second, "no member walked past the second");
+}
+
+#[test]
+fn a_no_exit_path_member_stands_at_its_create_point_until_the_burst_ends() {
+    let m = load();
+    let (mut simulation, ids, _home, horde) = produce_horde_at(&m, "ZGateless");
+    let mut first: Option<(Entity, Vec2)> = None;
+    let mut held_ticks = 0u32;
+    for _ in 0..200 {
+        simulation.tick().unwrap();
+        let streaming = simulation.state().contains(ids.production_stream, horde);
+        let members = simulation
+            .state()
+            .get(ids.horde, horde)
+            .unwrap()
+            .members
+            .clone();
+        if let Some(&member) = members.first() {
+            let at = position(&simulation, ids, member);
+            let (_, start) = *first.get_or_insert((member, at));
+            if streaming {
+                held_ticks += 1;
+                assert!(
+                    at.minus(start).length() < 1.0,
+                    "walked at {at:?} mid-stream"
+                );
+            }
+        }
+        if !streaming && first.is_some() {
+            break;
+        }
+    }
+    assert!(held_ticks >= 3, "the member was never watched mid-stream");
+    let (member, start) = first.unwrap();
+    for _ in 0..300 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        position(&simulation, ids, member).minus(start).length() > 20.0,
+        "never walked to its slot after the burst"
     );
 }

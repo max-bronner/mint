@@ -2,6 +2,7 @@ use mint_movement::Vec2;
 use mint_sage_modules::effects::{Effect, Name};
 use mint_sim::{Component, Entity, Frame, PlayerId, Result, StateHasher, Tick};
 
+use super::map_scripts::Relation;
 use super::{Ids, RotwkRules};
 use crate::diag::diag;
 
@@ -29,7 +30,6 @@ pub(crate) struct GateCycle {
     ends_at: Frame,
     pathing_at: Frame,
     open_for_pathing: bool,
-    stamped: u32,
     held_open: Frame,
     commanded: Option<bool>,
 }
@@ -42,7 +42,6 @@ impl GateCycle {
             ends_at: now,
             pathing_at: now,
             open_for_pathing: open,
-            stamped: u32::MAX,
             held_open: Frame::new(0),
             commanded: None,
         }
@@ -68,7 +67,6 @@ impl Component for GateCycle {
         hasher.write_u64(self.ends_at.get());
         hasher.write_u64(self.pathing_at.get());
         hasher.write_u8(u8::from(self.open_for_pathing));
-        hasher.write_u32(self.stamped);
         hasher.write_u64(self.held_open.get());
         hasher.write_u8(match self.commanded {
             None => 0,
@@ -78,20 +76,97 @@ impl Component for GateCycle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GateBox {
+    allies: u32,
+    enemies: u32,
+    inside: Vec<Entity>,
+}
+
+impl GateBox {
+    fn observe(&mut self, object: Entity, inside_now: bool, relation: Relation) {
+        let at = self.inside.binary_search(&object);
+        if inside_now == at.is_ok() {
+            return;
+        }
+        let counter = match relation {
+            Relation::Allies => Some(&mut self.allies),
+            Relation::Enemies => Some(&mut self.enemies),
+            Relation::Neutral => None,
+        };
+        match at {
+            Err(place) => {
+                self.inside.insert(place, object);
+                if let Some(counter) = counter {
+                    *counter = counter.saturating_add(1);
+                }
+            }
+            Ok(place) => {
+                self.inside.remove(place);
+                if let Some(counter) = counter {
+                    *counter = counter.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    fn ally_inside(&self) -> bool {
+        self.allies > 0
+    }
+}
+
+impl Component for GateBox {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_u32(self.allies);
+        hasher.write_u32(self.enemies);
+        hasher.write_usize(self.inside.len());
+        for entity in &self.inside {
+            entity.hash_into(hasher);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoxSeen(i32, i32);
+
+impl BoxSeen {
+    #[allow(clippy::cast_possible_truncation)]
+    fn of(at: Vec2) -> Self {
+        Self(at.x as i32, at.y as i32)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn point(self) -> Vec2 {
+        Vec2::new(self.0 as f32, self.1 as f32)
+    }
+}
+
+impl Component for BoxSeen {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_i32(self.0);
+        hasher.write_i32(self.1);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GateButtons {
     pub(crate) may_operate: bool,
     pub(crate) open: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DynamicPortalStamp {
-    stamped: u32,
+    active: bool,
+    centre: Vec2,
+    angle: f32,
 }
 
 impl Component for DynamicPortalStamp {
     fn hash_into(&self, hasher: &mut StateHasher) {
-        hasher.write_u32(self.stamped);
+        hasher.write_u8(u8::from(self.active));
+        hasher.write_f32(self.centre.x);
+        hasher.write_f32(self.centre.y);
+        hasher.write_f32(self.angle);
     }
 }
 
@@ -109,25 +184,19 @@ impl RotwkRules {
         if gates.is_empty() {
             return Ok(());
         }
-        let movers = self.movers_for_gate_triggers(tick, ids);
+        self.track_gate_boxes(tick, ids, &gates)?;
         let now = tick.frame();
         let mut effects: Vec<(Entity, Effect)> = Vec::new();
         for gate in gates {
-            let Some(body) = tick.state().get(ids.body, gate).map(|body| body.0) else {
+            if !tick.state().contains(ids.body, gate) {
                 continue;
-            };
+            }
             let Some(owner) = tick.state().get(ids.owner, gate).map(|owner| owner.0) else {
                 continue;
             };
-            let Some(portal) = wiring.portal(tick.state(), gate) else {
+            if wiring.portal(tick.state(), gate).is_none() {
                 continue;
-            };
-            let admitted = self.admitted_askers(
-                owner,
-                true,
-                portal.allow_enemies(),
-                portal.allow_non_skirmish_ai_units(),
-            );
+            }
             let cycle_data = wiring.gate_cycle(tick.state(), gate);
             let open_by_default = cycle_data
                 .is_some_and(mint_sage_modules::GateOpenAndCloseBehavior::open_by_default);
@@ -136,24 +205,16 @@ impl RotwkRules {
                 0.0,
                 mint_sage_modules::GateOpenAndCloseBehavior::percent_open_for_pathing,
             );
-            let triggered = wiring
-                .gate_trigger(tick.state(), gate)
-                .is_some_and(|trigger| {
-                    let half = Vec2::new(
-                        trigger.trigger_width_x() * 0.5,
-                        trigger.trigger_width_y() * 0.5,
-                    );
-                    movers.iter().any(|(mover_owner, at)| {
-                        admitted & crate::rules::gates::asker_bits(*mover_owner) != 0
-                            && in_box(body.position, body.facing.radians(), half, *at)
-                    })
-                });
+            let triggered = tick
+                .state()
+                .get(ids.gate_box, gate)
+                .is_some_and(GateBox::ally_inside);
             let mut cycle = tick
                 .state()
                 .get(ids.gate_cycle, gate)
                 .copied()
                 .unwrap_or_else(|| GateCycle::at_rest(open_by_default, now));
-            let box_asked = triggered || open_by_default;
+            let box_asked = triggered;
             let is_skirmish_ai = self.ai_seeds.iter().any(|seed| seed.player == owner);
             let asked = if is_skirmish_ai {
                 box_asked
@@ -182,6 +243,7 @@ impl RotwkRules {
                     if target { "opening" } else { "closing" }
                 );
             }
+            let was_open_for_pathing = cycle.open_for_pathing;
             if cycle.phase != GatePhase::Idle {
                 if now.get() >= cycle.pathing_at.get() {
                     cycle.open_for_pathing = cycle.phase == GatePhase::Opening;
@@ -210,16 +272,24 @@ impl RotwkRules {
                     },
                 ));
             }
-            let wanted = if cycle.open_for_pathing { admitted } else { 0 };
-            if wanted != cycle.stamped {
-                self.stamp_portal(tick, ids, gate, wanted, PORTAL_KIND_WALK)?;
-                cycle.stamped = wanted;
+            if cycle.open_for_pathing != was_open_for_pathing {
+                self.swap_gate_geometry(tick, ids, gate, cycle.open_for_pathing)?;
                 diag!(
-                    "gate: entity {} passage {} (askers {wanted:#x})",
+                    "gate: entity {} passage {}",
                     gate.index(),
-                    if wanted == 0 { "shut" } else { "open" }
+                    if cycle.open_for_pathing {
+                        "open"
+                    } else {
+                        "shut"
+                    }
                 );
             }
+            self.set_gate_link(
+                tick,
+                ids,
+                gate,
+                is_skirmish_ai && !cycle.fully_open() && !dead,
+            )?;
             tick.state_mut().insert(ids.gate_cycle, gate, cycle)?;
         }
         self.apply_effects(tick, ids, effects)
@@ -234,43 +304,86 @@ impl RotwkRules {
             return Ok(());
         }
         let now = tick.frame();
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        let mut changes: Vec<(Entity, DynamicPortalStamp, Vec<mint_movement::PortalLink>)> =
+            Vec::new();
         for entity in entities {
-            let Some(owner) = tick.state().get(ids.owner, entity).map(|owner| owner.0) else {
+            let world = tick.state();
+            let Some(module) = wiring.dynamic_portal(world, entity) else {
                 continue;
             };
-            let Some((active, allow_enemies, kind)) =
-                wiring.dynamic_portal(tick.state(), entity).map(|module| {
-                    (
-                        module.is_active(now) || Self::siege_deployed(tick.state(), ids, entity),
-                        module.allow_enemies(),
-                        dynamic_portal_kind(module),
-                    )
-                })
-            else {
+            let Some(body) = world.get(ids.body, entity).map(|body| body.0) else {
                 continue;
             };
-            let admitted = if active {
-                self.admitted_askers(owner, false, allow_enemies, false)
-            } else {
-                0
+            let bones = world
+                .get(ids.kind, entity)
+                .and_then(|kind| self.portal_bones.get(usize::from(kind.0)))
+                .map_or(&[][..], Vec::as_slice);
+            let active = (module.is_active(now) || Self::siege_deployed(world, ids, entity))
+                && !bones.is_empty();
+            let want = DynamicPortalStamp {
+                active,
+                centre: body.position,
+                angle: body.facing.radians(),
             };
-            let stamped = tick
-                .state()
-                .get(ids.dynamic_portal_stamp, entity)
-                .map(|s| s.stamped);
-            if stamped != Some(admitted) {
-                self.stamp_portal(tick, ids, entity, admitted, kind)?;
-                tick.state_mut().insert(
-                    ids.dynamic_portal_stamp,
+            if world.get(ids.dynamic_portal_stamp, entity) == Some(&want) {
+                continue;
+            }
+            let links = if active {
+                super::portal_links::PortalSite {
                     entity,
-                    DynamicPortalStamp { stamped: admitted },
-                )?;
+                    waypoints: module.waypoints(),
+                    links: module.links(),
+                    bones,
+                    centre: want.centre,
+                    angle: want.angle,
+                    geometry,
+                    extent,
+                }
+                .links()
+            } else {
+                Vec::new()
+            };
+            changes.push((entity, want, links));
+        }
+        for (entity, stamp, links) in changes {
+            let clock = tick
+                .state()
+                .store(ids.portals)
+                .and_then(|store| store.entities().first().copied());
+            if let Some(layer) =
+                clock.and_then(|clock| tick.state_mut().get_mut(ids.portals, clock))
+            {
+                for link in &links {
+                    diag!(
+                        "portal: entity {} link from cell ({}, {}) to ({}, {}), {} node(s)",
+                        entity.index(),
+                        link.entry.x,
+                        link.entry.y,
+                        link.exit.x,
+                        link.exit.y,
+                        link.nodes.len()
+                    );
+                }
+                if links.is_empty() {
+                    layer.unregister(entity);
+                } else {
+                    layer.register(entity, links);
+                }
                 diag!(
-                    "portal: entity {} passage {} (askers {admitted:#x})",
+                    "portal: entity {} {} ({} link(s) on the layer)",
                     entity.index(),
-                    if admitted == 0 { "shut" } else { "open" }
+                    if stamp.active {
+                        "routes"
+                    } else {
+                        "stands down"
+                    },
+                    layer.links().len()
                 );
             }
+            tick.state_mut()
+                .insert(ids.dynamic_portal_stamp, entity, stamp)?;
         }
         Ok(())
     }
@@ -393,120 +506,212 @@ impl RotwkRules {
         Some(GateButtons { may_operate, open })
     }
 
-    fn movers_for_gate_triggers(&self, tick: &Tick<'_>, ids: Ids) -> Vec<(PlayerId, Vec2)> {
-        let Some(store) = tick.state().store(ids.body) else {
-            return Vec::new();
-        };
-        let entities: Vec<Entity> = store.entities().to_vec();
-        entities
-            .into_iter()
-            .filter_map(|entity| {
-                let body = tick.state().get(ids.body, entity)?.0;
-                let owner = tick.state().get(ids.owner, entity)?.0;
-                let kind = tick.state().get(ids.kind, entity).copied()?;
-                let entry = self.kinds.get(kind)?;
-                (!entry.record.has_kind("STRUCTURE")).then_some((owner, body.position))
-            })
-            .collect()
-    }
-
-    fn admitted_askers(
-        &self,
-        owner: PlayerId,
-        neutral: bool,
-        allow_enemies: bool,
-        allow_non_skirmish_ai: bool,
-    ) -> u32 {
-        let total = usize::from(self.players).saturating_add(self.map_players.len());
-        let total = u8::try_from(total.min(32)).unwrap_or(32);
-        let mut admitted = 0;
-        for slot in 0..total {
-            let player = PlayerId::new(slot);
-            let stance = self.alliances.stance(owner, player);
-            let passes = match stance {
-                crate::alliance::Stance::Allied => true,
-                crate::alliance::Stance::Neutral => neutral,
-                crate::alliance::Stance::Hostile => false,
-            };
-            let non_skirmish_ai = self.ai_seeds.iter().all(|seed| seed.player != player);
-            if passes || allow_enemies || (allow_non_skirmish_ai && non_skirmish_ai) {
-                admitted |= asker_bits(player);
+    fn track_gate_boxes(&self, tick: &mut Tick<'_>, ids: Ids, gates: &[Entity]) -> Result<()> {
+        let mut boxes: Vec<(Entity, Vec2, f32, Vec2)> = Vec::new();
+        if let Some(wiring) = self.modules.as_ref() {
+            for &gate in gates {
+                let world = tick.state();
+                let (Some(body), Some(owner), Some(trigger)) = (
+                    world.get(ids.body, gate).map(|body| body.0),
+                    world.get(ids.owner, gate).map(|owner| owner.0),
+                    wiring.gate_trigger(world, gate),
+                ) else {
+                    continue;
+                };
+                if !self.ai_seeds.iter().any(|seed| seed.player == owner) {
+                    continue;
+                }
+                let half = Vec2::new(
+                    trigger.trigger_width_x() * 0.5,
+                    trigger.trigger_width_y() * 0.5,
+                );
+                boxes.push((gate, body.position, body.facing.radians(), half));
             }
         }
-        admitted
+        if boxes.is_empty() {
+            return Ok(());
+        }
+        let primed = tick
+            .state()
+            .store(ids.box_seen)
+            .is_some_and(|store| !store.is_empty());
+        for &(gate, ..) in &boxes {
+            if !tick.state().contains(ids.gate_box, gate) {
+                tick.state_mut()
+                    .insert(ids.gate_box, gate, GateBox::default())?;
+            }
+        }
+        let objects: Vec<Entity> = tick
+            .state()
+            .store(ids.body)
+            .map(|store| store.entities().to_vec())
+            .unwrap_or_default();
+        for object in objects {
+            let world = tick.state();
+            let Some(at) = world.get(ids.body, object).map(|body| body.0.position) else {
+                continue;
+            };
+            let seen = world.get(ids.box_seen, object).copied();
+            let here = BoxSeen::of(at);
+            if seen == Some(here)
+                || !world.is_live(object)
+                || world.contains(ids.doomed, object)
+                || world.contains(ids.contained, object)
+                || world
+                    .get(ids.health, object)
+                    .is_some_and(|health| health.0.is_dead())
+                || world
+                    .get(ids.kind, object)
+                    .and_then(|kind| self.kinds.get(*kind))
+                    .is_some_and(|entry| {
+                        entry.record.has_kind("PROJECTILE") || entry.record.has_kind("INERT")
+                    })
+            {
+                continue;
+            }
+            tick.state_mut().insert(ids.box_seen, object, here)?;
+            if seen.is_none() && !primed {
+                continue;
+            }
+            for &(gate, centre, angle, half) in &boxes {
+                if gate == object {
+                    continue;
+                }
+                let inside = in_box(centre, angle, half, here.point());
+                let world = tick.state();
+                let relation = self.object_relation(world, object, gate);
+                if let Some(mut counted) = world.get(ids.gate_box, gate).cloned() {
+                    counted.observe(object, inside, relation);
+                    tick.state_mut().insert(ids.gate_box, gate, counted)?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn stamp_portal(
+    fn swap_gate_geometry(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         gate: Entity,
-        admitted: u32,
-        kind: u8,
+        open: bool,
     ) -> Result<()> {
-        let Some(clock_entity) = tick
+        let (Some(cycle_data), Some(kind), Some(body)) = (
+            self.modules
+                .as_ref()
+                .and_then(|wiring| wiring.gate_cycle(tick.state(), gate)),
+            tick.state().get(ids.kind, gate).copied(),
+            tick.state().get(ids.body, gate).map(|body| body.0),
+        ) else {
+            return Ok(());
+        };
+        let Some(entry) = self.kinds.get(kind) else {
+            return Ok(());
+        };
+        let overrides: Vec<(Name, bool)> = cycle_data
+            .geometry_for_open()
+            .iter()
+            .map(|name| (Name::from(name.as_str()), open))
+            .chain(
+                cycle_data
+                    .geometry_for_closed()
+                    .iter()
+                    .map(|name| (Name::from(name.as_str()), !open)),
+            )
+            .collect();
+        let records = crate::construction::shown_footprint(&entry.record, &overrides);
+        let Some(clock) = tick
+            .state()
+            .store(ids.obstacles)
+            .and_then(|store| store.entities().first().copied())
+        else {
+            return Ok(());
+        };
+        let Some(mut layer) = tick.state().get(ids.obstacles, clock).cloned() else {
+            return Ok(());
+        };
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
+        if layer.cells_of(geometry, extent, gate).is_none() {
+            return Ok(());
+        }
+        if let Err(message) = layer.stamp(
+            &self.passability.grid,
+            geometry,
+            extent,
+            gate,
+            body.position,
+            body.facing.radians(),
+            records,
+            false,
+        ) {
+            diag!("obstacles: {message}");
+        }
+        tick.state_mut().insert(ids.obstacles, clock, layer)?;
+        Ok(())
+    }
+
+    fn set_gate_link(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        gate: Entity,
+        wanted: bool,
+    ) -> Result<()> {
+        let Some(clock) = tick
             .state()
             .store(ids.portals)
             .and_then(|store| store.entities().first().copied())
         else {
             return Ok(());
         };
-        let Some(mut layer) = tick.state().get(ids.portals, clock_entity).cloned() else {
+        let held = tick
+            .state()
+            .get(ids.portals, clock)
+            .is_some_and(|layer| layer.holds(gate));
+        if held == wanted {
             return Ok(());
-        };
-        let geometry = self.passability.geometry;
-        let extent = self.passability.grid.extent();
-        if admitted == 0 {
-            layer.unstamp(geometry, extent, gate);
-        } else {
-            let Some(body) = tick.state().get(ids.body, gate).map(|body| body.0) else {
+        }
+        let links = if wanted {
+            let (Some(body), Some(kind)) = (
+                tick.state().get(ids.body, gate).map(|body| body.0),
+                tick.state().get(ids.kind, gate).copied(),
+            ) else {
                 return Ok(());
             };
-            let records = tick
-                .state()
-                .get(ids.kind, gate)
-                .copied()
-                .and_then(|kind| self.kinds.get(kind))
-                .map(|entry| crate::construction::footprint_of(&entry.record))
-                .unwrap_or_default();
-            if records.is_empty() {
+            let Some(entry) = self.kinds.get(kind) else {
                 return Ok(());
+            };
+            let geometry = &entry.record.geometry;
+            let reach = geometry
+                .major_radius
+                .filter(|reach| *reach > 0.0)
+                .or(geometry.minor_radius)
+                .unwrap_or(0.0);
+            super::portal_links::fake_gate_links(
+                gate,
+                body.position,
+                body.facing.radians(),
+                reach,
+                self.passability.geometry,
+                self.passability.grid.extent(),
+            )
+        } else {
+            Vec::new()
+        };
+        if let Some(layer) = tick.state_mut().get_mut(ids.portals, clock) {
+            if links.is_empty() {
+                layer.unregister(gate);
+            } else {
+                layer.register(gate, links);
             }
-            layer.stamp(
-                geometry,
-                extent,
-                crate::portals::PortalStamp {
-                    entity: gate,
-                    centre: body.position,
-                    angle: body.facing.radians(),
-                    records,
-                    admitted,
-                    kind,
-                },
-            );
         }
-        tick.state_mut().insert(ids.portals, clock_entity, layer)?;
+        diag!(
+            "gate: entity {} ai link {}",
+            gate.index(),
+            if wanted { "registered" } else { "removed" }
+        );
         Ok(())
-    }
-}
-
-fn asker_bits(player: PlayerId) -> u32 {
-    mint_sage_passability::asker_bit(mint_movement::Asker::new(player.get()))
-}
-
-const PORTAL_KIND_WALK: u8 = 2;
-
-const PORTAL_KIND_CLIMB: u8 = 3;
-
-fn dynamic_portal_kind(module: &mint_sage_modules::DynamicPortalBehaviour) -> u8 {
-    let is_climb = module
-        .waypoints()
-        .iter()
-        .any(|point| point.kind == mint_sage_modules::WayPointType::Climb);
-    if is_climb {
-        PORTAL_KIND_CLIMB
-    } else {
-        PORTAL_KIND_WALK
     }
 }
 
@@ -521,6 +726,42 @@ fn in_box(centre: Vec2, angle: f32, half: Vec2, point: Vec2) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_box_sees_whole_units_truncated_toward_zero() {
+        assert_eq!(
+            BoxSeen::of(Vec2::new(1.9, -1.9)),
+            BoxSeen::of(Vec2::new(1.1, -1.2))
+        );
+        assert_eq!(
+            BoxSeen::of(Vec2::new(1.9, -1.9)).point(),
+            Vec2::new(1.0, -1.0)
+        );
+    }
+
+    #[test]
+    fn the_box_counts_allies_only_and_a_death_inside_stays_counted() {
+        let mut counted = GateBox::default();
+        let (neutral, enemy, ally) = (
+            Entity::from_parts(1, 0),
+            Entity::from_parts(2, 0),
+            Entity::from_parts(3, 0),
+        );
+        counted.observe(neutral, true, Relation::Neutral);
+        counted.observe(enemy, true, Relation::Enemies);
+        assert!(!counted.ally_inside());
+        counted.observe(ally, true, Relation::Allies);
+        assert!(counted.ally_inside());
+        counted.observe(ally, true, Relation::Allies);
+        assert!(counted.ally_inside(), "a repeat entry counts once");
+        counted.observe(ally, false, Relation::Allies);
+        assert!(!counted.ally_inside(), "its own exit uncounts it");
+        counted.observe(ally, true, Relation::Allies);
+        assert!(
+            counted.ally_inside(),
+            "no exit is ever observed for the dead"
+        );
+    }
 
     #[test]
     fn a_trigger_box_is_read_in_the_gates_own_frame() {
@@ -539,45 +780,5 @@ mod tests {
             half,
             Vec2::new(100.0, 240.0)
         ));
-    }
-
-    #[test]
-    fn an_open_portals_cells_pass_an_admitted_asker_and_stop_everyone_else() {
-        use mint_movement::{Cell, CostGrid, GridExtent, MoverClass, Passability as _};
-        use mint_sage_passability::{DynamicView, GatedView, GROUND, OBSTACLE, PORTAL};
-
-        let extent = GridExtent::new(4, 4).unwrap();
-        let mut grid = CostGrid::new(extent);
-        let cell = Cell::new(2, 2);
-        grid.add_flags(cell, OBSTACLE).unwrap();
-        let mut masks = vec![0u32; 16];
-        let index = usize::try_from(extent.index(cell).unwrap()).unwrap();
-        masks[index] = asker_bits(PlayerId::new(1));
-        let view = GatedView {
-            ground: DynamicView {
-                grid: &grid,
-                counts: &[],
-                rubble: &[],
-                wall_rim: &[],
-                tags: &[],
-                connect: &[],
-                released: &[],
-                closed: &[],
-                obstacle_pinched: &[],
-                ramp_side: &[],
-                scaleable: &[],
-                barred: &[],
-            },
-            portals: &masks,
-            tags: &[],
-        };
-        let mover =
-            |player: u8| MoverClass::asking(GROUND, PORTAL, mint_movement::Asker::new(player));
-        assert!(view.is_passable(cell, mover(1)), "the owner passes");
-        assert!(!view.is_passable(cell, mover(2)), "an enemy does not");
-        assert!(
-            !view.is_passable(cell, GROUND),
-            "a query with no asker is stopped by the gate's own footprint"
-        );
     }
 }

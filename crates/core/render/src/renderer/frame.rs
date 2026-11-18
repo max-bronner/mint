@@ -152,36 +152,76 @@ impl FrameEncoder {
         offset: u64,
         data: &[u8],
     ) {
-        let Some(encoder) = self.encoder.as_mut() else {
+        if self.encoder.is_none() {
             queue.write_buffer(destination, offset, data);
             return;
-        };
+        }
         let Ok(len) = u64::try_from(data.len()) else {
             return;
         };
         if len == 0 {
             return;
         }
-        let mut at = self.staging_next;
-        let fits = at
-            .checked_add(len)
-            .is_some_and(|end| end <= self.staging_capacity);
-        if !fits || self.staging.is_none() {
-            let capacity = at.saturating_add(len).saturating_mul(2).max(64 * 1024);
-            self.staging = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mint ordered writes"),
-                size: capacity,
-                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.staging_capacity = capacity;
-            at = 0;
-        }
-        let Some(staging) = &self.staging else {
+        let at = self.claim_staging(device, len);
+        let (Some(staging), Some(encoder)) = (&self.staging, self.encoder.as_mut()) else {
             return;
         };
         queue.write_buffer(staging, at, data);
         encoder.copy_buffer_to_buffer(staging, at, destination, offset, len);
+        self.advance_staging(at, len);
+    }
+
+    pub(super) fn write_buffer_with(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        destination: &wgpu::Buffer,
+        offset: u64,
+        len: usize,
+        fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>),
+    ) {
+        let Some(size) = u64::try_from(len).ok().and_then(wgpu::BufferSize::new) else {
+            return;
+        };
+        if self.encoder.is_none() {
+            if let Some(mut view) = queue.write_buffer_with(destination, offset, size) {
+                fill(view.slice(..));
+            }
+            return;
+        }
+        let at = self.claim_staging(device, size.get());
+        let (Some(staging), Some(encoder)) = (&self.staging, self.encoder.as_mut()) else {
+            return;
+        };
+        let Some(mut view) = queue.write_buffer_with(staging, at, size) else {
+            return;
+        };
+        fill(view.slice(..));
+        drop(view);
+        encoder.copy_buffer_to_buffer(staging, at, destination, offset, size.get());
+        self.advance_staging(at, size.get());
+    }
+
+    fn claim_staging(&mut self, device: &wgpu::Device, len: u64) -> u64 {
+        let at = self.staging_next;
+        let fits = at
+            .checked_add(len)
+            .is_some_and(|end| end <= self.staging_capacity);
+        if fits && self.staging.is_some() {
+            return at;
+        }
+        let capacity = at.saturating_add(len).saturating_mul(2).max(64 * 1024);
+        self.staging = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mint ordered writes"),
+            size: capacity,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.staging_capacity = capacity;
+        0
+    }
+
+    fn advance_staging(&mut self, at: u64, len: u64) {
         self.staging_next = at
             .saturating_add(len)
             .div_ceil(wgpu::COPY_BUFFER_ALIGNMENT)

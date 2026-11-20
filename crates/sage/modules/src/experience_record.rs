@@ -42,6 +42,7 @@ pub struct LevelRecord {
     pub upgrades: Vec<String>,
     pub decal: Option<SelectionDecal>,
     pub level_up_fx: Option<String>,
+    pub level_up_ocl: Option<String>,
     pub emotion_type: Option<String>,
     pub level_up_tint: Option<LevelUpTint>,
     pub inform_update_module: bool,
@@ -116,6 +117,13 @@ fn read_decal(block: &Block, macros: &MacroTable) -> Option<SelectionDecal> {
 fn fx_list_name(value: &str) -> &str {
     match value.split_once(':') {
         Some((prefix, name)) if prefix.eq_ignore_ascii_case("FX") => name,
+        _ => value,
+    }
+}
+
+fn ocl_list_name(value: &str) -> &str {
+    match value.split_once(':') {
+        Some((prefix, name)) if prefix.eq_ignore_ascii_case("OCL") => name,
         _ => value,
     }
 }
@@ -224,6 +232,12 @@ impl ExperienceTables {
                 .field("LevelUpFx")
                 .and_then(Field::value)
                 .map(fx_list_name)
+                .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("NONE"))
+                .map(str::to_owned),
+            level_up_ocl: block
+                .field("LevelUpOCL")
+                .and_then(Field::value)
+                .map(ocl_list_name)
                 .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("NONE"))
                 .map(str::to_owned),
             level_up_tint: read_level_up_tint(block, macros),

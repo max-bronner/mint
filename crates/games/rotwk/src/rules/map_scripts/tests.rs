@@ -24,6 +24,7 @@ fn parse_in_mode(registry: &[ActionRow], name: &str, run_mode: u8) -> ParsedActi
     };
     let action = ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params: Vec::new(),
     };
@@ -117,10 +118,34 @@ fn parse_test_new_instance(params: &[Parameter], _: &ParseCtx<'_>) -> Option<Arc
     }))
 }
 
-pub(super) const TEST_CONDITIONS: &[ConditionRow] = &[ConditionRow {
-    name: "TEST_TEAM_HAS_UNITS",
-    parse: parse_test_team_has_units,
-}];
+struct TestAlwaysTrue;
+impl ConditionVerb for TestAlwaysTrue {
+    fn eval(
+        &self,
+        _: &RotwkRules,
+        _: &Tick<'_>,
+        _: Ids,
+        _: &MapScriptState,
+        _: Option<PlayerId>,
+    ) -> bool {
+        true
+    }
+}
+
+fn parse_test_always_true(_: &[Parameter], _: &ParseCtx<'_>) -> Option<Arc<dyn ConditionVerb>> {
+    Some(Arc::new(TestAlwaysTrue))
+}
+
+pub(super) const TEST_CONDITIONS: &[ConditionRow] = &[
+    ConditionRow {
+        name: "TEST_TEAM_HAS_UNITS",
+        parse: parse_test_team_has_units,
+    },
+    ConditionRow {
+        name: "TEST_ALWAYS_TRUE",
+        parse: parse_test_always_true,
+    },
+];
 
 pub(super) const TEST_ACTIONS: &[ActionRow] = &[ActionRow::new(
     "TEST_NEW_INSTANCE_WITH",
@@ -149,6 +174,7 @@ fn number(value: i32) -> Parameter {
 fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -177,6 +203,7 @@ fn script_of(
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: condition_name.to_owned(),
                 params,
@@ -418,6 +445,7 @@ fn parse_with(
     };
     let action = ScriptAction {
         action_type,
+        enabled: true,
         name: name.to_owned(),
         params,
     };
@@ -586,6 +614,38 @@ fn a_disabled_condition_counts_as_true() {
     let state = run_state(vec![disabled, enabled], &[], 30);
     assert!(state.counter_value("", "disabled") > 0);
     assert_eq!(state.counter_value("", "enabled"), 0);
+}
+
+#[test]
+fn not_negates_a_condition_except_on_the_types_the_engine_evaluates_itself() {
+    let counted = |condition: &str, inverted: bool| {
+        let mut script = script_of(
+            "S",
+            true,
+            false,
+            Some((condition, Vec::new())),
+            vec![act("INCREMENT_COUNTER", vec![number(1), text("fired")])],
+        );
+        script.or_conditions[0].conditions[0].inverted = inverted;
+        run_state(vec![script], &[], 30).counter_value("", "fired") > 0
+    };
+    assert!(counted("TEST_ALWAYS_TRUE", false));
+    assert!(!counted("TEST_ALWAYS_TRUE", true));
+    assert!(counted("CONDITION_TRUE", true));
+}
+
+#[test]
+fn a_disabled_action_is_skipped_while_its_script_still_fires() {
+    let mut off = act("INCREMENT_COUNTER", vec![number(1), text("off")]);
+    off.enabled = false;
+    let on = act("INCREMENT_COUNTER", vec![number(1), text("on")]);
+    let state = run_state(
+        vec![script_of("S", true, false, None, vec![off, on])],
+        &[],
+        30,
+    );
+    assert_eq!(state.counter_value("", "off"), 0);
+    assert!(state.counter_value("", "on") > 0);
 }
 
 #[test]

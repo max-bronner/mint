@@ -41,9 +41,18 @@ impl BodyRecord {
             size,
             entry.and_then(|entry| entry.record.pathfind_diameter),
         );
+        let filed = if shape.kind_of.contains(KindOf::PROJECTILE)
+            || shape.kind_of.contains(KindOf::INERT)
+        {
+            world
+                .get(ids.own_cell_entry, entity)
+                .map_or(body.0.position, |entry| entry.0)
+        } else {
+            body.0.position
+        };
         Self {
             entity,
-            position: body.0.position,
+            position: filed,
             radius: shape.radius,
             left_out: world.contains(ids.horde, entity)
                 || shape.kind_of.contains(KindOf::IMMOBILE)
@@ -51,7 +60,7 @@ impl BodyRecord {
                 || world.contains(ids.doomed, entity)
                 || world.contains(ids.concealed, entity),
             footprint,
-            body_rect: square(rules, body.0.position, footprint),
+            body_rect: square(rules, filed, footprint),
             member: world
                 .get(ids.member, entity)
                 .map(|member| (member.horde, member.slot)),

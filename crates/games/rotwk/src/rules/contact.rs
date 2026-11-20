@@ -91,7 +91,67 @@ fn distance_squared(a: Vec2, b: Vec2) -> f32 {
     dx * dx + dy * dy
 }
 
+const RAM_COLLIDE_PROBE: f32 = 2.0;
+
 impl RotwkRules {
+    pub(super) fn facing_point(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        weapon: WeaponId,
+        from: Vec2,
+        victim: &Foe,
+    ) -> Vec2 {
+        let world = tick.state();
+        let walled = self.has_kind_bit(world, ids, victim.entity, "WALK_ON_TOP_OF_WALL")
+            || self.has_kind_bit(world, ids, victim.entity, "BLOCKING_GATE");
+        if !walled || !self.combat.weapons.get(weapon).is_some_and(|t| t.melee) {
+            return victim.position;
+        }
+        let (Some(record), Some(body)) = (
+            self.record_of(tick, ids, victim.entity),
+            world.get(ids.body, victim.entity),
+        ) else {
+            return victim.position;
+        };
+        let turn = body.0.facing.to_vector();
+        let away = from.minus(body.0.position);
+        let local = Vec2::new(
+            away.x * turn.x + away.y * turn.y,
+            away.y * turn.x - away.x * turn.y,
+        );
+        let touches = |[x, y, _]: [f32; 3]| {
+            record.geometry.shown(&[]).any(|piece| {
+                let (rx, ry) = ((x - piece.offset.0).abs(), (y - piece.offset.1).abs());
+                match piece.shape {
+                    mint_sage_modules::PieceShape::Disc { radius } => {
+                        (rx * rx + ry * ry).sqrt() <= radius + RAM_COLLIDE_PROBE
+                    }
+                    mint_sage_modules::PieceShape::Box { major, minor } => {
+                        let (ex, ey) = ((rx - major).max(0.0), (ry - minor).max(0.0));
+                        ex * ex + ey * ey <= RAM_COLLIDE_PROBE * RAM_COLLIDE_PROBE
+                    }
+                }
+            })
+        };
+        record
+            .contact_points
+            .iter()
+            .filter(|point| point.tags.contains(ContactTags::RAM) && touches(point.position))
+            .fold(None, |best: Option<(f32, &ContactPoint)>, point| {
+                let [x, y, _] = point.position;
+                let (dx, dy) = (x - local.x, y - local.y);
+                let d = dx * dx + dy * dy;
+                match best {
+                    Some((best_d, _)) if best_d <= d => best,
+                    _ => Some((d, point)),
+                }
+            })
+            .map_or(victim.position, |(_, point)| {
+                world_point(point, body.0.position, body.0.facing)
+            })
+    }
+
     pub(super) fn contact_points_of(
         &self,
         tick: &Tick<'_>,
@@ -171,11 +231,10 @@ impl RotwkRules {
                 .filter(|(index, _)| !taken.contains(index))
                 .filter_map(|(index, point)| Some((index, spot_of(tick, point)?)))
                 .filter(|(_, spot)| {
-                    in_range(
-                        *spot,
-                        me.radius,
-                        target.position,
-                        target.radius,
+                    crate::combat::in_range_volumes(
+                        (*spot, me.radius, None),
+                        target.reach_volume(),
+                        0.0,
                         min_range,
                         max_range,
                     )
@@ -214,6 +273,7 @@ impl RotwkRules {
         Ok(Foe {
             position: spot,
             radius: 0.0,
+            volume: None,
             ..target
         })
     }

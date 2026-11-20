@@ -64,7 +64,7 @@ pub fn rebuild_hole_behavior_from_fields(
             .map(|ms| {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let whole = ms as u32;
-                LogicFrames::from_milliseconds(whole)
+                crate::special_ability_update::retail_duration_ticks(whole)
             }),
         regen_per_second: fields
             .field_percent("HoleHealthRegen%PerSecond")
@@ -100,7 +100,9 @@ mod tests {
         assert_eq!(module.worker_object_name(), Some("SomeWorker"));
         assert_eq!(
             module.worker_respawn_delay(),
-            Some(LogicFrames::from_milliseconds(120_000))
+            Some(crate::special_ability_update::retail_duration_ticks(
+                120_000
+            ))
         );
         assert!((module.regen_per_second() - 0.005).abs() < 1e-6);
     }

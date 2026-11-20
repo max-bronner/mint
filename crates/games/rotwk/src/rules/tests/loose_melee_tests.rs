@@ -1,4 +1,5 @@
 use super::*;
+use crate::rules::melee_engage::MeleePlacement;
 
 const DATA: &str = "\
 Locomotor Feet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 200\nEnd\n\
@@ -16,19 +17,33 @@ Object Post\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100000\n  End\n  \
   LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+ChildObject Cavalry Swordsman\n  \
+  LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 300\n  End\nEnd\n\
 ChildObject Runner Post\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = No\n  End\n  \
   LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 30\n  End\nEnd\n\
+Object Boulder\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100000\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 40\n  GeometryHeight = 16\nEnd\n\
 Object Straw\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 1\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 fn start(spawns: &[(&str, f32, f32, PlayerId)]) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    start_on(flat_map(96, 96), MeleePlacement::default(), spawns)
+}
+
+fn start_on(
+    map: HeightMapData,
+    placement: MeleePlacement,
+    spawns: &[(&str, f32, f32, PlayerId)],
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
     assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
     let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
-    let names = ["Swordsman", "Post", "Runner", "Straw"].map(str::to_owned);
+    let names = ["Swordsman", "Cavalry", "Post", "Runner", "Straw", "Boulder"].map(str::to_owned);
     let (kinds, missing) = KindTable::closure(&data, &names);
     assert!(missing.is_empty(), "missing from the closure: {missing:?}");
     let kinds = Arc::new(kinds);
@@ -47,12 +62,13 @@ fn start(spawns: &[(&str, f32, f32, PlayerId)]) -> (Simulation<RotwkRules>, Ids,
                 .unwrap()
         })
         .collect();
-    let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
+    let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
     let rules = RotwkRules::new(passability, spawns)
         .with_players(2)
         .with_combat(data.combat.clone())
         .with_guard_ranges(data.guard_ranges)
         .with_construction(Arc::clone(&kinds), production)
+        .with_melee_placement(placement)
         .with_teams(vec![None, None]);
     let simulation = Simulation::new(5, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
@@ -271,4 +287,155 @@ fn a_fleeing_victim_is_struck_on_the_move() {
         }
     }
     panic!("never struck");
+}
+
+#[test]
+fn an_attacker_nearer_a_big_victims_edge_than_the_approach_distance_does_not_back_off() {
+    let (mut simulation, ids, entities) = start(&[
+        ("Boulder", 400.0, 300.0, OTHER),
+        ("Swordsman", 330.0, 300.0, PLAYER),
+    ]);
+    attack(&mut simulation, PLAYER, &entities[1..], entities[0]);
+    let mut farthest = 0.0f32;
+    for _ in 0..30 {
+        simulation.tick().unwrap();
+        let from =
+            position(&simulation, ids, entities[1]).minus(position(&simulation, ids, entities[0]));
+        farthest = farthest.max(from.length());
+    }
+    assert!(farthest < 71.0, "backed off to {farthest} from the centre");
+}
+
+#[test]
+fn an_approach_that_replans_inside_the_hand_over_distance_ends_the_attack() {
+    let (mut simulation, ids, entities) = start(&[
+        ("Swordsman", 300.0, 300.0, PLAYER),
+        ("Runner", 500.0, 240.0, OTHER),
+    ]);
+    let (swordsman, runner) = (entities[0], entities[1]);
+    walk(&mut simulation, runner, 300.0, 240.0);
+    attack(&mut simulation, PLAYER, &[swordsman], runner);
+    let ended = (0..70).find(|_| {
+        simulation.tick().unwrap();
+        !simulation.state().contains(ids.attack_order, swordsman)
+    });
+    assert!(
+        ended.is_some(),
+        "the attack order outlived the failed approach"
+    );
+}
+
+#[test]
+fn a_victim_that_flees_mid_approach_ends_the_attack_at_the_replan() {
+    let (mut simulation, ids, entities) = start(&[
+        ("Swordsman", 100.0, 300.0, PLAYER),
+        ("Runner", 500.0, 300.0, OTHER),
+    ]);
+    let (swordsman, runner) = (entities[0], entities[1]);
+    attack(&mut simulation, PLAYER, &[swordsman], runner);
+    for _ in 0..5 {
+        simulation.tick().unwrap();
+    }
+    walk(&mut simulation, runner, 900.0, 300.0);
+    let ended = (0..70).find(|_| {
+        simulation.tick().unwrap();
+        !simulation.state().contains(ids.attack_order, swordsman)
+    });
+    assert!(ended.is_some(), "the attack order outlived the flight");
+}
+
+#[test]
+fn a_chaser_paces_a_fleeing_victim_it_has_caught_up_with() {
+    let (mut simulation, ids, entities) = start(&[
+        ("Swordsman", 300.0, 300.0, PLAYER),
+        ("Runner", 340.0, 300.0, OTHER),
+    ]);
+    let (swordsman, runner) = (entities[0], entities[1]);
+    walk(&mut simulation, runner, 900.0, 300.0);
+    for _ in 0..30 {
+        simulation.tick().unwrap();
+    }
+    attack(&mut simulation, PLAYER, &[swordsman], runner);
+    for _ in 0..300 {
+        simulation.tick().unwrap();
+        if simulation.state().contains(ids.running_down, swordsman) {
+            let asked = simulation.state().get(ids.desired_speed, swordsman);
+            assert!(
+                asked.is_some_and(|asked| asked.0 < 60.0),
+                "asks for {asked:?} while closing within its top speed of 60"
+            );
+            return;
+        }
+    }
+    panic!("the status was never held");
+}
+
+#[test]
+fn a_chaser_holding_the_status_does_not_strike_beyond_the_chase_limit() {
+    let (mut simulation, ids, entities) = start(&[
+        ("Cavalry", 300.0, 300.0, PLAYER),
+        ("Runner", 450.0, 300.0, OTHER),
+    ]);
+    let (cavalry, runner) = (entities[0], entities[1]);
+    walk(&mut simulation, runner, 900.0, 300.0);
+    for _ in 0..30 {
+        simulation.tick().unwrap();
+    }
+    attack(&mut simulation, PLAYER, &[cavalry], runner);
+    let mut far_with_status = 0;
+    for _ in 0..200 {
+        simulation.tick().unwrap();
+        let edge = position(&simulation, ids, runner)
+            .minus(position(&simulation, ids, cavalry))
+            .length()
+            - 10.0;
+        if edge >= 55.0 && simulation.state().contains(ids.running_down, cavalry) {
+            far_with_status += 1;
+            assert_eq!(
+                health(&simulation, ids, runner),
+                100_000.0,
+                "struck at {edge}"
+            );
+        }
+    }
+    assert!(far_with_status > 0, "the status was never held out there");
+}
+
+fn walk(simulation: &mut Simulation<RotwkRules>, entity: Entity, x: f32, y: f32) {
+    simulation
+        .submit(
+            OTHER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![entity],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(OTHER, RotwkCommand::MoveTo { x, y, queue: false })
+        .unwrap();
+}
+
+#[test]
+#[allow(clippy::reversed_empty_ranges)]
+fn an_attacker_with_no_engagement_spot_walks_to_the_first_reachable_step_back() {
+    let (mut simulation, ids, entities) = start_on(
+        wall_map(96, 96, 50, 1..0),
+        MeleePlacement {
+            approach_dist: 200.0,
+            ..MeleePlacement::default()
+        },
+        &[
+            ("Post", 520.0, 300.0, OTHER),
+            ("Swordsman", 420.0, 300.0, PLAYER),
+        ],
+    );
+    let swordsman = entities[1];
+    attack(&mut simulation, PLAYER, &[swordsman], entities[0]);
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+    }
+    let moved = position(&simulation, ids, swordsman).x - 420.0;
+    assert!(moved > 15.0, "moved {moved}");
+    assert!(simulation.state().contains(ids.attack_order, swordsman));
 }

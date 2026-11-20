@@ -1241,6 +1241,19 @@ fn a_rigid_mesh_bound_by_hlod_carries_its_pivot_index_forward() {
 }
 
 #[test]
+fn a_rigid_bone_index_past_the_pivot_count_is_bone_zero() {
+    let mesh_bytes = build_model(&unit_triangle());
+    let bytes = [mesh_bytes, hlod_with_one_sub_object("TRI", 7)].concat();
+    let model = Model::parse(&bytes).expect("mesh + HLOD parses");
+    let hierarchy = two_pivot_hierarchy();
+
+    let converted = convert_model(&model, Some(&hierarchy)).expect("converts");
+    let part = converted.parts.first().expect("one part");
+    assert_eq!(part.pivot, Some(0));
+    assert!(close(part.transform.transform_point(Vec3::ZERO).z, 0.0));
+}
+
+#[test]
 fn a_mesh_with_no_hlod_binding_has_no_pivot_and_sits_at_the_origin() {
     let converted = convert_one(&unit_triangle());
     let part = converted.parts.first().expect("one part");

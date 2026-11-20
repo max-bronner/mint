@@ -29,6 +29,17 @@ pub struct Condition {
     pub name: String,
     pub params: Vec<Parameter>,
     pub enabled: bool,
+    pub inverted: bool,
+}
+
+impl Condition {
+    pub fn negates(&self) -> bool {
+        self.inverted
+            && !matches!(
+                self.name.as_str(),
+                "CONDITION_FALSE" | "COUNTER" | "FLAG" | "CONDITION_TRUE" | "TIMER_EXPIRED"
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -41,6 +52,7 @@ pub struct ScriptAction {
     pub action_type: i32,
     pub name: String,
     pub params: Vec<Parameter>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,18 +193,18 @@ fn read_condition(body: &[u8], chunk: &RawChunk, names: &NameTable) -> Result<Co
             remaining,
         });
     }
-    let enabled = if trailer == 0 {
-        true
+    let (enabled, inverted) = if trailer == 0 {
+        (true, false)
     } else {
         let enabled = r.u32()? != 0;
-        let _unread_flag = r.u32()?;
-        enabled
+        (enabled, r.u32()? != 0)
     };
     Ok(Condition {
         condition_type,
         name,
         params,
         enabled,
+        inverted,
     })
 }
 
@@ -240,10 +252,12 @@ fn read_script_action(
             remaining,
         });
     }
+    let enabled = trailer == 0 || r.u32()? != 0;
     Ok(ScriptAction {
         action_type,
         name,
         params,
+        enabled,
     })
 }
 

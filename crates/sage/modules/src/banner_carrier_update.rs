@@ -60,6 +60,7 @@ impl Component for BannerCarrierUpdate {
 }
 
 impl ModuleKind for BannerCarrierUpdate {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::HELD;
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::Update);
 
     fn on_attach(&mut self, _now: Frame) {
@@ -172,8 +173,8 @@ fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<LogicFrames
         return Ok(LogicFrames::ZERO);
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(LogicFrames::from_milliseconds(
-        ms.min(MAX_MILLISECONDS) as u32
+    Ok(crate::special_ability_update::retail_duration_ticks(
+        ms.min(MAX_MILLISECONDS) as u32,
     ))
 }
 
@@ -273,10 +274,10 @@ mod tests {
         assert_eq!(
             read.clocks(),
             BannerClocks {
-                idle_spawn: LogicFrames::from_milliseconds(10_000),
-                melee_free_unit: LogicFrames::from_milliseconds(20_000),
-                died_respawn: LogicFrames::from_milliseconds(10_000),
-                melee_free_banner: LogicFrames::from_milliseconds(20_000),
+                idle_spawn: LogicFrames::from_engine_milliseconds(10_000),
+                melee_free_unit: LogicFrames::from_engine_milliseconds(20_000),
+                died_respawn: LogicFrames::from_engine_milliseconds(10_000),
+                melee_free_banner: LogicFrames::from_engine_milliseconds(20_000),
             }
         );
     }

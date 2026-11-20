@@ -347,7 +347,7 @@ mod tests {
             for (_, effect) in log.drain() {
                 match effect {
                     Effect::ToggleModelCondition(_) => toggles += 1,
-                    Effect::HoldOrders(false) => released = released.or(Some(frame)),
+                    Effect::IgnoreOrders(false) => released = released.or(Some(frame)),
                     _ => {}
                 }
             }

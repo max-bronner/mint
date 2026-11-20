@@ -7,6 +7,10 @@ pub const PLAYER_TEMPLATE_KEYWORD: &str = "PlayerTemplate";
 
 pub const MAX_STARTING_UNITS: u8 = 10;
 
+pub const DEFAULT_MAX_LEVEL_MP: &str = "60";
+
+pub const DEFAULT_MAX_LEVEL_SP: &str = "100";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartingUnit {
     pub index: u8,
@@ -27,12 +31,17 @@ pub struct PlayerTemplateDef {
     pub ring_heroes: Vec<String>,
     pub heroes: Vec<String>,
     pub intrinsic_sciences_mp: Vec<String>,
+    pub intrinsic_sciences: Vec<String>,
     pub spell_book_mp: Option<String>,
+    pub spell_book: Option<String>,
     pub purchase_science_command_set_mp: Option<String>,
+    pub purchase_science_command_set: Option<String>,
     pub max_level_mp: Option<String>,
+    pub max_level_sp: Option<String>,
     pub intrinsic_science_purchase_points: Option<String>,
     pub start_money: Option<i64>,
     pub initial_upgrades: Vec<String>,
+    pub starting_units_wotr: Vec<String>,
     pub production_cost_change: Option<f32>,
     pub load_screen_music: Option<String>,
     pub objective_added_sound: Option<String>,
@@ -85,7 +94,15 @@ pub fn read_player_template(block: &Block) -> PlayerTemplateDef {
     let mut units: BTreeMap<u8, String> = BTreeMap::new();
     let mut offsets: BTreeMap<u8, [f32; 3]> = BTreeMap::new();
     let mut refused = 0usize;
+    let mut wotr = Vec::new();
     for field in block.fields() {
+        if field
+            .keyword
+            .eq_ignore_ascii_case("StartingUnitTacticalWOTR")
+        {
+            wotr.extend(field.args.iter().filter(|a| !is_none(a)).cloned());
+            continue;
+        }
         if let Some(index) = numbered(&field.keyword, "StartingUnitOffset") {
             if let (Some(index), Some(xyz)) = (slot(index), offset(field)) {
                 offsets.insert(index, xyz);
@@ -121,10 +138,15 @@ pub fn read_player_template(block: &Block) -> PlayerTemplateDef {
         ring_heroes: names("BuildableRingHeroesMP"),
         heroes: names("BuildableHeroesMP"),
         intrinsic_sciences_mp: names("IntrinsicSciencesMP"),
+        intrinsic_sciences: names("IntrinsicSciences"),
         spell_book_mp: text("SpellBookMp").filter(|name| !is_none(name)),
+        spell_book: text("SpellBook").filter(|name| !is_none(name)),
         purchase_science_command_set_mp: text("PurchaseScienceCommandSetMP")
             .filter(|name| !is_none(name)),
+        purchase_science_command_set: text("PurchaseScienceCommandSet")
+            .filter(|name| !is_none(name)),
         max_level_mp: block.field("MaxLevelMP").map(|field| field.args.join(" ")),
+        max_level_sp: block.field("MaxLevelSP").map(|field| field.args.join(" ")),
         intrinsic_science_purchase_points: block
             .field("IntrinsicSciencePurchasePoints")
             .map(|field| field.args.join(" ")),
@@ -133,6 +155,7 @@ pub fn read_player_template(block: &Block) -> PlayerTemplateDef {
             .and_then(Field::value)
             .and_then(parse_int),
         initial_upgrades: names("InitialUpgrades"),
+        starting_units_wotr: wotr,
         production_cost_change: block
             .field("ProductionCostChange")
             .and_then(Field::value)
@@ -147,6 +170,44 @@ pub fn read_player_template(block: &Block) -> PlayerTemplateDef {
 pub struct PlayerTemplateIndex {
     defs: BTreeMap<String, PlayerTemplateDef>,
     order: Vec<String>,
+}
+
+impl PlayerTemplateDef {
+    #[must_use]
+    pub fn intrinsic_sciences_for(&self, multiplayer: bool) -> &[String] {
+        if multiplayer {
+            &self.intrinsic_sciences_mp
+        } else {
+            &self.intrinsic_sciences
+        }
+    }
+
+    #[must_use]
+    pub fn spell_book_for(&self, multiplayer: bool) -> Option<&str> {
+        if multiplayer {
+            self.spell_book_mp.as_deref()
+        } else {
+            self.spell_book.as_deref()
+        }
+    }
+
+    #[must_use]
+    pub fn max_level_for(&self, multiplayer: bool) -> &str {
+        if multiplayer {
+            self.max_level_mp.as_deref().unwrap_or(DEFAULT_MAX_LEVEL_MP)
+        } else {
+            self.max_level_sp.as_deref().unwrap_or(DEFAULT_MAX_LEVEL_SP)
+        }
+    }
+
+    #[must_use]
+    pub fn purchase_science_command_set_for(&self, multiplayer: bool) -> Option<&str> {
+        if multiplayer {
+            self.purchase_science_command_set_mp.as_deref()
+        } else {
+            self.purchase_science_command_set.as_deref()
+        }
+    }
 }
 
 impl PlayerTemplateIndex {
@@ -258,6 +319,25 @@ End
     }
 
     #[test]
+    fn the_rank_cap_follows_the_game_mode_and_defaults_when_omitted() {
+        let index = index(
+            "PlayerTemplate Both
+  MaxLevelMP = 5
+  MaxLevelSP = 7
+End
+\n             PlayerTemplate Neither
+End
+",
+        );
+        let both = index.get("Both").unwrap();
+        assert_eq!(both.max_level_for(true), "5");
+        assert_eq!(both.max_level_for(false), "7");
+        let neither = index.get("Neither").unwrap();
+        assert_eq!(neither.max_level_for(true), "60");
+        assert_eq!(neither.max_level_for(false), "100");
+    }
+
+    #[test]
     fn initial_upgrades_are_read_as_written() {
         let index = index(
             "PlayerTemplate F\n  InitialUpgrades = Upgrade_FactionA Upgrade_DualEconomy\nEnd\n\
@@ -284,16 +364,21 @@ End
             "PlayerTemplate F\n  IntrinsicSciences = SCIENCE_GOOD\n  \
              IntrinsicSciencesMP = SCIENCE_MEN\n  SpellBook = GoodSpellBook\n  \
              SpellBookMp = MenSpellBook\n  PurchaseScienceCommandSetMP = MenSpellStoreCommandSet\n  \
-             MaxLevelMP = #DIVIDE( A B )\nEnd\nPlayerTemplate G\n  SpellBookMp = None\nEnd\n",
+             MaxLevelMP = #DIVIDE( A B )\n  MaxLevelSP = 5\nEnd\nPlayerTemplate G\n  SpellBookMp = None\nEnd\n",
         );
         let f = index.get("F").unwrap();
-        assert_eq!(f.intrinsic_sciences_mp, ["SCIENCE_MEN"]);
+        assert_eq!(f.intrinsic_sciences_for(true), ["SCIENCE_MEN"]);
+        assert_eq!(f.intrinsic_sciences_for(false), ["SCIENCE_GOOD"]);
+        assert_eq!(f.spell_book_for(false), Some("GoodSpellBook"));
+        assert_eq!(f.spell_book_for(true), Some("MenSpellBook"));
         assert_eq!(f.spell_book_mp.as_deref(), Some("MenSpellBook"));
         assert_eq!(
             f.purchase_science_command_set_mp.as_deref(),
             Some("MenSpellStoreCommandSet")
         );
         assert_eq!(f.max_level_mp.as_deref(), Some("#DIVIDE( A B )"));
+        assert_eq!(f.max_level_for(false), "5");
+        assert_eq!(f.max_level_for(true), "#DIVIDE( A B )");
         assert_eq!(index.get("G").unwrap().spell_book_mp, None, "None clears");
     }
 

@@ -1,171 +1,150 @@
-use mint_movement::{CellGeometry, GridExtent, Vec2};
-use mint_sage_passability::{covered_cells, FootprintRecord, Obstacle};
+use mint_movement::PortalLink;
 use mint_sim::{Component, ComponentId, Entity, StateHasher, World};
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PortalStamp {
-    pub(crate) entity: Entity,
-    pub(crate) centre: Vec2,
-    pub(crate) angle: f32,
-    pub(crate) records: Vec<FootprintRecord>,
-    pub(crate) admitted: u32,
-    pub(crate) kind: u8,
-}
-
-impl PortalStamp {
-    fn as_obstacle(&self) -> Obstacle {
-        Obstacle {
-            id: 0,
-            centre: self.centre,
-            angle: self.angle,
-            records: self.records.clone(),
-        }
-    }
-}
-
-fn pack_tag(entity: Entity, kind: u8) -> u32 {
-    let id = entity.index().wrapping_add(1) & 0x00FF_FFFF;
-    (u32::from(kind) << 24) | id
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct PortalLayer {
-    masks: Vec<u32>,
-    tags: Vec<u32>,
-    stamps: Vec<PortalStamp>,
+    registered: Vec<LinkSet>,
+    links: Vec<PortalLink>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LinkSet {
+    pub(crate) entity: Entity,
+    pub(crate) links: Vec<PortalLink>,
 }
 
 impl PortalLayer {
-    pub(crate) fn empty(cell_count: usize) -> Self {
-        Self {
-            masks: vec![0; cell_count],
-            tags: vec![0; cell_count],
-            stamps: Vec::new(),
-        }
+    pub(crate) fn links(&self) -> &[PortalLink] {
+        &self.links
     }
 
-    pub(crate) fn masks(&self) -> &[u32] {
-        &self.masks
+    pub(crate) fn slots(&self) -> Vec<(u8, Entity)> {
+        let mut slots: Vec<(u8, Entity)> = self
+            .registered
+            .iter()
+            .flat_map(|set| set.links.iter().map(|link| (link.slot, set.entity)))
+            .collect();
+        slots.sort_unstable_by_key(|(slot, _)| *slot);
+        slots
     }
 
-    pub(crate) fn tags(&self) -> &[u32] {
-        &self.tags
-    }
-
-    pub(crate) fn entities(&self) -> Vec<Entity> {
-        self.stamps.iter().map(|stamp| stamp.entity).collect()
-    }
-
-    pub(crate) fn stamp(&mut self, geometry: CellGeometry, extent: GridExtent, stamp: PortalStamp) {
-        self.remove_stamp(stamp.entity);
-        let at = self
-            .stamps
-            .binary_search_by_key(&stamp.entity.index(), |held| held.entity.index())
-            .unwrap_or_else(|at| at);
-        self.stamps.insert(at, stamp);
-        self.rebuild(geometry, extent);
-    }
-
-    pub(crate) fn unstamp(&mut self, geometry: CellGeometry, extent: GridExtent, entity: Entity) {
-        if self.remove_stamp(entity) {
-            self.rebuild(geometry, extent);
-        }
-    }
-
-    fn remove_stamp(&mut self, entity: Entity) -> bool {
-        let before = self.stamps.len();
-        self.stamps
-            .retain(|stamp| stamp.entity.index() != entity.index());
-        self.stamps.len() != before
-    }
-
-    fn rebuild(&mut self, geometry: CellGeometry, extent: GridExtent) {
-        self.masks.iter_mut().for_each(|mask| *mask = 0);
-        self.tags.iter_mut().for_each(|tag| *tag = 0);
-        for stamp in &self.stamps {
-            let tag = pack_tag(stamp.entity, stamp.kind);
-            for cell in covered_cells(geometry, extent, &stamp.as_obstacle()) {
-                let Some(index) = extent.index(cell).and_then(|i| usize::try_from(i).ok()) else {
-                    continue;
-                };
-                if let Some(mask) = self.masks.get_mut(index) {
-                    *mask |= stamp.admitted;
+    pub(crate) fn register(&mut self, entity: Entity, mut links: Vec<PortalLink>) {
+        self.unregister(entity);
+        let mut taken = [false; mint_movement::PortalPass::SLOTS as usize];
+        for set in &self.registered {
+            for link in &set.links {
+                if let Some(held) = taken.get_mut(usize::from(link.slot)) {
+                    *held = true;
                 }
-                if let Some(slot) = self.tags.get_mut(index) {
-                    *slot = tag;
+            }
+        }
+        let mut next = 0usize;
+        links.retain_mut(|link| {
+            while taken.get(next).copied().unwrap_or(false) {
+                next = next.saturating_add(1);
+            }
+            let Ok(slot) = u8::try_from(next) else {
+                return false;
+            };
+            if slot >= mint_movement::PortalPass::SLOTS {
+                return false;
+            }
+            link.slot = slot;
+            if let Some(held) = taken.get_mut(next) {
+                *held = true;
+            }
+            true
+        });
+        let at = self
+            .registered
+            .binary_search_by_key(&entity.index(), |held| held.entity.index())
+            .unwrap_or_else(|at| at);
+        self.registered.insert(at, LinkSet { entity, links });
+        self.relink();
+    }
+
+    pub(crate) fn unregister(&mut self, entity: Entity) -> bool {
+        let before = self.registered.len();
+        self.registered
+            .retain(|set| set.entity.index() != entity.index());
+        let changed = self.registered.len() != before;
+        if changed {
+            self.relink();
+        }
+        changed
+    }
+
+    pub(crate) fn holds(&self, entity: Entity) -> bool {
+        self.registered
+            .iter()
+            .any(|set| set.entity.index() == entity.index())
+    }
+
+    fn relink(&mut self) {
+        self.links = self
+            .registered
+            .iter()
+            .flat_map(|set| set.links.iter().cloned())
+            .collect();
+        self.links.sort_by_key(|link| (link.entry, link.slot));
+    }
+
+    fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.registered.iter().map(|set| set.entity)
+    }
+}
+
+impl Component for PortalLayer {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_usize(self.registered.len());
+        for set in &self.registered {
+            set.entity.hash_into(hasher);
+            hasher.write_usize(set.links.len());
+            for link in &set.links {
+                hasher.write_u8(link.slot);
+                hasher.write_usize(link.nodes.len());
+                for node in &link.nodes {
+                    hasher.write_f32(node.position.x);
+                    hasher.write_f32(node.position.y);
                 }
             }
         }
     }
 }
 
-impl Component for PortalLayer {
-    fn hash_into(&self, hasher: &mut StateHasher) {
-        hasher.write_usize(self.stamps.len());
-        for stamp in &self.stamps {
-            stamp.entity.hash_into(hasher);
-            hasher.write_f32(stamp.centre.x);
-            hasher.write_f32(stamp.centre.y);
-            hasher.write_f32(stamp.angle);
-            hasher.write_u32(stamp.admitted);
-            hasher.write_u8(stamp.kind);
-            hasher.write_usize(stamp.records.len());
-        }
-    }
-}
-
-pub(crate) fn masks_of(world: &World, id: ComponentId<PortalLayer>) -> &[u32] {
+pub(crate) fn layer_in(world: &World, id: ComponentId<PortalLayer>) -> Option<&PortalLayer> {
     world
         .store(id)
         .and_then(|store| store.entities().first().copied())
         .and_then(|entity| world.get(id, entity))
-        .map_or(&[], PortalLayer::masks)
 }
 
-pub(crate) fn tags_of(world: &World, id: ComponentId<PortalLayer>) -> &[u32] {
-    world
-        .store(id)
-        .and_then(|store| store.entities().first().copied())
-        .and_then(|entity| world.get(id, entity))
-        .map_or(&[], PortalLayer::tags)
+pub(crate) fn links_of(world: &World, id: ComponentId<PortalLayer>) -> &[PortalLink] {
+    layer_in(world, id).map_or(&[], PortalLayer::links)
 }
 
-pub(crate) fn reap_dead_portals(
-    world: &mut World,
-    id: ComponentId<PortalLayer>,
-    geometry: CellGeometry,
-    extent: GridExtent,
-) {
+pub(crate) fn reap_dead_portals(world: &mut World, id: ComponentId<PortalLayer>) {
     let Some(clock_entity) = world
         .store(id)
         .and_then(|store| store.entities().first().copied())
     else {
         return;
     };
-    let Some(mut layer) = world.get(id, clock_entity).cloned() else {
-        return;
-    };
-    let dead: Vec<Entity> = layer
-        .entities()
-        .into_iter()
-        .filter(|entity| !world.is_live(*entity))
-        .collect();
+    let dead: Vec<Entity> = world
+        .get(id, clock_entity)
+        .map(|layer| {
+            layer
+                .entities()
+                .filter(|entity| !world.is_live(*entity))
+                .collect()
+        })
+        .unwrap_or_default();
     if dead.is_empty() {
         return;
     }
-    for entity in dead {
-        layer.unstamp(geometry, extent, entity);
-    }
-    let _ = world.insert(id, clock_entity, layer);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entity_index_zero_with_kind_zero_still_packs_to_a_nonzero_tag() {
-        let entity = Entity::from_parts(0, 0);
-        assert_ne!(pack_tag(entity, 0), 0);
+    if let Some(layer) = world.get_mut(id, clock_entity) {
+        for entity in dead {
+            layer.unregister(entity);
+        }
     }
 }

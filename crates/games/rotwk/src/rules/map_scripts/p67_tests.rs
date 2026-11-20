@@ -44,6 +44,13 @@ Object ZWalker\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   LocomotorSet\n    Locomotor = ZWalk\n    Condition = SET_PANIC\n    Speed = 120\n  End\n  \
   Behavior = AIUpdateInterface Tag_AI\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object ZTownie\n  Side = Men\n  KindOf = INFANTRY SELECTABLE CAN_BE_REPULSED\n  VisionRange = 100\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+  LocomotorSet\n    Locomotor = ZWalk\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  LocomotorSet\n    Locomotor = ZWalk\n    Condition = SET_WANDER\n    Speed = 30\n  End\n  \
+  LocomotorSet\n    Locomotor = ZWalk\n    Condition = SET_PANIC\n    Speed = 120\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object ZSoldier\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n  BuildTime = 1\n  \
   Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
   LocomotorSet\n    Locomotor = ZFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
@@ -53,7 +60,7 @@ Object ZTower\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  BuildCo
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 const ROOTS: &[&str] = &[
-    "ZKiller", "ZVictim", "ZCaster", "ZSoldier", "ZTower", "ZWalker",
+    "ZKiller", "ZVictim", "ZCaster", "ZSoldier", "ZTower", "ZWalker", "ZTownie",
 ];
 
 pub(super) const P0: PlayerId = PlayerId::new(0);
@@ -68,6 +75,8 @@ pub(super) struct Rig {
     pub(super) computer: bool,
     pub(super) fire: bool,
     pub(super) paths: Vec<super::PathPoint>,
+    pub(super) fudge: f32,
+    pub(super) ai_seat: bool,
 }
 
 pub(super) fn rig(scripts: Vec<mint_sage_map::Script>) -> Rig {
@@ -79,6 +88,8 @@ pub(super) fn rig(scripts: Vec<mint_sage_map::Script>) -> Rig {
         computer: false,
         fire: false,
         paths: Vec::new(),
+        fudge: 0.0,
+        ai_seat: false,
     }
 }
 
@@ -156,6 +167,22 @@ impl Rig {
                 evil: true,
                 cash: 3_000,
             }]);
+        }
+        if self.fudge > 0.0 {
+            rules = rules.with_group_formation(crate::rules::GroupFormation {
+                skirmish_group_fudge: self.fudge,
+                ..crate::rules::GroupFormation::default()
+            });
+        }
+        if self.ai_seat {
+            rules = rules.with_skirmish_ai(
+                vec![crate::skirmish_ai::AiSeed {
+                    player: SIDE,
+                    candidates: Vec::new(),
+                }],
+                crate::combat::AiTiming::default(),
+                Vec::new(),
+            );
         }
         if self.fire {
             let material = FireMaterial {

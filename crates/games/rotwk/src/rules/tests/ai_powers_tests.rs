@@ -197,7 +197,9 @@ fn foe(entity: Entity, position: Vec2) -> Foe {
         airborne: None,
         unattackable: false,
         not_autoacquirable: false,
+        enclosed: false,
         ai_kind_of: None,
+        volume: None,
     }
 }
 

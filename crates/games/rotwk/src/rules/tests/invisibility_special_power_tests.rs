@@ -1,9 +1,11 @@
 use super::*;
 
 const DATA: &str = "\
-SpecialPower CloakPower\n  ReloadTime = 5000\nEnd\n\
-CommandSet CasterSet\n  1 = Fire_Cloak\nEnd\n\
-CommandButton Fire_Cloak\n  Command = SPECIAL_POWER\n  SpecialPower = CloakPower\nEnd\n\
+SpecialPower CloakPower\n  ReloadTime = 1000\nEnd\n\
+CommandSet CasterSet\n  1 = Fire_Cloak\n  2 = Fire_Cloak_Blind\nEnd\n\
+CommandButton Fire_Cloak\n  Command = SPECIAL_POWER\n  SpecialPower = CloakPower\n  \
+  Options = NEED_TARGET_POS\nEnd\n\
+CommandButton Fire_Cloak_Blind\n  Command = SPECIAL_POWER\n  SpecialPower = CloakPower\nEnd\n\
 Object Caster\n  Side = Men\n  KindOf = HERO SELECTABLE\n  CommandSet = CasterSet\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 1000\n  End\n  \
   Behavior = InvisibilitySpecialPower Tag_Cloak\n    SpecialPowerTemplate = CloakPower\n    \
@@ -13,6 +15,13 @@ Object Caster\n  Side = Men\n  KindOf = HERO SELECTABLE\n  CommandSet = CasterSe
 Object Ally\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 400\n  End\n  \
   Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = No\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object Native\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 400\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = No\n  End\n  \
+  Behavior = InvisibilityUpdate Tag_Camo\n    \
+    InvisibilityNugget\n      InvisibilityType = CAMOUFLAGE\n      DetectionRange = 40\n      \
+      ForbiddenConditions = AWAY_FROM_TREES\n    End\n    UpdatePeriod = 100\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object Scout\n  Side = Mordor\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 400\n  End\n  \
@@ -32,7 +41,7 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
             .unwrap();
     assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
     let (game, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
-    let roots = ["Caster", "Ally", "Scout"];
+    let roots = ["Caster", "Ally", "Scout", "Native"];
     let (kinds, missing) = KindTable::closure(
         &game,
         &roots
@@ -49,8 +58,9 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
         Vec2::new(300.0, 300.0),
         Vec2::new(310.0, 300.0),
         Vec2::new(650.0, 300.0),
+        Vec2::new(300.0, 320.0),
     ];
-    let owners = [PLAYER, PLAYER, OTHER];
+    let owners = [PLAYER, PLAYER, OTHER, PLAYER];
     let spawns = roots
         .iter()
         .zip(places)
@@ -86,6 +96,15 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
 }
 
 fn press(simulation: &mut Simulation<RotwkRules>, caster: Entity) {
+    press_button(simulation, caster, 0, Some((300.0, 300.0)));
+}
+
+fn press_button(
+    simulation: &mut Simulation<RotwkRules>,
+    caster: Entity,
+    button: u8,
+    at: Option<(f32, f32)>,
+) {
     simulation
         .submit(
             PLAYER,
@@ -99,9 +118,9 @@ fn press(simulation: &mut Simulation<RotwkRules>, caster: Entity) {
         .submit(
             PLAYER,
             RotwkCommand::FireSpecialPower {
-                button: 0,
+                button,
                 target: None,
-                at: None,
+                at,
             },
         )
         .unwrap();
@@ -148,5 +167,68 @@ fn the_grant_lapses_with_its_own_duration() {
     assert!(
         !hidden(&simulation, ids, ally),
         "revealed once Duration elapses"
+    );
+}
+
+fn native(simulation: &Simulation<RotwkRules>, ids: Ids) -> Entity {
+    simulation
+        .state()
+        .store(ids.body)
+        .unwrap()
+        .entities()
+        .to_vec()[3]
+}
+
+#[test]
+fn a_grant_hides_an_ally_whose_own_camouflage_is_forbidden_away_from_trees() {
+    let (mut simulation, ids, caster, _ally) = scene();
+    let native = native(&simulation, ids);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        !hidden(&simulation, ids, native),
+        "its own camouflage hides it nowhere here"
+    );
+    press(&mut simulation, caster);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    assert!(hidden(&simulation, ids, native));
+}
+
+#[test]
+fn a_repeat_grant_adds_one_duration_to_the_end_it_has() {
+    let (mut simulation, ids, caster, ally) = scene();
+    press(&mut simulation, caster);
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+    }
+    press(&mut simulation, caster);
+    for _ in 0..100 {
+        simulation.tick().unwrap();
+    }
+    assert!(hidden(&simulation, ids, ally), "still hidden at 4.7 s");
+    for _ in 0..80 {
+        simulation.tick().unwrap();
+    }
+    assert!(!hidden(&simulation, ids, ally), "ended by 7.3 s");
+}
+
+#[test]
+fn a_cast_hides_only_around_the_clicked_point() {
+    let (mut simulation, ids, caster, ally) = scene();
+    press_button(&mut simulation, caster, 0, Some((300.0, 700.0)));
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+    }
+    assert!(!hidden(&simulation, ids, ally), "the click was far from it");
+    press_button(&mut simulation, caster, 1, None);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        !hidden(&simulation, ids, ally),
+        "a target-less cast hides nobody"
     );
 }

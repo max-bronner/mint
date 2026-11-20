@@ -20,6 +20,7 @@ struct AutoPickUpData {
     pick_up_filter: Option<ObjectFilter>,
     eat: Option<EatObjectEntry>,
     button: Option<u8>,
+    can_scan_while_busy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +33,11 @@ pub struct AutoPickUpUpdate {
 const DEFAULT_SCAN_DISTANCE: f32 = 300.0;
 
 impl AutoPickUpUpdate {
+    #[must_use]
+    pub fn scans_while_busy(&self) -> bool {
+        self.data.can_scan_while_busy
+    }
+
     #[must_use]
     pub fn scan_delay(&self) -> LogicFrames {
         self.data.scan_delay
@@ -140,7 +146,7 @@ pub fn auto_pick_up_update_from_fields(
         .map_or(LogicFrames::ZERO, |ms| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let whole = ms.min(86_400_000.0) as u32;
-            LogicFrames::from_milliseconds(whole)
+            crate::special_ability_update::retail_duration_ticks(whole)
         });
     let scan_distance = fields
         .field_numeric("ScanDistance")
@@ -179,6 +185,7 @@ pub fn auto_pick_up_update_from_fields(
             pick_up_filter,
             eat,
             button,
+            can_scan_while_busy: flag(fields, "CanScanWhileAttackingOrMoving") == Some(true),
         }),
         next_scan: Frame::ZERO,
         woken: false,

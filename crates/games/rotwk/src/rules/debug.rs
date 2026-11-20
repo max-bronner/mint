@@ -1,6 +1,6 @@
 use mint_movement::{Facing, Vec2};
 use mint_sage_combat::{BodyKind, HealthPool};
-use mint_sim::{Component, Entity, Frame, PlayerId, Result, StateHasher, Tick, World};
+use mint_sim::{Component, Entity, Frame, LogicFrames, PlayerId, Result, StateHasher, Tick, World};
 
 use super::{Ids, RotwkRules};
 use crate::combat::Health;
@@ -46,6 +46,34 @@ pub(crate) enum DebugCommand {
         name: String,
         value: i32,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
+    IgnoreAiCommand {
+        ticks: u32,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    AdjustDestination {
+        target: DebugTarget,
+        x: f32,
+        y: f32,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    AdjustTowards {
+        target: DebugTarget,
+        x: f32,
+        y: f32,
+        goal_x: f32,
+        goal_y: f32,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    StartAttackWave,
+    #[cfg_attr(not(test), allow(dead_code))]
+    DropPath,
+    #[cfg_attr(not(test), allow(dead_code))]
+    MarkHordeDirty,
+    #[cfg_attr(not(test), allow(dead_code))]
+    SwapPositions,
+    #[cfg_attr(not(test), allow(dead_code))]
+    HuntWhenIdle,
     SetScriptTimer {
         name: String,
         frames: i32,
@@ -189,6 +217,35 @@ impl DebugCommand {
                 hasher.write_bytes(name.as_bytes());
                 hasher.write_i32(*frames);
             }
+            Self::AdjustDestination { target, x, y } => {
+                hasher.write_u8(19);
+                target.hash_into(hasher);
+                hasher.write_f32(*x);
+                hasher.write_f32(*y);
+            }
+            Self::AdjustTowards {
+                target,
+                x,
+                y,
+                goal_x,
+                goal_y,
+            } => {
+                hasher.write_u8(23);
+                target.hash_into(hasher);
+                hasher.write_f32(*x);
+                hasher.write_f32(*y);
+                hasher.write_f32(*goal_x);
+                hasher.write_f32(*goal_y);
+            }
+            Self::StartAttackWave => hasher.write_u8(20),
+            Self::DropPath => hasher.write_u8(21),
+            Self::MarkHordeDirty => hasher.write_u8(22),
+            Self::SwapPositions => hasher.write_u8(25),
+            Self::HuntWhenIdle => hasher.write_u8(24),
+            Self::IgnoreAiCommand { ticks } => {
+                hasher.write_u8(18);
+                hasher.write_u32(*ticks);
+            }
             Self::Kill { target } => {
                 hasher.write_u8(11);
                 target.hash_into(hasher);
@@ -323,6 +380,7 @@ impl RotwkRules {
                     health.0.set_current(left.max(0.0));
                     tick.state_mut().insert(ids.health, entity, health)?;
                     self.note_hurt(tick, ids, entity);
+                    self.note_repulsor_damage(tick, ids, entity)?;
                     if left <= 0.0 {
                         killed.push((entity, 0.0));
                     }
@@ -414,6 +472,85 @@ impl RotwkRules {
                 );
                 Ok(())
             }
+            DebugCommand::SwapPositions => {
+                if let [a, b, ..] = self.selection(tick, ids, player).as_slice() {
+                    let positions = (
+                        tick.state().get(ids.body, *a).copied(),
+                        tick.state().get(ids.body, *b).copied(),
+                    );
+                    if let (Some(mut first), Some(mut second)) = positions {
+                        std::mem::swap(&mut first.0.position, &mut second.0.position);
+                        tick.state_mut().insert(ids.body, *a, first)?;
+                        tick.state_mut().insert(ids.body, *b, second)?;
+                    }
+                }
+                Ok(())
+            }
+            DebugCommand::MarkHordeDirty => {
+                for entity in self.selection(tick, ids, player) {
+                    let Some(horde) = tick.state().get(ids.member, entity).map(|m| m.horde) else {
+                        continue;
+                    };
+                    if let Some(horde) = tick.state_mut().get_mut(ids.horde, horde) {
+                        horde.dirty = true;
+                    }
+                }
+                Ok(())
+            }
+            DebugCommand::HuntWhenIdle => {
+                let held: Vec<Entity> = self
+                    .selection(tick, ids, player)
+                    .into_iter()
+                    .map(|entity| {
+                        tick.state()
+                            .get(ids.member, entity)
+                            .map_or(entity, |member| member.horde)
+                    })
+                    .collect();
+                self.debug_hunt(tick, ids, &held)
+            }
+            DebugCommand::DropPath => {
+                for entity in self.selection(tick, ids, player) {
+                    tick.state_mut().remove(ids.path, entity);
+                }
+                Ok(())
+            }
+            DebugCommand::StartAttackWave => {
+                let hordes = self.selection(tick, ids, player);
+                let Some(entity) =
+                    crate::economy::player_entity(tick.state(), Self::economy_ids(ids), player)
+                else {
+                    return Ok(());
+                };
+                let Some(mut progress) = tick.state().get(ids.ai_attack_progress, entity).cloned()
+                else {
+                    return Ok(());
+                };
+                progress.wave = Some(crate::skirmish_ai::AttackWave {
+                    phase: crate::skirmish_ai::AttackPhase::EnRoute { marker: Vec2::ZERO },
+                    hordes,
+                });
+                tick.state_mut()
+                    .insert(ids.ai_attack_progress, entity, progress)?;
+                Ok(())
+            }
+            DebugCommand::AdjustDestination { target, x, y } => {
+                self.debug_adjust(tick, ids, player, target, Vec2::new(*x, *y), None)
+            }
+            DebugCommand::AdjustTowards {
+                target,
+                x,
+                y,
+                goal_x,
+                goal_y,
+            } => self.debug_adjust(
+                tick,
+                ids,
+                player,
+                target,
+                Vec2::new(*x, *y),
+                Some(Vec2::new(*goal_x, *goal_y)),
+            ),
             DebugCommand::DummiesInvincible { on } => {
                 let kind = if *on {
                     BodyKind::Immortal
@@ -445,6 +582,20 @@ impl RotwkRules {
                     })
                     .collect();
                 self.apply_effects(tick, ids, entries)
+            }
+            DebugCommand::IgnoreAiCommand { ticks } => {
+                let until = tick
+                    .frame()
+                    .checked_add(LogicFrames::from_frames(*ticks))
+                    .unwrap_or(Frame::FOREVER);
+                for entity in self.selection(tick, ids, player) {
+                    tick.state_mut().insert(
+                        ids.ignore_ai_command,
+                        entity,
+                        super::busy::IgnoreAiCommand(until),
+                    )?;
+                }
+                Ok(())
             }
             DebugCommand::SetScriptFlag { name, value } => self.debug_set_script_value(
                 tick,
@@ -748,7 +899,7 @@ impl RotwkRules {
                     return Ok(Vec::new());
                 };
                 let entity = tick.state_mut().spawn()?;
-                Self::insert_spawn(
+                self.insert_spawn(
                     tick,
                     ids,
                     entity,
@@ -763,6 +914,29 @@ impl RotwkRules {
             }
         };
         Ok(spawned)
+    }
+
+    fn debug_adjust(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        player: PlayerId,
+        target: &DebugTarget,
+        dest: Vec2,
+        group_goal: Option<Vec2>,
+    ) -> Result<()> {
+        for entity in self.debug_targets(tick, ids, player, target) {
+            let request = super::adjust_destination::Request {
+                mover: entity,
+                dest,
+                group_goal,
+            };
+            let mut claims = super::adjust_destination::OrderClaims::none();
+            if let Some(at) = self.adjust_destination(tick, ids, request, &mut claims) {
+                self.script_teleport(tick, ids, entity, at)?;
+            }
+        }
+        Ok(())
     }
 
     fn debug_targets(

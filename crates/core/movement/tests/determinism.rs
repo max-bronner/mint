@@ -40,6 +40,9 @@ fn plan(grid: &CostGrid) -> Plan {
     let request = PathRequest {
         corner_radius: 0.0,
         departure: None,
+        approach: None,
+        prune: false,
+        final_goal: true,
         start: Cell::new(1, 1),
         goal: Cell::new(30, 30),
         mover: MOVER,
@@ -78,6 +81,8 @@ fn a_planned_and_followed_run_repeats_bit_for_bit() {
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,

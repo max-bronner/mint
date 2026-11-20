@@ -201,6 +201,7 @@ pub(crate) struct GiantBird {
     mode: Mode,
     set: SwoopSet,
     horde: Option<Entity>,
+    held_stop: bool,
 }
 
 impl GiantBird {
@@ -221,6 +222,7 @@ impl GiantBird {
             mode: Mode::Strike,
             set: SwoopSet::Supersonic,
             horde: None,
+            held_stop: false,
         }
     }
 
@@ -338,6 +340,7 @@ impl Component for GiantBird {
         hasher.write_u8(self.mode as u8);
         hasher.write_u8(self.set as u8);
         hasher.write_u32(self.horde.map_or(u32::MAX, Entity::index));
+        hasher.write_bool(self.held_stop);
     }
 }
 
@@ -598,7 +601,7 @@ impl RotwkRules {
     ) -> Result<()> {
         match bird.phase {
             Phase::Hover | Phase::Cruise { .. } => {
-                self.decide_idle(tick, ids, entity, bird, flight)
+                self.decide_idle(tick, ids, entity, bird, flight)?;
             }
             Phase::Swoop { .. } => self.decide_swoop(tick, ids, entity, bird, flight, spec)?,
             Phase::Attack { .. } => self.decide_attack(tick, ids, entity, bird, flight, spec)?,
@@ -646,6 +649,41 @@ impl RotwkRules {
         Ok(())
     }
 
+    pub(super) fn hold_bird_stop(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+    ) -> Result<()> {
+        let Some(mut bird) = tick.state().get(ids.giant_bird, entity).cloned() else {
+            return Ok(());
+        };
+        if matches!(
+            bird.phase,
+            Phase::Attack { .. } | Phase::FollowThrough { .. }
+        ) {
+            bird.held_stop = true;
+            tick.state_mut().insert(ids.giant_bird, entity, bird)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn drop_bird_held_stop(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+    ) -> Result<()> {
+        match tick.state().get(ids.giant_bird, entity).cloned() {
+            Some(mut bird) if bird.held_stop => {
+                bird.held_stop = false;
+                tick.state_mut().insert(ids.giant_bird, entity, bird)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn end_follow_through(
         &self,
         tick: &mut Tick<'_>,
@@ -661,7 +699,10 @@ impl RotwkRules {
             .state()
             .get(ids.path, entity)
             .is_some_and(|path| path.kind == PathKind::Ordered);
-        let again = if self.target_is_live(tick, ids, target) {
+        let stopped = std::mem::take(&mut bird.held_stop) && !ordered_move;
+        let again = if stopped {
+            None
+        } else if self.target_is_live(tick, ids, target) {
             Some(target)
         } else {
             bird.horde
@@ -670,7 +711,7 @@ impl RotwkRules {
         bird.enter(Phase::Hover);
         let Some(again) = again.filter(|_| !ordered_move) else {
             bird.horde = None;
-            self.decide_idle(tick, ids, entity, bird, flight);
+            self.decide_idle(tick, ids, entity, bird, flight)?;
             return Ok(());
         };
         tick.state_mut()
@@ -692,11 +733,27 @@ impl RotwkRules {
         entity: Entity,
         bird: &mut GiantBird,
         flight: &Flight,
-    ) {
-        let order = tick.state().get(ids.path, entity).map(|path| path.goal);
+    ) -> Result<()> {
+        let order = tick
+            .state()
+            .get(ids.path, entity)
+            .map(|path| path.route.points.first().copied().unwrap_or(path.goal));
         match (order, bird.phase) {
             (Some(goal), Phase::Cruise { goal: flying }) if goal == flying => {
-                if bird.finished() {
+                if !bird.finished() {
+                    return Ok(());
+                }
+                let following = tick
+                    .state()
+                    .get(ids.path, entity)
+                    .filter(|path| path.route.points.len() > 1)
+                    .cloned();
+                if let Some(mut path) = following {
+                    path.route.points.drain(..1);
+                    let next = path.route.points.first().copied().unwrap_or(path.goal);
+                    tick.state_mut().insert(ids.path, entity, path)?;
+                    self.cruise_to(tick, ids, entity, bird, flight, next);
+                } else {
                     tick.state_mut().remove(ids.path, entity);
                     diag!(
                         "bird: frame {} entity {} arrives at ({:.0}, {:.0})",
@@ -706,25 +763,40 @@ impl RotwkRules {
                         goal.y
                     );
                     bird.enter(Phase::Hover);
+                    self.end_factory_exit(tick, ids, entity)?;
                 }
             }
-            (Some(goal), _) => {
-                let height = self
-                    .ground_at(goal)
-                    .map_or(flight.position.z, |ground| ground + flight.preferred);
-                let to = Vec3::new(goal.x, goal.y, height);
-                let scene = Scene {
-                    world: tick.state(),
-                    ids,
-                    entity,
-                    victim: None,
-                };
-                self.plan(scene, bird, flight, flight.position, to, Shape::PLAIN, true);
-                bird.enter(Phase::Cruise { goal });
+            (Some(goal), _) => self.cruise_to(tick, ids, entity, bird, flight, goal),
+            (None, Phase::Cruise { .. }) => {
+                bird.enter(Phase::Hover);
+                self.end_factory_exit(tick, ids, entity)?;
             }
-            (None, Phase::Cruise { .. }) => bird.enter(Phase::Hover),
             (None, _) => {}
         }
+        Ok(())
+    }
+
+    fn cruise_to(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        bird: &mut GiantBird,
+        flight: &Flight,
+        goal: Vec2,
+    ) {
+        let height = self
+            .ground_at(goal)
+            .map_or(flight.position.z, |ground| ground + flight.preferred);
+        let to = Vec3::new(goal.x, goal.y, height);
+        let scene = Scene {
+            world: tick.state(),
+            ids,
+            entity,
+            victim: None,
+        };
+        self.plan(scene, bird, flight, flight.position, to, Shape::PLAIN, true);
+        bird.enter(Phase::Cruise { goal });
     }
 
     fn decide_swoop(
@@ -751,7 +823,7 @@ impl RotwkRules {
         if ordered_move {
             self.set_conditions(tick, ids, entity, &[], &[ABOUT_TO_HIT])?;
             bird.enter(Phase::Hover);
-            self.decide_idle(tick, ids, entity, bird, flight);
+            self.decide_idle(tick, ids, entity, bird, flight)?;
             return Ok(());
         }
         if let Some(ordered) = Self::attack_goal(tick, ids, entity).filter(|ordered| {
@@ -1688,6 +1760,9 @@ impl RotwkRules {
         };
         if !free {
             return Ok(());
+        }
+        if matches!(bird.phase, Phase::Cruise { .. }) {
+            self.end_factory_exit(tick, ids, entity)?;
         }
         let hz = self.logic_hz().clamp(1.0, Self::ticks_per_second());
         bird.phase = Phase::Swoop {

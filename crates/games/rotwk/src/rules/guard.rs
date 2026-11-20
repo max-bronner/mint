@@ -130,8 +130,8 @@ impl Component for LastAttacker {
 }
 
 const RETURN_ARRIVED: f32 = 5.0;
-const STRUCTURE_FIRST_RECHECK: LogicFrames = LogicFrames::from_milliseconds(3_000);
-const STRUCTURE_RECHECK: LogicFrames = LogicFrames::from_milliseconds(1_000);
+const STRUCTURE_FIRST_RECHECK: LogicFrames = LogicFrames::from_engine_milliseconds(3_000);
+const STRUCTURE_RECHECK: LogicFrames = LogicFrames::from_engine_milliseconds(1_000);
 const WARD_MOVED_SQUARED: f32 = 400.0;
 const MAX_TRANSITIONS: usize = 4;
 
@@ -221,6 +221,7 @@ impl RotwkRules {
                 .get(ids.path, unit)
                 .is_some_and(|path| matches!(path.kind, PathKind::Ordered | PathKind::Ability))
             || Self::emotion_holds(world, ids, unit)
+            || world.contains(ids.ai_busy, unit)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -247,15 +248,18 @@ impl RotwkRules {
         }
         units.sort_unstable_by_key(|entity| entity.index());
         units.dedup();
+        units.retain(|unit| !self.ai_disabled(tick.state(), ids, *unit, now));
         let scan = GuardScan {
             grid,
             living,
             global_max_radius,
         };
+        let decide_perf = crate::perf::sub(crate::perf::sub_row!("decide_guards"));
         let decided: Vec<GuardDecision> = units
             .iter()
             .map(|&unit| self.decide_guard(tick.state(), ids, unit))
             .collect();
+        drop(decide_perf);
         for (unit, decision) in units.into_iter().zip(decided) {
             debug_assert_eq!(
                 decision,
@@ -299,7 +303,7 @@ impl RotwkRules {
                 GuardDecision::Pass
             };
         }
-        if Self::emotion_holds(world, ids, unit) {
+        if Self::emotion_holds(world, ids, unit) || world.contains(ids.ai_busy, unit) {
             return GuardDecision::Pass;
         }
         if Self::guard_displaced(world, ids, unit) {
@@ -664,11 +668,10 @@ impl RotwkRules {
             let Some(here) = self.guard_position(tick, ids, unit) else {
                 return Ok(false);
             };
-            return Ok(in_range(
-                here,
-                Self::mover_radius(tick, ids, unit),
-                foe.position,
-                foe.radius,
+            return Ok(crate::combat::in_range_volumes(
+                (here, Self::mover_radius(tick, ids, unit), None),
+                foe.reach_volume(),
+                0.0,
                 0.0,
                 reach,
             ));
@@ -678,16 +681,35 @@ impl RotwkRules {
 
     fn look_for_inner_target(
         &self,
-        tick: &Tick<'_>,
+        tick: &mut Tick<'_>,
         ids: Ids,
         unit: Entity,
         guard: &Guard,
         scan: &GuardScan<'_>,
     ) -> Option<Entity> {
+        let (found, scanned) = self.inner_target(tick, ids, unit, guard, scan)?;
+        Some(if scanned {
+            self.horde_member_pick(tick, ids, unit, found)
+        } else {
+            found
+        })
+    }
+
+    fn inner_target(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        unit: Entity,
+        guard: &Guard,
+        scan: &GuardScan<'_>,
+    ) -> Option<(Entity, bool)> {
         let _perf = crate::perf::sub(crate::perf::sub_row!("guard_scan"));
+        if Self::holds_fire(tick.state(), ids, unit) {
+            return None;
+        }
         let mask = self.guard_attack_mask(tick, ids, unit)?;
         if let Some(common) = self.common_target(tick.state(), ids, unit, scan.living, false) {
-            return Some(common.entity);
+            return Some((common.entity, false));
         }
         let owner = Self::commanded_owner(tick.state(), ids, unit)?;
         let radius = guard
@@ -731,9 +753,13 @@ impl RotwkRules {
                             return None;
                         }
                     }
+                    let relation = relation.to(foe.entity).victim();
+                    if !crate::combat::auto_acquirable(relation) {
+                        return None;
+                    }
                     mint_sage_combat::can_target(
                         mint_sage_combat::Attacker {
-                            relation: relation.to(foe.entity).victim(),
+                            relation,
                             class_allowed: target_allowed(mask, foe),
                             scans_structures: structures,
                         },
@@ -752,20 +778,21 @@ impl RotwkRules {
         if tick.state().contains(ids.giant_bird, unit) {
             return if self.computer_controlled(owner) {
                 let here = self.guard_position(tick, ids, unit)?;
-                nearest(here, radius, true)
+                nearest(here, radius, true).map(|found| (found, true))
             } else {
-                nearest(centre?, radius, false)
+                nearest(centre?, radius, false).map(|found| (found, true))
             };
         }
         let centre = centre?;
         if let Some(found) = nearest(centre, radius, true) {
-            return Some(found);
+            return Some((found, true));
         }
         let here = self.guard_position(tick, ids, unit)?;
         let half = radius * 0.5;
         (distance(here, centre) > half)
             .then(|| nearest(here, half, true))
             .flatten()
+            .map(|found| (found, true))
     }
 
     pub(super) fn guard_radius(&self, tick: &Tick<'_>, ids: Ids, unit: Entity) -> f32 {
@@ -781,8 +808,45 @@ impl RotwkRules {
             .get(ids.bonuses, unit)
             .map_or(0.0, |bonuses| bonuses.0.vision);
         let range = vision * (1.0 + bonus).max(0.0) + Self::mover_radius(tick, ids, unit);
+        self.attitude_scaled(tick.state(), ids, unit, range)
+    }
+
+    pub(super) fn mood_scan_radius(&self, world: &World, ids: Ids, unit: Entity) -> f32 {
+        if !self.has_ai(world, ids, unit) {
+            return 0.0;
+        }
+        let Some(record) = world
+            .get(ids.kind, unit)
+            .and_then(|kind| self.kinds.get(*kind))
+            .map(|entry| &entry.record)
+        else {
+            return 0.0;
+        };
+        let vision = record
+            .vision_range
+            .filter(|vision| vision.is_finite() && *vision > 0.0)
+            .unwrap_or(0.0);
+        let bonus = world
+            .get(ids.bonuses, unit)
+            .map_or(0.0, |bonuses| bonuses.0.vision);
+        let height = record
+            .vision_bonus
+            .as_ref()
+            .zip(world.get(ids.body, unit))
+            .map_or(0.0, |(bonus, body)| {
+                let ground = |x, y| self.passability.heights.height_at(x, y);
+                let at = body.0.position;
+                crate::combat::ground_rise(bonus, &ground, at.x, at.y)
+                    .map_or(0.0, |rise| crate::combat::height_bonus(bonus, rise))
+            });
+        let radius = world.get(ids.shape, unit).map_or(5.0, |shape| shape.radius);
+        let range = crate::combat::vision_reach(vision * (1.0 + bonus).max(0.0), height) + radius;
+        self.attitude_scaled(world, ids, unit, range)
+    }
+
+    fn attitude_scaled(&self, world: &World, ids: Ids, unit: Entity, range: f32) -> f32 {
         let ranges = self.attack_priorities.ranges;
-        match self.mood_attitude(tick.state(), ids, unit) {
+        match self.mood_attitude(world, ids, unit) {
             ATTITUDE_SLEEP => 0.0,
             ATTITUDE_ALERT => range * ranges.alert,
             ATTITUDE_AGGRESSIVE => range * ranges.aggressive,
@@ -934,7 +998,7 @@ impl RotwkRules {
                 planned: false,
                 horde,
                 guard: true,
-                forced: false,
+                relation_free: false,
                 order_owner: None,
             },
         )?;

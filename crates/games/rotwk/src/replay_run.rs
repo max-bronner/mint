@@ -482,6 +482,17 @@ fn command(value: &Value) -> Result<RotwkCommand, String> {
             },
             other => return Err(format!("button: wanted a string, got {other:?}")),
         },
+        "Sacrifice" => RotwkCommand::Sacrifice { target: target()? },
+        "ToggleWeapon" => {
+            let slot = |name: &str| -> Result<u8, String> { number(f, name) };
+            RotwkCommand::ToggleWeapon {
+                toggles: [slot("first")?, slot("second")?, slot("third")?],
+                lead: option(field(f, "lead")?, entity)?,
+            }
+        }
+        "ToggleHoldFire" => RotwkCommand::ToggleHoldFire {
+            lead: option(field(f, "lead")?, entity)?,
+        },
         "MoveTo" => RotwkCommand::MoveTo {
             x: number(f, "x")?,
             y: number(f, "y")?,

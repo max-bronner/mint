@@ -117,6 +117,7 @@ impl TutorialBlock {
                 carryover: mint_sage_campaign::Carryover::default(),
                 delayed: Vec::new(),
                 mode: GameMode::SinglePlayerPractice,
+                drive_templates: Vec::new(),
             },
             presentation: MatchStartPresentation {
                 intro_movie: self.load_movie.clone(),

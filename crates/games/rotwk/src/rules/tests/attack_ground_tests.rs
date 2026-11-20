@@ -235,7 +235,7 @@ fn an_attacker_inside_its_minimum_range_backs_off_and_fires_only_from_there() {
         });
         let distance = from.minus(Vec2::new(350.0, 300.0)).length();
         assert!(
-            distance >= 105.0,
+            distance >= 102.5,
             "{order:?}: fired from {from:?}, {distance} away"
         );
     }

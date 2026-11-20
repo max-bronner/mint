@@ -73,6 +73,7 @@ pub(super) fn real(value: f32) -> Parameter {
 pub(super) fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -100,6 +101,7 @@ pub(super) fn script(
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: condition_name.to_owned(),
                 params,

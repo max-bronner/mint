@@ -127,6 +127,7 @@ impl RotwkRules {
                 .collect();
             let radius = Self::mover_radius(tick, ids, member);
             let victim = self.acquire_for(world, ids, member, at, radius, &foes, 0.0, HUNT_RANGE);
+            let victim = victim.map(|victim| self.horde_member_pick(tick, ids, member, victim));
             let Some(victim) = victim else {
                 state.rt.attack_areas.forget(member);
                 self.issue_script_order(tick, ids, &[member], ScriptOrder::Stop)?;

@@ -62,6 +62,7 @@ fn script(name: &str, timer: Option<&str>, actions: Vec<ScriptAction>) -> Script
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 name: condition.to_owned(),
                 params,
                 enabled: true,
@@ -81,6 +82,7 @@ fn switch(name: &str, timer: &str, indices: &[i32]) -> Script {
             .iter()
             .map(|index| ScriptAction {
                 action_type: 0,
+                enabled: true,
                 name: "MAP_SWITCH_BORDER".to_owned(),
                 params: vec![number(*index)],
             })
@@ -91,6 +93,7 @@ fn switch(name: &str, timer: &str, indices: &[i32]) -> Script {
 fn simulation() -> Simulation<RotwkRules> {
     let arm = |timer: &str, frames: i32| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: "SET_TIMER".to_owned(),
         params: vec![text(timer), number(frames)],
     };
@@ -197,8 +200,14 @@ fn runner(sim: &Simulation<RotwkRules>, owner: PlayerId) -> mint_sim::Entity {
 }
 
 fn enterable(sim: &Simulation<RotwkRules>, owner: PlayerId, at: Vec2) -> bool {
+    let class = sim
+        .rules()
+        .mover_class_in(sim.state(), ids(sim), runner(sim, owner));
+    passable(sim, class, at)
+}
+
+fn passable(sim: &Simulation<RotwkRules>, class: mint_movement::MoverClass, at: Vec2) -> bool {
     let rules = sim.rules();
-    let class = rules.mover_class_in(sim.state(), ids(sim), runner(sim, owner));
     let cell = rules.passability.cell_at(at).unwrap();
     let view = mint_sage_passability::DynamicView {
         grid: &rules.passability.grid,
@@ -268,6 +277,51 @@ fn a_switch_moves_the_off_map_line_and_confines_only_human_movers() {
 }
 
 #[test]
+fn the_tighten_class_is_confined_for_a_computer_mover() {
+    let mut sim = simulation();
+    run_to(&mut sim, 25);
+    let ids = ids(&sim);
+    let rules = sim.rules();
+    let own = rules.mover_class_in(sim.state(), ids, runner(&sim, COMPUTER));
+    let confined = rules.restriction(sim.state(), ids).confine(own);
+    let inside_union = Vec2::new(150.0, 100.0);
+    assert!(passable(&sim, own, inside_union));
+    assert!(!passable(&sim, confined, inside_union));
+    assert!(passable(&sim, confined, Vec2::new(100.0, 100.0)));
+}
+
+#[test]
+fn tighten_path_does_not_pull_a_computer_mover_across_the_active_boundary() {
+    let mut sim = simulation();
+    run_to(&mut sim, 25);
+    let answer = |sim: &mut Simulation<RotwkRules>, goal_x: f32| {
+        sim.submit(
+            COMPUTER,
+            crate::rules::RotwkCommand::Debug(crate::rules::debug::DebugCommand::AdjustTowards {
+                target: crate::rules::debug::DebugTarget::All,
+                x: 60.0,
+                y: 100.0,
+                goal_x,
+                goal_y: 100.0,
+            }),
+        )
+        .unwrap();
+        sim.tick().unwrap();
+        let ids = ids(sim);
+        sim.state()
+            .get(ids.body, runner(sim, COMPUTER))
+            .unwrap()
+            .0
+            .position
+    };
+    let inside = answer(&mut sim, 100.0);
+    assert!(inside.x > 85.0 && inside.x < 120.0, "control {inside:?}");
+    let pulled = answer(&mut sim, 190.0);
+    assert!(pulled.x < 120.0, "pulled across the boundary to {pulled:?}");
+    assert!(pulled.x > 100.0, "not pulled at all, at {pulled:?}");
+}
+
+#[test]
 fn a_switch_narrows_what_the_shroud_answers_without_losing_what_it_held() {
     let mut sim = simulation();
     let state = |sim: &Simulation<RotwkRules>| {
@@ -290,11 +344,13 @@ fn a_switch_narrows_what_the_shroud_answers_without_losing_what_it_held() {
 fn a_human_impassable_area_bars_only_human_movers_until_it_is_freed() {
     let area = |name: &str, flag: i32| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: "HUMAN_IMPASSABLE_AREA".to_owned(),
         params: vec![text(name), number(flag)],
     };
     let arm = |timer: &str, frames: i32| ScriptAction {
         action_type: 0,
+        enabled: true,
         name: "SET_TIMER".to_owned(),
         params: vec![text(timer), number(frames)],
     };

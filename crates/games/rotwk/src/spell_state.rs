@@ -14,6 +14,7 @@ pub(crate) struct PendingShot {
     pub(crate) alive_only: bool,
     pub(crate) reload_slot: Option<u32>,
     pub(crate) owner_if_gone: Option<PlayerId>,
+    pub(crate) victim: Option<Entity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -31,6 +32,7 @@ impl Component for PendingShots {
             hasher.write_bool(shot.alive_only);
             hasher.write_u32(shot.reload_slot.map_or(u32::MAX, |n| n));
             hasher.write_u32(shot.owner_if_gone.map_or(u32::MAX, |p| u32::from(p.get())));
+            hasher.write_u32(shot.victim.map_or(u32::MAX, |v| v.index()));
         }
     }
 }
@@ -45,6 +47,7 @@ pub(crate) struct DelayedHit {
     pub(crate) due: Frame,
     pub(crate) nugget: Option<u16>,
     pub(crate) owner_if_gone: Option<PlayerId>,
+    pub(crate) blow: Option<crate::combat::DamageEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -63,6 +66,34 @@ impl Component for DelayedHits {
             hit.due.hash_into(hasher);
             hasher.write_u32(hit.nugget.map_or(u32::MAX, u32::from));
             hasher.write_u32(hit.owner_if_gone.map_or(u32::MAX, |p| u32::from(p.get())));
+            hasher.write_u32(hit.blow.map_or(u32::MAX, |blow| blow.victim.index()));
+            hasher.write_f32(hit.blow.map_or(0.0, |blow| blow.amount));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PendingImpact {
+    pub(crate) attacker: Entity,
+    pub(crate) victim: Entity,
+    pub(crate) weapon: WeaponId,
+    pub(crate) nugget: u16,
+    pub(crate) centre: Vec2,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct PendingImpacts(pub(crate) Vec<PendingImpact>);
+
+impl Component for PendingImpacts {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_usize(self.0.len());
+        for impact in &self.0 {
+            hasher.write_u32(impact.attacker.index());
+            hasher.write_u32(impact.victim.index());
+            impact.weapon.hash_into(hasher);
+            hasher.write_u16(impact.nugget);
+            hasher.write_f32(impact.centre.x);
+            hasher.write_f32(impact.centre.y);
         }
     }
 }
@@ -190,6 +221,8 @@ impl Dot {
             nugget: 0,
             accepts_add: self.accepts_add,
             bonuses_applied: self.from_nugget,
+            force_kill: false,
+            drain_life: 0.0,
         }
     }
 }
@@ -197,41 +230,89 @@ impl Dot {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct ArrowStormHits {
     pub(crate) fired: u32,
-    pub(crate) per_target: Vec<(u32, u32)>,
+    pub(crate) list: Option<Vec<Entity>>,
+    pub(crate) taken: usize,
+    pub(crate) current: Option<(Entity, u32)>,
+    pub(crate) per_target: u32,
+    pub(crate) max_shots: u32,
 }
 
 impl ArrowStormHits {
-    pub(crate) fn count(&self, target: u32) -> u32 {
-        self.per_target
-            .iter()
-            .find(|(index, _)| *index == target)
-            .map_or(0, |(_, count)| *count)
+    pub(crate) fn shots_left(&self, alive: impl Fn(Entity) -> bool) -> u32 {
+        let Some(list) = self.list.as_ref() else {
+            return 0;
+        };
+        let mut left = match self.current {
+            Some((entity, shots)) if shots < self.per_target && alive(entity) => {
+                self.per_target.saturating_sub(shots)
+            }
+            _ => 0,
+        };
+        for entity in list.iter().skip(self.taken) {
+            if alive(*entity) {
+                left = left.saturating_add(self.per_target);
+            }
+        }
+        left.min(self.max_shots.saturating_sub(self.fired))
     }
 
-    pub(crate) fn record(&mut self, target: u32) {
-        self.fired = self.fired.saturating_add(1);
-        match self
-            .per_target
-            .iter_mut()
-            .find(|(index, _)| *index == target)
-        {
-            Some((_, count)) => *count = count.saturating_add(1),
-            None => self.per_target.push((target, 1)),
+    pub(crate) fn next_target(
+        &mut self,
+        shots_per_target: u32,
+        alive: impl Fn(Entity) -> bool,
+    ) -> Option<Entity> {
+        loop {
+            if let Some((entity, shots)) = self.current {
+                if shots < shots_per_target && alive(entity) {
+                    self.current = Some((entity, shots.saturating_add(1)));
+                    return Some(entity);
+                }
+            }
+            let entity = self.list.as_ref()?.get(self.taken).copied()?;
+            self.taken = self.taken.saturating_add(1);
+            self.current = Some((entity, 0));
         }
     }
+}
 
-    pub(crate) fn record_ground(&mut self) {
-        self.fired = self.fired.saturating_add(1);
+pub(crate) fn arrow_storm_list(found: &[(Entity, bool)], max_shots: usize) -> Vec<Entity> {
+    let mut list: Vec<Entity> = found.iter().map(|(entity, _)| *entity).collect();
+    let monsters: Vec<Entity> = found
+        .iter()
+        .filter(|(_, monster)| *monster)
+        .map(|(entity, _)| *entity)
+        .collect();
+    let cycle: &[Entity] = if monsters.is_empty() {
+        &list.clone()
+    } else {
+        &monsters
+    };
+    let mut next = 0usize;
+    while !cycle.is_empty() && list.len() < max_shots {
+        if let Some(entity) = cycle.get(next % cycle.len()) {
+            list.push(*entity);
+        }
+        next = next.saturating_add(1);
     }
+    list
 }
 
 impl Component for ArrowStormHits {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_u32(self.fired);
-        hasher.write_usize(self.per_target.len());
-        for (index, count) in &self.per_target {
-            hasher.write_u32(*index);
-            hasher.write_u32(*count);
+        hasher.write_u32(self.per_target);
+        hasher.write_u32(self.max_shots);
+        hasher.write_bool(self.list.is_some());
+        let list = self.list.as_deref().unwrap_or_default();
+        hasher.write_usize(list.len());
+        for entity in list {
+            hasher.write_u32(entity.index());
+        }
+        hasher.write_usize(self.taken);
+        hasher.write_bool(self.current.is_some());
+        if let Some((entity, shots)) = self.current {
+            hasher.write_u32(entity.index());
+            hasher.write_u32(shots);
         }
     }
 }
@@ -355,6 +436,14 @@ impl Suppressed {
         })
     }
 
+    pub(crate) fn active(&self, category: Option<&str>, now: Frame) -> bool {
+        category.is_some_and(|category| {
+            self.0
+                .iter()
+                .any(|(held, until)| held.eq_ignore_ascii_case(category) && now < *until)
+        })
+    }
+
     pub(crate) fn expire(&mut self, now: Frame) -> bool {
         let before = self.0.len();
         self.0.retain(|(_, until)| *until > now);
@@ -387,6 +476,55 @@ impl Component for CashBounty {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_f32(self.0);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct CashBountyPower(pub(crate) f32);
+
+impl Component for CashBountyPower {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.0);
+    }
+}
+
+pub(crate) fn bounty_fraction(own: f32, players: f32) -> f32 {
+    if own != 0.0 {
+        own
+    } else {
+        players
+    }
+}
+
+pub(crate) fn pause_bounty(
+    world: &mut mint_sim::World,
+    ids: (
+        mint_sim::ComponentId<CashBounty>,
+        mint_sim::ComponentId<CashBountyPower>,
+    ),
+    source: Entity,
+    player: Entity,
+    disabled: bool,
+) -> mint_sim::Result<()> {
+    let Some(CashBountyPower(fraction)) = world.get(ids.1, source).copied() else {
+        return Ok(());
+    };
+    let bounty = if disabled { 0.0 } else { fraction };
+    world.insert(ids.0, player, CashBounty(bounty))?;
+    Ok(())
+}
+
+pub(crate) fn restore_bounty(
+    world: &mut mint_sim::World,
+    id: mint_sim::ComponentId<CashBounty>,
+    player: Entity,
+    bounty: f32,
+) -> mint_sim::Result<()> {
+    if bounty.is_finite() && bounty > 0.0 {
+        world.insert(id, player, CashBounty(bounty))?;
+    } else {
+        world.remove(id, player);
+    }
+    Ok(())
 }
 
 pub(crate) fn bounty_for(value: f32, fraction: f32) -> i64 {
@@ -645,6 +783,44 @@ mod tests {
     use super::*;
     use mint_sage_combat::DamageTypes;
 
+    #[test]
+    fn a_non_zero_killer_bounty_wins_over_the_players_otherwise_the_players_applies() {
+        assert_eq!(bounty_fraction(0.5, 1.0), 0.5);
+        assert_eq!(bounty_fraction(0.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn a_disabled_bounty_power_holds_the_bounty_at_zero_until_it_is_enabled() {
+        let mut world = mint_sim::World::new();
+        let bounty = world.register::<CashBounty>();
+        let power = world.register::<CashBountyPower>();
+        let (source, player) = (world.spawn().unwrap(), world.spawn().unwrap());
+        let other = world.spawn().unwrap();
+        world.insert(power, source, CashBountyPower(0.5)).unwrap();
+        pause_bounty(&mut world, (bounty, power), source, player, true).unwrap();
+        assert_eq!(world.get(bounty, player), Some(&CashBounty(0.0)));
+        pause_bounty(&mut world, (bounty, power), source, player, false).unwrap();
+        assert_eq!(world.get(bounty, player), Some(&CashBounty(0.5)));
+        pause_bounty(&mut world, (bounty, power), other, player, true).unwrap();
+        assert_eq!(
+            world.get(bounty, player),
+            Some(&CashBounty(0.5)),
+            "no power, no change"
+        );
+    }
+
+    #[test]
+    fn restoring_a_zero_bounty_clears_the_one_the_player_held() {
+        let mut world = mint_sim::World::new();
+        let id = world.register::<CashBounty>();
+        let player = world.spawn().unwrap();
+        world.insert(id, player, CashBounty(0.7)).unwrap();
+        restore_bounty(&mut world, id, player, 0.0).unwrap();
+        assert!(world.get(id, player).is_none());
+        restore_bounty(&mut world, id, player, 0.4).unwrap();
+        assert_eq!(world.get(id, player), Some(&CashBounty(0.4)));
+    }
+
     fn entity(index: u32) -> Entity {
         let mut world = mint_sim::World::new();
         let mut last = world.spawn().unwrap();
@@ -896,16 +1072,37 @@ mod tests {
         );
     }
 
+    fn entities(n: usize) -> Vec<Entity> {
+        let mut world = mint_sim::World::new();
+        (0..n).map(|_| world.spawn().unwrap()).collect()
+    }
+
     #[test]
-    fn ground_shots_count_toward_fired_but_not_a_targets_own_quota() {
-        let mut hits = ArrowStormHits::default();
-        hits.record(7);
-        hits.record(7);
-        hits.record_ground();
-        hits.record(9);
-        assert_eq!(hits.fired, 4);
-        assert_eq!(hits.count(7), 2);
-        assert_eq!(hits.count(9), 1);
-        assert_eq!(hits.count(0), 0, "an untouched target has no count");
+    fn the_arrow_storm_list_pads_by_cycling_monsters_first() {
+        let e = entities(3);
+        assert_eq!(
+            arrow_storm_list(&[(e[0], false), (e[1], true)], 5),
+            vec![e[0], e[1], e[1], e[1], e[1]]
+        );
+        assert_eq!(
+            arrow_storm_list(&[(e[0], false), (e[2], false)], 5),
+            vec![e[0], e[2], e[0], e[2], e[0]]
+        );
+        assert!(arrow_storm_list(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn arrow_storm_targets_are_shot_in_list_order_and_the_dead_skipped() {
+        let e = entities(3);
+        let mut hits = ArrowStormHits {
+            list: Some(vec![e[0], e[1], e[2]]),
+            ..ArrowStormHits::default()
+        };
+        let alive = |entity: Entity| entity != e[1];
+        let shots: Vec<Option<Entity>> = (0..5).map(|_| hits.next_target(2, alive)).collect();
+        assert_eq!(
+            shots,
+            vec![Some(e[0]), Some(e[0]), Some(e[2]), Some(e[2]), None]
+        );
     }
 }

@@ -2,7 +2,7 @@ use mint_movement::Vec2;
 use mint_sage_map::{ScriptAction, Value};
 use mint_sim::{Entity, Simulation};
 
-use super::p67_tests::{rig, team, P0, SIDE};
+use super::p67_tests::{rig, team, P0, P1, SIDE};
 use super::team::TeamId;
 use super::w3a_tests::{act, after, named, number, once, real, run, state_of, text};
 use super::PathPoint;
@@ -263,6 +263,85 @@ fn wander_in_place_walks_a_member_about_its_origin() {
 }
 
 #[test]
+fn wander_walks_a_member_along_the_path_to_its_end() {
+    let mut setup = rig(vec![
+        once("Make", make("U", "ZWalker", "teamGroup", "P1")),
+        after(
+            "Go",
+            "U",
+            vec![act("TEAM_WANDER", vec![text("teamGroup"), text("Roam")])],
+        ),
+    ]);
+    setup.teams = vec![team("Wilds", "teamGroup", true, &[])];
+    setup.paths = vec![
+        PathPoint {
+            position: Vec2::new(30.0, 30.0),
+            labels: [Some("Roam".to_owned()), None, None],
+            links: vec![1],
+        },
+        PathPoint {
+            position: Vec2::new(200.0, 30.0),
+            labels: [Some("Roam".to_owned()), None, None],
+            links: Vec::new(),
+        },
+    ];
+    let mut sim = setup.start();
+    run(&mut sim, 12);
+    let unit = named(&sim, "U");
+    let mut farthest = 0.0_f32;
+    for _ in 0..900 {
+        run(&mut sim, 1);
+        farthest = farthest.max(position_of(&sim, unit).x);
+    }
+    assert!(farthest > 190.0, "{farthest}");
+}
+
+fn wander_rig(links_back: bool) -> Simulation<RotwkRules> {
+    let mut setup = rig(vec![
+        once("Make", make("U", "ZWalker", "teamGroup", "P1")),
+        after(
+            "Go",
+            "U",
+            vec![act("TEAM_WANDER", vec![text("teamGroup"), text("Roam")])],
+        ),
+    ]);
+    setup.teams = vec![team("Wilds", "teamGroup", true, &[])];
+    let label = || [Some("Roam".to_owned()), None, None];
+    setup.paths = vec![
+        PathPoint {
+            position: Vec2::new(30.0, 30.0),
+            labels: label(),
+            links: vec![1],
+        },
+        PathPoint {
+            position: Vec2::new(120.0, 30.0),
+            labels: label(),
+            links: if links_back { vec![0] } else { Vec::new() },
+        },
+    ];
+    let mut sim = setup.start();
+    run(&mut sim, 12);
+    sim
+}
+
+#[test]
+fn a_wander_that_ends_records_the_finished_walk() {
+    let mut sim = wander_rig(false);
+    run(&mut sim, 900);
+    let unit = named(&sim, "U");
+    assert!(state_of(&sim).rt.walks.finished(unit, "Roam"));
+}
+
+#[test]
+fn a_looped_wander_path_never_ends() {
+    let mut sim = wander_rig(true);
+    run(&mut sim, 1500);
+    let unit = named(&sim, "U");
+    assert!(!state_of(&sim).rt.walks.finished(unit, "Roam"));
+    assert!(position_of(&sim, unit).x > 100.0 || position_of(&sim, unit).x < 60.0);
+}
+
+#[test]
 fn panic_runs_a_member_along_the_path_on_the_panic_locomotor_set() {
     let mut setup = rig(vec![
         once("Make", make("U", "ZWalker", "teamGroup", "P1")),
@@ -291,4 +370,194 @@ fn panic_runs_a_member_along_the_path_on_the_panic_locomotor_set() {
     let unit = named(&sim, "U");
     assert!(sim.state().contains(ids.locomotor_override, unit));
     assert!((position_of(&sim, unit).x - 200.0).abs() < 10.0);
+}
+
+fn panic_rig(far_end: f32) -> Simulation<RotwkRules> {
+    let mut setup = rig(vec![
+        once("Make", make("U", "ZWalker", "teamGroup", "P1")),
+        after(
+            "Go",
+            "U",
+            vec![act("TEAM_PANIC", vec![text("teamGroup"), text("Run")])],
+        ),
+    ]);
+    setup.teams = vec![team("Wilds", "teamGroup", true, &[])];
+    let label = || [Some("Run".to_owned()), None, None];
+    setup.paths = vec![
+        PathPoint {
+            position: Vec2::new(30.0, 30.0),
+            labels: label(),
+            links: vec![1],
+        },
+        PathPoint {
+            position: Vec2::new(far_end, 30.0),
+            labels: label(),
+            links: Vec::new(),
+        },
+    ];
+    setup.start()
+}
+
+fn panicking(sim: &Simulation<RotwkRules>, unit: Entity) -> bool {
+    let wiring = sim.rules().modules.as_ref().unwrap().state;
+    sim.state().get(wiring, unit).is_some_and(|state| {
+        state
+            .model_conditions
+            .iter()
+            .any(|name| name.to_string() == "PANICKING")
+    })
+}
+
+#[test]
+fn a_panic_at_its_last_waypoint_is_idle_and_not_panicking() {
+    let mut sim = panic_rig(200.0);
+    run(&mut sim, 40);
+    let unit = named(&sim, "U");
+    assert!(panicking(&sim, unit));
+    run(&mut sim, 900);
+    let ids = sim.rules().ids().unwrap();
+    assert!(!panicking(&sim, unit));
+    assert!(!state_of(&sim).rt.wanderers.contains(unit));
+    assert!(state_of(&sim).rt.walks.finished(unit, "Run"));
+    assert!(sim.state().contains(ids.locomotor_override, unit));
+}
+
+#[test]
+fn a_panic_walk_that_cannot_arrive_keeps_the_member_in_the_state() {
+    let mut sim = panic_rig(50_000.0);
+    run(&mut sim, 1500);
+    let unit = named(&sim, "U");
+    assert!(panicking(&sim, unit));
+    assert!(state_of(&sim).rt.wanderers.contains(unit));
+    assert!(!state_of(&sim).rt.walks.finished(unit, "Run"));
+}
+
+fn panic_rig_with(
+    placed: Vec<(&'static str, f32, f32, mint_sim::PlayerId)>,
+    far: f32,
+) -> Simulation<RotwkRules> {
+    let mut setup = rig(vec![
+        once("Make", make("U", "ZWalker", "teamGroup", "P1")),
+        after(
+            "Go",
+            "U",
+            vec![act("TEAM_PANIC", vec![text("teamGroup"), text("Run")])],
+        ),
+    ]);
+    setup.placed = placed;
+    setup.teams = vec![team("Wilds", "teamGroup", true, &[])];
+    let label = || [Some("Run".to_owned()), None, None];
+    setup.paths = vec![
+        PathPoint {
+            position: Vec2::new(30.0, 30.0),
+            labels: label(),
+            links: vec![1],
+        },
+        PathPoint {
+            position: Vec2::new(far, 30.0),
+            labels: label(),
+            links: Vec::new(),
+        },
+    ];
+    setup.start()
+}
+
+fn goal_of(sim: &Simulation<RotwkRules>, unit: Entity) -> Option<Vec2> {
+    let ids = sim.rules().ids().unwrap();
+    sim.state().get(ids.path, unit).map(|path| path.goal)
+}
+
+#[test]
+fn a_panic_walk_with_an_onward_link_advances_under_twice_its_speed() {
+    let mut sim = panic_rig(400.0);
+    let ids = sim.rules().ids().unwrap();
+    let mut seen = None;
+    for _ in 0..200 {
+        run(&mut sim, 1);
+        let unit = sim.state().store(ids.script_name).and_then(|store| {
+            store
+                .iter()
+                .find(|(_, tag)| tag.0 == "U")
+                .map(|(entity, _)| entity)
+        });
+        let Some(unit) = unit else { continue };
+        if goal_of(&sim, unit).is_some_and(|goal| goal.x > 100.0) {
+            seen = Some(
+                position_of(&sim, unit)
+                    .minus(Vec2::new(30.0, 30.0))
+                    .length(),
+            );
+            break;
+        }
+    }
+    let left = seen.expect("the walk advanced to the second waypoint");
+    assert!(left > 5.0, "advanced {left} from the first waypoint");
+}
+
+#[test]
+fn a_panic_walk_arrives_at_the_end_of_an_adjusted_route() {
+    let mut sim = panic_rig_with(vec![("ZSoldier", 200.0, 30.0, P1)], 200.0);
+    run(&mut sim, 900);
+    let unit = named(&sim, "U");
+    assert!(
+        position_of(&sim, unit)
+            .minus(Vec2::new(200.0, 30.0))
+            .length()
+            > 1.0
+    );
+    assert!(state_of(&sim).rt.walks.finished(unit, "Run"));
+}
+
+fn repulsor_rig(path_wander: bool) -> Simulation<RotwkRules> {
+    let mut setup = rig(vec![
+        once("Make", make("U", "ZTownie", "teamGroup", "P1")),
+        once("MakeScarer", make("R", "ZVictim", "teamGroup", "P2")),
+        after(
+            "Go",
+            "U",
+            if path_wander {
+                vec![act("TEAM_WANDER", vec![text("teamGroup"), text("Roam")])]
+            } else {
+                Vec::new()
+            },
+        ),
+        after(
+            "Mark",
+            "R",
+            vec![act("NAMED_SET_REPULSOR", vec![text("R"), number(1)])],
+        ),
+    ]);
+    setup.teams = vec![team("Wilds", "teamGroup", true, &[])];
+    let label = || [Some("Roam".to_owned()), None, None];
+    setup.paths = vec![
+        PathPoint {
+            position: Vec2::new(30.0, 30.0),
+            labels: label(),
+            links: vec![1],
+        },
+        PathPoint {
+            position: Vec2::new(120.0, 30.0),
+            labels: label(),
+            links: vec![0],
+        },
+    ];
+    let mut sim = setup.start();
+    run(&mut sim, 40);
+    sim
+}
+
+#[test]
+fn named_set_repulsor_marks_the_object_a_repulsor() {
+    let sim = repulsor_rig(false);
+    let scarer = named(&sim, "R");
+    assert!(sim.rules().has_status_bit(sim.state(), scarer, "REPULSOR"));
+}
+
+#[test]
+fn a_repulsed_wanderer_leaves_its_path_for_the_flee_state() {
+    let sim = repulsor_rig(true);
+    let ids = sim.rules().ids().unwrap();
+    let unit = named(&sim, "U");
+    assert!(sim.state().contains(ids.repulsed, unit));
+    assert!(!state_of(&sim).rt.wanderers.contains(unit));
 }

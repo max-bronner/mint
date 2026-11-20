@@ -352,6 +352,23 @@ impl Component for SlavedTo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchedSlave(pub Entity);
+
+impl Component for WatchedSlave {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        self.0.hash_into(hasher);
+    }
+}
+
+#[must_use]
+pub fn watches_slaves(record: &crate::ObjectRecord) -> bool {
+    record
+        .declared_modules
+        .iter()
+        .any(|module| module.name == "SlaveWatcherBehavior")
+}
+
 #[must_use]
 pub fn is_slaved(record: &crate::ObjectRecord) -> bool {
     record

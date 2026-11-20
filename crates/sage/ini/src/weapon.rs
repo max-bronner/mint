@@ -65,7 +65,7 @@ pub struct WeaponDef {
     pub weapon_speed: Option<f32>,
     pub melee_weapon: Option<bool>,
     pub clip_size: Option<i64>,
-    pub linear_target: Option<LinearTarget>,
+    pub linear_targets: Vec<LinearTarget>,
     pub range_bonus_per_foot_raw: Option<String>,
     pub is_aiming_weapon: Option<bool>,
     pub acceptable_aim_delta: Option<f32>,
@@ -83,11 +83,14 @@ fn reference(block: &Block, keyword: &str) -> Option<String> {
 
 #[must_use]
 pub fn read_weapon(block: &Block) -> WeaponDef {
-    let linear_target = block.field("LinearTarget").map(|f| LinearTarget {
-        x: crate::value::tagged_value(&f.args, "X").and_then(parse_float),
-        y: crate::value::tagged_value(&f.args, "Y").and_then(parse_float),
-        t: crate::value::tagged_value(&f.args, "T").and_then(parse_float),
-    });
+    let linear_targets = block
+        .fields_named("LinearTarget")
+        .map(|f| LinearTarget {
+            x: crate::value::tagged_value(&f.args, "X").and_then(parse_float),
+            y: crate::value::tagged_value(&f.args, "Y").and_then(parse_float),
+            t: crate::value::tagged_value(&f.args, "T").and_then(parse_float),
+        })
+        .collect();
 
     WeaponDef {
         attack_range: scalar(block, "AttackRange", parse_float),
@@ -105,7 +108,7 @@ pub fn read_weapon(block: &Block) -> WeaponDef {
         weapon_speed: scalar(block, "WeaponSpeed", parse_float),
         melee_weapon: scalar(block, "MeleeWeapon", parse_bool),
         clip_size: scalar(block, "ClipSize", parse_int),
-        linear_target,
+        linear_targets,
         range_bonus_per_foot_raw: block.field("RangeBonusPerFoot").map(|f| f.args.join(" ")),
         is_aiming_weapon: scalar(block, "IsAimingWeapon", parse_bool),
         acceptable_aim_delta: scalar(block, "AcceptableAimDelta", parse_float),
@@ -239,7 +242,7 @@ mod tests {
         )
         .unwrap();
         let def = read_weapon(&doc.roots()[0]);
-        let target = def.linear_target.unwrap();
+        let target = def.linear_targets[0];
         assert_eq!(target.x, Some(0.0));
         assert_eq!(target.t, Some(5.0));
     }

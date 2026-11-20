@@ -135,3 +135,34 @@ fn the_refreshed_index_equals_a_rebuild_after_writes_to_its_inputs() {
         }
     }
 }
+
+#[test]
+fn an_inert_movers_position_list_entry_stays_where_it_was_filed() {
+    let passability = Passability::build(&flat_map(64, 64), 5.0 / 128.0).unwrap();
+    let spawns = vec![
+        spawn_at(100.0, 100.0, KindOf::SELECTABLE.union(KindOf::INERT), OTHER),
+        spawn_at(300.0, 100.0, KindOf::SELECTABLE, OTHER),
+    ];
+    let simulation = Simulation::new(3, RotwkRules::new(passability, spawns)).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let mut world = World::new();
+    world.restore(&simulation.state().snapshot());
+    let bodies: Vec<Entity> = world.store(ids.body).unwrap().entities().to_vec();
+    for &entity in &bodies {
+        let body = world.get_mut(ids.body, entity).unwrap();
+        body.0.position = body.0.position.plus(Vec2::new(0.0, 200.0));
+    }
+    let records = simulation
+        .rules()
+        .bodies_near(&world, ids, Vec2::new(200.0, 200.0), 1.0e6);
+    let at = |entity: Entity| {
+        records
+            .iter()
+            .find(|record| record.entity == entity)
+            .map(|record| record.position)
+    };
+    assert_eq!(
+        (at(bodies[0]), at(bodies[1])),
+        (Some(Vec2::new(100.0, 100.0)), Some(Vec2::new(300.0, 300.0)))
+    );
+}

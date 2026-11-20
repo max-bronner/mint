@@ -20,6 +20,9 @@ pub struct PathRequest {
     pub origin: Option<crate::Vec2>,
     pub corner_radius: f32,
     pub departure: Option<crate::Departure>,
+    pub approach: Option<crate::Vec2>,
+    pub prune: bool,
+    pub final_goal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,13 @@ impl NodeBudget {
 pub struct CellPath {
     pub cells: Vec<Cell>,
     pub cost: u32,
+    pub hops: Vec<PortalHop>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortalHop {
+    pub to: usize,
+    pub slot: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +81,12 @@ pub enum SearchOutcome {
     Unreachable,
     BudgetExhausted,
     Closest(CellPath),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub added: u32,
+    pub open_empty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +110,17 @@ pub trait Search {
         budget: &mut NodeBudget,
     ) -> Result<SearchResult> {
         self.find(grid, request, budget)
+    }
+
+    fn find_closest_accepting(
+        &mut self,
+        grid: &dyn Passability,
+        request: &PathRequest,
+        budget: &mut NodeBudget,
+        _accept: &dyn Fn(Cell) -> bool,
+        _cost_weight: f32,
+    ) -> Result<SearchResult> {
+        self.find_closest(grid, request, budget)
     }
 }
 
@@ -159,6 +186,8 @@ struct NodeState {
     g: u32,
     parent: u32,
     closed: bool,
+    via: u8,
+    extra: u32,
 }
 
 const NEIGHBOURS: [(i32, i32); 8] = [
@@ -239,8 +268,9 @@ impl<H: Heuristic> AStar<H> {
         }
     }
 
-    fn reconstruct(&self, extent: GridExtent, start: u32, goal: u32) -> Option<Vec<Cell>> {
+    fn reconstruct(&self, extent: GridExtent, start: u32, goal: u32) -> Option<CellPath> {
         let mut cells = Vec::new();
+        let mut taken: Vec<(usize, u8)> = Vec::new();
         let mut node = goal;
         let mut steps = 0u32;
         let cap = extent.cell_count();
@@ -253,20 +283,72 @@ impl<H: Heuristic> AStar<H> {
             if steps > cap {
                 return None;
             }
-            node = self.state(node)?.parent;
+            let state = self.state(node)?;
+            if let Some(slot) = state.via.checked_sub(1) {
+                taken.push((cells.len().saturating_sub(1), slot));
+            }
+            node = state.parent;
         }
+        let last = cells.len().saturating_sub(1);
         cells.reverse();
-        Some(cells)
+        let hops = taken
+            .into_iter()
+            .rev()
+            .map(|(at, slot)| PortalHop {
+                to: last.saturating_sub(at),
+                slot,
+            })
+            .collect();
+        Some(CellPath {
+            cells,
+            cost: self.state(goal)?.g,
+            hops,
+        })
     }
 }
 
-fn step_cost(grid: &dyn Passability, to: Cell, diagonal: bool) -> u32 {
+fn cell_distance_squared(cell: Cell, goal: Cell) -> u64 {
+    let dx = u64::from(cell.x.abs_diff(goal.x));
+    let dy = u64::from(cell.y.abs_diff(goal.y));
+    dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+}
+
+type Screen = (u64, u32);
+
+#[allow(clippy::cast_precision_loss)]
+fn prune_skips(distance: u64, screen: Screen) -> bool {
+    if distance < 100 {
+        return false;
+    }
+    let (closest, walk) = screen;
+    let threshold = if walk <= 25 {
+        closest.saturating_mul(4) as f32
+    } else {
+        let reach = (closest as f32).sqrt() + 25.0;
+        reach * reach
+    };
+    distance as f32 > threshold
+}
+
+fn cell_walk(cell: Cell, goal: Cell) -> u32 {
+    cell.x
+        .abs_diff(goal.x)
+        .saturating_add(cell.y.abs_diff(goal.y))
+        .into()
+}
+
+fn entering_cost(grid: &dyn Passability, cell: Cell, goal: Option<Cell>) -> u32 {
+    grid.extra_cost(cell)
+        .saturating_add(grid.goal_extra_cost(cell, goal))
+}
+
+const fn step_cost(extra: u32, diagonal: bool) -> u32 {
     let base = if diagonal {
         COST_DIAGONAL
     } else {
         COST_ORTHOGONAL
     };
-    base.saturating_add(grid.extra_cost(to))
+    base.saturating_add(extra)
 }
 
 pub(crate) fn offset(cell: Cell, delta: (i32, i32), extent: GridExtent) -> Option<Cell> {
@@ -283,6 +365,8 @@ impl<H: Heuristic> AStar<H> {
         request: &PathRequest,
         budget: &mut NodeBudget,
         want_closest: bool,
+        accept: Option<&dyn Fn(Cell) -> bool>,
+        cost_weight: f32,
     ) -> Result<SearchResult> {
         let extent = grid.extent();
         let start = extent.index(request.start).ok_or(Error::CellOutOfBounds {
@@ -301,6 +385,7 @@ impl<H: Heuristic> AStar<H> {
                 outcome: SearchOutcome::Found(CellPath {
                     cells: vec![request.start],
                     cost: 0,
+                    hops: Vec::new(),
                 }),
                 expanded: 0,
             });
@@ -316,7 +401,13 @@ impl<H: Heuristic> AStar<H> {
 
         let stamp = self.begin(extent);
         let mut expanded = 0u32;
-        let mut closest: Option<(u32, u32, u32)> = None;
+        let mut closest: Option<(f32, u32)> = None;
+        let goal_valid = grid.is_passable(request.goal, request.mover);
+        let mut bar = f32::INFINITY;
+        let mut screen: Screen = (
+            cell_distance_squared(request.start, request.goal),
+            cell_walk(request.start, request.goal),
+        );
         self.write(
             start,
             NodeState {
@@ -324,6 +415,8 @@ impl<H: Heuristic> AStar<H> {
                 g: 0,
                 parent: start,
                 closed: false,
+                via: 0,
+                extra: entering_cost(grid, request.start, Some(request.goal)),
             },
         );
         let h0 = self.heuristic.estimate(request.start, request.goal);
@@ -350,22 +443,29 @@ impl<H: Heuristic> AStar<H> {
             expanded = expanded.saturating_add(1);
             state.closed = true;
             self.write(entry.node, state);
-            if entry.node != start {
-                let candidate = (entry.h, entry.f, entry.node);
-                if closest.is_none_or(|best| candidate < best) {
-                    closest = Some(candidate);
+            if want_closest && entry.node != start {
+                if let Some(cell) = extent.cell_at_index(entry.node) {
+                    #[allow(clippy::cast_precision_loss)]
+                    let score = cell_distance_squared(cell, request.goal) as f32
+                        + cost_weight * (state.g as f32) * (state.g as f32);
+                    if score < bar {
+                        let accepted = accept.is_none_or(|accept| accept(cell));
+                        if goal_valid || accepted {
+                            bar = score;
+                        }
+                        if accepted {
+                            closest = Some((score, entry.node));
+                        }
+                    }
                 }
             }
 
             if entry.node == goal {
-                let cells = self
+                let path = self
                     .reconstruct(extent, start, goal)
                     .ok_or(Error::PathReconstruction)?;
                 return Ok(SearchResult {
-                    outcome: SearchOutcome::Found(CellPath {
-                        cells,
-                        cost: state.g,
-                    }),
+                    outcome: SearchOutcome::Found(path),
                     expanded,
                 });
             }
@@ -390,6 +490,10 @@ impl<H: Heuristic> AStar<H> {
                 let Some(neighbour) = offset(current, *delta, extent) else {
                     continue;
                 };
+                let distance = cell_distance_squared(neighbour, request.goal);
+                if distance < screen.0 {
+                    screen = (distance, cell_walk(neighbour, request.goal));
+                }
                 if !grid.is_passable(neighbour, request.mover)
                     || !grid.admits_step(current, neighbour, request.mover)
                 {
@@ -398,13 +502,27 @@ impl<H: Heuristic> AStar<H> {
                 if let Some(slot) = orthogonal_open.get_mut(slot) {
                     *slot = true;
                 }
+                if request.prune && prune_skips(distance, screen) {
+                    continue;
+                }
                 let Some(index) = extent.index(neighbour) else {
                     continue;
                 };
-                let tentative = state.g.saturating_add(step_cost(grid, neighbour, diagonal));
                 let existing = self.state(index).unwrap_or_default();
                 let seen = existing.stamp == stamp;
-                if seen && (existing.closed || existing.g <= tentative) {
+                if seen && existing.closed {
+                    continue;
+                }
+                let extra = if seen {
+                    existing.extra
+                } else {
+                    entering_cost(grid, neighbour, Some(request.goal))
+                };
+                let tentative = state.g.saturating_add(step_cost(
+                    extra.saturating_add(grid.step_extra_cost(current, neighbour)),
+                    diagonal,
+                ));
+                if seen && existing.g <= tentative {
                     continue;
                 }
                 self.write(
@@ -414,6 +532,8 @@ impl<H: Heuristic> AStar<H> {
                         g: tentative,
                         parent: entry.node,
                         closed: false,
+                        via: 0,
+                        extra,
                     },
                 );
                 let h = self.heuristic.estimate(neighbour, request.goal);
@@ -422,6 +542,20 @@ impl<H: Heuristic> AStar<H> {
                     h,
                     node: index,
                 }));
+            }
+            for link in grid.portal_links(current) {
+                if !request.mover.portal_pass.has(link.slot) {
+                    continue;
+                }
+                let _ = self.open_link(
+                    grid,
+                    extent,
+                    stamp,
+                    (entry.node, state.g),
+                    link,
+                    request.goal,
+                    0,
+                );
             }
         }
 
@@ -442,6 +576,28 @@ impl<H: Heuristic> AStar<H> {
         budget: &mut NodeBudget,
         mut accept: impl FnMut(Cell) -> bool,
     ) -> Result<SearchResult> {
+        self.find_where_with(
+            grid,
+            start,
+            mover,
+            bias_towards,
+            floor,
+            budget,
+            |cell, _| accept(cell),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_where_with(
+        &mut self,
+        grid: &dyn Passability,
+        start: Cell,
+        mover: MoverClass,
+        bias_towards: Cell,
+        floor: u32,
+        budget: &mut NodeBudget,
+        mut accept: impl FnMut(Cell, SearchProgress) -> bool,
+    ) -> Result<SearchResult> {
         let extent = grid.extent();
         let start_index = extent.index(start).ok_or(Error::CellOutOfBounds {
             layer: start.layer,
@@ -457,6 +613,8 @@ impl<H: Heuristic> AStar<H> {
 
         let stamp = self.begin(extent);
         let mut expanded = 0u32;
+        let mut added = 0u32;
+        let mut pending = 1u32;
         self.write(
             start_index,
             NodeState {
@@ -464,6 +622,8 @@ impl<H: Heuristic> AStar<H> {
                 g: 0,
                 parent: start_index,
                 closed: false,
+                via: 0,
+                extra: entering_cost(grid, start, None),
             },
         );
         let h0 = self
@@ -491,20 +651,22 @@ impl<H: Heuristic> AStar<H> {
             }
             expanded = expanded.saturating_add(1);
             state.closed = true;
+            pending = pending.saturating_sub(1);
             self.write(entry.node, state);
 
             let Some(current) = extent.cell_at_index(entry.node) else {
                 continue;
             };
-            if entry.node != start_index && accept(current) {
-                let cells = self
+            let progress = SearchProgress {
+                added,
+                open_empty: pending == 0,
+            };
+            if entry.node != start_index && accept(current, progress) {
+                let path = self
                     .reconstruct(extent, start_index, entry.node)
                     .ok_or(Error::PathReconstruction)?;
                 return Ok(SearchResult {
-                    outcome: SearchOutcome::Found(CellPath {
-                        cells,
-                        cost: state.g,
-                    }),
+                    outcome: SearchOutcome::Found(path),
                     expanded,
                 });
             }
@@ -537,11 +699,26 @@ impl<H: Heuristic> AStar<H> {
                 let Some(index) = extent.index(neighbour) else {
                     continue;
                 };
-                let tentative = state.g.saturating_add(step_cost(grid, neighbour, diagonal));
                 let existing = self.state(index).unwrap_or_default();
                 let seen = existing.stamp == stamp;
-                if seen && (existing.closed || existing.g <= tentative) {
+                if seen && existing.closed {
                     continue;
+                }
+                let extra = if seen {
+                    existing.extra
+                } else {
+                    entering_cost(grid, neighbour, None)
+                };
+                let tentative = state.g.saturating_add(step_cost(
+                    extra.saturating_add(grid.step_extra_cost(current, neighbour)),
+                    diagonal,
+                ));
+                if seen && existing.g <= tentative {
+                    continue;
+                }
+                if !seen {
+                    added = added.saturating_add(1);
+                    pending = pending.saturating_add(1);
                 }
                 self.write(
                     index,
@@ -550,6 +727,8 @@ impl<H: Heuristic> AStar<H> {
                         g: tentative,
                         parent: entry.node,
                         closed: false,
+                        via: 0,
+                        extra,
                     },
                 );
                 let h = self
@@ -562,6 +741,23 @@ impl<H: Heuristic> AStar<H> {
                     node: index,
                 }));
             }
+            for link in grid.portal_links(current) {
+                if !mover.portal_pass.has(link.slot) {
+                    continue;
+                }
+                if self.open_link(
+                    grid,
+                    extent,
+                    stamp,
+                    (entry.node, state.g),
+                    link,
+                    bias_towards,
+                    floor,
+                ) {
+                    added = added.saturating_add(1);
+                    pending = pending.saturating_add(1);
+                }
+            }
         }
 
         Ok(SearchResult {
@@ -570,22 +766,243 @@ impl<H: Heuristic> AStar<H> {
         })
     }
 
+    pub fn find_first_visit(
+        &mut self,
+        grid: &dyn Passability,
+        request: &PathRequest,
+        budget: &mut NodeBudget,
+        refuse: &dyn Fn(Cell) -> bool,
+    ) -> Result<SearchResult> {
+        let extent = grid.extent();
+        let start = extent.index(request.start).ok_or(Error::CellOutOfBounds {
+            layer: request.start.layer,
+            x: request.start.x,
+            y: request.start.y,
+        })?;
+        let goal = extent.index(request.goal).ok_or(Error::CellOutOfBounds {
+            layer: request.goal.layer,
+            x: request.goal.x,
+            y: request.goal.y,
+        })?;
+        if start == goal {
+            return Ok(SearchResult {
+                outcome: SearchOutcome::Found(CellPath {
+                    cells: vec![request.start],
+                    cost: 0,
+                    hops: Vec::new(),
+                }),
+                expanded: 0,
+            });
+        }
+        if !grid.is_passable(request.start, request.mover)
+            || !grid.is_passable(request.goal, request.mover)
+        {
+            return Ok(SearchResult {
+                outcome: SearchOutcome::Unreachable,
+                expanded: 0,
+            });
+        }
+
+        let stamp = self.begin(extent);
+        let mut expanded = 0u32;
+        self.write(
+            start,
+            NodeState {
+                stamp,
+                g: 0,
+                parent: start,
+                closed: false,
+                via: 0,
+                extra: entering_cost(grid, request.start, Some(request.goal)),
+            },
+        );
+        let h0 = self.heuristic.estimate(request.start, request.goal);
+        self.open.push(Reverse(OpenKey {
+            f: h0,
+            h: h0,
+            node: start,
+        }));
+
+        while let Some(Reverse(entry)) = self.open.pop() {
+            let Some(mut state) = self.state(entry.node) else {
+                continue;
+            };
+            if state.stamp != stamp || state.closed {
+                continue;
+            }
+            if !budget.spend() {
+                return Ok(SearchResult {
+                    outcome: SearchOutcome::BudgetExhausted,
+                    expanded,
+                });
+            }
+            expanded = expanded.saturating_add(1);
+            state.closed = true;
+            self.write(entry.node, state);
+            if entry.node == goal {
+                let path = self
+                    .reconstruct(extent, start, goal)
+                    .ok_or(Error::PathReconstruction)?;
+                return Ok(SearchResult {
+                    outcome: SearchOutcome::Found(path),
+                    expanded,
+                });
+            }
+
+            let Some(current) = extent.cell_at_index(entry.node) else {
+                continue;
+            };
+            let mut orthogonal_open = [false; 4];
+            for (slot, delta) in NEIGHBOURS.iter().enumerate() {
+                let diagonal = slot >= 4;
+                let Some(neighbour) = offset(current, *delta, extent) else {
+                    continue;
+                };
+                if !grid.is_passable(neighbour, request.mover)
+                    || !grid.admits_step(current, neighbour, request.mover)
+                {
+                    continue;
+                }
+                let Some(index) = extent.index(neighbour) else {
+                    continue;
+                };
+                if self.state(index).is_some_and(|seen| seen.stamp == stamp) {
+                    continue;
+                }
+                if index != goal {
+                    if diagonal {
+                        let Some((a, b)) =
+                            DIAGONAL_ORTHOGONALS.get(slot.saturating_sub(4)).copied()
+                        else {
+                            continue;
+                        };
+                        let open = orthogonal_open.get(a).copied().unwrap_or(false)
+                            || orthogonal_open.get(b).copied().unwrap_or(false);
+                        if !open || refuse(neighbour) {
+                            continue;
+                        }
+                    } else if refuse(neighbour) {
+                        continue;
+                    }
+                }
+                if let Some(flag) = orthogonal_open.get_mut(slot) {
+                    *flag = true;
+                }
+                let extra = entering_cost(grid, neighbour, Some(request.goal));
+                let tentative = state.g.saturating_add(step_cost(
+                    extra.saturating_add(grid.step_extra_cost(current, neighbour)),
+                    diagonal,
+                ));
+                self.write(
+                    index,
+                    NodeState {
+                        stamp,
+                        g: tentative,
+                        parent: entry.node,
+                        closed: false,
+                        via: 0,
+                        extra,
+                    },
+                );
+                let h = self.heuristic.estimate(neighbour, request.goal);
+                self.open.push(Reverse(OpenKey {
+                    f: tentative.saturating_add(h),
+                    h,
+                    node: index,
+                }));
+            }
+            for link in grid.portal_links(current) {
+                if !request.mover.portal_pass.has(link.slot) {
+                    continue;
+                }
+                let listed = extent
+                    .index(link.exit)
+                    .and_then(|exit| self.state(exit))
+                    .is_some_and(|seen| seen.stamp == stamp);
+                if !listed {
+                    let _ = self.open_link(
+                        grid,
+                        extent,
+                        stamp,
+                        (entry.node, state.g),
+                        link,
+                        request.goal,
+                        0,
+                    );
+                }
+            }
+        }
+        Ok(SearchResult {
+            outcome: SearchOutcome::Unreachable,
+            expanded,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_link(
+        &mut self,
+        grid: &dyn Passability,
+        extent: GridExtent,
+        stamp: u32,
+        from: (u32, u32),
+        link: &crate::grid::PortalLink,
+        towards: Cell,
+        floor: u32,
+    ) -> bool {
+        let Some(index) = extent.index(link.exit) else {
+            return false;
+        };
+        let existing = self.state(index).unwrap_or_default();
+        let seen = existing.stamp == stamp;
+        if seen && existing.closed {
+            return false;
+        }
+        let extra = if seen {
+            existing.extra
+        } else {
+            entering_cost(grid, link.exit, Some(towards))
+        };
+        let tentative = from.1.saturating_add(step_cost(extra, false));
+        if seen && existing.g <= tentative {
+            return false;
+        }
+        self.write(
+            index,
+            NodeState {
+                stamp,
+                g: tentative,
+                parent: from.0,
+                closed: false,
+                via: link.slot.saturating_add(1),
+                extra,
+            },
+        );
+        let h = self
+            .heuristic
+            .estimate(link.exit, towards)
+            .saturating_sub(floor);
+        self.open.push(Reverse(OpenKey {
+            f: tentative.saturating_add(h),
+            h,
+            node: index,
+        }));
+        !seen
+    }
+
     fn give_up(
         &self,
         extent: GridExtent,
         start: u32,
-        closest: Option<(u32, u32, u32)>,
+        closest: Option<(f32, u32)>,
         want_closest: bool,
     ) -> Option<SearchOutcome> {
         if !want_closest {
             return None;
         }
-        let (_, _, node) = closest?;
-        let cells = self.reconstruct(extent, start, node)?;
-        Some(SearchOutcome::Closest(CellPath {
-            cells,
-            cost: self.state(node)?.g,
-        }))
+        let (_, node) = closest?;
+        Some(SearchOutcome::Closest(
+            self.reconstruct(extent, start, node)?,
+        ))
     }
 }
 
@@ -596,7 +1013,7 @@ impl<H: Heuristic> Search for AStar<H> {
         request: &PathRequest,
         budget: &mut NodeBudget,
     ) -> Result<SearchResult> {
-        self.run(grid, request, budget, false)
+        self.run(grid, request, budget, false, None, 0.0)
     }
 
     fn find_closest(
@@ -605,7 +1022,18 @@ impl<H: Heuristic> Search for AStar<H> {
         request: &PathRequest,
         budget: &mut NodeBudget,
     ) -> Result<SearchResult> {
-        self.run(grid, request, budget, true)
+        self.run(grid, request, budget, true, None, 0.0)
+    }
+
+    fn find_closest_accepting(
+        &mut self,
+        grid: &dyn Passability,
+        request: &PathRequest,
+        budget: &mut NodeBudget,
+        accept: &dyn Fn(Cell) -> bool,
+        cost_weight: f32,
+    ) -> Result<SearchResult> {
+        self.run(grid, request, budget, true, Some(accept), cost_weight)
     }
 }
 
@@ -638,6 +1066,7 @@ impl Search for StraightLineSearch {
             outcome: SearchOutcome::Found(CellPath {
                 cost: Octile::admissible().estimate(request.start, request.goal),
                 cells,
+                hops: Vec::new(),
             }),
             expanded: 0,
         })
@@ -659,6 +1088,9 @@ mod tests {
         PathRequest {
             corner_radius: 0.0,
             departure: None,
+            approach: None,
+            prune: false,
+            final_goal: true,
             start,
             goal,
             mover: MoverClass::new(WALL),
@@ -672,6 +1104,25 @@ mod tests {
             SearchOutcome::Found(path) => path,
             other => panic!("expected a path, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pruned_search_for_a_walled_off_goal_expands_fewer_cells() {
+        let mut grid = open_grid(80, 80);
+        for y in 0..80 {
+            grid.set_flags(Cell::new(60, y), WALL).unwrap();
+        }
+        let expanded = |prune: bool| {
+            let mut asked = request(Cell::new(10, 40), Cell::new(70, 40));
+            asked.prune = prune;
+            let mut search = AStar::octile();
+            let result = search
+                .find(&grid, &asked, &mut NodeBudget::unlimited())
+                .unwrap();
+            assert_eq!(result.outcome, SearchOutcome::Unreachable);
+            result.expanded
+        };
+        assert!(expanded(true) < expanded(false) / 2);
     }
 
     #[test]
@@ -776,6 +1227,29 @@ mod tests {
     }
 
     #[test]
+    fn a_cost_weight_trades_distance_to_the_goal_against_cost_so_far() {
+        let mut grid = open_grid(10, 1);
+        grid.set_flags(Cell::new(9, 0), WALL).unwrap();
+        let end = |weight: f32| {
+            let result = AStar::octile()
+                .find_closest_accepting(
+                    &grid,
+                    &request(Cell::new(0, 0), Cell::new(9, 0)),
+                    &mut NodeBudget::unlimited(),
+                    &|_| true,
+                    weight,
+                )
+                .unwrap();
+            let SearchOutcome::Closest(path) = result.outcome else {
+                panic!("expected a closest path, got {:?}", result.outcome)
+            };
+            path.cells.last().copied()
+        };
+        assert_eq!(end(0.0), Some(Cell::new(8, 0)));
+        assert_eq!(end(1.0), Some(Cell::new(1, 0)));
+    }
+
+    #[test]
     fn a_unit_cannot_cut_the_corner_between_two_blocked_cells() {
         let mut grid = open_grid(3, 3);
         grid.set_flags(Cell::new(1, 0), WALL).unwrap();
@@ -789,6 +1263,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.outcome, SearchOutcome::Unreachable);
+    }
+
+    #[test]
+    fn the_first_visit_search_never_relaxes_a_listed_cell() {
+        let mut grid = open_grid(4, 3);
+        grid.set_extra_cost(Cell::new(1, 1), 6).unwrap();
+        let ask = request(Cell::new(0, 1), Cell::new(3, 1));
+        let relaxed = found(
+            AStar::new(ZeroHeuristic)
+                .find(&grid, &ask, &mut NodeBudget::unlimited())
+                .unwrap(),
+        );
+        let first = found(
+            AStar::new(ZeroHeuristic)
+                .find_first_visit(&grid, &ask, &mut NodeBudget::unlimited(), &|_| false)
+                .unwrap(),
+        );
+        assert_eq!(relaxed.cost, 36);
+        assert_eq!(first.cost, 38);
     }
 
     #[test]
@@ -827,6 +1320,54 @@ mod tests {
             "the cheap gap should be used: {:?}",
             path.cells
         );
+    }
+
+    struct CostlyFarFromGoal(CostGrid);
+
+    impl Passability for CostlyFarFromGoal {
+        fn extent(&self) -> GridExtent {
+            self.0.extent()
+        }
+        fn flags(&self, cell: Cell) -> CellFlags {
+            self.0.flags(cell)
+        }
+        fn extra_cost(&self, cell: Cell) -> u32 {
+            self.0.extra_cost(cell)
+        }
+        fn goal_extra_cost(&self, cell: Cell, goal: Option<Cell>) -> u32 {
+            let near = goal.is_some_and(|goal| cell.x.abs_diff(goal.x) <= 3);
+            if cell.y == 1 && cell.x == 4 && !near {
+                500
+            } else {
+                0
+            }
+        }
+    }
+
+    #[test]
+    fn a_goal_dependent_charge_steers_the_path_and_is_free_near_the_goal() {
+        let grid = CostlyFarFromGoal(open_grid(12, 3));
+        let mut search = AStar::octile();
+        let far = found(
+            search
+                .find(
+                    &grid,
+                    &request(Cell::new(0, 1), Cell::new(11, 1)),
+                    &mut NodeBudget::unlimited(),
+                )
+                .unwrap(),
+        );
+        assert!(!far.cells.contains(&Cell::new(4, 1)), "{:?}", far.cells);
+        let near = found(
+            search
+                .find(
+                    &grid,
+                    &request(Cell::new(0, 1), Cell::new(6, 1)),
+                    &mut NodeBudget::unlimited(),
+                )
+                .unwrap(),
+        );
+        assert!(near.cells.contains(&Cell::new(4, 1)), "{:?}", near.cells);
     }
 
     #[test]
@@ -939,6 +1480,40 @@ mod tests {
                 Some(expected) => assert_eq!(&path.cells, expected),
             }
         }
+    }
+
+    #[test]
+    fn find_where_with_reports_an_exhausted_open_list_on_the_last_cell() {
+        let grid = open_grid(3, 3);
+        let mut search = AStar::octile();
+        let mut taken = Vec::new();
+        let result = search
+            .find_where_with(
+                &grid,
+                Cell::new(1, 1),
+                MoverClass::new(WALL),
+                Cell::new(1, 1),
+                u32::MAX,
+                &mut NodeBudget::unlimited(),
+                |cell, progress| {
+                    taken.push((cell, progress));
+                    progress.open_empty && progress.added > 0
+                },
+            )
+            .unwrap();
+        let path = found(result);
+        assert_eq!(
+            taken.len(),
+            8,
+            "every other cell was tested before the search ran dry"
+        );
+        assert_eq!(path.cells.last(), taken.last().map(|(cell, _)| cell));
+        assert_eq!(taken.last().map(|(_, progress)| progress.added), Some(8));
+        assert!(taken
+            .iter()
+            .rev()
+            .skip(1)
+            .all(|(_, progress)| !progress.open_empty));
     }
 
     #[test]

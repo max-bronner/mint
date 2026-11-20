@@ -60,7 +60,7 @@ impl Component for Harvesting {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn after_ms(now: Frame, ms: f32) -> Frame {
     let ms = ms.max(0.0).min(f64::from(u32::MAX) as f32) as u32;
-    now.checked_add(LogicFrames::from_milliseconds(ms))
+    now.checked_add(mint_sage_modules::retail_duration_ticks(ms))
         .unwrap_or(Frame::FOREVER)
 }
 

@@ -19,6 +19,12 @@ Object Shed\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
   GeometryContactPoint = X:40 Y:0 Z:0\n  \
   GeometryContactPoint = X:-40 Y:0 Z:0\n  \
   GeometryContactPoint = X:0 Y:40 Z:0 Repair\nEnd\n\
+Object Gate\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE BLOCKING_GATE\n  \
+  Body = StructureBody Tag_Body\n    MaxHealth = 100000\n  End\n  \
+  Geometry = BOX\n  GeometryMajorRadius = 30\n  GeometryMinorRadius = 10\n  GeometryHeight = 30\n  \
+  GeometryContactPoint = X:-25 Y:0 Z:0 Ram\n  \
+  GeometryContactPoint = X:25 Y:0 Z:0 Ram\n  \
+  GeometryContactPoint = X:0 Y:200 Z:0 Ram\nEnd\n\
 CommandSet PorterSet\n  1 = Build_Shed\nEnd\n\
 CommandButton Build_Shed\n  Command = DOZER_CONSTRUCT\n  Object = Shed\nEnd\n";
 
@@ -33,7 +39,7 @@ fn load() -> Match {
             .unwrap();
     assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
     let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
-    let seeds: Vec<String> = ["Raider", "Porter", "Shed"]
+    let seeds: Vec<String> = ["Raider", "Porter", "Shed", "Gate"]
         .into_iter()
         .map(str::to_owned)
         .collect();
@@ -50,6 +56,7 @@ fn start(
     spawns: &[(&str, f32, f32, PlayerId)],
 ) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let production = m.kinds.production(&m.data);
+    let placed = spawns;
     let spawns: Vec<Spawn> = spawns
         .iter()
         .map(|(name, x, y, owner)| {
@@ -67,7 +74,19 @@ fn start(
         .collect();
     let map = flat_map(96, 96);
     let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
+    let footprints = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (name, ..))| {
+            let entry = m.kinds.get(m.kinds.kind(name)?)?;
+            entry
+                .record
+                .has_kind("STRUCTURE")
+                .then(|| (at, crate::construction::footprint_of(&entry.record)))
+        })
+        .collect();
     let rules = RotwkRules::new(passability, spawns)
+        .with_structure_footprints(footprints)
         .with_players(2)
         .with_combat(m.data.combat.clone())
         .with_construction(Arc::clone(&m.kinds), production.clone())
@@ -199,5 +218,46 @@ fn a_repair_builder_walks_to_the_repair_point() {
     assert!(
         dx * dx + dy * dy <= 10.0 * 10.0,
         "the porter's goal {goal:?} is the Repair point (300, 340)"
+    );
+}
+
+#[test]
+fn a_melee_attacker_of_a_gate_turns_to_its_nearest_ram_point() {
+    let m = load();
+    let (mut simulation, ids, e) = start(
+        &m,
+        &[
+            ("Gate", 300.0, 300.0, PLAYER),
+            ("Raider", 270.0, 200.0, OTHER),
+        ],
+    );
+    simulation
+        .submit(
+            OTHER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![e[1]],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(OTHER, RotwkCommand::AttackObject { target: e[0] })
+        .unwrap();
+    for _ in 0..240 {
+        simulation.tick().unwrap();
+    }
+    let at = simulation.state().get(ids.body, e[1]).unwrap().0;
+    let ram = Vec2::new(275.0, 300.0).minus(at.position);
+    let centre = Vec2::new(300.0, 300.0).minus(at.position);
+    let off = |towards: Vec2| {
+        at.facing
+            .delta_to(Facing::from_vector(towards).unwrap())
+            .abs()
+    };
+    assert!(
+        off(ram) < off(centre),
+        "faces {:?} from {:?}",
+        at.facing,
+        at.position
     );
 }

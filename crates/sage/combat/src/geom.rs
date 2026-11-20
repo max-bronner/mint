@@ -64,6 +64,67 @@ pub fn surface_distance_squared_2d(a: Point3, a_radius: f32, b: Point3, b_radius
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxVolume {
+    pub major: f32,
+    pub minor: f32,
+    pub cos: f32,
+    pub sin: f32,
+}
+
+impl BoxVolume {
+    #[must_use]
+    pub fn distance_squared_to(&self, centre: (f32, f32), at: (f32, f32), at_radius: f32) -> f32 {
+        let dx = at.0 - centre.0;
+        let dy = at.1 - centre.1;
+        let a = (dx * self.cos + dy * self.sin).abs();
+        let b = (dy * self.cos - dx * self.sin).abs();
+        let raw = if a < self.major && b < self.minor {
+            0.0
+        } else if a < self.major {
+            b - self.minor
+        } else if b < self.minor {
+            a - self.major
+        } else {
+            let length = (dx * dx + dy * dy).sqrt();
+            if length > 0.0 {
+                length - (self.major * a + self.minor * b) / length
+            } else {
+                0.0
+            }
+        };
+        let border = raw - at_radius.max(0.0);
+        if border.is_finite() && border > 0.0 {
+            border * border
+        } else if border.is_finite() {
+            0.0
+        } else {
+            f32::INFINITY
+        }
+    }
+}
+
+#[must_use]
+pub fn border_distance_squared(
+    a: (f32, f32),
+    a_radius: f32,
+    a_box: Option<&BoxVolume>,
+    b: (f32, f32),
+    b_radius: f32,
+    b_box: Option<&BoxVolume>,
+) -> f32 {
+    match (a_box, b_box) {
+        (Some(shape), None) => shape.distance_squared_to(a, b, b_radius),
+        (None, Some(shape)) => shape.distance_squared_to(b, a, a_radius),
+        _ => surface_distance_squared_2d(
+            Point3::new(a.0, a.1, 0.0),
+            a_radius,
+            Point3::new(b.0, b.1, 0.0),
+            b_radius,
+        ),
+    }
+}
+
 #[must_use]
 pub fn within_attack_range(distance_squared: f32, min_range: f32, max_range: f32) -> bool {
     if !distance_squared.is_finite() || !min_range.is_finite() || !max_range.is_finite() {
@@ -81,6 +142,36 @@ pub fn within_attack_range(distance_squared: f32, min_range: f32, max_range: f32
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_box_victim_is_reached_by_its_sides_not_its_bounding_circle() {
+        let shape = BoxVolume {
+            major: 50.0,
+            minor: 10.0,
+            cos: 1.0,
+            sin: 0.0,
+        };
+        let from = |at: (f32, f32), shape: &BoxVolume| {
+            border_distance_squared(at, 5.0, None, (0.0, 0.0), 0.0, Some(shape)).sqrt()
+        };
+        assert!((from((0.0, 60.0), &shape) - 45.0).abs() < 1e-3);
+        assert!((from((60.0, 0.0), &shape) - 5.0).abs() < 1e-3);
+        let turned = BoxVolume {
+            cos: 0.0,
+            sin: 1.0,
+            ..shape
+        };
+        assert!((from((0.0, 60.0), &turned) - 5.0).abs() < 1e-3);
+        let both = border_distance_squared(
+            (0.0, 60.0),
+            5.0,
+            Some(&shape),
+            (0.0, 0.0),
+            0.0,
+            Some(&shape),
+        );
+        assert!((both.sqrt() - (60.0 - 5.0)).abs() < 1e-3);
+    }
 
     #[test]
     fn surface_distance_subtracts_both_radii_and_clamps_at_zero() {

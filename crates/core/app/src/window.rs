@@ -11,7 +11,7 @@ use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::clock::FixedTimestep;
 use crate::frame_log::{FrameLog, FrameMarks};
-use crate::input::{lines_from_pixels, InputEvent, Key, PointerButton};
+use crate::input::{lines_from_pixels, DoubleClicks, InputEvent, Key, PointerButton};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -60,6 +60,10 @@ pub trait App {
         false
     }
 
+    fn abandon_on_exit(&self) -> bool {
+        false
+    }
+
     fn paused(&self) -> bool {
         false
     }
@@ -96,10 +100,17 @@ where
         build: Some(build),
         state: None,
         failure: None,
+        abandon_state: false,
     };
     event_loop
         .run_app(&mut handler)
         .map_err(|e| Error::event_loop("running the event loop", e))?;
+    if handler.abandon_state && handler.failure.is_none() {
+        if let Some(state) = handler.state.take() {
+            #[allow(clippy::mem_forget)]
+            std::mem::forget(state);
+        }
+    }
 
     match handler.failure {
         Some(error) => Err(error),
@@ -116,6 +127,9 @@ struct State<A> {
     frame_log: FrameLog,
     ctrl: bool,
     shift: bool,
+    pointer: [f32; 2],
+    started: Instant,
+    double_clicks: DoubleClicks,
 }
 
 struct Handler<A, F> {
@@ -123,6 +137,7 @@ struct Handler<A, F> {
     build: Option<F>,
     state: Option<State<A>>,
     failure: Option<Error>,
+    abandon_state: bool,
 }
 
 impl<A, F> Handler<A, F>
@@ -168,6 +183,9 @@ where
             frame_log: FrameLog::from_env(),
             ctrl: false,
             shift: false,
+            pointer: [0.0, 0.0],
+            started: Instant::now(),
+            double_clicks: DoubleClicks::default(),
         })
     }
 }
@@ -210,21 +228,27 @@ where
             }
             WindowEvent::CursorMoved { position, .. } => {
                 #[allow(clippy::cast_possible_truncation)]
-                state.app.input(&InputEvent::PointerMoved {
-                    x: position.x as f32,
-                    y: position.y as f32,
-                });
+                let at = [position.x as f32, position.y as f32];
+                state.pointer = at;
+                state
+                    .app
+                    .input(&InputEvent::PointerMoved { x: at[0], y: at[1] });
             }
+            WindowEvent::CursorLeft { .. } => state.app.input(&InputEvent::PointerLeft),
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
                 ..
             } => {
                 if let Some(button) = translate_button(button) {
-                    state.app.input(&InputEvent::PointerButton {
-                        button,
-                        pressed: pressed == ElementState::Pressed,
-                    });
+                    let pressed = pressed == ElementState::Pressed;
+                    state
+                        .app
+                        .input(&InputEvent::PointerButton { button, pressed });
+                    let at = state.started.elapsed();
+                    if pressed && state.double_clicks.press(button, at, state.pointer) {
+                        state.app.input(&InputEvent::PointerDoubleClick { button });
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -237,18 +261,15 @@ where
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if !event.repeat {
-                    let key = physical_digit(event.physical_key)
-                        .filter(|_| state.ctrl && state.shift)
-                        .map_or_else(
-                            || {
-                                with_modifiers(
-                                    translate_key(&event.logical_key),
-                                    state.ctrl,
-                                    state.shift,
-                                )
-                            },
-                            Key::CtrlShiftDigit,
-                        );
+                    let key = numpad_digit(event.physical_key).map(Key::Numpad);
+                    let key = key.or_else(|| {
+                        physical_digit(event.physical_key)
+                            .filter(|_| state.ctrl && state.shift)
+                            .map(Key::CtrlShiftDigit)
+                    });
+                    let key = key.unwrap_or_else(|| {
+                        with_modifiers(translate_key(&event.logical_key), state.ctrl, state.shift)
+                    });
                     state.app.input(&InputEvent::Key {
                         key,
                         pressed: event.state == ElementState::Pressed,
@@ -304,6 +325,7 @@ where
                     .record(elapsed, steps, &marks, present, &state.app);
 
                 apply_cursor_request(state.app.cursor(), event_loop, &state.window);
+                let abandon = state.app.exit_requested() && state.app.abandon_on_exit();
                 if state.app.exit_requested() {
                     event_loop.exit();
                 }
@@ -311,6 +333,7 @@ where
                 if let Err(error) = drawn {
                     self.fail(event_loop, Error::Render(error));
                 }
+                self.abandon_state |= abandon;
             }
             _ => {}
         }
@@ -380,6 +403,25 @@ fn physical_digit(key: PhysicalKey) -> Option<u8> {
         KeyCode::Digit7 => 7,
         KeyCode::Digit8 => 8,
         KeyCode::Digit9 => 9,
+        _ => return None,
+    })
+}
+
+fn numpad_digit(key: PhysicalKey) -> Option<u8> {
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    Some(match code {
+        KeyCode::Numpad0 => 0,
+        KeyCode::Numpad1 => 1,
+        KeyCode::Numpad2 => 2,
+        KeyCode::Numpad3 => 3,
+        KeyCode::Numpad4 => 4,
+        KeyCode::Numpad5 => 5,
+        KeyCode::Numpad6 => 6,
+        KeyCode::Numpad7 => 7,
+        KeyCode::Numpad8 => 8,
+        KeyCode::Numpad9 => 9,
         _ => return None,
     })
 }

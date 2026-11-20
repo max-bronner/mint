@@ -21,6 +21,7 @@ use crate::animation_state::{
 
 mod blend;
 mod fx;
+mod index;
 mod pose;
 mod ride;
 mod tint;
@@ -78,16 +79,24 @@ pub struct LookTexture {
     pub exclude: Vec<Arc<str>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LookSubObject {
+    pub name: Arc<str>,
+    pub shown: bool,
+    pub permanent: bool,
+    pub rewrites: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnitLook {
     pub conditions: Vec<Arc<str>>,
-    pub sub_objects: Vec<(Arc<str>, bool)>,
+    pub sub_objects: Vec<LookSubObject>,
     pub textures: Vec<LookTexture>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct LookArt {
-    pub parts: Vec<Option<bool>>,
+    pub writes: Arc<[LookSubObject]>,
     pub skin: Option<Skin>,
     pub conditions: Conditions,
 }
@@ -224,9 +233,18 @@ pub struct CompanionModule {
     pub has_model: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FloorFlags {
+    pub(crate) hidden: bool,
+    pub(crate) lock: bool,
+    pub(crate) changed: bool,
+}
+
 pub struct FloorModule {
     pub model: Arc<CachedModel>,
     pub hide_if: Conditions,
+    pub tag: Option<String>,
+    pub start_hidden: bool,
     weather: Vec<(NuggetWeather, Skin)>,
     force_to_back: bool,
 }
@@ -253,6 +271,8 @@ pub struct UnitTemplate {
     pub companions: Vec<CompanionModule>,
     pub floors: Vec<FloorModule>,
     pub modules: Vec<usize>,
+    pub module_tags: Vec<Option<String>>,
+    body_rank: usize,
     pub module_of: Option<usize>,
     pub attach: Option<mint_render::Vec3>,
     look_conditions: Vec<Option<Conditions>>,
@@ -265,7 +285,7 @@ pub struct UnitTemplate {
     animation_sounds: Vec<mint_sage_ini::AnimationSoundEntry>,
     pub max_update_range_cap: Option<f32>,
     sound_cues: BTreeMap<(usize, usize), Vec<(String, Vec<u32>)>>,
-    frame_event_parts: BTreeMap<String, Vec<(String, bool)>>,
+    frame_event_parts: BTreeMap<String, Vec<(String, bool, bool)>>,
 }
 
 pub struct BodyArt {
@@ -495,6 +515,9 @@ pub struct UnitDrawable {
     state_parts: Option<Arc<[Option<bool>]>>,
     plain_parts: Vec<(String, bool)>,
     permanent_parts: Vec<(String, bool)>,
+    look_writes: Arc<[LookSubObject]>,
+    floor_flags: Vec<FloorFlags>,
+    module_hidden: Vec<bool>,
     fx_frame: Option<f32>,
     fx_pending: Vec<String>,
     bone_fx_pending: Vec<fx::BoneFxCue>,
@@ -625,6 +648,8 @@ pub struct BoneFxFire {
 pub struct UnitScene {
     pub templates: Vec<UnitTemplate>,
     drawables: Vec<UnitDrawable>,
+    keys: index::DrawableKeys,
+    drawing_nothing: std::sync::OnceLock<Vec<u32>>,
     by_name: BTreeMap<String, usize>,
     cache: ModelCache,
     body_art: BTreeMap<String, Option<Arc<BodyArt>>>,
@@ -681,7 +706,12 @@ impl UnitScene {
         out
     }
 
-    pub fn set_frame_event_parts(&mut self, slot: usize, data: &str, parts: Vec<(String, bool)>) {
+    pub fn set_frame_event_parts(
+        &mut self,
+        slot: usize,
+        data: &str,
+        parts: Vec<(String, bool, bool)>,
+    ) {
         if let Some(template) = self.templates.get_mut(slot) {
             template.frame_event_parts.insert(data.to_owned(), parts);
         }
@@ -740,18 +770,22 @@ impl UnitScene {
 
     #[must_use]
     pub fn ids_drawing_nothing(&self) -> Vec<u32> {
-        let mut shown: Vec<(u32, bool)> = self
-            .drawables
-            .iter()
-            .filter(|drawable| drawable.ghost.is_none())
-            .map(|drawable| (drawable.id, !drawable.hidden))
-            .collect();
-        shown.sort_unstable();
-        shown
-            .chunk_by(|a, b| a.0 == b.0)
-            .filter(|modules| modules.iter().all(|(_, shown)| !shown))
-            .filter_map(|modules| modules.first().map(|(id, _)| *id))
-            .collect()
+        self.drawing_nothing
+            .get_or_init(|| {
+                let mut shown: Vec<(u32, bool)> = self
+                    .drawables
+                    .iter()
+                    .filter(|drawable| drawable.ghost.is_none())
+                    .map(|drawable| (drawable.id, !drawable.hidden))
+                    .collect();
+                shown.sort_unstable();
+                shown
+                    .chunk_by(|a, b| a.0 == b.0)
+                    .filter(|modules| modules.iter().all(|(_, shown)| !shown))
+                    .filter_map(|modules| modules.first().map(|(id, _)| *id))
+                    .collect()
+            })
+            .clone()
     }
 
     pub fn state_decals(&self) -> impl Iterator<Item = (u32, Mat4, &StateDecal)> + '_ {
@@ -780,7 +814,7 @@ impl UnitScene {
 
     #[must_use]
     pub fn drawable_by_id(&self, id: u32) -> Option<&UnitDrawable> {
-        self.drawables.iter().find(|drawable| drawable.id == id)
+        self.drawables.get(self.keys.by_id(id)?)
     }
 
     pub fn active_states(&self, id: u32) -> impl Iterator<Item = &ModelStateDef> {
@@ -842,9 +876,30 @@ impl UnitScene {
         generation: u32,
         template: usize,
     ) -> Option<&UnitDrawable> {
-        self.drawables.iter().find(|drawable| {
-            drawable.id == id && drawable.generation == generation && drawable.template == template
-        })
+        self.drawables
+            .get(self.keys.by_key(id, generation, template)?)
+    }
+
+    pub(crate) fn module_drawables<'a>(
+        &'a self,
+        drawable: &'a UnitDrawable,
+    ) -> impl Iterator<Item = &'a UnitDrawable> {
+        let owner = self
+            .templates
+            .get(drawable.template)
+            .and_then(|template| template.module_of)
+            .unwrap_or(drawable.template);
+        let (modules, rank) = self.templates.get(owner).map_or((&[][..], 0), |template| {
+            (template.modules.as_slice(), template.body_rank)
+        });
+        let rank = rank.min(modules.len());
+        let (before, after) = modules.split_at(rank);
+        before
+            .iter()
+            .copied()
+            .chain(std::iter::once(owner))
+            .chain(after.iter().copied())
+            .filter_map(move |slot| self.drawable_by_key(drawable.id, drawable.generation, slot))
     }
 
     pub fn intern_look(&mut self, look: UnitLook) -> LookKey {
@@ -941,17 +996,17 @@ impl UnitScene {
                 .collect();
             let mut matched = vec![false; look.sub_objects.len()];
             let mut resolved = Vec::with_capacity(bodies.len());
+            let writes: Arc<[LookSubObject]> = look.sub_objects.iter().cloned().collect();
             for (body, body_art) in bodies {
                 let parts = &body_art.model.parts;
-                let overrides = model_part_overrides(&look.sub_objects, &body_art.model);
-                for (seen, (pattern, _)) in matched.iter_mut().zip(&look.sub_objects) {
-                    *seen |= parts.iter().any(|part| names_part(pattern, &part.name));
+                for (seen, write) in matched.iter_mut().zip(&look.sub_objects) {
+                    *seen |= parts.iter().any(|part| names_part(&write.name, &part.name));
                 }
                 let skin = self.look_skin(renderer, vfs, resolver, &body_art.model, &look.textures);
                 resolved.push((
                     (body, key),
                     Arc::new(LookArt {
-                        parts: overrides,
+                        writes: Arc::clone(&writes),
                         skin,
                         conditions,
                     }),
@@ -978,9 +1033,9 @@ impl UnitScene {
         }
         for ((owner, key), seen) in by_owner {
             let look = self.look(key);
-            for (seen, (pattern, _)) in seen.iter().zip(&look.sub_objects) {
+            for (seen, write) in seen.iter().zip(&look.sub_objects) {
                 if !seen {
-                    self.look_misses.insert(format!("{owner}: {pattern}"));
+                    self.look_misses.insert(format!("{owner}: {}", write.name));
                 }
             }
         }
@@ -1075,14 +1130,38 @@ impl UnitScene {
             return Some(*found);
         }
         self.report.templates = self.report.templates.saturating_add(1);
-        let body = ModuleSource {
-            model: index.lookup(name).model().map(str::to_owned),
-            alternates: index.model_alternates(name).to_vec(),
-            states: index.animation_states(name).to_vec(),
-            model_states: index.model_states(name).to_vec(),
-            hide_if: index.hide_if_model_conditions(name).to_vec(),
-            ok_to_change_model_color: index.ok_to_change_model_color(name),
-            truck_tires: index.truck_tires(name).cloned(),
+        let tree_body = index.tree_drawable_body(name);
+        let mut model_states = tree_body.as_ref().map_or_else(
+            || index.model_states(name).to_vec(),
+            |view| view.model_states.to_vec(),
+        );
+        if let Some(decal) = index.object_decal(name) {
+            for state in model_states
+                .iter_mut()
+                .filter(|state| state.decal.is_none() && state.model.is_some())
+            {
+                state.decal = Some(decal.clone());
+            }
+        }
+        let body = match tree_body {
+            Some(view) => ModuleSource {
+                model: view.model.map(str::to_owned),
+                alternates: view.alternates.to_vec(),
+                states: view.animation_states.to_vec(),
+                model_states,
+                hide_if: view.hide_if.to_vec(),
+                ok_to_change_model_color: view.ok_to_change_model_color,
+                truck_tires: None,
+            },
+            None => ModuleSource {
+                model: index.lookup(name).model().map(str::to_owned),
+                alternates: index.model_alternates(name).to_vec(),
+                states: index.animation_states(name).to_vec(),
+                model_states,
+                hide_if: index.hide_if_model_conditions(name).to_vec(),
+                ok_to_change_model_color: index.ok_to_change_model_color(name),
+                truck_tires: index.truck_tires(name).cloned(),
+            },
         };
         let companions: Vec<DrawModuleView<'_>> = index
             .draw_modules(name)
@@ -1110,7 +1189,10 @@ impl UnitScene {
             self.resolve_sound_cues(slot);
         }
         let mut modules = Vec::new();
-        for view in index.model_modules(name) {
+        let mut module_tags = Vec::new();
+        let declared_before_body = index.model_modules_before_body(name);
+        let mut body_rank = 0;
+        for (declared, view) in index.model_modules(name).into_iter().enumerate() {
             if view.is_floor() {
                 continue;
             }
@@ -1146,10 +1228,16 @@ impl UnitScene {
                 template.attach = attach;
             }
             modules.push(module);
+            module_tags.push(view.tag_as_written.map(str::to_owned));
+            if declared < declared_before_body {
+                body_rank = modules.len();
+            }
         }
         self.report.model_modules = self.report.model_modules.saturating_add(modules.len());
         if let Some(template) = self.templates.get_mut(slot) {
             template.modules = modules;
+            template.module_tags = module_tags;
+            template.body_rank = body_rank;
         }
         self.by_name.insert(key, slot);
         self.report.templates_drawn = self.report.templates_drawn.saturating_add(1);
@@ -1200,15 +1288,14 @@ impl UnitScene {
                 self.report.script_failures.push(failure.clone());
             }
         }
-        let transition_names: BTreeMap<String, usize> = states
-            .iter()
-            .enumerate()
-            .filter_map(|(index, state)| {
-                state
-                    .transition_name()
-                    .map(|name| (name.to_ascii_uppercase(), index))
-            })
-            .collect();
+        let mut transition_names: BTreeMap<String, usize> = BTreeMap::new();
+        for (index, state) in states.iter().enumerate() {
+            if let Some(name) = state.transition_name() {
+                transition_names
+                    .entry(name.to_ascii_uppercase())
+                    .or_insert(index);
+            }
+        }
         let mut extras = ExtraTokens::default();
         let machine = StateMachine::compile_with(&states, Some(&mut extras));
         let model_machine = ModelStateMachine::compile_with(&model_states, Some(&mut extras));
@@ -1216,12 +1303,14 @@ impl UnitScene {
         let floor_specs: Vec<FloorSpec> = floors
             .iter()
             .filter_map(|module| {
-                Some((
-                    module.model?.to_owned(),
-                    conditions_of(module.hide_if, &mut extras),
-                    module.weather_textures.to_vec(),
-                    module.force_to_back,
-                ))
+                Some(FloorSpec {
+                    model: module.model?.to_owned(),
+                    hide_if: conditions_of(module.hide_if, &mut extras),
+                    weather: module.weather_textures.to_vec(),
+                    force_to_back: module.force_to_back,
+                    tag: module.tag_as_written.map(str::to_owned),
+                    start_hidden: module.start_hidden,
+                })
             })
             .collect();
         let companions: Vec<CompanionModule> = companions
@@ -1289,6 +1378,8 @@ impl UnitScene {
             companions,
             floors: Vec::new(),
             modules: Vec::new(),
+            module_tags: Vec::new(),
+            body_rank: 0,
             module_of: None,
             attach: None,
             look_conditions: Vec::new(),
@@ -1379,7 +1470,15 @@ impl UnitScene {
         specs: Vec<FloorSpec>,
     ) -> Vec<FloorModule> {
         let mut floors = Vec::with_capacity(specs.len());
-        for (name, hide_if, textures, force_to_back) in specs {
+        for spec in specs {
+            let FloorSpec {
+                model: name,
+                hide_if,
+                weather: textures,
+                force_to_back,
+                tag,
+                start_hidden,
+            } = spec;
             let Some(model) = self.cache.get_or_load(renderer, vfs, resolver, &name) else {
                 self.report.floors_unloadable = self.report.floors_unloadable.saturating_add(1);
                 continue;
@@ -1395,6 +1494,8 @@ impl UnitScene {
             floors.push(FloorModule {
                 model,
                 hide_if,
+                tag,
+                start_hidden,
                 weather,
                 force_to_back,
             });
@@ -1679,6 +1780,7 @@ impl UnitScene {
     }
 
     fn sync_expanded(&mut self, poses: &[UnitPose], now: f32) -> usize {
+        self.drawing_nothing.take();
         if self.drawables.len() == poses.len()
             && self
                 .drawables
@@ -1796,6 +1898,9 @@ impl UnitScene {
                 state_parts: None,
                 plain_parts: Vec::new(),
                 permanent_parts: Vec::new(),
+                look_writes: Arc::from([]),
+                floor_flags: Vec::new(),
+                module_hidden: Vec::new(),
                 fx_frame: None,
                 fx_pending: Vec::new(),
                 bone_fx_pending: Vec::new(),
@@ -1803,6 +1908,8 @@ impl UnitScene {
             });
         }
         self.report.drawables = kept.len();
+        self.keys
+            .rebuild(kept.iter().map(|d| (d.id, d.generation, d.template)));
         self.drawables = kept;
         created
     }
@@ -1827,6 +1934,7 @@ impl UnitScene {
         out: &mut Vec<Instance>,
         views: &[Frustum],
     ) {
+        self.drawing_nothing.take();
         let profiling = self.profiling;
         let mut bones = std::mem::take(&mut self.palette);
         bones.clear();
@@ -1850,7 +1958,8 @@ impl UnitScene {
             profiling,
         );
         self.report.host_calls_refused.add(&refused);
-        ride::carry_riders(&mut self.drawables, &paired, poses);
+        ride::carry_riders(&mut self.drawables, &self.keys, &paired, poses);
+        hide_modules_by_name(&mut self.drawables, &self.templates, &self.keys);
         self.paired = paired;
         stats.drawables = counts.paired;
         stats.sampled = counts.sampled;
@@ -2174,14 +2283,9 @@ impl UnitScene {
     }
 
     #[must_use]
-    pub fn state_lines(&self) -> Vec<String> {
-        let mut counts: BTreeMap<(usize, Option<usize>), usize> = BTreeMap::new();
+    pub fn part_lines(&self) -> Vec<String> {
         let mut standing: BTreeMap<(usize, bool, &str, bool), usize> = BTreeMap::new();
         for drawable in &self.drawables {
-            let slot = counts
-                .entry((drawable.template, drawable.state))
-                .or_insert(0);
-            *slot = slot.saturating_add(1);
             let plain = drawable.plain_parts.iter().map(|write| (false, write));
             let permanent = drawable.permanent_parts.iter().map(|write| (true, write));
             for (is_permanent, (part, shown)) in plain.chain(permanent) {
@@ -2191,7 +2295,7 @@ impl UnitScene {
                 *slot = slot.saturating_add(1);
             }
         }
-        let writes = standing
+        standing
             .into_iter()
             .map(|((template, is_permanent, part, shown), count)| {
                 let name = self
@@ -2205,7 +2309,19 @@ impl UnitScene {
                     "by a script"
                 };
                 format!("  {count} x {name}: {part} {verb} {how}")
-            });
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn state_lines(&self) -> Vec<String> {
+        let mut counts: BTreeMap<(usize, Option<usize>), usize> = BTreeMap::new();
+        for drawable in &self.drawables {
+            let slot = counts
+                .entry((drawable.template, drawable.state))
+                .or_insert(0);
+            *slot = slot.saturating_add(1);
+        }
         counts
             .into_iter()
             .map(|((template, state), count)| {
@@ -2226,7 +2342,7 @@ impl UnitScene {
                 };
                 format!("  {count} x {name}: {label}")
             })
-            .chain(writes)
+            .chain(self.part_lines())
             .collect()
     }
 
@@ -2436,11 +2552,6 @@ fn states_needing_a_rescue_body(
 }
 
 #[must_use]
-pub fn overridden_hidden(by_look: Option<bool>, by_state: Option<bool>) -> bool {
-    by_look.or(by_state) == Some(false)
-}
-
-#[must_use]
 pub fn ghost_tint(tint: [f32; 4], ghost: GhostLook) -> [f32; 4] {
     let unit = |v: f32| {
         if v.is_finite() {
@@ -2549,13 +2660,11 @@ fn emit_group(drawables: &[UnitDrawable], group: &[usize], now: f32, out: &mut V
                         .and_then(|skin| skin.get(index).copied().flatten())
                 })
                 .or(base.texture);
-            let hidden_by_override = overridden_hidden(
-                look.and_then(|look| look.parts.get(index).copied().flatten()),
-                drawable
-                    .state_parts
-                    .as_deref()
-                    .and_then(|parts| parts.get(index).copied().flatten()),
-            );
+            let hidden_by_override = drawable
+                .state_parts
+                .as_deref()
+                .and_then(|parts| parts.get(index).copied().flatten())
+                == Some(false);
             let uv = uv_override_for_part(part.uv_mapper.as_ref(), now);
             let mut instance = Instance {
                 blend,
@@ -2566,7 +2675,10 @@ fn emit_group(drawables: &[UnitDrawable], group: &[usize], now: f32, out: &mut V
                 bounds: pose.bounds.or(base.bounds),
                 tint,
                 light_add,
-                light_set: drawable.light_set,
+                light_set: mint_sage_model::cache::part_light_set(
+                    drawable.light_set,
+                    mint_sage_model::cache::instance_effect_lit(base),
+                ),
                 visibility_mask: drawable.shroud_masked,
                 visible: base.visible && pose.visible && !hidden_by_override,
                 casts_shadow: base.casts_shadow && drawable.casts_shadow,
@@ -2593,7 +2705,43 @@ fn emit_group(drawables: &[UnitDrawable], group: &[usize], now: f32, out: &mut V
     }
 }
 
-type FloorSpec = (String, Conditions, Vec<(NuggetWeather, String)>, bool);
+struct FloorSpec {
+    model: String,
+    hide_if: Conditions,
+    weather: Vec<(NuggetWeather, String)>,
+    force_to_back: bool,
+    tag: Option<String>,
+    start_hidden: bool,
+}
+
+fn hide_modules_by_name(
+    drawables: &mut [UnitDrawable],
+    templates: &[UnitTemplate],
+    keys: &index::DrawableKeys,
+) {
+    let mut hidden = Vec::new();
+    for drawable in drawables.iter() {
+        if !drawable.module_hidden.contains(&true) {
+            continue;
+        }
+        let Some(template) = templates.get(drawable.template) else {
+            continue;
+        };
+        for (module, _) in template
+            .modules
+            .iter()
+            .zip(&drawable.module_hidden)
+            .filter(|(_, hidden)| **hidden)
+        {
+            hidden.extend(keys.by_key(drawable.id, drawable.generation, *module));
+        }
+    }
+    for at in hidden {
+        if let Some(module) = drawables.get_mut(at) {
+            module.drawn = false;
+        }
+    }
+}
 
 fn expand_poses(templates: &[UnitTemplate], poses: &[UnitPose], out: &mut Vec<UnitPose>) {
     out.clear();
@@ -2677,7 +2825,12 @@ fn floors_wanted(
             continue;
         };
         for (floor, module) in art.floors.iter().enumerate() {
-            if !drawable.last_conditions.intersects(module.hide_if) {
+            let flags = drawable.floor_flags.get(floor).copied().unwrap_or_default();
+            let drawn = !flags.hidden
+                && !flags.lock
+                && (flags.changed || !module.start_hidden)
+                && !drawable.last_conditions.intersects(module.hide_if);
+            if drawn {
                 wanted.push((module.force_to_back, drawable.template, floor, at));
             }
         }
@@ -2720,7 +2873,10 @@ fn emit_floors(
                     drawable.placement,
                     base.transform,
                 ),
-                light_set: drawable.light_set,
+                light_set: mint_sage_model::cache::part_light_set(
+                    drawable.light_set,
+                    mint_sage_model::cache::instance_effect_lit(base),
+                ),
                 visibility_mask: drawable.shroud_masked,
                 surface_overlay: true,
                 depth_test: FLOOR_DEPTH_TEST,

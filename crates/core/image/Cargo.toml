@@ -13,7 +13,8 @@ kind = "format"
 [dependencies]
 thiserror.workspace = true
 mint-bytes = { path = "../bytes" }
-jpeg-decoder.workspace = true
+zune-jpeg.workspace = true
+zune-png.workspace = true
 
 [lints]
 workspace = true

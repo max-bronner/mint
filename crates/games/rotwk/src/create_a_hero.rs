@@ -11,6 +11,7 @@ use mint_sage_modules::{PowerSlot, UpgradeBits};
 use mint_sim::{Component, PlayerId, StateHasher, UpgradeBit};
 
 use crate::game_data::GameData;
+use crate::lobby::CarriedHero;
 use crate::templates::KindTable;
 use crate::unit::Kind;
 
@@ -133,7 +134,13 @@ impl HeroPlan {
     }
 }
 
-fn bling_options(data: &CahData, class: usize, subclass: usize, binder: &str) -> Vec<String> {
+fn bling_options(
+    data: &CahData,
+    class: usize,
+    subclass: usize,
+    binder: &str,
+    earned: &[(String, String)],
+) -> Vec<String> {
     let Some(sub) = data
         .system
         .classes
@@ -168,12 +175,22 @@ fn bling_options(data: &CahData, class: usize, subclass: usize, binder: &str) ->
         }
     }
     options.sort_by_key(|upgrade| data.group_order(upgrade));
+    if !options.is_empty() {
+        for (group, upgrade) in earned {
+            if group.eq_ignore_ascii_case(binder)
+                && !options.iter().any(|o| o.eq_ignore_ascii_case(upgrade))
+            {
+                options.push(upgrade.clone());
+            }
+        }
+    }
     options
 }
 
 pub(crate) fn upgrade_names(
     data: &CahData,
     record: &HeroRecord,
+    earned: &[(String, String)],
     resolves: &dyn Fn(&str) -> bool,
 ) -> (Vec<String>, Vec<String>) {
     let (mut grants, mut removes) = (Vec::new(), Vec::new());
@@ -188,7 +205,7 @@ pub(crate) fn upgrade_names(
     let subclass = usize::try_from(record.subclass_index).unwrap_or(usize::MAX);
     for (group, index) in &record.blings {
         let group = String::from_utf8_lossy(group);
-        let options = bling_options(data, class, subclass, &group);
+        let options = bling_options(data, class, subclass, &group, earned);
         let chosen = usize::try_from(*index)
             .ok()
             .and_then(|index| options.get(index));
@@ -327,7 +344,7 @@ pub(crate) fn command_set_at(
 pub(crate) fn plan_heroes(
     data: &GameData,
     kinds: &mut KindTable,
-    heroes: &[(PlayerId, Arc<HeroRecord>)],
+    heroes: &[(PlayerId, CarriedHero)],
 ) -> (Vec<HeroPlan>, Vec<String>) {
     let cah = &data.create_a_hero;
     let system = &cah.system;
@@ -362,10 +379,15 @@ pub(crate) fn plan_heroes(
         .special_power_discount_per_level
         .map_or(DEFAULT_POWER_DISCOUNT, whole_u32);
     let mut plans = Vec::new();
-    for (player, record) in heroes {
-        let (grants, removes) = upgrade_names(cah, record, &|name| bits.bit(name).is_some());
+    for (player, carried) in heroes {
+        let record = &carried.record;
         let class = usize::try_from(record.class_index).unwrap_or(usize::MAX);
         let subclass = usize::try_from(record.subclass_index).unwrap_or(usize::MAX);
+        let earned = data.cah_system.as_deref().map_or_else(Vec::new, |sys| {
+            sys.award_blings(class, subclass, &carried.stats)
+        });
+        let (grants, removes) =
+            upgrade_names(cah, record, &earned, &|name| bits.bit(name).is_some());
         let button_image = system
             .classes
             .get(class)

@@ -470,6 +470,11 @@ impl Player {
         self.stage.externs.insert(Arc::from(name), value);
     }
 
+    pub fn share_global(&mut self, shared: &crate::SharedGlobal) {
+        self.stage.shared_global = Some(shared.clone());
+        self.stage.shared_seen = 0;
+    }
+
     pub fn register_native_extern(&mut self, name: &str) {
         self.stage.native_externs.insert(Arc::from(name));
     }

@@ -263,7 +263,44 @@ fn a_landed_object_lies_stunned_for_its_own_shock_times_before_it_takes_an_order
         }
     }
     let (landed, up) = (landed.expect("never landed"), up.expect("never got up"));
-    assert_eq!(up - landed, 45, "landed on {landed}, up on {up}");
+    assert_eq!(up - landed, 48, "landed on {landed}, up on {up}");
+}
+
+#[test]
+fn a_fling_s_speed_counts_the_vertical_part_of_its_distance() {
+    let speed = crate::rules::knockback::fling_speed(
+        mint_sage_combat::Point3::new(3.0, 0.0, 4.0),
+        4.0,
+        10.0,
+        10.0,
+        0.0,
+    );
+    assert!((speed - (13.0f32.sqrt() + 2.0)).abs() < 1e-4, "{speed}");
+}
+
+#[test]
+fn a_flung_body_lands_two_retail_frames_after_its_flight_runs() {
+    let (mut simulation, ids, entities) = scene();
+    let peon = entities[2];
+    let mut first: Option<(u64, u16, u16)> = None;
+    let mut landed: Option<u64> = None;
+    for _ in 0..240 {
+        simulation.tick().unwrap();
+        let frame = simulation.frame().get();
+        let Some(knocked) = simulation.state().get(ids.knocked, peon) else {
+            continue;
+        };
+        if first.is_none() && knocked.phase == crate::rules::knockback::Phase::Airborne {
+            let frames = knocked.flight.map_or(0, |flight| flight.frames());
+            first = Some((frame, knocked.age, frames));
+        }
+        if knocked.phase == crate::rules::knockback::Phase::Stunned {
+            landed = Some(frame);
+            break;
+        }
+    }
+    let ((seen, age, frames), landed) = (first.expect("never flew"), landed.expect("never landed"));
+    assert_eq!(landed - seen, u64::from(frames) + 12 - u64::from(age));
 }
 
 #[test]
@@ -468,6 +505,127 @@ Object ZSturdy\n  Side = Men\n  KindOf = INFANTRY SELECTABLE NOT_AUTOACQUIRABLE\
                 .is_some_and(|health| !health.0.is_dead()),
             "the filter must not kill what it does not name"
         );
+    }
+}
+
+mod cyclonic_ship {
+    use super::*;
+
+    const DATA: &str = "Weapon ZCyclone
+  AttackRange = 300
+  DelayBetweenShots = 5000
+    DamageNugget
+    Damage = 1
+    DamageType = MAGIC
+    Radius = 200
+  End
+    MetaImpactNugget
+    ShockWaveAmount = 50
+    ShockWaveRadius = 200
+        ShockWaveTaperOff = 1.0
+    ShockWaveZMult = 1.0
+    CyclonicFactor = 1.0
+    End
+End
+Object ZCycloner
+  Side = Wild
+  KindOf = INFANTRY SELECTABLE
+  VisionRange = 400
+    Body = ActiveBody Tag_Body
+    MaxHealth = 4000
+  End
+    WeaponSet
+    Conditions = None
+    Weapon = PRIMARY ZCyclone
+  End
+    Behavior = AIUpdateInterface Tag_AI
+    AutoAcquireEnemiesWhenIdle = Yes
+        MoodAttackCheckRate = 500
+  End
+    Geometry = CYLINDER
+  GeometryMajorRadius = 5
+  GeometryHeight = 16
+End
+Object ZBait
+  Side = Men
+  KindOf = INFANTRY SELECTABLE
+    Body = ActiveBody Tag_Body
+    MaxHealth = 4000
+  End
+    Geometry = CYLINDER
+  GeometryMajorRadius = 5
+  GeometryHeight = 16
+End
+Object ZShip
+  Side = Men
+  KindOf = SELECTABLE SHIP NOT_AUTOACQUIRABLE
+    ShockwaveResistance = 80
+    Behavior = PhysicsBehavior Tag_Physics
+  End
+    Body = ActiveBody Tag_Body
+    MaxHealth = 4000
+  End
+    Geometry = CYLINDER
+  GeometryMajorRadius = 5
+  GeometryHeight = 16
+End
+";
+
+    fn scene() -> (Simulation<RotwkRules>, Ids, Entity) {
+        let doc = mint_sage_ini::Document::parse(
+            "t.ini",
+            DATA,
+            &mint_sage_ini::BlockTable::corpus_path(),
+        )
+        .unwrap();
+        assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
+        let (data, _) =
+            crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
+        let roots = ["ZCycloner", "ZBait", "ZShip"].map(str::to_owned);
+        let (kinds, missing) = KindTable::closure(&data, &roots);
+        assert!(missing.is_empty(), "{missing:?}");
+        let kinds = Arc::new(kinds);
+        let production = kinds.production(&data);
+        let spawns = [
+            ("ZCycloner", Vec2::new(300.0, 300.0), OTHER),
+            ("ZBait", Vec2::new(400.0, 300.0), PLAYER),
+            ("ZShip", Vec2::new(460.0, 300.0), PLAYER),
+        ]
+        .into_iter()
+        .map(|(name, at, player)| {
+            kinds
+                .spawn(
+                    &data.combat,
+                    kinds.kind(name).unwrap(),
+                    at,
+                    Facing::EAST,
+                    player,
+                )
+                .unwrap()
+        })
+        .collect();
+        let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
+        let rules = RotwkRules::new(passability, spawns)
+            .with_combat(data.combat.clone())
+            .with_gravity(data.gravity)
+            .with_construction(Arc::clone(&kinds), production)
+            .with_teams(vec![None, None]);
+        let mut simulation = Simulation::new(5, rules).unwrap();
+        let ids = simulation.rules().ids().unwrap();
+        let ship = simulation.state().store(ids.body).unwrap().entities()[2];
+        simulation.tick().unwrap();
+        (simulation, ids, ship)
+    }
+
+    #[test]
+    fn a_cyclonic_impact_throws_a_ship_whose_resistance_exceeds_the_amount() {
+        let (mut simulation, ids, ship) = scene();
+        let mut airborne = false;
+        for _ in 0..120 {
+            simulation.tick().unwrap();
+            airborne |= simulation.state().get(ids.knocked, ship).is_some();
+        }
+        assert!(airborne, "the cyclonic SHIP exception was cancelled");
     }
 }
 

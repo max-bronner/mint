@@ -14,6 +14,7 @@ struct Triggers {
     requires_all_triggers: bool,
     removes_upgrades: UpgradeMask,
     custom_anim: Option<CustomAnim>,
+    permanent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +39,10 @@ impl UpgradeMuxData {
                 requires_all_triggers,
                 removes_upgrades: fields.field_upgrade_mask("RemovesUpgrades"),
                 custom_anim: custom_anim_and_duration(fields)?,
+                permanent: fields
+                    .field("Permanent")
+                    .and_then(parse_bool)
+                    .unwrap_or(false),
             }),
             fired: false,
             clears: Vec::new(),
@@ -135,6 +140,11 @@ impl UpgradeMuxData {
         if self.triggers.triggered_by.intersects(removed) {
             self.fired = false;
         }
+    }
+
+    #[must_use]
+    pub fn undone_by(&self, removed: &UpgradeMask) -> bool {
+        !self.triggers.permanent && self.triggers.triggered_by.intersects(removed)
     }
 
     #[must_use]

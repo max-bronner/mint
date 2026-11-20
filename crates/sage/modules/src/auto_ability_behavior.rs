@@ -29,7 +29,16 @@ struct AutoAbilityData {
 pub struct AutoAbilityBehavior {
     data: Arc<AutoAbilityData>,
     pub next_scan: Frame,
-    pub idle_since: Option<Frame>,
+    pub active: ActiveButton,
+    pub start_position: Option<(f32, f32)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ActiveButton {
+    #[default]
+    Unresolved,
+    Off,
+    On(String),
 }
 
 impl AutoAbilityBehavior {
@@ -91,30 +100,24 @@ impl AutoAbilityBehavior {
     pub fn defer_scan(&mut self, until: Frame) {
         self.next_scan = until;
     }
-
-    pub fn note_order(&mut self, now: Frame, ordered: bool) {
-        if ordered {
-            self.idle_since = None;
-        } else if self.idle_since.is_none() {
-            self.idle_since = Some(now);
-        }
-    }
-
-    #[must_use]
-    pub fn idle_long_enough(&self, now: Frame) -> bool {
-        let idle_time = self.idle_time();
-        idle_time.is_zero()
-            || self
-                .idle_since
-                .is_some_and(|since| now.since(since).is_some_and(|elapsed| elapsed >= idle_time))
-    }
 }
 
 impl Component for AutoAbilityBehavior {
     fn hash_into(&self, hasher: &mut StateHasher) {
         self.next_scan.hash_into(hasher);
-        hasher.write_bool(self.idle_since.is_some());
-        self.idle_since.unwrap_or(Frame::ZERO).hash_into(hasher);
+        match &self.active {
+            ActiveButton::Unresolved => hasher.write_u8(0),
+            ActiveButton::Off => hasher.write_u8(1),
+            ActiveButton::On(power) => {
+                hasher.write_u8(2);
+                hasher.write_usize(power.len());
+                hasher.write_bytes(power.as_bytes());
+            }
+        }
+        hasher.write_bool(self.start_position.is_some());
+        let (x, y) = self.start_position.unwrap_or((0.0, 0.0));
+        hasher.write_f32(x);
+        hasher.write_f32(y);
     }
 }
 
@@ -148,7 +151,7 @@ pub fn auto_ability_behavior_from_fields(
         .field_numeric("MinScanRange")
         .filter(|range| range.is_finite() && *range > 0.0)
         .unwrap_or(0.0);
-    let allow_self = flag(fields, "AllowSelf").unwrap_or(false);
+    let allow_self = flag(fields, "AllowSelf").unwrap_or(true);
     let forbidden_status = names(
         fields
             .field_args("ForbiddenStatus")
@@ -177,7 +180,8 @@ pub fn auto_ability_behavior_from_fields(
             adjust_attack_melee_position,
         }),
         next_scan: Frame::ZERO,
-        idle_since: None,
+        active: ActiveButton::Unresolved,
+        start_position: None,
     })
 }
 
@@ -247,22 +251,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(module.power(), Some("SpecialAbilityAragornAthelas"));
-    }
-
-    #[test]
-    fn idle_time_tracks_a_continuous_idle_stretch() {
-        let mut module =
-            auto_ability_behavior_from_fields(&fields(&[("IdleTimeSeconds", "1")]), Frame::ZERO)
-                .unwrap();
-        assert_eq!(module.idle_time(), LogicFrames::from_seconds(1.0));
-        module.note_order(Frame::new(0), true);
-        assert!(!module.idle_long_enough(Frame::new(10)), "still ordered");
-        module.note_order(Frame::new(10), false);
-        assert!(
-            !module.idle_long_enough(Frame::new(20)),
-            "not yet a full second"
-        );
-        assert!(module.idle_long_enough(Frame::new(40)));
     }
 
     #[test]

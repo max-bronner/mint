@@ -23,6 +23,7 @@ pub(crate) struct UnitView {
     pub(crate) moving: bool,
     pub(crate) health: Option<f32>,
     pub(crate) dying: bool,
+    pub(crate) created: u64,
     pub(crate) speed: f32,
     pub(crate) weapon_cycle: f32,
     pub(crate) visibility: mint_sage_shroud::ObjectVisibility,
@@ -548,7 +549,22 @@ impl<'a> RenderState<'a> {
         };
         let mut views = Vec::with_capacity(bodies.len());
         let now = Frame::new(self.match_clock(ids.clock).unwrap_or(0));
+        let mut flying: Vec<u32> = self
+            .world
+            .store(ids.flight)
+            .map(|flights| {
+                flights
+                    .iter()
+                    .filter(|(_, flight)| flight.object)
+                    .filter_map(|(_, flight)| flight.carried.map(|object| object.index()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        flying.sort_unstable();
         for (entity, body) in bodies.iter() {
+            if flying.binary_search(&entity.index()).is_ok() {
+                continue;
+            }
             if self.world.contains(ids.concealed, entity) {
                 continue;
             }
@@ -608,6 +624,10 @@ impl<'a> RenderState<'a> {
                     .filter(|_| !shape.kind_of.contains(KindOf::UNATTACKABLE))
                     .map(|health| health.0.fraction()),
                 dying: self.world.contains(ids.doomed, entity),
+                created: self
+                    .world
+                    .get(ids.created, entity)
+                    .map_or(0, |created| created.0),
                 visibility: self
                     .world
                     .get(ids.seen, entity)

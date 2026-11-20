@@ -1,4 +1,5 @@
 pub(crate) mod display;
+pub(crate) mod global;
 pub(crate) mod heap;
 pub(crate) mod host;
 pub(crate) mod interp;
@@ -8,6 +9,7 @@ pub(crate) mod value;
 
 use std::collections::BTreeMap;
 
+pub use global::SharedGlobal;
 pub use heap::Scope;
 pub use object::Object;
 pub use value::{ObjectId, Value};

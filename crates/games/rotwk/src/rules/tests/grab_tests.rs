@@ -6,6 +6,10 @@ Weapon ZClaw\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
   GrabNugget\n    ContainTargetOnEffect = Yes\n    ImpactTargetOnEffect = Yes\n    \
     ShockWaveAmount = 60\n    ShockWaveRadius = 16\n    ShockWaveTaperOff = 1.0\n    \
     ShockWaveZMult = 1.0\n  End\nEnd\n\
+Weapon ZFling\n  AttackRange = 300\n  DelayBetweenShots = 5000\n  \
+  GrabNugget\n    ImpactTargetOnEffect = Yes\n    \
+    ShockWaveAmount = 60\n    ShockWaveRadius = 16\n    ShockWaveTaperOff = 1.0\n    \
+    ShockWaveZMult = 1.0\n  End\nEnd\n\
 Weapon ZSwipe\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
   DamageNugget\n    Damage = 1\n    DamageType = MAGIC\n  End\nEnd\n\
 Weapon ZMaul\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
@@ -22,6 +26,8 @@ Object ZGrabber\n  Side = Wild\n  KindOf = SELECTABLE\n  VisionRange = 400\n  \
     PassengerFilter = ANY +INFANTRY -ZBrute\n    Slots = 1\n    \
     AllowEnemiesInside = Yes\n    GrabWeapon = ZSplash\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 10\n  GeometryHeight = 20\nEnd\n\
+ChildObject ZFlinger ZGrabber\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY ZFling\n  End\nEnd\n\
 ChildObject ZSwiper ZGrabber\n  \
   WeaponSet\n    Conditions = None\n    Weapon = PRIMARY ZSwipe\n  End\nEnd\n\
 ChildObject ZMauler ZGrabber\n  \
@@ -182,15 +188,33 @@ fn a_plain_hit_by_a_grabber_takes_nothing_in() {
 }
 
 #[test]
-fn a_victim_the_contain_refuses_is_shoved_instead() {
-    let (mut simulation, ids, _, victim) = scene("ZGrabber", "ZBrute");
-    let mut thrown = false;
-    for _ in 0..90 {
-        simulation.tick().unwrap();
-        thrown |= simulation.state().contains(ids.knocked, victim);
+fn a_victim_the_contain_refuses_is_left_alone() {
+    for grabber in ["ZGrabber", "ZFlinger"] {
+        let (mut simulation, ids, _, victim) = scene(grabber, "ZBrute");
+        let mut thrown = false;
+        for _ in 0..90 {
+            simulation.tick().unwrap();
+            thrown |= simulation.state().contains(ids.knocked, victim);
+        }
+        assert!(!thrown, "{grabber} shoved the refused victim");
+        assert_eq!(held_by(&simulation, ids, victim), None);
     }
-    assert!(thrown, "the refused victim was never shoved");
+}
+
+#[test]
+fn a_grab_impact_throws_the_victim_away_from_the_grabber() {
+    let (mut simulation, ids, _, victim) = scene("ZFlinger", "ZPeon");
+    let mut farthest = 0.0_f32;
+    for _ in 0..60 {
+        simulation.tick().unwrap();
+        let at = simulation.state().get(ids.body, victim).unwrap().0.position;
+        farthest = farthest.max(at.x - VICTIM_AT.x);
+    }
     assert_eq!(held_by(&simulation, ids, victim), None);
+    assert!(
+        farthest > 5.0,
+        "the victim was never thrown east: {farthest}"
+    );
 }
 
 #[test]

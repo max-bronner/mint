@@ -47,6 +47,7 @@ fn condition(name: &str, params: Vec<Parameter>) -> OrCondition {
     OrCondition {
         conditions: vec![Condition {
             condition_type: 0,
+            inverted: false,
             enabled: true,
             name: name.to_owned(),
             params,
@@ -57,6 +58,7 @@ fn condition(name: &str, params: Vec<Parameter>) -> OrCondition {
 fn action(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -872,6 +874,22 @@ fn team_player_n_resolves_through_the_start_contestant_pairs_not_the_start_index
         .and_then(|(entity, _)| world.get(ids.owner, entity))
         .map(|owner| owner.0);
     assert_eq!(owner, Some(PlayerId::new(0)), "start 1 is held by player 0");
+}
+
+#[test]
+fn a_start_nobody_holds_is_refused_by_name_with_the_seated_ones_listed() {
+    let map = flat_map(8, 8);
+    let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
+    let rules = RotwkRules::new(passability, Vec::new())
+        .with_players(2)
+        .with_map_scripts(None, vec![(0, PlayerId::new(0)), (2, PlayerId::new(1))]);
+    assert_eq!(rules.seated_side("Player_1"), Ok(PlayerId::new(0)));
+    assert_eq!(rules.seated_side("player_3"), Ok(PlayerId::new(1)));
+    let refused = rules.seated_side("Player_2").unwrap_err();
+    assert!(
+        refused.contains("Player_1, Player_3"),
+        "the refusal lists the seated starts: {refused}"
+    );
 }
 
 #[test]
@@ -1818,4 +1836,126 @@ fn an_object_on_no_team_counts_on_its_owners_default_team() {
         .and_then(|store| store.iter().next().map(|(_, s)| s.clone()))
         .unwrap();
     assert_eq!(state.counter_value("Wilds", "Seen"), 1);
+}
+
+#[test]
+fn a_campaign_mission_starts_with_the_carried_skill_points_and_bounty_not_money() {
+    let mut carry = mint_sage_campaign::Carryover::default();
+    carry.capture(
+        &[],
+        &[],
+        Some(&mint_sage_campaign::PlayerCapture {
+            skill_points: 70.0,
+            sciences: Vec::new(),
+            upgrades: Vec::new(),
+            cash_bounty: 0.5,
+        }),
+    );
+    let (purse, science, bounty) = state_after_restore(carry);
+    assert_eq!(
+        purse,
+        mint_sage_economy::Money::new(mint_sage_economy::DEFAULT_STARTING_CASH)
+    );
+    assert_eq!((science.skill_points, science.rank), (70, 2));
+    assert_eq!(bounty, Some(0.5));
+    let (_, fresh, none) = state_after_restore(mint_sage_campaign::Carryover::default());
+    assert_eq!((fresh.skill_points, fresh.rank, none), (0, 1, None));
+}
+
+#[test]
+fn a_scripted_victory_ends_in_a_result_the_next_roster_is_read_from() {
+    let mut carry = mint_sage_campaign::Carryover::default();
+    carry.capture(
+        &[],
+        &[],
+        Some(&mint_sage_campaign::PlayerCapture {
+            skill_points: 70.0,
+            sciences: Vec::new(),
+            upgrades: Vec::new(),
+            cash_bounty: 0.5,
+        }),
+    );
+    let tree = ScriptTree {
+        player_slots: vec![vec![one_shot(
+            "Win",
+            condition("CONDITION_TRUE", vec![]),
+            vec![action("VICTORY", vec![])],
+        )]],
+    };
+    let mut simulation = carryover_simulation(carry, tree);
+    simulation.tick().unwrap();
+    simulation.tick().unwrap();
+    let result = simulation.rules().match_result(simulation.state());
+    let next = result.carryover().unwrap();
+    assert_eq!(
+        (result.end, next.skill_points(), next.cash_bounty()),
+        (Some(mint_sage_campaign::MissionEnd::Victory), 70.0, 0.5)
+    );
+}
+
+fn carryover_simulation(
+    carry: mint_sage_campaign::Carryover,
+    tree: ScriptTree,
+) -> Simulation<RotwkRules> {
+    let engine = MapScriptEngine::build(
+        &[tree],
+        &[],
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+        true,
+    )
+    .with_carryover(crate::rules::carryover::CarryoverStart {
+        carry,
+        delayed: Vec::new(),
+        start: None,
+        rally: None,
+    });
+    let map = flat_map(32, 32);
+    let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
+    let rules = RotwkRules::new(passability, Vec::new())
+        .with_players(2)
+        .with_spell_books(
+            std::sync::Arc::new(crate::sciences::ScienceTable::default()),
+            std::sync::Arc::new(crate::sciences::Ranks::from_columns(
+                vec![0, 60, 120],
+                vec![0, 0, 0],
+            )),
+            vec![crate::sciences::SpellPlan::default(); 2],
+            Vec::new(),
+        )
+        .with_map_scripts(Some(engine), vec![(0, PlayerId::new(0))]);
+    Simulation::new(5, rules).unwrap()
+}
+
+fn state_after_restore(
+    carry: mint_sage_campaign::Carryover,
+) -> (
+    mint_sage_economy::Money,
+    crate::sciences::PlayerScience,
+    Option<f32>,
+) {
+    let mut simulation = carryover_simulation(carry, ScriptTree::default());
+    simulation.tick().unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let purse = crate::economy::purse_of(
+        simulation.state(),
+        RotwkRules::economy_ids(ids),
+        PlayerId::new(0),
+    );
+    let player = crate::economy::player_entity(
+        simulation.state(),
+        RotwkRules::economy_ids(ids),
+        PlayerId::new(0),
+    )
+    .unwrap();
+    let science = simulation
+        .state()
+        .get(ids.player_science, player)
+        .unwrap()
+        .clone();
+    let bounty = simulation
+        .state()
+        .get(ids.cash_bounty, player)
+        .map(|bounty| bounty.0);
+    (purse, science, bounty)
 }

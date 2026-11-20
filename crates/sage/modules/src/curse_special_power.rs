@@ -10,6 +10,7 @@ use crate::special_ability_update::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurseTrigger {
+    power: Name,
     share: f32,
     cursed_fx: Option<Name>,
     trigger_fx: Option<Name>,
@@ -34,6 +35,7 @@ impl Trigger for CurseTrigger {
         log.push(
             entity,
             Effect::CursePowers {
+                power: Name::clone(&self.power),
                 at: crate::dominate_enemy_special_power::place_of(target),
                 share: self.share,
                 fx: self.cursed_fx.clone(),
@@ -57,7 +59,12 @@ pub fn curse_special_power_from_fields(
                 FieldError::new("CursePercentage is present but not a percentage/known macro")
             })?,
     };
+    let power = fields
+        .field("SpecialPowerTemplate")
+        .map(Name::from)
+        .ok_or_else(|| FieldError::new("SpecialPowerTemplate is missing"))?;
     let trigger = CurseTrigger {
+        power,
         share,
         cursed_fx: fields.field("CursedFX").map(Name::from),
         trigger_fx: fields.field("TriggerFX").map(Name::from),

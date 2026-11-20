@@ -59,8 +59,7 @@ impl Nugget {
             }
             Nugget::Modifier(nugget) => {
                 hasher.write_u8(5);
-                hasher.write_bytes(nugget.list.as_bytes());
-                hasher.write_f32(nugget.radius);
+                nugget.hash_into(hasher);
             }
         }
     }
@@ -79,6 +78,7 @@ pub enum EffectNugget {
     EmotionWeapon(EmotionWeaponNugget),
     OpenGate(OpenGateNugget),
     StealMoney(StealMoneyNugget),
+    DamageContained(DamageContainedNugget),
 }
 
 impl EffectNugget {
@@ -126,6 +126,10 @@ impl EffectNugget {
             EffectNugget::StealMoney(nugget) => {
                 hasher.write_u8(10);
                 hasher.write_i32(nugget.amount);
+            }
+            EffectNugget::DamageContained(nugget) => {
+                hasher.write_u8(11);
+                nugget.hash_into(hasher);
             }
         }
     }
@@ -196,6 +200,9 @@ pub struct ParalyzeNugget {
     pub duration: LogicFrames,
     pub special_object_filter: Vec<String>,
     pub fx: Option<String>,
+    pub damage_arc: Option<f32>,
+    pub freeze_animation: bool,
+    pub affect_horde_members: bool,
 }
 
 impl ParalyzeNugget {
@@ -213,6 +220,10 @@ impl ParalyzeNugget {
             }
             None => hasher.write_bool(false),
         }
+        hasher.write_bool(self.damage_arc.is_some());
+        hasher.write_f32(self.damage_arc.unwrap_or(0.0));
+        hasher.write_bool(self.freeze_animation);
+        hasher.write_bool(self.affect_horde_members);
     }
 }
 
@@ -314,6 +325,23 @@ pub struct OpenGateNugget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StealMoneyNugget {
     pub amount: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DamageContainedNugget {
+    pub kill_kind_of: Vec<String>,
+    pub kill_kind_of_not: Vec<String>,
+}
+
+impl DamageContainedNugget {
+    pub fn hash_into(&self, hasher: &mut StateHasher) {
+        for list in [&self.kill_kind_of, &self.kill_kind_of_not] {
+            hasher.write_usize(list.len());
+            for token in list {
+                hasher.write_bytes(token.as_bytes());
+            }
+        }
+    }
 }
 
 #[must_use]
@@ -461,6 +489,26 @@ impl DotNugget {
 pub struct ModifierNugget {
     pub list: String,
     pub radius: f32,
+    pub affect_horde_members: bool,
+    pub damage_arc: Option<f32>,
+    pub anti_categories: Vec<String>,
+    pub anti_fx: Option<String>,
+}
+
+impl ModifierNugget {
+    pub fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_bytes(self.list.as_bytes());
+        hasher.write_f32(self.radius);
+        hasher.write_bool(self.affect_horde_members);
+        hasher.write_bool(self.damage_arc.is_some());
+        hasher.write_f32(self.damage_arc.unwrap_or(0.0));
+        hasher.write_usize(self.anti_categories.len());
+        for category in &self.anti_categories {
+            hasher.write_bytes(category.as_bytes());
+        }
+        hasher.write_bool(self.anti_fx.is_some());
+        hasher.write_bytes(self.anti_fx.as_deref().unwrap_or_default().as_bytes());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -477,6 +525,38 @@ pub struct DamageNugget {
     pub flanking_bonus: f32,
     pub requires_upgrade: bool,
     pub accepts_add: bool,
+    pub shape: DamageShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DamageShape {
+    pub cylinder_aoe: bool,
+    pub min_radius: f32,
+    pub taper_off: Option<f32>,
+    pub max_height: Option<f32>,
+    pub speed: f32,
+    pub max_height_above_terrain: Option<f32>,
+    pub drain_life: bool,
+    pub drain_multiplier: f32,
+    pub flanked_scalar: Option<f32>,
+}
+
+impl DamageShape {
+    pub fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_bool(self.cylinder_aoe);
+        hasher.write_f32(self.min_radius);
+        hasher.write_bool(self.taper_off.is_some());
+        hasher.write_f32(self.taper_off.unwrap_or(0.0));
+        hasher.write_bool(self.max_height.is_some());
+        hasher.write_f32(self.max_height.unwrap_or(0.0));
+        hasher.write_f32(self.speed);
+        hasher.write_bool(self.max_height_above_terrain.is_some());
+        hasher.write_f32(self.max_height_above_terrain.unwrap_or(0.0));
+        hasher.write_bool(self.drain_life);
+        hasher.write_f32(self.drain_multiplier);
+        hasher.write_bool(self.flanked_scalar.is_some());
+        hasher.write_f32(self.flanked_scalar.unwrap_or(1.0));
+    }
 }
 
 impl DamageNugget {
@@ -506,6 +586,7 @@ impl DamageNugget {
         hasher.write_f32(self.flanking_bonus);
         hasher.write_bool(self.requires_upgrade);
         hasher.write_bool(self.accepts_add);
+        self.shape.hash_into(hasher);
     }
 }
 
@@ -514,6 +595,8 @@ pub struct ProjectileNugget {
     pub projectile_template: Option<String>,
     pub warhead: String,
     pub requires_upgrade: bool,
+    pub launch_slot: Option<crate::weapon_slots::WeaponSlot>,
+    pub always_attack_offset: Option<[f32; 3]>,
 }
 
 impl ProjectileNugget {
@@ -527,6 +610,19 @@ impl ProjectileNugget {
         }
         hasher.write_bytes(self.warhead.as_bytes());
         hasher.write_bool(self.requires_upgrade);
+        if let Some(slot) = self.launch_slot {
+            hasher.write_u8(1);
+            hasher.write_usize(slot.index());
+        }
+        match self.always_attack_offset {
+            Some(offset) => {
+                hasher.write_u8(1);
+                for axis in offset {
+                    hasher.write_f32(axis);
+                }
+            }
+            None => hasher.write_u8(0),
+        }
     }
 }
 
@@ -638,6 +734,7 @@ mod tests {
             flanking_bonus: 0.0,
             requires_upgrade: false,
             accepts_add: true,
+            shape: Default::default(),
         };
         let baseline = hash_of(&Nugget::Damage(base));
         let mut harder = base;
@@ -673,11 +770,15 @@ mod tests {
             projectile_template: None,
             warhead: "W".to_owned(),
             requires_upgrade: false,
+            launch_slot: None,
+            always_attack_offset: None,
         });
         let fire = Nugget::Projectile(ProjectileNugget {
             projectile_template: None,
             warhead: "W".to_owned(),
             requires_upgrade: true,
+            launch_slot: None,
+            always_attack_offset: None,
         });
         assert!(!plain.is_gated());
         assert!(fire.is_gated());
@@ -694,6 +795,7 @@ mod tests {
             flanking_bonus: 0.0,
             requires_upgrade: false,
             accepts_add: true,
+            shape: Default::default(),
         })
         .is_gated());
         assert!(!Nugget::Unmodelled("X".to_owned()).is_gated());
@@ -717,11 +819,14 @@ mod tests {
                 flanking_bonus: 0.0,
                 requires_upgrade: false,
                 accepts_add: true,
+                shape: Default::default(),
             }),
             Nugget::Projectile(ProjectileNugget {
                 projectile_template: None,
                 warhead: String::new(),
                 requires_upgrade: false,
+                launch_slot: None,
+                always_attack_offset: None,
             }),
             Nugget::MetaImpact(MetaImpactNugget::default()),
             Nugget::Unmodelled(String::new()),

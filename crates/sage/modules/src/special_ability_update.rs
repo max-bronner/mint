@@ -52,6 +52,51 @@ fn report_using_ability(ctx: &mut UpdateContext<'_>, entity: Entity, using: bool
 const UNPACKING: &str = "UNPACKING";
 const PREPARING: &str = "PREPARING";
 const PACKING: &str = "PACKING";
+const CHARGING: &str = "CHARGING";
+
+const CAST_MASK: [&str; 10] = [
+    "FIRING_A",
+    "RAISING_FLAG",
+    "START_CAPTURE",
+    "CANCEL_CAPTURE",
+    "PACKING_TYPE_1",
+    "PACKING_TYPE_2",
+    "PACKING_TYPE_3",
+    "PACKING_TYPE_4",
+    "PACKING_TYPE_5",
+    "PACKING_TYPE_6",
+];
+
+fn clear_cast_mask(effects: &mut mint_sim::module::Effects<'_>, entity: Entity) {
+    let Some(log) = effects.get::<EffectLog>() else {
+        return;
+    };
+    let remove = [UNPACKING, PREPARING, PACKING, CHARGING]
+        .into_iter()
+        .chain(CAST_MASK)
+        .map(Name::from)
+        .collect::<Vec<_>>();
+    log.push(
+        entity,
+        Effect::ModelConditions {
+            add: Names::from(Vec::new()),
+            remove: Names::from(remove),
+        },
+    );
+}
+
+fn raise_charging<T: Trigger>(
+    data: &AbilityData<T>,
+    active: &mut Active,
+    entity: Entity,
+    ctx: &mut UpdateContext<'_>,
+) {
+    if !data.charges || active.charged {
+        return;
+    }
+    active.charged = true;
+    push_conditions(ctx, entity, vec![Name::from(CHARGING)], Vec::new());
+}
 
 fn push_conditions(ctx: &mut UpdateContext<'_>, entity: Entity, add: Vec<Name>, remove: Vec<Name>) {
     if add.is_empty() && remove.is_empty() {
@@ -82,7 +127,9 @@ fn end_ability<T: Trigger>(data: &AbilityData<T>, entity: Entity, ctx: &mut Upda
         Name::from(UNPACKING),
         Name::from(PREPARING),
         Name::from(PACKING),
+        Name::from(CHARGING),
     ];
+    remove.extend(CAST_MASK.iter().map(|bit| Name::from(*bit)));
     if let Some(packing_type) = &data.packing_type {
         remove.push(Name::clone(packing_type));
     }
@@ -120,9 +167,18 @@ fn finish_ability<T: Trigger>(
     active_slot: &mut Option<Active>,
     entity: Entity,
     ctx: &mut UpdateContext<'_>,
-    hold: LogicFrames,
+    paralyze: LogicFrames,
     completed: bool,
 ) -> Sleep {
+    if let Some(active) = active_slot.as_ref() {
+        data.trigger
+            .finish_ability(entity, active.target, active.triggers, ctx);
+    }
+    if !paralyze.is_zero() {
+        if let Some(log) = ctx.effects.get::<EffectLog>() {
+            log.push(entity, Effect::AiBusy(paralyze));
+        }
+    }
     if completed {
         if let Some(button) = &data.chained_button {
             if let Some(log) = ctx.effects.get::<EffectLog>() {
@@ -132,7 +188,7 @@ fn finish_ability<T: Trigger>(
     }
     let hold = active_slot
         .as_ref()
-        .map_or(hold, |active| hold.max(active.frozen));
+        .map_or(LogicFrames::ZERO, |active| active.frozen);
     if hold.is_zero() {
         *active_slot = None;
         end_ability(data, entity, ctx);
@@ -196,13 +252,22 @@ fn resolve_mover(reads: mint_sim::module::Reads<'_>, entity: Entity) -> Entity {
 
 pub const RETAIL_LOGIC_HZ: u32 = 5;
 
-const TICKS_PER_RETAIL_FRAME: u32 = mint_sim::SIMULATION_HZ / RETAIL_LOGIC_HZ;
+pub(crate) const TICKS_PER_RETAIL_FRAME: u32 = mint_sim::SIMULATION_HZ / RETAIL_LOGIC_HZ;
+
+pub(crate) const RETAIL_LOGIC_NONZERO: core::num::NonZeroU32 =
+    match core::num::NonZeroU32::new(RETAIL_LOGIC_HZ) {
+        Some(hz) => hz,
+        None => core::num::NonZeroU32::MIN,
+    };
 
 #[must_use]
-pub fn retail_duration_ticks(milliseconds: u32) -> LogicFrames {
-    let ms_per_retail_frame = 1000 / RETAIL_LOGIC_HZ;
-    let retail_frames = milliseconds.div_ceil(ms_per_retail_frame);
-    LogicFrames::from_frames(retail_frames.saturating_mul(TICKS_PER_RETAIL_FRAME))
+pub const fn retail_duration_ticks(milliseconds: u32) -> LogicFrames {
+    LogicFrames::from_authored_milliseconds(milliseconds, RETAIL_LOGIC_NONZERO)
+}
+
+#[must_use]
+pub fn retail_duration_ticks_f32(milliseconds: f32) -> LogicFrames {
+    LogicFrames::from_authored_milliseconds_f32(milliseconds, RETAIL_LOGIC_NONZERO)
 }
 
 pub(crate) fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> (bool, LogicFrames) {
@@ -246,19 +311,23 @@ pub(crate) struct Active {
     busy: LogicFrames,
     last_known_target: Option<(f32, f32)>,
     holding: bool,
+    ignoring: bool,
     last_period: bool,
     approaches: u32,
     last_approach_aim: Option<(f32, f32)>,
+    counted_approach_frame: Option<u64>,
     pending_custom_anim: Option<Frame>,
     capture_phase: f32,
+    no_target: bool,
+    charged: bool,
 }
 
 fn ignores_orders<T: Trigger>(data: &AbilityData<T>, active: &Active) -> bool {
     data.ignore_ai_command_always || !active.busy.is_zero()
 }
 
-fn movement_held<T: Trigger>(data: &AbilityData<T>, active: &Active) -> bool {
-    ignores_orders(data, active) || !active.frozen.is_zero()
+fn movement_held(active: &Active) -> bool {
+    !active.frozen.is_zero()
 }
 
 pub trait Trigger: 'static + Clone + std::fmt::Debug + PartialEq {
@@ -267,6 +336,10 @@ pub trait Trigger: 'static + Clone + std::fmt::Debug + PartialEq {
     fn prepare(&self, _entity: Entity, _target: AbilityTarget, _ctx: &mut UpdateContext<'_>) {}
 
     fn fire(&self, entity: Entity, target: AbilityTarget, ctx: &mut UpdateContext<'_>);
+
+    fn ends_cast_after_fire(&self, _entity: Entity, _ctx: &UpdateContext<'_>) -> bool {
+        false
+    }
 
     fn fires_after_first_trigger(&self) -> bool {
         true
@@ -277,6 +350,15 @@ pub trait Trigger: 'static + Clone + std::fmt::Debug + PartialEq {
     }
 
     fn abort(&self, _entity: Entity, _target: AbilityTarget, _ctx: &mut UpdateContext<'_>) {}
+
+    fn finish_ability(
+        &self,
+        _entity: Entity,
+        _target: AbilityTarget,
+        _triggers: u32,
+        _ctx: &mut UpdateContext<'_>,
+    ) {
+    }
 
     fn finish(&self, _entity: Entity, _ctx: &mut UpdateContext<'_>) {}
 
@@ -335,6 +417,16 @@ impl Trigger for PowerTrigger {
     fn abort(&self, entity: Entity, target: AbilityTarget, ctx: &mut UpdateContext<'_>) {
         self.report(entity, target, CastEdge::Abort, ctx);
     }
+
+    fn finish_ability(
+        &self,
+        entity: Entity,
+        target: AbilityTarget,
+        triggers: u32,
+        ctx: &mut UpdateContext<'_>,
+    ) {
+        self.report(entity, target, CastEdge::Finish { triggers }, ctx);
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -345,11 +437,13 @@ pub(crate) struct AbilityData<T: Trigger> {
     unpack_frames: LogicFrames,
     pack_needed: bool,
     pack_frames: LogicFrames,
+    skip_packing_with_no_target: bool,
     prep_frames: LogicFrames,
     persistent_frames: Option<LogicFrames>,
     persistent_count: Option<u32>,
     silent_final_trigger: bool,
     halts_on_arrival: bool,
+    charges: bool,
     needs_facing: bool,
     packing_type: Option<Name>,
     paralyze_completed: LogicFrames,
@@ -360,6 +454,7 @@ pub(crate) struct AbilityData<T: Trigger> {
     ignore_ai_command_always: bool,
     freeze_frames: LogicFrames,
     busy_frames: LogicFrames,
+    busy_from_unpack: bool,
     pub(crate) stops_before_activating: bool,
     instant: bool,
     chained_button: Option<Name>,
@@ -394,6 +489,53 @@ impl<T: Trigger> AbilityUpdate<T> {
         if let Some(active) = &mut self.active {
             active.last_period = true;
         }
+    }
+
+    pub fn end_persistence_now(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.last_period = true;
+            if active.phase == Phase::Preparing {
+                active.remaining = LogicFrames::ZERO;
+            }
+        }
+    }
+
+    pub fn cut_period(&mut self) {
+        if let Some(active) = &mut self.active {
+            if active.phase == Phase::Preparing {
+                active.remaining = LogicFrames::ZERO;
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn triggers(&self) -> u32 {
+        self.active.as_ref().map_or(0, |active| active.triggers)
+    }
+
+    #[must_use]
+    pub fn target_position(&self) -> Option<(f32, f32)> {
+        match self.active.as_ref()?.target {
+            AbilityTarget::Position(x, y) => Some((x, y)),
+            AbilityTarget::Object(_) | AbilityTarget::None => None,
+        }
+    }
+
+    pub fn retarget(&mut self, target: Entity) {
+        if let Some(active) = &mut self.active {
+            active.target = AbilityTarget::Object(target);
+        }
+    }
+
+    pub fn mark_no_target(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.no_target = true;
+        }
+    }
+
+    #[must_use]
+    pub fn packing_type(&self) -> Option<&Name> {
+        self.data.packing_type.as_ref()
     }
 
     pub(crate) fn trigger_nearness(&self) -> f32 {
@@ -449,8 +591,10 @@ impl<T: Trigger> Component for AbilityUpdate<T> {
                     None => hasher.write_bool(false),
                 }
                 hasher.write_bool(active.holding);
+                hasher.write_bool(active.ignoring);
                 hasher.write_bool(active.last_period);
                 hasher.write_u32(active.approaches);
+                hasher.write_u64(active.counted_approach_frame.unwrap_or(u64::MAX));
                 match active.last_approach_aim {
                     Some((x, y)) => {
                         hasher.write_bool(true);
@@ -461,6 +605,9 @@ impl<T: Trigger> Component for AbilityUpdate<T> {
                 }
                 hasher.write_bool(active.pending_custom_anim.is_some());
                 hasher.write_u64(active.pending_custom_anim.map_or(0, Frame::get));
+                if active.no_target != matches!(active.target, AbilityTarget::None) {
+                    hasher.write_bool(active.no_target);
+                }
             }
         }
         hasher.write_bool(self.effect_until.is_some());
@@ -469,6 +616,7 @@ impl<T: Trigger> Component for AbilityUpdate<T> {
 }
 
 impl<T: Trigger> ModuleKind for AbilityUpdate<T> {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::HELD;
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::SpecialPower)
         .union(CapabilityMask::single(Capability::Update))
         .union(CapabilityMask::single(Capability::Create));
@@ -500,12 +648,17 @@ impl<T: Trigger> ModuleKind for AbilityUpdate<T> {
             busy: LogicFrames::ZERO,
             last_known_target: None,
             holding: false,
+            ignoring: false,
             last_period: false,
             approaches: 0,
             last_approach_aim: None,
+            counted_approach_frame: None,
             pending_custom_anim: None,
             capture_phase: 0.0,
+            no_target: matches!(target, AbilityTarget::None),
+            charged: false,
         });
+        clear_cast_mask(&mut ctx.effects, ctx.entity);
         if !(self.data.instant && matches!(target, AbilityTarget::None)) {
             report_status_bit(&mut ctx.effects, ctx.entity, NO_AUTO_ACQUIRE, true);
         }
@@ -520,6 +673,7 @@ impl<T: Trigger> ModuleKind for AbilityUpdate<T> {
         };
         let entity = ctx.entity;
         let was_holding = active.holding;
+        let was_ignoring = active.ignoring;
         let target = active.target;
         let preparing = preparing(active);
         if preparing {
@@ -531,13 +685,17 @@ impl<T: Trigger> ModuleKind for AbilityUpdate<T> {
             LogicFrames::ZERO
         };
         finish_ability(&self.data, &mut self.active, entity, ctx, hold, false);
-        let held = self
+        let held = self.active.as_ref().is_some_and(movement_held);
+        let ignoring = self
             .active
             .as_ref()
-            .is_some_and(|active| movement_held(&self.data, active));
-        if held != was_holding {
-            if let Some(log) = ctx.effects.get::<EffectLog>() {
+            .is_some_and(|_| self.data.ignore_ai_command_always);
+        if let Some(log) = ctx.effects.get::<EffectLog>() {
+            if held != was_holding {
                 log.push(entity, Effect::HoldOrders(held));
+            }
+            if ignoring != was_ignoring {
+                log.push(entity, Effect::IgnoreOrders(ignoring));
             }
         }
     }
@@ -571,22 +729,28 @@ impl<T: Trigger> ModuleKind for AbilityUpdate<T> {
         active.frozen = active.frozen.saturating_sub(LogicFrames::ONE);
         active.busy = active.busy.saturating_sub(LogicFrames::ONE);
         let was_holding = active.holding;
+        let was_ignoring = active.ignoring;
         let sleep = self.step(ctx);
         let sleep = match timer_sleep {
             Some(timer_sleep) => crate::upgrade_mux::sooner(sleep, timer_sleep),
             None => sleep,
         };
-        let held = self
+        let held = self.active.as_ref().is_some_and(movement_held);
+        let ignoring = self
             .active
             .as_ref()
-            .is_some_and(|active| movement_held(&self.data, active));
-        if held != was_holding {
-            if let Some(log) = ctx.effects.get::<EffectLog>() {
+            .is_some_and(|_| self.data.ignore_ai_command_always);
+        if let Some(log) = ctx.effects.get::<EffectLog>() {
+            if held != was_holding {
                 log.push(ctx.entity, Effect::HoldOrders(held));
+            }
+            if ignoring != was_ignoring {
+                log.push(ctx.entity, Effect::IgnoreOrders(ignoring));
             }
         }
         if let Some(active) = &mut self.active {
             active.holding = held;
+            active.ignoring = ignoring;
         }
         sleep
     }
@@ -636,6 +800,9 @@ impl<T: Trigger> AbilityUpdate<T> {
             return finish_ability(&self.data, &mut self.active, entity, ctx, hold, false);
         }
         let positions = ctx.reads.get::<Positions>();
+        let quiet_phase =
+            matches!(active.phase, Phase::Unpacking | Phase::Packing) && !self.data.charges;
+        let mut target_lost = false;
         let placed = match active.target {
             AbilityTarget::None => None,
             AbilityTarget::Object(target) => {
@@ -651,6 +818,10 @@ impl<T: Trigger> AbilityUpdate<T> {
                         let (x, y) = active.last_known_target.unwrap_or((here.0, here.1));
                         active.target = AbilityTarget::Position(x, y);
                         Some((here, (x, y, 0.0, 0.0)))
+                    }
+                    (Some(_), None) if quiet_phase => {
+                        target_lost = true;
+                        None
                     }
                     _ => {
                         let preparing = preparing(active);
@@ -701,6 +872,7 @@ impl<T: Trigger> AbilityUpdate<T> {
             Phase::Approaching => {
                 if self.data.instant && matches!(active.target, AbilityTarget::None) {
                     self.data.trigger.fire(entity, active.target, ctx);
+                    raise_charging(&self.data, active, entity, ctx);
                     apply_trigger_modifier(&self.data, entity, ctx);
                     report_triggered(&self.data, entity, ctx);
                     play_trigger_sound(&self.data, entity, ctx);
@@ -741,7 +913,13 @@ impl<T: Trigger> AbilityUpdate<T> {
                             .get::<StillMoving>()
                             .is_some_and(|moving| moving.contains(mover));
                         if idle {
-                            if active.approaches > APPROACH_GIVE_UP_COUNT {
+                            let retail_frame = ctx
+                                .now
+                                .get()
+                                .checked_div(u64::from(TICKS_PER_RETAIL_FRAME))
+                                .unwrap_or(0);
+                            let counts = active.counted_approach_frame != Some(retail_frame);
+                            if counts && active.approaches > APPROACH_GIVE_UP_COUNT {
                                 let stuck = active.last_approach_aim.is_some_and(|(ax, ay)| {
                                     let (dx, dy) = (there.0 - ax, there.1 - ay);
                                     dx * dx + dy * dy
@@ -758,8 +936,11 @@ impl<T: Trigger> AbilityUpdate<T> {
                                     );
                                 }
                             }
-                            active.approaches = active.approaches.saturating_add(1);
-                            active.last_approach_aim = Some((there.0, there.1));
+                            if counts {
+                                active.approaches = active.approaches.saturating_add(1);
+                                active.last_approach_aim = Some((there.0, there.1));
+                                active.counted_approach_frame = Some(retail_frame);
+                            }
                             let approach = match active.target {
                                 AbilityTarget::Object(target)
                                     if self.data.start_range > FIXED_POINT_RANGE
@@ -877,6 +1058,16 @@ impl<T: Trigger> AbilityUpdate<T> {
                     push_lose_stealth(ctx, entity);
                 }
                 if active.remaining.is_zero() {
+                    if target_lost {
+                        return finish_ability(
+                            &self.data,
+                            &mut self.active,
+                            entity,
+                            ctx,
+                            LogicFrames::ZERO,
+                            false,
+                        );
+                    }
                     start_preparation(&self.data, active, entity, ctx);
                 }
                 Sleep::NextFrame
@@ -901,7 +1092,11 @@ impl<T: Trigger> AbilityUpdate<T> {
                             if active.triggers == 0 || self.data.trigger.fires_after_first_trigger()
                             {
                                 self.data.trigger.fire(entity, target, ctx);
+                                if self.data.trigger.ends_cast_after_fire(entity, ctx) {
+                                    active.last_period = true;
+                                }
                             }
+                            raise_charging(&self.data, active, entity, ctx);
                             apply_trigger_modifier(&self.data, entity, ctx);
                             report_triggered(&self.data, entity, ctx);
                             if self.data.lose_stealth_on_trigger {
@@ -915,7 +1110,17 @@ impl<T: Trigger> AbilityUpdate<T> {
                         }
                         active.triggers = active.triggers.saturating_add(1);
                         active.frozen = self.data.freeze_frames;
-                        active.busy = self.data.busy_frames;
+                        if !self.data.busy_from_unpack {
+                            active.busy = self.data.busy_frames;
+                            if !self.data.busy_frames.is_zero() {
+                                if let Some(log) = ctx.effects.get::<EffectLog>() {
+                                    log.push(
+                                        entity,
+                                        Effect::IgnoreOrdersFor(self.data.busy_frames),
+                                    );
+                                }
+                            }
+                        }
                     }
                     match self.data.persistent_frames {
                         Some(persistent)
@@ -927,7 +1132,7 @@ impl<T: Trigger> AbilityUpdate<T> {
                         {
                             active.remaining = persistent;
                         }
-                        _ if self.data.pack_needed => {
+                        _ if self.data.pack_needed && !skips_packing(&self.data, active) => {
                             active.phase = Phase::Packing;
                             active.remaining = self.data.pack_frames;
                             stop_active_loop_sound(&self.data, entity, ctx);
@@ -965,7 +1170,7 @@ impl<T: Trigger> AbilityUpdate<T> {
                             })
                         });
                     if !continue_preparation || out_of_range {
-                        if self.data.pack_needed {
+                        if self.data.pack_needed && !skips_packing(&self.data, active) {
                             active.phase = Phase::Packing;
                             active.remaining = self.data.pack_frames;
                             stop_active_loop_sound(&self.data, entity, ctx);
@@ -1026,6 +1231,10 @@ impl<T: Trigger> AbilityUpdate<T> {
     }
 }
 
+fn skips_packing<T: Trigger>(data: &AbilityData<T>, active: &Active) -> bool {
+    data.skip_packing_with_no_target && active.no_target
+}
+
 const fn preparing(active: &Active) -> bool {
     active.prepare_reported && active.triggers == 0
 }
@@ -1044,12 +1253,21 @@ fn begin_unpack_or_prepare<T: Trigger>(
         .trigger
         .effect_timer()
         .and_then(|lasts| ctx.now.checked_add(lasts));
-    if data.unpack_needed {
+    if data.unpack_needed && !skips_packing(data, active) {
         let mut add = whole_cast;
         add.push(Name::from(UNPACKING));
         push_conditions(ctx, entity, add, Vec::new());
         active.phase = Phase::Unpacking;
         active.remaining = data.unpack_frames;
+        if let Some(log) = ctx.effects.get::<EffectLog>() {
+            log.push(entity, Effect::UnpackStarted(Name::clone(&data.power)));
+        }
+        if data.busy_from_unpack && !data.busy_frames.is_zero() {
+            active.busy = data.busy_frames;
+            if let Some(log) = ctx.effects.get::<EffectLog>() {
+                log.push(entity, Effect::IgnoreOrdersFor(data.busy_frames));
+            }
+        }
         if let Some(anim) = &data.custom_anim {
             if anim.delay.is_zero() {
                 raise_custom_anim(data, entity, ctx);
@@ -1245,13 +1463,8 @@ impl<T: Trigger> AbilityData<T> {
     }
 }
 
-pub(crate) fn hold_at_least_after_trigger<T: Trigger>(
-    mut data: AbilityData<T>,
-    at_least: LogicFrames,
-) -> AbilityData<T> {
-    if at_least > data.freeze_frames {
-        data.freeze_frames = at_least;
-    }
+pub(crate) fn busy_window_from_unpack<T: Trigger>(mut data: AbilityData<T>) -> AbilityData<T> {
+    data.busy_from_unpack = true;
     data
 }
 
@@ -1339,6 +1552,10 @@ pub(crate) fn ability_data_from_fields_with_persistence<T: Trigger>(
         unpack_frames,
         pack_needed,
         pack_frames,
+        skip_packing_with_no_target: crate::fire_weapon_update::flag(
+            fields,
+            "SkipPackingWithNoTarget",
+        ) == Some(true),
         prep_frames,
         persistent_frames: (persists && persistent_needed).then_some(persistent_frames),
         persistent_count: if skip_continue_persists {
@@ -1348,6 +1565,7 @@ pub(crate) fn ability_data_from_fields_with_persistence<T: Trigger>(
         },
         silent_final_trigger: skip_continue_persists,
         halts_on_arrival: !charges,
+        charges,
         needs_facing: !ignore_facing_check,
         packing_type,
         paralyze_completed,
@@ -1358,6 +1576,7 @@ pub(crate) fn ability_data_from_fields_with_persistence<T: Trigger>(
         ignore_ai_command_always: false,
         freeze_frames,
         busy_frames,
+        busy_from_unpack: false,
         stops_before_activating: true,
         instant,
         chained_button,
@@ -1405,7 +1624,6 @@ fn packing_type_condition(value: Option<f32>) -> Option<Name> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrabPassengerEat {
     pub state: Name,
-    pub after: LogicFrames,
     pub lasts: LogicFrames,
     pub trigger: LogicFrames,
     pub heal: Option<f32>,
@@ -1417,7 +1635,7 @@ pub(crate) fn millisecond_token(token: &str, key: &str) -> Option<LogicFrames> {
         return None;
     }
     let ms: u32 = value.trim().parse().ok()?;
-    Some(LogicFrames::from_milliseconds(ms.min(86_400_000)))
+    Some(retail_duration_ticks(ms.min(86_400_000)))
 }
 
 fn retail_ms_token(token: &str, key: &str) -> Option<u32> {
@@ -1542,10 +1760,6 @@ pub fn grab_passenger_eat(
     };
     Ok(Some(GrabPassengerEat {
         state,
-        after: duration(fields, "PersistentPrepTime")
-            .1
-            .checked_add(duration(fields, "PackTime").1)
-            .ok_or_else(|| FieldError::new("PersistentPrepTime + PackTime overflows"))?,
         lasts,
         trigger,
         heal,

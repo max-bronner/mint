@@ -5,8 +5,7 @@ use mint_sim::{Entity, FieldError, Frame, ModuleFieldSource};
 
 use crate::effects::{Effect, EffectLog, Name, PowerPlace};
 use crate::special_ability_update::{
-    ability_data_from_fields, duration, hold_at_least_after_trigger, AbilityTarget, AbilityUpdate,
-    Trigger,
+    ability_data_from_fields, busy_window_from_unpack, AbilityTarget, AbilityUpdate, Trigger,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,13 +69,7 @@ pub fn teleport_special_ability_update_from_fields(
         source_weapon: fields.field("SourceWeaponName").map(Name::from),
         destination_weapon: fields.field("DestinationWeaponName").map(Name::from),
     };
-    let data = ability_data_from_fields(fields, trigger)?;
-    let (busy_needed, busy_frames) = duration(fields, "BusyForDuration");
-    let data = if busy_needed {
-        hold_at_least_after_trigger(data, busy_frames)
-    } else {
-        data
-    };
+    let data = busy_window_from_unpack(ability_data_from_fields(fields, trigger)?);
     Ok(AbilityUpdate {
         data: Arc::new(data),
         active: None,

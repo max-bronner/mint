@@ -30,6 +30,7 @@ mod cost_modifier_upgrade;
 mod curse_special_power;
 mod destroy_die;
 pub mod die_mux;
+pub mod disabled_masks;
 mod do_command_upgrade;
 mod dominate_enemy_special_power;
 mod dual_weapon_behavior;
@@ -43,6 +44,7 @@ mod fields;
 mod fire_weapon_update;
 pub mod flammable;
 mod fling_passenger_special_ability_update;
+mod flood_update;
 mod fx_list_die;
 mod gate_open_and_close_behavior;
 mod geometry_upgrade;
@@ -60,8 +62,11 @@ mod large_group_bonus_update;
 mod level_grant_special_power;
 mod level_up_upgrade;
 mod lifetime_update;
+mod lock_weapon_create;
+mod locomotor_set_upgrade;
 mod model_condition_special_ability_update;
 mod model_condition_upgrade;
+mod oathbreakers_fade_away_behavior;
 pub mod object_creation_upgrade;
 pub mod object_filter;
 pub mod object_scripts;
@@ -81,6 +86,7 @@ mod replace_object_update;
 mod replace_self_upgrade;
 mod salvage_crate_collide;
 pub mod script_events;
+mod set_conditions;
 pub mod slave_watcher_behavior;
 pub mod slaved_update;
 mod slow_death_behavior;
@@ -88,6 +94,7 @@ pub mod spawn_behavior;
 mod spawn_point_production_exit_update;
 mod special_ability_update;
 mod special_disguise_update;
+mod special_enemy_sense_update;
 pub mod special_power_effects;
 pub mod spell_powers;
 mod spell_recharge_modifier_upgrade;
@@ -139,7 +146,7 @@ pub use attribute_modifier_upgrade::{
     attribute_modifier_upgrade_from_fields, AttributeModifierUpgrade,
 };
 pub use auto_ability_behavior::{
-    auto_ability_behavior_from_fields, AutoAbilityBehavior, Query, UNBOUNDED_RANGE,
+    auto_ability_behavior_from_fields, ActiveButton, AutoAbilityBehavior, Query, UNBOUNDED_RANGE,
 };
 pub use auto_heal_behavior::{auto_heal_behavior_from_fields, AutoHealBehavior};
 pub use auto_pick_up_update::{auto_pick_up_update_from_fields, AutoPickUpUpdate, EatObjectEntry};
@@ -186,8 +193,8 @@ pub use dynamic_portal_behaviour::{
     dynamic_portal_behaviour_from_fields, DynamicPortalBehaviour, Link, WayPoint, WayPointType,
 };
 pub use effects::{
-    CastEdge, Changed, CreateLocation, Effect, EffectLog, ModifierRule, OclFrom, PowerPlace,
-    PowerSides, ReplaceCarry, TextureSwap, UpgradeState, WeatherKind,
+    CastEdge, Changed, CreateLocation, Effect, EffectLog, HealerRules, ModifierRule, OclFrom,
+    PowerPlace, PowerSides, Regrow, ReplaceCarry, TextureSwap, UpgradeState, WeatherKind,
 };
 pub use emotion_tracker_update::{
     emotion_tracker_update_from_fields, frightens, points_at, taunt_excluded, EmotionTrackerUpdate,
@@ -210,6 +217,7 @@ pub use fire_weapon_update::{
 pub use fling_passenger_special_ability_update::{
     fling_passenger_special_ability_update_from_fields, FlingPassengerSpecialAbilityUpdate,
 };
+pub use flood_update::{flood_update_from_fields, FloodMember, FloodSpec, FloodUpdate};
 pub use fx_list_die::{fx_list_die_from_fields, FxListDie};
 pub use gate_open_and_close_behavior::{
     gate_open_and_close_behavior_from_fields, GateOpenAndCloseBehavior,
@@ -244,10 +252,15 @@ pub use level_grant_special_power::{
 };
 pub use level_up_upgrade::{level_up_upgrade_from_fields, LevelUpUpgrade};
 pub use lifetime_update::{lifetime_update_from_fields, LifetimeUpdate};
+pub use lock_weapon_create::{lock_weapon_create_from_fields, LockWeaponCreate};
+pub use locomotor_set_upgrade::{locomotor_set_upgrade_from_fields, LocomotorSetUpgrade};
 pub use model_condition_special_ability_update::{
     model_condition_special_ability_update_from_fields, ModelConditionSpecialAbilityUpdate,
 };
 pub use model_condition_upgrade::{model_condition_upgrade_from_fields, ModelConditionUpgrade};
+pub use oathbreakers_fade_away_behavior::{
+    oathbreakers_fade_away_behavior_from_fields, OathbreakersFadeAwayBehavior,
+};
 pub use object_creation_upgrade::{object_creation_upgrade_from_fields, ObjectCreationUpgrade};
 pub use object_filter::{ObjectFilter, Relation};
 pub use passive_area_effect_behavior::{
@@ -266,12 +279,13 @@ pub use record::{
     player_upgrades, purchase_science_buttons, revive_buttons, special_power_buttons,
     spell_book_buttons, unit_builds, weapon_toggle_buttons, AiKindOf, AiTable, AnimalWander,
     AodCrush, AutoAcquire, BackAway, BuildCompletion, BuildableStatus, Castle, ConditionedSet,
-    ContactLabels, ContactPoint, ContactTags, Crush, CrushResistance, DeadCollideSize,
-    DeployStyleDef, FormationPreviewDecal, Foundation, Geometry, GeometryPiece, HarvestDef,
-    LocomotorSlot, ObjectRecord, PieceShape, PowerButton, PowerSlot, ProductionModifierDef,
-    RadarPriority, RespawnEntry, RespawnRule, SiegeDeployDef, SiegeRecord, SupplyCenterDockDef,
-    TemplateRecords, ToggleDeployDef, TurretDef, UnitBuild, UpgradeButton, VisionBonus,
-    DOZER_CONSTRUCT, FOUNDATION_CONSTRUCT, OBJECT_UPGRADE, PLAYER_UPGRADE, REVIVE, UNCRUSHABLE,
+    ContactLabels, ContactPoint, ContactTags, CritterEmitter, Crush, CrushResistance,
+    DeadCollideSize, DeployStyleDef, FormationPreviewDecal, Foundation, Geometry, GeometryPiece,
+    HarvestDef, LocomotorSlot, ObjectRecord, PieceShape, PowerButton, PowerSlot,
+    ProductionModifierDef, RadarPriority, RespawnEntry, RespawnRule, SiegeDeployDef, SiegeRecord,
+    SupplyCenterDockDef, TemplateRecords, ToggleDeployDef, TurretDef, UnitBuild, UpgradeButton,
+    VisionBonus, DOZER_CONSTRUCT, FOUNDATION_CONSTRUCT, OBJECT_UPGRADE, PLAYER_UPGRADE, REVIVE,
+    UNCRUSHABLE,
 };
 pub use refund_die::{refund_die_from_fields, RefundDie};
 pub use register_effects::{
@@ -290,17 +304,22 @@ pub use slow_death_behavior::{
     sink_delay_from_fields, sink_rate_from_fields, slow_death_behavior_from_fields,
     SlowDeathBehavior,
 };
-pub use spawn_behavior::{is_slaved, spawn_behavior_from_fields, SlavedTo, SpawnBehavior};
+pub use spawn_behavior::{
+    is_slaved, spawn_behavior_from_fields, watches_slaves, SlavedTo, SpawnBehavior, WatchedSlave,
+};
 pub use spawn_point_production_exit_update::{
     spawn_point_production_exit_update_from_fields, SpawnPointProductionExitUpdate,
     MAX_SPAWN_POINTS,
 };
 pub use special_ability_update::{
-    grab_passenger_eat, retail_duration_ticks, special_ability_update_from_fields,
-    GrabPassengerEat, SpecialAbilityUpdate, RETAIL_LOGIC_HZ,
+    grab_passenger_eat, retail_duration_ticks, retail_duration_ticks_f32,
+    special_ability_update_from_fields, GrabPassengerEat, SpecialAbilityUpdate, RETAIL_LOGIC_HZ,
 };
 pub use special_disguise_update::{
     special_disguise_update_from_fields, SpecialDisguiseUpdate, DISGUISED,
+};
+pub use special_enemy_sense_update::{
+    special_enemy_sense_update_from_fields, SpecialEnemySenseUpdate,
 };
 pub use spell_recharge_modifier_upgrade::{
     spell_recharge_modifier_upgrade_from_fields, SpellRechargeModifierUpgrade,
@@ -336,7 +355,7 @@ pub use unpause_special_power_upgrade::{
 };
 pub use upgrade_bits::UpgradeBits;
 pub use upgrade_mux::{attempt_upgrade_via_mux, UpgradeEffect, UpgradeMuxData};
-pub use upgrade_record::{build_upgrade_records, UpgradeRecord};
+pub use upgrade_record::{build_upgrade_costs, build_upgrade_records, UpgradeCost, UpgradeRecord};
 pub use wall_hub_behavior::{
     wall_hub_behavior_from_fields, ModuleOption, WallHubBehavior, BUILDER_RADIUS_USES_HUB,
 };
@@ -352,9 +371,9 @@ pub use weapon_mode_special_power_update::{
 };
 pub use weapon_set_upgrade::{weapon_set_upgrade_from_fields, WeaponSetUpgrade};
 pub use world_reads::{
-    Hordes, Immobile, MasterSlaves, MasterView, ModelConditions, Movers, NeutralControlled,
-    PlayerOrdered, Positions, SlaveView, Slaves, StillMoving, Structures, UnderConstruction,
-    ViewBlocked,
+    ArrowStormShots, Hordes, Immobile, InCombat, MasterSlaves, MasterView, ModelConditions, Movers,
+    NeutralControlled, PlayerOrdered, Positions, SlaveView, Slaves, StillMoving, Structures,
+    UnderConstruction, ViewBlocked,
 };
 
 use mint_sim::module::ModuleRegistry;
@@ -473,6 +492,11 @@ pub fn register_upgrade_family(registry: &mut ModuleRegistry, world: &mut World)
     );
     registry.register_loadable(world, "GeometryUpgrade", geometry_upgrade_from_fields);
     registry.register_loadable(world, "LevelUpUpgrade", level_up_upgrade_from_fields);
+    registry.register_loadable(
+        world,
+        "LocomotorSetUpgrade",
+        locomotor_set_upgrade_from_fields,
+    );
     registry.register_loadable(world, "StatusBitsUpgrade", status_bits_upgrade_from_fields);
     registry.register_loadable(
         world,
@@ -563,6 +587,7 @@ pub fn register_spell_family(registry: &mut ModuleRegistry, world: &mut World) {
     );
     registry.register_loadable(world, "FireWeaponUpdate", fire_weapon_update_from_fields);
     registry.register_loadable(world, "DeletionUpdate", deletion_update_from_fields);
+    registry.register_loadable(world, "FloodUpdate", flood_update_from_fields);
     registry.register_loadable(
         world,
         "AttributeModifierAuraUpdate",
@@ -858,6 +883,25 @@ pub fn register_live_families(registry: &mut ModuleRegistry, world: &mut World) 
     register_attach_family(registry, world);
     register_summon_replacement_family(registry, world);
     register_small_power_family(registry, world);
+    register_unit_ability_family(registry, world);
+}
+
+pub fn register_unit_ability_family(registry: &mut ModuleRegistry, world: &mut World) {
+    registry.register_loadable(
+        world,
+        "SpecialEnemySenseUpdate",
+        special_enemy_sense_update::special_enemy_sense_update_from_fields,
+    );
+    registry.register_loadable(
+        world,
+        "LockWeaponCreate",
+        lock_weapon_create::lock_weapon_create_from_fields,
+    );
+    registry.register_loadable(
+        world,
+        "OathbreakersFadeAwayBehavior",
+        oathbreakers_fade_away_behavior::oathbreakers_fade_away_behavior_from_fields,
+    );
 }
 
 pub fn register_summon_replacement_family(registry: &mut ModuleRegistry, world: &mut World) {
@@ -1307,10 +1351,15 @@ mod tests {
             effects,
             vec![
                 Effect::ArmorSetFlag("PLAYER_UPGRADE".into()),
+                Effect::ModelConditions {
+                    add: vec![effects::Name::from("ARMORSET_PLAYER_UPGRADE")].into(),
+                    remove: Vec::new().into(),
+                },
                 Effect::WeaponSetFlag("PLAYER_UPGRADE".into()),
                 Effect::SubObjects {
                     show: vec![effects::Name::from("Sub_Flag")].into(),
                     hide: Vec::new().into(),
+                    permanent: true,
                 },
             ],
             "declaration order"

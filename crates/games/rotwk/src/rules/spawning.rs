@@ -1,6 +1,6 @@
 use mint_movement::{Facing, MoverState, Route, Vec2};
 use mint_sage_modules::{
-    Effect, MasterSlaves, MasterView, NeutralControlled, SlaveView, SlavedTo, Slaves,
+    Effect, MasterSlaves, MasterView, NeutralControlled, SlaveView, SlavedTo, Slaves, WatchedSlave,
 };
 use mint_sim::module::OwnerChange;
 use mint_sim::{Entity, PlayerId, Requester, Result, Tick, World};
@@ -228,6 +228,7 @@ impl RotwkRules {
             route: Route {
                 points: points.clone(),
                 extra_distance: 0.0,
+                unsearched: false,
                 portals: Vec::new(),
             },
             goal,
@@ -398,6 +399,7 @@ impl RotwkRules {
             tick.state_mut()
                 .insert(ids.ground_offset, product, crate::unit::GroundOffset(dz))?;
         }
+        self.register_with_watcher(tick, ids, source, product)?;
         let slaved =
             self.enslave_if_slaved(tick, wiring, kind, source, product, destroy_when_sold)?;
         diag!(
@@ -411,6 +413,28 @@ impl RotwkRules {
             at.y,
             dz
         );
+        Ok(())
+    }
+
+    pub(super) fn register_with_watcher(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        master: Entity,
+        product: Entity,
+    ) -> Result<()> {
+        let Some(wiring) = self.modules.as_ref() else {
+            return Ok(());
+        };
+        let watches = tick
+            .state()
+            .get(ids.kind, master)
+            .and_then(|kind| self.kinds.get(*kind))
+            .is_some_and(|entry| mint_sage_modules::watches_slaves(&entry.record));
+        if watches {
+            tick.state_mut()
+                .insert(wiring.watched_slave, master, WatchedSlave(product))?;
+        }
         Ok(())
     }
 
@@ -438,18 +462,12 @@ impl RotwkRules {
             .collect()
     }
 
-    pub(super) fn order_slaves_to_attack(
-        &self,
-        tick: &mut Tick<'_>,
-        ids: Ids,
-        master: Entity,
-        target: Entity,
-    ) -> Result<usize> {
+    pub(super) fn idle_slaves(&self, tick: &mut Tick<'_>, ids: Ids, master: Entity) {
         let Some(wiring) = self.modules.as_ref() else {
-            return Ok(0);
+            return;
         };
         let Some(store) = tick.state().store(wiring.slaved_to) else {
-            return Ok(0);
+            return;
         };
         let mut slaves: Vec<Entity> = store
             .iter()
@@ -457,30 +475,13 @@ impl RotwkRules {
                 link.master == master
                     && tick.state().is_live(*slave)
                     && !tick.state().contains(ids.doomed, *slave)
-                    && tick.state().contains(ids.armed, *slave)
             })
             .map(|(slave, _)| slave)
             .collect();
         slaves.sort_unstable_by_key(|slave| slave.index());
-        for slave in &slaves {
-            if tick.state().get(ids.attack_order, *slave).map(|o| o.target) == Some(target) {
-                continue;
-            }
-            tick.state_mut().remove(ids.player_order, *slave);
-            tick.state_mut().insert(
-                ids.attack_order,
-                *slave,
-                AttackOrder {
-                    target,
-                    planned: false,
-                    horde: None,
-                    guard: false,
-                    forced: false,
-                    order_owner: None,
-                },
-            )?;
+        for slave in slaves {
+            self.stop_unit(tick, ids, slave);
         }
-        Ok(slaves.len())
     }
 
     pub(super) fn neutral_spawners(&self, world: &World, ids: Ids) -> NeutralControlled {
@@ -638,17 +639,14 @@ impl RotwkRules {
                 if std::env::var_os("MINT_ROTWK_SLAVED_DEBUG").is_some() {
                     self.log_slave_walk(tick, ids, entity, from, to);
                 }
-                tick.state_mut().remove(ids.attack_order, entity);
-                tick.state_mut().remove(ids.attack_move_order, entity);
-                tick.state_mut().remove(ids.player_order, entity);
-                tick.state_mut().remove(ids.path, mover);
                 let kind = if *acquires {
                     PathKind::Ability
                 } else {
                     PathKind::Ordered
                 };
-                self.close_on_target(tick, ids, mover, from, to, 0.0, kind, budgets)?;
+                self.ai_move(tick, ids, (entity, mover), from, to, kind, budgets)?;
             }
+
             Effect::AiAttack { target } => {
                 let current = tick.state().get(ids.attack_order, entity).map(|o| o.target);
                 if current != Some(*target) {
@@ -661,7 +659,7 @@ impl RotwkRules {
                             planned: false,
                             horde: None,
                             guard: false,
-                            forced: false,
+                            relation_free: false,
                             order_owner: None,
                         },
                     )?;
@@ -887,7 +885,7 @@ impl RotwkRules {
             ..spawn
         };
         let entity = tick.state_mut().spawn()?;
-        Self::insert_spawn(tick, ids, entity, &spawn, &self.combat)?;
+        self.insert_spawn(tick, ids, entity, &spawn, &self.combat)?;
         self.attach_upgrade_state(tick, ids, entity, Some(kind))?;
         let records = crate::construction::footprint_of(&entry.record);
         if entry.record.has_kind("STRUCTURE") && !records.is_empty() {

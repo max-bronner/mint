@@ -20,7 +20,7 @@ SpecialPower SpellPoison\n  ReloadTime = 0\nEnd\n\
 SpecialPower SpellStone\n  ReloadTime = 0\nEnd\n\
 SpecialPower SpellWood\n  ReloadTime = 0\nEnd\n\
 SpecialPower SpellCall\n  ReloadTime = 0\nEnd\n\
-ModifierList GroundBuff\n  Category = BUFF\n  Modifier = DAMAGE_MULT 200%\nEnd\n\
+ModifierList GroundBuff\n  Category = BUFF\n  Modifier = DAMAGE_MULT 200%\n  Duration = 1500\nEnd\n\
 ModifierList DarkMod\n  Category = SPELL\n  Modifier = ARMOR 50%\n  Duration = 0\nEnd\n\
 ModifierList LeaderMod\n  Category = LEADERSHIP\n  Modifier = DAMAGE_MULT 150%\nEnd\n\
 ModifierList StoneMod\n  Category = DEBUFF\n  Modifier = SPEED 0%\n  Duration = 2000\nEnd\n\
@@ -281,7 +281,13 @@ fn simulation_with_trees(
             ai_base_candidates: Vec::new(),
         })
         .collect();
-    let (sciences, ranks, plans) = crate::skirmish::spell_setup(&s.data, &s.kinds, &starts);
+    let (sciences, ranks, plans) = crate::skirmish::spell_setup(
+        &s.data,
+        &s.kinds,
+        &starts,
+        crate::game_mode::GameMode::Skirmish,
+        false,
+    );
     let power_sciences = power_names.required_sciences(&s.data.special_powers, &sciences);
     let spawns: Vec<Spawn> = placed
         .iter()

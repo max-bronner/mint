@@ -41,24 +41,30 @@ pub(crate) struct PlayerStart {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Inputs {
+    pub(crate) mode: crate::game_mode::GameMode,
     pub(crate) players: Vec<PlayerStart>,
     pub(crate) first_obstacle_id: u32,
     pub(crate) route_markers: Vec<crate::skirmish_ai::RouteMarker>,
     pub(crate) lines: Vec<String>,
     pub(crate) teams: Vec<Option<u8>>,
     pub(crate) handicaps: Vec<crate::handicap::Handicap>,
-    pub(crate) heroes: Vec<(PlayerId, Arc<mint_sage_cah::HeroRecord>)>,
+    pub(crate) heroes: Vec<(PlayerId, crate::lobby::CarriedHero)>,
     pub(crate) starting_money: Option<i64>,
     pub(crate) command_point_factor: Option<u32>,
+    pub(crate) cash: Vec<Option<i64>>,
+    pub(crate) command_points: Vec<Option<u32>>,
+    pub(crate) defeat_mode: crate::defeat::DefeatMode,
     pub(crate) allow_ring_heroes: bool,
     pub(crate) test_seeds: Vec<String>,
     pub(crate) map_cast: crate::map_players::MapCast,
     pub(crate) trees: Vec<crate::forest::TreeSeed>,
     pub(crate) ai_difficulty: Vec<(PlayerId, crate::lobby::Difficulty)>,
+    pub(crate) forfeit: Option<mint_sage_ini::game_data::RetreatTuning>,
     pub(crate) difficulty: crate::rules::difficulty::DifficultySetup,
     pub(crate) map_scripts: Option<crate::rules::map_scripts::MapScriptEngine>,
     pub(crate) starts: Vec<(u8, PlayerId)>,
     pub(crate) castle_layouts: crate::castle::CastleLayouts,
+    pub(crate) snowy: bool,
 }
 
 pub(crate) struct Start {
@@ -103,11 +109,12 @@ pub(crate) fn resolve(
     data: &GameData,
     objects: &[Object],
     read: impl Fn(&str) -> Option<Vec<u8>>,
-    players: &[crate::lobby::ResolvedPlayer],
+    players: &[crate::match_values::PlayerSeat],
     map_label: &str,
     map_scripts: Option<crate::rules::map_scripts::MapScriptEngine>,
     script_lines: Vec<String>,
     allow_ring_heroes: bool,
+    homes: &[(PlayerId, Vec2)],
 ) -> Result<Inputs, String> {
     let route_markers = crate::skirmish_ai::route_markers(objects);
     let mut inputs = Inputs {
@@ -138,10 +145,12 @@ pub(crate) fn resolve(
             counts.join(", ")
         ));
     }
-    for resolved in players {
-        let name = &resolved.faction;
-        let slot = resolved.start;
-        let Some(faction) = data.players.get(name) else {
+    for seat in players {
+        let crate::match_values::StartAt::Waypoint(slot) = seat.at else {
+            continue;
+        };
+        let name = &seat.template;
+        let Some(template) = data.players.get(name) else {
             let known: Vec<&str> = data
                 .players
                 .iter()
@@ -153,13 +162,19 @@ pub(crate) fn resolve(
                 known.join(", ")
             ));
         };
+        let faction = seat.starting.applied_to(template);
         if faction.playable != Some(true) {
             inputs.lines.push(format!(
                 "skirmish: {name} is not a PlayableSide - starting it anyway"
             ));
         }
+        let home = homes
+            .iter()
+            .find(|(p, _)| *p == seat.player)
+            .map(|(_, at)| *at);
         let waypoint = mint_sage_map::start_waypoint_name(slot);
-        let Some(start) = mint_sage_map::named_waypoint(objects, &waypoint) else {
+        let named = mint_sage_map::named_waypoint(objects, &waypoint).map(|w| Vec2::new(w.x, w.y));
+        let Some(start) = home.or(named) else {
             let found: Vec<&str> = objects
                 .iter()
                 .filter_map(Object::waypoint_name)
@@ -175,18 +190,18 @@ pub(crate) fn resolve(
                 }
             ));
         };
-        let castle = castle_for(data, faction, &inputs.castle_layouts, &mut inputs.lines);
-        let player = resolved.player;
-        let ai_base_candidates = if resolved.ai.is_some() {
-            ai_base_candidates_for(data, faction, &read, map_label, &mut inputs.lines)
+        let castle = castle_for(data, &faction, &inputs.castle_layouts, &mut inputs.lines);
+        let player = seat.player;
+        let ai_base_candidates = if seat.ai.is_some() {
+            ai_base_candidates_for(data, &faction, &read, map_label, &mut inputs.lines)
         } else {
             Vec::new()
         };
         inputs.starts.push((slot, player));
         inputs.players.push(PlayerStart {
             player,
-            faction: faction.clone(),
-            at: Vec2::new(start.x, start.y),
+            faction,
+            at: start,
             castle,
             ai_base_candidates,
         });
@@ -570,6 +585,7 @@ fn siege_docks(
                         .map(move |perch| crate::rules::siege::DockBone {
                             ladder,
                             at: mint_movement::Vec2::new(perch.position[0], perch.position[1]),
+                            height: perch.position[2],
                             axis: perch.facing,
                         })
                 })
@@ -594,11 +610,11 @@ fn siege_ladder_exits(
         .collect()
 }
 
-fn siege_above_wall(
+pub(crate) fn siege_above_wall(
     data: &GameData,
     kinds: &KindTable,
     perches: &dyn Fn(&str, &str) -> Vec<crate::perches::Perch>,
-) -> Vec<Option<mint_movement::Vec2>> {
+) -> Vec<Option<crate::rules::siege::AboveWall>> {
     kinds
         .iter()
         .map(|entry| {
@@ -615,16 +631,48 @@ fn siege_above_wall(
                     )
                     .ok()
                 })?;
-            let waypoint = portal
-                .waypoints()
-                .get(usize::try_from(portal.above_wall()?).ok()?)?
-                .index;
+            let Some(waypoint) = portal
+                .above_wall()
+                .and_then(|index| portal.waypoints().get(usize::try_from(index).ok()?))
+            else {
+                return Some(crate::rules::siege::AboveWall::Unlisted);
+            };
             let bones = perches(&entry.record.name, portal.bone_prefix()?);
-            let perch = bones.get(usize::try_from(waypoint).ok()?)?;
-            Some(mint_movement::Vec2::new(
-                perch.position[0],
-                perch.position[1],
+            let perch = bones.get(usize::try_from(waypoint.index).ok()?)?;
+            Some(crate::rules::siege::AboveWall::Bone(
+                mint_movement::Vec2::new(perch.position[0], perch.position[1]),
+                perch.position[2],
             ))
+        })
+        .collect()
+}
+
+fn portal_bones(
+    data: &GameData,
+    kinds: &KindTable,
+    perches: &dyn Fn(&str, &str) -> Vec<crate::perches::Perch>,
+) -> Vec<Vec<crate::perches::Perch>> {
+    kinds
+        .iter()
+        .map(|entry| {
+            entry
+                .record
+                .declared_modules
+                .iter()
+                .filter(|module| module.name.eq_ignore_ascii_case("DynamicPortalBehaviour"))
+                .find_map(|module| {
+                    mint_sage_modules::dynamic_portal_behaviour_from_fields(
+                        &module.source(&data.upgrade_bits),
+                        mint_sim::Frame::ZERO,
+                    )
+                    .ok()
+                })
+                .and_then(|portal| {
+                    let mut bones = perches(&entry.record.name, portal.bone_prefix()?);
+                    bones.truncate(usize::try_from(portal.number_of_bones()).ok()?);
+                    Some(bones)
+                })
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -682,6 +730,7 @@ pub(crate) fn build(
     ai_players: &[PlayerId],
 ) -> Result<Start, String> {
     let mut lines = inputs.lines.clone();
+    let multiplayer = inputs.mode.is_skirmish_or_multiplayer(None);
     let mut variation_rng = Pcg32::new(seed);
 
     let mut seeds: Vec<String> = Vec::new();
@@ -707,15 +756,12 @@ pub(crate) fn build(
                 .into_iter()
                 .filter(|name| data.templates.get(name).is_some()),
         );
-        seeds.extend(start.faction.spell_book_mp.iter().cloned());
+        seeds.extend(start.faction.spell_book_for(multiplayer).map(str::to_owned));
     }
-    seeds.extend(
-        inputs
-            .map_cast
-            .players
-            .iter()
-            .filter_map(|side| data.players.get(&side.faction)?.spell_book_mp.clone()),
-    );
+    seeds.extend(inputs.map_cast.players.iter().filter_map(|side| {
+        let faction = data.players.get(&side.faction)?;
+        faction.spell_book_for(multiplayer).map(str::to_owned)
+    }));
     seeds.extend(inputs.test_seeds.iter().cloned());
     seeds.extend(
         inputs
@@ -737,6 +783,10 @@ pub(crate) fn build(
             .filter(|name| data.templates.get(name).is_some()),
     );
     seeds.extend(inputs.trees.iter().map(|seed| seed.template.clone()));
+    seeds.extend(
+        Some(crate::visuals::RALLY_MARKER_TEMPLATE.to_owned())
+            .filter(|name| data.templates.get(name).is_some()),
+    );
     let (mut kinds, mut missing) = KindTable::closure(data, &seeds);
     let match_sides: Vec<&str> = inputs
         .players
@@ -800,7 +850,7 @@ pub(crate) fn build(
         hero_buildables.len()
     ));
     lines.push(format!(
-        "victory: unit filter {:?} (parsed, not consulted for defeat)",
+        "victory: unit filter {:?} (read as data by the skirmish defeat mode)",
         data.victory_unit_filter
     ));
     lines.push(format!(
@@ -1250,7 +1300,9 @@ pub(crate) fn build(
             }
         })
         .collect();
-    let starting_cash_overrides: Vec<Option<i64>> = if inputs.starting_money.is_some() {
+    let starting_cash_overrides: Vec<Option<i64>> = if inputs.cash.iter().any(Option::is_some) {
+        inputs.cash.clone()
+    } else if inputs.starting_money.is_some() {
         Vec::new()
     } else {
         inputs
@@ -1330,7 +1382,12 @@ pub(crate) fn build(
         obstacles.len()
     ));
     let power_names = crate::powers::PowerNames::build(kinds.power_names().map(str::to_owned));
-    let (sciences, ranks, mut spell_plans) = spell_setup(data, &kinds, &inputs.players);
+    let campaign = inputs
+        .map_scripts
+        .as_ref()
+        .is_some_and(|engine| engine.carryover_start().is_some());
+    let (sciences, ranks, mut spell_plans) =
+        spell_setup(data, &kinds, &inputs.players, inputs.mode, campaign);
     if spell_plans.len() < usize::from(contestants) {
         spell_plans.resize(
             usize::from(contestants),
@@ -1342,7 +1399,7 @@ pub(crate) fn build(
             spell_book: data
                 .players
                 .get(&side.faction)
-                .and_then(|faction| faction.spell_book_mp.as_deref())
+                .and_then(|faction| faction.spell_book_for(multiplayer))
                 .and_then(|name| kinds.kind(name)),
             ..crate::sciences::SpellPlan::default()
         }
@@ -1473,124 +1530,189 @@ pub(crate) fn build(
         .find(|player| !ai_seeds.iter().any(|seed| seed.player == *player));
     let mut simulation = Simulation::new(
         seed,
-        RotwkRules::new(passability, spawns)
-            .with_wall_geometry(wall_geometry)
-            .with_structure_footprints(structure_footprints)
-            .with_map_placements(map_placements)
-            .with_script_object_names(script_object_names)
-            .with_indestructible(indestructible)
-            .with_placed_keys(placed_keys)
-            .with_script_teams(script_teams)
-            .with_placed_hordes(placed_hordes)
-            .with_fire_grid(fire_grid)
-            .with_forest_seeds(forest_seeds)
-            .with_tree_templates(tree_templates)
-            .with_castles(castle_members, Arc::new(inputs.castle_layouts.clone()))
-            .with_combat(data.combat.clone())
-            .with_emotions(Arc::clone(&data.emotions))
-            .with_stances(Arc::clone(&data.stances))
-            .with_ai_power_buttons(Arc::clone(&data.command_buttons))
-            .with_command_sets(Arc::clone(&data.command_sets))
-            .with_ai_power_tuning(
-                data.ai_power_activation_tuning,
-                inputs.ai_difficulty.clone(),
-            )
-            .with_difficulty(inputs.difficulty.clone())
-            .with_combat_chains((*data.combat_chains).clone())
-            .with_hordes(data.formations.tables().to_vec(), hordes)
-            .with_melee_hordes(data.formations.melee().to_vec())
-            .with_horde_rangefinders(data.formations.rangefinders().to_vec())
-            .with_banners(crate::horde::banner_plans(&data.formations, &kinds))
-            .with_construction(Arc::clone(&kinds), production.clone())
-            .with_cancel_refund_percent(data.construction_cancel_refund_percent)
-            .with_max_cells_adjust_horde_melee(data.max_cells_adjust_horde_melee)
-            .with_max_cells_adjust_destination(data.max_cells_adjust_destination)
-            .with_max_cells_adjust_to_possible_destination(
-                data.max_cells_adjust_to_possible_destination,
-            )
-            .with_max_tunnel_capacity(data.max_tunnel_capacity)
-            .with_melee_placement(data.melee_placement)
-            .with_group_formation(data.group_formation)
-            .with_drag_formation(Arc::clone(&data.drag_formation))
-            .with_castle_siege_stand_back_distance(data.castle_siege_stand_back_distance)
-            .with_victory(Arc::clone(&kinds), data.victory_structure_filter.clone())
-            .with_passenger_perches(passenger_perches(data, &kinds, perches))
-            .with_spawn_points(spawn_points(data, &kinds, perches))
-            .with_launch_bones(launch_bones)
-            .with_wall_bounds(wall_bounds)
-            .with_ramp_meshes(ramp_meshes)
-            .with_raised_wall_meshes(raised_wall_meshes)
-            .with_siege_bones(
-                siege_docks(&kinds, perches),
-                siege_above_wall(data, &kinds, perches),
-                siege_ladder_exits(&kinds, perches),
-            )
-            .with_economy(
-                production.buildables,
-                inputs
-                    .starting_money
-                    .unwrap_or(mint_sage_economy::DEFAULT_STARTING_CASH),
-            )
-            .with_starting_cash_overrides(starting_cash_overrides)
-            .with_initial_upgrades(initial_upgrades)
-            .with_production_cost_change(production_cost_change)
-            .with_menus(production.menus)
-            .with_menu_needs(production.menu_needs)
-            .with_heroes(hero_rosters, hero_buildables)
-            .with_create_a_hero(cah_plans, cah_can_build, cah_revival_discount)
-            .with_upgrades(kinds.upgrades(data), Arc::clone(&data.upgrade_bits))
-            .with_powers(
-                power_names.clone(),
-                power_names.reload_table(&data.special_powers),
-            )
-            .with_power_cast_rules(power_names.cast_rules(&data.special_powers))
-            .with_experience(Arc::clone(&data.experience), data.armor_bonus_cap)
-            .with_experience_scalars(Arc::clone(&data.experience_scalars))
-            .with_damage_thresholds(data.damage_thresholds)
-            .with_engaged_defaults(data.engaged_defaults)
-            .with_spell_books(sciences, ranks, spell_plans, power_sciences)
-            .with_creation_lists(Arc::clone(&data.ocls))
-            .with_sell_percentage(data.sell_percentage)
-            .with_base_check_frames(data.base_check_frames)
-            .with_value_per_supply_box(data.value_per_supply_box)
-            .with_gravity(data.gravity)
-            .with_ground_stiffness(data.ground_stiffness)
-            .with_claim_cell_size(data.terrain_resource_cell_size)
-            .with_guard_ranges(data.guard_ranges)
-            .with_attack_priorities(data.attack_priorities.clone())
-            .with_alignments(alignments)
-            .with_skirmish_ai(ai_seeds, data.ai_timing, ai_army_plans)
-            .with_object_scripts(data.object_scripts.clone())
-            .with_attack_ai(
-                data.attack_urgency_values,
-                inputs.route_markers.clone(),
-                player_sides,
-            )
-            .with_player_starts(
-                inputs
-                    .players
-                    .iter()
-                    .map(|start| (start.player, start.at))
-                    .collect(),
-            )
-            .with_shroud(false)
-            .with_players(contestants)
-            .with_teams(inputs.teams.clone())
-            .with_map_players(contestants, map_setup.names, map_setup.relations)
-            .with_contestant_sides(map_setup.contestant_sides)
-            .with_computer_sides(computer_sides)
-            .with_map_scripts(inputs.map_scripts.clone(), inputs.starts.clone())
-            .with_script_named_sides(inputs.map_cast.named.clone())
-            .with_script_local_player(local_player)
-            .with_handicaps(inputs.handicaps.clone())
-            .with_command_point_factor(inputs.command_point_factor.unwrap_or(100))
-            .with_command_point_table(data.command_points)
-            .with_campaign_command_points(
-                (!inputs.difficulty.multiplayer).then_some(data.command_points_solo),
-            )
-            .with_multiplay_multipliers(data.multiplay)
-            .with_score_weights(data.score_weights)
-            .with_objects_that_score(data.objects_that_score.clone()),
+        *Box::new(RotwkRules::new(passability, spawns))
+            .configured(|rules| rules.with_wall_geometry(wall_geometry))
+            .configured(|rules| rules.with_structure_footprints(structure_footprints))
+            .configured(|rules| rules.with_map_placements(map_placements))
+            .configured(|rules| rules.with_script_object_names(script_object_names))
+            .configured(|rules| rules.with_indestructible(indestructible))
+            .configured(|rules| rules.with_map_snowy(inputs.snowy))
+            .configured(|rules| rules.with_placed_keys(placed_keys))
+            .configured(|rules| rules.with_script_teams(script_teams))
+            .configured(|rules| rules.with_placed_hordes(placed_hordes))
+            .configured(|rules| rules.with_fire_grid(fire_grid))
+            .configured(|rules| rules.with_forest_seeds(forest_seeds))
+            .configured(|rules| rules.with_tree_templates(tree_templates))
+            .configured(|rules| {
+                rules.with_castles(castle_members, Arc::new(inputs.castle_layouts.clone()))
+            })
+            .configured(|rules| rules.with_combat(data.combat.clone()))
+            .configured(|rules| rules.with_emotions(Arc::clone(&data.emotions)))
+            .configured(|rules| rules.with_stances(Arc::clone(&data.stances)))
+            .configured(|rules| rules.with_ai_power_buttons(Arc::clone(&data.command_buttons)))
+            .configured(|rules| rules.with_command_sets(Arc::clone(&data.command_sets)))
+            .configured(|rules| {
+                rules.with_ai_power_tuning(
+                    data.ai_power_activation_tuning,
+                    inputs.ai_difficulty.clone(),
+                )
+            })
+            .configured(|rules| rules.with_brutal_cheats(data.brutal_cheats))
+            .configured(|rules| rules.with_forfeit(inputs.forfeit))
+            .configured(|rules| rules.with_difficulty(inputs.difficulty.clone()))
+            .configured(|rules| rules.with_combat_chains((*data.combat_chains).clone()))
+            .configured(|rules| rules.with_hordes(data.formations.tables().to_vec(), hordes))
+            .configured(|rules| rules.with_melee_hordes(data.formations.melee().to_vec()))
+            .configured(|rules| {
+                rules.with_horde_rangefinders(data.formations.rangefinders().to_vec())
+            })
+            .configured(|rules| {
+                rules.with_horde_rangefinder_weapons(data.formations.rangefinder_weapons().to_vec())
+            })
+            .configured(|rules| rules.with_horde_overloaded(data.formations.overloaded().to_vec()))
+            .configured(|rules| {
+                rules.with_banners(crate::horde::banner_plans(&data.formations, &kinds))
+            })
+            .configured(|rules| rules.with_construction(Arc::clone(&kinds), production.clone()))
+            .configured(|rules| {
+                rules.with_cancel_refund_percent(data.construction_cancel_refund_percent)
+            })
+            .configured(|rules| {
+                rules.with_max_cells_adjust_horde_melee(data.max_cells_adjust_horde_melee)
+            })
+            .configured(|rules| {
+                rules.with_max_cells_adjust_destination(data.max_cells_adjust_destination)
+            })
+            .configured(|rules| {
+                rules.with_max_cells_adjust_to_possible_destination(
+                    data.max_cells_adjust_to_possible_destination,
+                )
+            })
+            .configured(|rules| rules.with_max_tunnel_capacity(data.max_tunnel_capacity))
+            .configured(|rules| rules.with_melee_placement(data.melee_placement))
+            .configured(|rules| rules.with_group_formation(data.group_formation))
+            .configured(|rules| rules.with_drag_formation(Arc::clone(&data.drag_formation)))
+            .configured(|rules| {
+                rules.with_castle_siege_stand_back_distance(data.castle_siege_stand_back_distance)
+            })
+            .configured(|rules| {
+                rules
+                    .with_victory(Arc::clone(&kinds), data.victory_structure_filter.clone())
+                    .with_victory_units(data.victory_unit_filter.clone())
+                    .with_defeat_mode(inputs.defeat_mode)
+            })
+            .configured(|rules| {
+                rules.with_passenger_perches(passenger_perches(data, &kinds, perches))
+            })
+            .configured(|rules| rules.with_spawn_points(spawn_points(data, &kinds, perches)))
+            .configured(|rules| rules.with_portal_bones(portal_bones(data, &kinds, perches)))
+            .configured(|rules| rules.with_launch_bones(launch_bones))
+            .configured(|rules| rules.with_wall_bounds(wall_bounds))
+            .configured(|rules| rules.with_ramp_meshes(ramp_meshes))
+            .configured(|rules| rules.with_raised_wall_meshes(raised_wall_meshes))
+            .configured(|rules| {
+                rules.with_siege_bones(
+                    siege_docks(&kinds, perches),
+                    siege_above_wall(data, &kinds, perches),
+                    siege_ladder_exits(&kinds, perches),
+                )
+            })
+            .configured(|rules| {
+                rules.with_economy(
+                    production.buildables,
+                    inputs
+                        .starting_money
+                        .unwrap_or(mint_sage_economy::DEFAULT_STARTING_CASH),
+                )
+            })
+            .configured(|rules| rules.with_starting_cash_overrides(starting_cash_overrides))
+            .configured(|rules| rules.with_initial_upgrades(initial_upgrades))
+            .configured(|rules| rules.with_production_cost_change(production_cost_change))
+            .configured(|rules| rules.with_menus(production.menus))
+            .configured(|rules| rules.with_menu_needs(production.menu_needs))
+            .configured(|rules| rules.with_heroes(hero_rosters, hero_buildables))
+            .configured(|rules| {
+                rules.with_create_a_hero(cah_plans, cah_can_build, cah_revival_discount)
+            })
+            .configured(|rules| {
+                rules.with_upgrades(kinds.upgrades(data), Arc::clone(&data.upgrade_bits))
+            })
+            .configured(|rules| {
+                rules.with_powers(
+                    power_names.clone(),
+                    power_names.reload_table(&data.special_powers),
+                )
+            })
+            .configured(|rules| {
+                rules.with_power_cast_rules(power_names.cast_rules(&data.special_powers))
+            })
+            .configured(|rules| {
+                rules.with_experience(Arc::clone(&data.experience), data.armor_bonus_cap)
+            })
+            .configured(|rules| rules.with_experience_scalars(Arc::clone(&data.experience_scalars)))
+            .configured(|rules| rules.with_damage_thresholds(data.damage_thresholds))
+            .configured(|rules| rules.with_engaged_defaults(data.engaged_defaults))
+            .configured(|rules| {
+                rules.with_spell_books(sciences, ranks, spell_plans, power_sciences)
+            })
+            .configured(|rules| rules.with_creation_lists(Arc::clone(&data.ocls)))
+            .configured(|rules| rules.with_sell_percentage(data.sell_percentage))
+            .configured(|rules| rules.with_base_check_frames(data.base_check_frames))
+            .configured(|rules| rules.with_value_per_supply_box(data.value_per_supply_box))
+            .configured(|rules| {
+                rules.with_building_height_variation(data.building_height_variation)
+            })
+            .configured(|rules| rules.with_gravity(data.gravity))
+            .configured(|rules| rules.with_ground_stiffness(data.ground_stiffness))
+            .configured(|rules| rules.with_claim_cell_size(data.terrain_resource_cell_size))
+            .configured(|rules| rules.with_guard_ranges(data.guard_ranges))
+            .configured(|rules| rules.with_attack_priorities(data.attack_priorities.clone()))
+            .configured(|rules| rules.with_alignments(alignments))
+            .configured(|rules| rules.with_skirmish_ai(ai_seeds, data.ai_timing, ai_army_plans))
+            .configured(|rules| rules.with_object_scripts(data.object_scripts.clone()))
+            .configured(|rules| {
+                rules.with_attack_ai(
+                    data.attack_urgency_values,
+                    inputs.route_markers.clone(),
+                    player_sides,
+                )
+            })
+            .configured(|rules| {
+                rules.with_player_starts(
+                    inputs
+                        .players
+                        .iter()
+                        .map(|start| (start.player, start.at))
+                        .collect(),
+                )
+            })
+            .configured(|rules| rules.with_shroud(false))
+            .configured(|rules| rules.with_players(contestants))
+            .configured(|rules| rules.with_teams(inputs.teams.clone()))
+            .configured(|rules| {
+                rules.with_map_players(contestants, map_setup.names, map_setup.relations)
+            })
+            .configured(|rules| rules.with_contestant_sides(map_setup.contestant_sides))
+            .configured(|rules| rules.with_computer_sides(computer_sides))
+            .configured(|rules| {
+                rules.with_map_scripts(inputs.map_scripts.clone(), inputs.starts.clone())
+            })
+            .configured(|rules| rules.with_script_named_sides(inputs.map_cast.named.clone()))
+            .configured(|rules| rules.with_script_local_player(local_player))
+            .configured(|rules| rules.with_handicaps(inputs.handicaps.clone()))
+            .configured(|rules| {
+                rules.with_command_point_factor(inputs.command_point_factor.unwrap_or(100))
+            })
+            .configured(|rules| rules.with_command_point_table(data.command_points))
+            .configured(|rules| rules.with_command_point_overrides(inputs.command_points.clone()))
+            .configured(|rules| {
+                rules.with_campaign_command_points(
+                    (!inputs.difficulty.multiplayer).then_some(data.command_points_solo),
+                )
+            })
+            .configured(|rules| rules.with_multiplay_multipliers(data.multiplay))
+            .configured(|rules| rules.with_score_weights(data.score_weights))
+            .configured(|rules| rules.with_objects_that_score(data.objects_that_score.clone())),
     )
     .map_err(|e| e.to_string())?;
     simulation
@@ -1845,25 +1967,39 @@ pub(crate) fn spell_setup(
     data: &GameData,
     kinds: &KindTable,
     players: &[PlayerStart],
+    mode: crate::game_mode::GameMode,
+    campaign: bool,
 ) -> (
     Arc<crate::sciences::ScienceTable>,
     Arc<crate::sciences::Ranks>,
     Vec<crate::sciences::SpellPlan>,
 ) {
-    let sciences = crate::sciences::ScienceTable::build(&data.sciences);
-    let ranks = crate::sciences::Ranks::build(&data.ranks, &sciences);
+    let multiplayer = mode.is_skirmish_or_multiplayer(None);
+    let sciences = crate::sciences::ScienceTable::build(&data.sciences, multiplayer);
+    let ranks = crate::sciences::Ranks::build(&data.ranks, &sciences, campaign, None);
+    let mut by_side: std::collections::BTreeMap<String, Arc<crate::sciences::Ranks>> =
+        std::collections::BTreeMap::new();
     let plans = players
         .iter()
         .map(|start| {
             let faction = &start.faction;
+            let side_ranks = faction.side.as_deref().map(|side| {
+                Arc::clone(by_side.entry(side.to_ascii_lowercase()).or_insert_with(|| {
+                    Arc::new(crate::sciences::Ranks::build(
+                        &data.ranks,
+                        &sciences,
+                        campaign,
+                        Some(side),
+                    ))
+                }))
+            });
             crate::sciences::SpellPlan {
+                ranks: side_ranks,
                 spell_book: faction
-                    .spell_book_mp
-                    .as_deref()
+                    .spell_book_for(multiplayer)
                     .and_then(|name| kinds.kind(name)),
                 store: faction
-                    .purchase_science_command_set_mp
-                    .as_deref()
+                    .purchase_science_command_set_for(multiplayer)
                     .map(|set| {
                         mint_sage_modules::purchase_science_buttons(
                             set,
@@ -1876,22 +2012,20 @@ pub(crate) fn spell_setup(
                     })
                     .unwrap_or_default(),
                 intrinsic: faction
-                    .intrinsic_sciences_mp
+                    .intrinsic_sciences_for(multiplayer)
                     .iter()
                     .filter_map(|name| sciences.id(name))
                     .collect(),
-                rank_cap: faction
-                    .max_level_mp
-                    .as_deref()
-                    .and_then(|raw| {
-                        mint_sage_ini::value::parse_float_or_expression(raw, &data.macros)
-                    })
-                    .filter(|cap| cap.is_finite() && *cap >= 1.0 && *cap <= 100_000.0)
-                    .map(|cap| {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let whole = cap as u32;
-                        whole
-                    }),
+                rank_cap: mint_sage_ini::value::parse_float_or_expression(
+                    faction.max_level_for(multiplayer),
+                    &data.macros,
+                )
+                .filter(|cap| cap.is_finite() && *cap >= 1.0 && *cap <= 100_000.0)
+                .map(|cap| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let whole = cap as u32;
+                    whole
+                }),
                 intrinsic_purchase_points: faction
                     .intrinsic_science_purchase_points
                     .as_deref()

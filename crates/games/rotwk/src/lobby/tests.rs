@@ -28,6 +28,8 @@ fn setup(slots: Vec<SlotSetup>) -> SkirmishSetup {
         spawn_buildings: None,
         dummies: None,
         dummies_attack: false,
+        drive_templates: Vec::new(),
+        wotr: None,
         cah_hero: None,
         random_seed: crate::skirmish::SKIRMISH_SEED,
         resolved: None,
@@ -44,7 +46,12 @@ fn a_setup_breaking_a_rule_is_refused_with_the_rule() {
     assert_eq!(two().validate(&c), Ok(()));
     assert_eq!(
         setup(vec![SlotSetup::new(Occupant::Human), SlotSetup::closed()]).validate(&c),
-        Err(SetupError::TooFewPlayers(1))
+        Ok(())
+    );
+    assert_eq!(setup(vec![ai(), ai()]).validate(&c), Ok(()));
+    assert_eq!(
+        setup(vec![ai(), ai()]).validate_play(&c),
+        Err(SetupError::NeedHumanPlayers)
     );
     assert_eq!(
         setup(vec![ai(), ai(), ai(), ai(), ai()]).validate(&c),

@@ -131,6 +131,7 @@ pub struct Viewer {
     marker_mesh: Option<MeshHandle>,
     attached: Vec<mint_sage_particle::SystemId>,
     instances: Vec<Instance>,
+    palette: Vec<Mat4>,
     quads: Vec<UiQuad>,
     want_fire: bool,
     want_subject: bool,
@@ -186,6 +187,7 @@ impl Viewer {
             marker_mesh,
             attached: Vec::new(),
             instances: Vec::new(),
+            palette: Vec::new(),
             quads: Vec::new(),
             want_fire: false,
             want_subject: false,
@@ -1096,11 +1098,18 @@ impl App for Viewer {
         );
         self.instances = instances;
         self.play_events(renderer, &events);
-        renderer.set_bones(self.subject.bones())?;
-
         let camera = self.camera.camera(FAR);
         let mut particles = std::mem::take(&mut self.instances);
-        self.scene.draw(renderer, &camera, &mut particles);
+        self.scene.draw(
+            renderer,
+            &camera,
+            &mut particles,
+            self.subject.bones().len(),
+        );
+        self.palette.clear();
+        self.palette.extend_from_slice(self.subject.bones());
+        self.palette.extend_from_slice(self.scene.bones());
+        renderer.set_bones(&self.palette)?;
         self.instances = particles;
 
         self.build_sidebar(renderer);

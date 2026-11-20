@@ -3,6 +3,7 @@ pub enum DepthTest {
     #[default]
     Nearer,
     NearerOrEqual,
+    Always,
 }
 
 impl DepthTest {
@@ -11,6 +12,7 @@ impl DepthTest {
         match self {
             Self::Nearer => 0,
             Self::NearerOrEqual => 1,
+            Self::Always => 2,
         }
     }
 }

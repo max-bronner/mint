@@ -442,11 +442,10 @@ impl RotwkRules {
             let reaches = self
                 .melee_reach(tick, ids, member.entity)
                 .is_some_and(|range| {
-                    in_range(
-                        member.position,
-                        member.radius,
-                        goal.position,
-                        goal.radius,
+                    crate::combat::in_range_volumes(
+                        member.reach_volume(),
+                        goal.reach_volume(),
+                        0.0,
                         0.0,
                         range,
                     )

@@ -165,8 +165,25 @@ Object TestPrivileged\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   LocomotorSet\n    Locomotor = TestFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Locomotor TestSwivel\n  Surfaces = GROUND\n  TurnTime = 2000\nEnd\n\
-Weapon TestBow\n  AttackRange = 100\n  DelayBetweenShots = 500\n  \
+Weapon TestBow\n  AttackRange = 100\n  DelayBetweenShots = 500\n  CanFireWhileMoving = Yes\n  \
   DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+Weapon TestMuteBow\n  AttackRange = 100\n  DelayBetweenShots = 500\n  \
+  DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+Object TestMuteRider\n  Side = Men\n  KindOf = INFANTRY IMMOBILE UNATTACKABLE\n  VisionRange = 200\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY TestMuteBow\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes\n    \
+    CanAttackWhileContained = Yes\n    MoodAttackCheckRate = 100\n  End\n  \
+  LocomotorSet\n    Locomotor = TestSwivel\n    Condition = SET_NORMAL\n    Speed = 0\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object TestMuteMount\n  Side = Men\n  KindOf = SELECTABLE TRANSPORT\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = HordeTransportContain Tag_Howdah\n    \
+    ObjectStatusOfContained = UNSELECTABLE UNATTACKABLE CAN_ATTACK\n    Slots = 1\n    \
+    PassengerFilter = NONE +TestMuteRider\n    AllowOwnPlayerInsideOverride = Yes\n    \
+    ForceOrientationContainer = No\n    InitialPayload = TestMuteRider 1\n  End\n  \
+  LocomotorSet\n    Locomotor = TestFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 40\nEnd\n\
 Weapon TestSmash\n  AttackRange = 100\n  DelayBetweenShots = 60000\n  HitPercentage = 100\n  \
   DamageNugget\n    Damage = 920\n    DamageType = CRUSH\n  End\nEnd\n\
 Object TestBasher\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
@@ -236,7 +253,7 @@ Object TestCrewMember\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
 Object TestSiege\n  Side = Men\n  KindOf = SELECTABLE VEHICLE\n  \
   Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
   Behavior = SiegeEngineContain Tag_Crew\n    \
-    ObjectStatusOfContained = UNSELECTABLE\n    CrewMax = 4\n    \
+    ObjectStatusOfContained = UNSELECTABLE\n    ObjectStatusOfCrew = UNATTACKABLE\n    CrewMax = 4\n    \
     CrewFilter = NONE +TestCrewMember\n    AllowOwnPlayerInsideOverride = Yes\n    \
     InitialCrew = TestCrewMember 2\n    SpeedPercentPerCrew = 40%\n  End\n  \
   LocomotorSet\n    Locomotor = TestSiegeLoco\n    Condition = SET_NORMAL\n    Speed = 50\n  End\n  \
@@ -286,7 +303,32 @@ Object TestCitadel\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
     ObjectToDestroyForRingEntry = ANY +TestWard\n    \
     UpgradeForRingEntry = Upgrade_TestRingPlayerBit Upgrade_TestRingObjectBit\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryMinorRadius = 20\n  \
-  GeometryHeight = 60\nEnd\n";
+  GeometryHeight = 60\nEnd\n\
+Object TestCastle\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+  Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = HordeGarrisonContain Tag_Garrison\n    \
+    ObjectStatusOfContained = UNSELECTABLE CAN_ATTACK ENCLOSED\n    ContainMax = 4\n    \
+    PassengerFilter = ANY +INFANTRY +VEHICLE\n    AllowOwnPlayerInsideOverride = Yes\n    \
+    EntryOffset = X:30.0 Y:0.0 Z:0.0\n    EntryPosition = X:0.0 Y:0.0 Z:0.0\n    \
+    ExitOffset = X:30.0 Y:0.0 Z:0.0\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryMinorRadius = 20\n  \
+  GeometryHeight = 60\nEnd\n\
+Object TestBay\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+  Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = HordeTransportContain Tag_Bay\n    \
+    ObjectStatusOfContained = UNSELECTABLE\n    Slots = 6\n    \
+    PassengerFilter = ANY +INFANTRY +VEHICLE\n    AllowOwnPlayerInsideOverride = Yes\n    \
+    EntryOffset = X:30.0 Y:0.0 Z:0.0\n    EntryPosition = X:0.0 Y:0.0 Z:0.0\n    \
+    ExitOffset = X:30.0 Y:0.0 Z:0.0\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryMinorRadius = 20\n  \
+  GeometryHeight = 60\nEnd\n\
+Object TestCab\n  Side = Men\n  KindOf = SELECTABLE VEHICLE TRANSPORT\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = HordeTransportContain Tag_Cab\n    \
+    ObjectStatusOfContained = UNSELECTABLE CAN_ATTACK\n    Slots = 1\n    \
+    PassengerFilter = ANY +INFANTRY\n    AllowOwnPlayerInsideOverride = Yes\n  End\n  \
+  LocomotorSet\n    Locomotor = TestFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 10\n  GeometryHeight = 20\nEnd\n";
 
 struct Base {
     data: GameData,
@@ -322,6 +364,8 @@ fn load() -> Base {
         "TestLaggard",
         "TestPricker",
         "TestMount",
+        "TestMuteMount",
+        "TestMuteRider",
         "TestCrewMember",
         "TestSiege",
         "TestSiegeNoCrew",
@@ -329,6 +373,10 @@ fn load() -> Base {
         "TestRingBearerHorde",
         "TestWard",
         "TestCitadel",
+        "TestCastle",
+        "TestBay",
+        "TestCab",
+        "TestSoldierHorde",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -742,7 +790,9 @@ fn a_passenger_stands_and_shoots_from_its_containers_next_passenger_bone() {
             airborne: None,
             unattackable: false,
             not_autoacquirable: false,
+            enclosed: false,
             ai_kind_of: None,
+            volume: None,
         };
         let launch = simulation.rules().launch_of(world, *soldier, &me);
         assert_eq!((launch.x, launch.y, launch.z), (at.x, at.y, feet));
@@ -1018,16 +1068,25 @@ fn a_rider_turns_on_its_mount_to_face_its_victim_and_then_shoots() {
 }
 
 #[test]
-fn a_riders_shot_does_not_wait_for_its_mount_to_stop() {
+fn a_flagged_riders_shot_does_not_wait_for_its_mount_to_stop() {
+    assert!(rider_shoots_while_mount_walks("TestMount"));
+}
+
+#[test]
+fn an_unflagged_rider_holds_fire_while_its_mount_moves() {
+    assert!(!rider_shoots_while_mount_walks("TestMuteMount"));
+}
+
+fn rider_shoots_while_mount_walks(mount_name: &str) -> bool {
     let b = load();
     let (mut simulation, ids) = start_owned(
         &b,
         &[
-            ("TestMount", 300.0, 300.0, PLAYER),
+            (mount_name, 300.0, 300.0, PLAYER),
             ("TestSoldier", 300.0, 360.0, OTHER),
         ],
     );
-    let mount = of_kind(&b, &simulation, ids, "TestMount");
+    let mount = of_kind(&b, &simulation, ids, mount_name);
     let victim = of_kind(&b, &simulation, ids, "TestSoldier");
     simulation
         .submit(
@@ -1064,10 +1123,15 @@ fn a_riders_shot_does_not_wait_for_its_mount_to_stop() {
                 pos.x > 300.5,
                 "the mount never got moving before the shot landed: {pos:?}"
             );
-            return;
+            return true;
         }
     }
-    panic!("the rider never shot while its mount moved");
+    let pos = simulation.state().get(ids.body, mount).unwrap().0.position;
+    assert!(
+        pos.x > 300.5,
+        "the mount never moved, so holding fire proves nothing: {pos:?}"
+    );
+    false
 }
 
 #[test]
@@ -1433,7 +1497,7 @@ fn a_mobile_containers_move_is_refused_while_a_horde_boards() {
     let b = load();
     let (mut simulation, ids) = start(&b, &[("TestWagon", 300.0, 300.0)]);
     let wagon = of_kind(&b, &simulation, ids, "TestWagon");
-    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 0.0, 0.0);
+    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 60.0, 60.0);
 
     simulation
         .submit(
@@ -1529,8 +1593,8 @@ fn two_hordes_ordered_into_one_tower_together_both_get_in() {
     let b = load();
     let (mut simulation, ids) = start(&b, &[("TestTower", 300.0, 300.0)]);
     let tower = of_kind(&b, &simulation, ids, "TestTower");
-    let horde_a = spawn_horde(&mut simulation, "TestSoldierHorde", 0.0, 0.0);
-    let horde_b = spawn_horde(&mut simulation, "TestSoldierHorde", 0.0, 40.0);
+    let horde_a = spawn_horde(&mut simulation, "TestSoldierHorde", 60.0, 60.0);
+    let horde_b = spawn_horde(&mut simulation, "TestSoldierHorde", 60.0, 100.0);
 
     simulation
         .submit(
@@ -1606,7 +1670,7 @@ fn a_mobile_containers_hold_lasts_through_the_whole_boarding_not_just_the_approa
     let b = load();
     let (mut simulation, ids) = start(&b, &[("TestWagon", 300.0, 300.0)]);
     let wagon = of_kind(&b, &simulation, ids, "TestWagon");
-    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 0.0, 0.0);
+    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 60.0, 60.0);
 
     simulation
         .submit(
@@ -1796,7 +1860,7 @@ fn a_combo_horde_only_enters_garrison_or_cash_producer_containers() {
     let (mut simulation, ids) = start(&b, &[("TestBastion", 80.0, 0.0), ("TestKeep", 80.0, 150.0)]);
     let bastion = of_kind(&b, &simulation, ids, "TestBastion");
     let keep = of_kind(&b, &simulation, ids, "TestKeep");
-    let horde = spawn_horde(&mut simulation, "TestComboHorde", 0.0, 0.0);
+    let horde = spawn_horde(&mut simulation, "TestComboHorde", 60.0, 60.0);
 
     simulation
         .submit(
@@ -1848,7 +1912,7 @@ fn a_crippled_horde_member_is_pulled_in_by_the_straggler_clock() {
     );
     let tower = of_kind(&b, &simulation, ids, "TestTower");
     let pricker = of_kind(&b, &simulation, ids, "TestPricker");
-    let horde = spawn_horde(&mut simulation, "TestStragglerHorde", 0.0, 0.0);
+    let horde = spawn_horde(&mut simulation, "TestStragglerHorde", 60.0, 60.0);
     let members = simulation
         .state()
         .get(ids.horde, horde)
@@ -1913,7 +1977,7 @@ fn an_enter_order_voices_the_enter_not_the_walk() {
     let b = load();
     let (mut simulation, ids) = start(&b, &[("TestTower", 300.0, 300.0)]);
     let tower = of_kind(&b, &simulation, ids, "TestTower");
-    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 0.0, 0.0);
+    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 60.0, 60.0);
     simulation
         .submit(
             PLAYER,
@@ -2046,7 +2110,7 @@ fn a_ring_bearing_horde_delivers_to_its_own_citadel() {
     let b = load();
     let (mut simulation, ids) = start(&b, &[("TestCitadel", 300.0, 300.0)]);
     let citadel = of_kind(&b, &simulation, ids, "TestCitadel");
-    let horde = spawn_horde(&mut simulation, "TestRingBearerHorde", 0.0, 0.0);
+    let horde = spawn_horde(&mut simulation, "TestRingBearerHorde", 60.0, 60.0);
     research(&mut simulation, horde, 0);
 
     simulation
@@ -2125,7 +2189,7 @@ fn a_soldier_boarding_a_moving_wagon_tracks_its_door_once_it_drives_off() {
             },
         )
         .unwrap();
-    run(&mut simulation, 65);
+    run(&mut simulation, 310);
 
     let wagon_pos = simulation.state().get(ids.body, wagon).unwrap().0.position;
     assert!(
@@ -2143,4 +2207,228 @@ fn a_soldier_boarding_a_moving_wagon_tracks_its_door_once_it_drives_off() {
         "the goal should sit at the wagon's current door, not a stale one: goal {current_goal:?}, \
          wagon {wagon_pos:?}"
     );
+}
+
+#[test]
+fn the_boarding_replan_interval_is_fifty_one_retail_frames() {
+    assert_eq!(crate::rules::movement::BOARDING_REPLAN_FRAMES, 306);
+}
+
+#[test]
+fn a_transport_whose_passengers_may_fire_and_holds_one_is_able_to_attack() {
+    let b = load();
+    let (mut simulation, ids) = start(&b, &[("TestMuteMount", 300.0, 300.0)]);
+    run(&mut simulation, 3);
+    let mount = of_kind(&b, &simulation, ids, "TestMuteMount");
+    assert!(simulation
+        .rules()
+        .object_able_to_attack(simulation.state(), ids, mount));
+}
+
+#[test]
+fn a_passenger_is_able_to_attack_only_where_its_container_lets_it_fire() {
+    let b = load();
+    let (mut simulation, ids) = start(
+        &b,
+        &[
+            ("TestTunnelA", 300.0, 300.0),
+            ("TestTower", 400.0, 300.0),
+            ("TestBasher", 330.0, 300.0),
+            ("TestBasher", 430.0, 300.0),
+        ],
+    );
+    let tunnel = of_kind(&b, &simulation, ids, "TestTunnelA");
+    let tower = of_kind(&b, &simulation, ids, "TestTower");
+    let bashers: Vec<Entity> = simulation
+        .state()
+        .store(ids.kind)
+        .unwrap()
+        .iter()
+        .filter(|(_, k)| **k == b.kinds.kind("TestBasher").unwrap())
+        .map(|(entity, _)| entity)
+        .collect();
+    let able = |simulation: &Simulation<RotwkRules>, entity| {
+        simulation
+            .rules()
+            .object_able_to_attack(simulation.state(), ids, entity)
+    };
+    assert!(able(&simulation, bashers[0]) && able(&simulation, bashers[1]));
+    order_in(&mut simulation, bashers[0], tunnel);
+    order_in(&mut simulation, bashers[1], tower);
+    assert!(simulation.state().contains(ids.contained, bashers[0]));
+    assert!(simulation.state().contains(ids.contained, bashers[1]));
+    assert!(!able(&simulation, bashers[0]));
+    assert!(able(&simulation, bashers[1]));
+}
+
+#[test]
+fn a_tunnel_lets_passengers_fire_whatever_its_status_list_says() {
+    let b = load();
+    let (mut simulation, ids) = start(
+        &b,
+        &[("TestTunnelA", 300.0, 300.0), ("TestBasher", 330.0, 300.0)],
+    );
+    let tunnel = of_kind(&b, &simulation, ids, "TestTunnelA");
+    let basher = of_kind(&b, &simulation, ids, "TestBasher");
+    let able = |simulation: &Simulation<RotwkRules>| {
+        simulation
+            .rules()
+            .object_able_to_attack(simulation.state(), ids, tunnel)
+    };
+    assert!(!able(&simulation), "empty: nobody to fire");
+    order_in(&mut simulation, basher, tunnel);
+    assert!(simulation.state().contains(ids.contained, basher));
+    assert!(able(&simulation));
+}
+
+#[test]
+fn a_low_passenger_may_not_fire_towards_its_container() {
+    use crate::rules::group_move::refuses_by_height;
+    let to_container = Vec2::new(10.0, 0.0);
+    assert!(refuses_by_height(
+        80.0,
+        10.0,
+        to_container,
+        Vec2::new(50.0, 3.0)
+    ));
+    assert!(refuses_by_height(
+        80.0,
+        10.0,
+        to_container,
+        Vec2::new(0.0, 40.0)
+    ));
+    assert!(!refuses_by_height(
+        80.0,
+        10.0,
+        to_container,
+        Vec2::new(-50.0, 3.0)
+    ));
+    assert!(!refuses_by_height(
+        80.0,
+        90.0,
+        to_container,
+        Vec2::new(50.0, 3.0)
+    ));
+}
+
+#[test]
+fn a_siege_engines_crew_take_the_crew_status_not_the_contained_one() {
+    let b = load();
+    let (mut simulation, ids) = start(&b, &[("TestSiege", 300.0, 300.0)]);
+    run(&mut simulation, 3);
+    let siege = of_kind(&b, &simulation, ids, "TestSiege");
+    let crew = simulation.state().get(ids.passengers, siege).unwrap().0[0];
+    let held = simulation.state().get(ids.contained, crew).unwrap();
+    assert!(held
+        .status
+        .has(crate::rules::contain::ContainStatus::UNATTACKABLE));
+    assert!(!held
+        .status
+        .has(crate::rules::contain::ContainStatus::UNSELECTABLE));
+}
+
+#[test]
+fn a_horde_lets_its_members_fire_as_the_container_holding_it_does() {
+    let b = load();
+    let (mut simulation, ids) = start(
+        &b,
+        &[("TestCastle", 300.0, 300.0), ("TestBay", 500.0, 300.0)],
+    );
+    let castle = of_kind(&b, &simulation, ids, "TestCastle");
+    let bay = of_kind(&b, &simulation, ids, "TestBay");
+    let fires = |simulation: &Simulation<RotwkRules>, who| {
+        simulation
+            .rules()
+            .lets_passengers_fire(simulation.state(), who)
+    };
+    let loose = spawn_horde(&mut simulation, "TestSoldierHorde", 300.0, 380.0);
+    let housed = spawn_horde(&mut simulation, "TestSoldierHorde", 500.0, 380.0);
+    assert!(!fires(&simulation, loose), "a horde held by nothing");
+    order_in(&mut simulation, housed, bay);
+    run(&mut simulation, 300);
+    assert!(simulation.state().contains(ids.contained, housed));
+    assert!(
+        !fires(&simulation, housed),
+        "a bay's status lacks CAN_ATTACK"
+    );
+    order_in(&mut simulation, loose, castle);
+    run(&mut simulation, 300);
+    assert!(simulation.state().contains(ids.contained, loose));
+    assert!(
+        fires(&simulation, loose),
+        "a castle lets its passengers fire"
+    );
+}
+
+#[test]
+fn an_open_container_that_is_itself_held_asks_its_own_container() {
+    let b = load();
+    let (mut simulation, ids) = start(
+        &b,
+        &[
+            ("TestCastle", 300.0, 300.0),
+            ("TestBay", 500.0, 300.0),
+            ("TestCab", 300.0, 380.0),
+            ("TestCab", 500.0, 380.0),
+        ],
+    );
+    let all = |simulation: &Simulation<RotwkRules>, name: &str| -> Vec<Entity> {
+        let kind = b.kinds.kind(name).unwrap();
+        simulation
+            .state()
+            .store(ids.kind)
+            .unwrap()
+            .iter()
+            .filter(|(_, k)| **k == kind)
+            .map(|(entity, _)| entity)
+            .collect()
+    };
+    let castle = all(&simulation, "TestCastle")[0];
+    let bay = all(&simulation, "TestBay")[0];
+    let cabs = all(&simulation, "TestCab");
+    let fires = |simulation: &Simulation<RotwkRules>, who| {
+        simulation
+            .rules()
+            .lets_passengers_fire(simulation.state(), who)
+    };
+    assert!(fires(&simulation, cabs[0]), "an open cab with CAN_ATTACK");
+    assert!(!fires(&simulation, bay), "an open bay without it");
+    order_in(&mut simulation, cabs[0], castle);
+    order_in(&mut simulation, cabs[1], bay);
+    run(&mut simulation, 300);
+    assert!(simulation.state().contains(ids.contained, cabs[0]));
+    assert!(simulation.state().contains(ids.contained, cabs[1]));
+    assert!(fires(&simulation, cabs[0]), "a cab in a castle");
+    assert!(!fires(&simulation, cabs[1]), "a cab in a bay");
+}
+
+#[test]
+fn a_garrisoned_hordes_passenger_choice_is_its_nearest_member() {
+    let b = load();
+    let (mut simulation, ids) = start(&b, &[("TestCastle", 300.0, 300.0)]);
+    let castle = of_kind(&b, &simulation, ids, "TestCastle");
+    let horde = spawn_horde(&mut simulation, "TestSoldierHorde", 300.0, 380.0);
+    order_in(&mut simulation, horde, castle);
+    run(&mut simulation, 300);
+    assert!(simulation.state().contains(ids.contained, horde));
+    let picked = simulation
+        .rules()
+        .first_passenger(simulation.state(), ids, castle)
+        .unwrap();
+    let members = simulation
+        .state()
+        .get(ids.horde, horde)
+        .unwrap()
+        .members
+        .clone();
+    let distance = |entity: Entity| {
+        let at = simulation.state().get(ids.body, entity).unwrap().0.position;
+        let castle_at = simulation.state().get(ids.body, castle).unwrap().0.position;
+        let (dx, dy) = (at.x - castle_at.x, at.y - castle_at.y);
+        dx * dx + dy * dy
+    };
+    assert!(members.contains(&picked));
+    assert!(members
+        .iter()
+        .all(|member| distance(picked) <= distance(*member)));
 }

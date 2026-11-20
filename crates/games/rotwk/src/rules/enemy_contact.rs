@@ -61,6 +61,8 @@ struct Party {
     priority: u32,
     crusher: u8,
     crushable: i16,
+    crush_arm: bool,
+    infantry: bool,
 }
 
 fn ahead(a: &Party, b: &Party) -> bool {
@@ -89,6 +91,14 @@ impl Passability for ClearOf<'_> {
 
     fn extra_cost(&self, cell: Cell) -> u32 {
         self.inner.extra_cost(cell)
+    }
+
+    fn goal_extra_cost(&self, cell: Cell, goal: Option<Cell>) -> u32 {
+        self.inner.goal_extra_cost(cell, goal)
+    }
+
+    fn tail_clear(&self, cell: Cell, mover: mint_movement::MoverClass) -> bool {
+        self.inner.tail_clear(cell, mover)
     }
 
     fn admits(&self, cell: Cell, asker: mint_movement::Asker) -> bool {
@@ -165,6 +175,10 @@ impl RotwkRules {
                 priority: self.path_priority(tick, ids, entity),
                 crusher,
                 crushable,
+                crush_arm: self.crush_pass_arm(tick, ids, entity, true),
+                infantry: self
+                    .record_of(tick, ids, entity)
+                    .is_some_and(|record| record.kind_of.iter().any(|kind| kind == "INFANTRY")),
             });
         }
         out
@@ -319,7 +333,9 @@ impl RotwkRules {
                 put(tick, ids, me.entity, contact)
             }
         };
-        if i16::from(me.crusher) > other.crushable {
+        if me.crush_arm && i16::from(me.crusher) > other.crushable
+            || me.infantry && other.crush_arm && i16::from(other.crusher) > me.crushable
+        {
             return done(tick, contact);
         }
         let near_end = |party: &Party| {
@@ -364,8 +380,11 @@ impl RotwkRules {
         if contact.frames == 0 {
             contact.frames = 1;
         }
+        if Self::moving_and_awaiting_path(tick, ids, other.entity) {
+            return done(tick, contact);
+        }
         let id = u64::from(me.entity.index());
-        if (contact.frames / FPS) % FPS == (id / FPS) % FPS {
+        if contact.frames % FPS == id % FPS {
             if contact.pending.is_none() {
                 contact.pending = Some(other.entity);
             }
@@ -426,9 +445,13 @@ impl RotwkRules {
             origin: Some(from.position),
             corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
             departure: self.departure(tick, ids, entity),
+            approach: None,
+            prune: false,
+            final_goal: true,
         };
         let modes = self.modes(tick, ids);
         crate::perf::note_plan_call();
+        let _site = crate::perf::sub(crate::perf::sub_row!("path_site_contact"));
         let outcome = self
             .plan_path(modes.config(), &view, &request, budget)
             .map_err(|e| mint_sim::Error::Rules {
@@ -657,9 +680,13 @@ impl RotwkRules {
             origin: Some(me.at),
             corner_radius: self.mover_limits(tick, ids, entity).corner_radius,
             departure: self.departure(tick, ids, entity),
+            approach: None,
+            prune: false,
+            final_goal: true,
         };
         let modes = self.modes(tick, ids);
         crate::perf::note_plan_call();
+        let _site = crate::perf::sub(crate::perf::sub_row!("path_site_contact"));
         let outcome = self
             .plan_path(modes.config(), &clear, &request, budget)
             .map_err(|e| mint_sim::Error::Rules {

@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use mint_sage_apt_player::{Exposure, ImageKey, Outward, SyncHost, Value};
 use mint_sage_asset::{HeroSource, HeroStore};
-use mint_sage_str::StringTable;
+use mint_sage_cah::LanguageFilter;
+use mint_sage_str::{format_placeholder, Placeholder, StringTable};
 
 use crate::cah_edit::{
     confirm_delete, name_is_valid, request_delete, save_new, save_over, AutoChange, CahSystem,
@@ -114,6 +115,7 @@ pub(crate) struct CahState {
     selected: Option<usize>,
     hero_sort: Option<ColumnSort>,
     name: String,
+    language_filter: LanguageFilter,
     focused: bool,
     suppress_promo: bool,
     pending_delete: Option<PendingDelete>,
@@ -193,6 +195,9 @@ impl SyncHost for CahHost {
 
     fn get_extern(&mut self, name: &str) -> Option<Value> {
         let mut state = self.0.try_borrow_mut().ok()?;
+        if name.rsplit("::").next() == Some("HeroNameSet") {
+            state.clean_name();
+        }
         let value = state.extern_value(name);
         if state.seen_externs.insert(format!("{name}={value:?}")) {
             state
@@ -330,6 +335,7 @@ impl CahState {
             selected: None,
             hero_sort: None,
             name: String::new(),
+            language_filter: LanguageFilter::default(),
             focused: false,
             suppress_promo,
             pending_delete: None,
@@ -512,7 +518,7 @@ impl CahState {
 
     pub(crate) fn picture_taken(&mut self, path: &str) {
         self.fire("OnGameTookPicture", Vec::new());
-        let text = self.loc("GUI:OnPictureTaken").replace("%s", path);
+        let text = format_placeholder(&self.loc("GUI:OnPictureTaken"), Placeholder::Str(path));
         self.log.push(format!("cah: {text}"));
     }
 
@@ -847,8 +853,21 @@ impl CahState {
         name_is_valid(&self.name, &self.store)
     }
 
+    pub(crate) fn set_language_filter(&mut self, filter: LanguageFilter) {
+        self.language_filter = filter;
+    }
+
+    fn clean_name(&mut self) {
+        self.name = self
+            .language_filter
+            .filter_line(&self.name)
+            .trim()
+            .to_owned();
+    }
+
     fn complete(&mut self, from_appearance: bool) {
         if from_appearance {
+            self.clean_name();
             if !self.name_valid() {
                 return;
             }
@@ -1029,6 +1048,7 @@ impl CahState {
                 .and_then(|s| order.iter().position(|&i| i == s)),
             scroll_bar: None,
             text_inset_percent: 0,
+            scroll_to_top: false,
         }
     }
 
@@ -1042,20 +1062,28 @@ impl CahState {
         });
         let rows = sub
             .map(|sub| {
-                sub.stats
+                let mut stats: Vec<(&mint_sage_ini::ThingStatDef, String)> = sub
+                    .stats
                     .iter()
                     .filter_map(|name| self.sys.thing_stat(name))
                     .map(|stat| {
+                        let name = self.loc_opt(stat.name_tag.as_deref());
+                        (stat, name)
+                    })
+                    .collect();
+                stats.sort_by_cached_key(|(stat, name)| {
+                    (stat.primary_key, stat.secondary_key, name.to_lowercase())
+                });
+                stats
+                    .into_iter()
+                    .map(|(stat, name)| {
                         let value = stat
                             .stat_name
                             .as_deref()
                             .and_then(|n| self.stats.1.get(n))
                             .copied()
                             .unwrap_or(0);
-                        vec![
-                            CellSpec::Text(self.loc_opt(stat.name_tag.as_deref())),
-                            CellSpec::Text(value.to_string()),
-                        ]
+                        vec![CellSpec::Text(name), CellSpec::Text(value.to_string())]
                     })
                     .collect()
             })
@@ -1066,6 +1094,7 @@ impl CahState {
             selected: None,
             scroll_bar: None,
             text_inset_percent: 0,
+            scroll_to_top: false,
         }
     }
 
@@ -1082,6 +1111,9 @@ impl CahState {
                 .unwrap_or_default();
             if counters != self.stats.1 {
                 self.awards_dirty = true;
+            }
+            if let Some(edit) = self.edit.as_mut() {
+                edit.set_stats(counters.clone());
             }
             self.stats = (id, counters);
         }
@@ -1143,7 +1175,10 @@ impl CahState {
                     );
                     if kind == SlotKind::Appearance {
                         let choice = e.slot_choice(kind, i);
-                        let bling = def.blings.iter().find(|b| b.upgrade.as_deref() == choice);
+                        let bling = def
+                            .blings
+                            .iter()
+                            .find(|b| b.upgrade.as_deref() == choice.as_deref());
                         put(
                             format!("MyHeroAppearanceVal_{i}"),
                             self.loc_opt(bling.and_then(|b| b.name_tag.as_deref())),
@@ -1339,8 +1374,8 @@ impl CahState {
     fn cost_label(&self) -> String {
         let cost = self.cost().to_string();
         let label = self.loc("CAH:FormatSpecialPowerCost");
-        if label.contains("%d") || label.contains("%u") {
-            label.replace("%d", &cost).replace("%u", &cost)
+        if label.contains("%d") {
+            format_placeholder(&label, Placeholder::Str(&cost))
         } else {
             cost
         }
@@ -1355,9 +1390,10 @@ impl CahState {
             WizardLine::SelectFirstPower => self.loc("WIZARD:CahPowersSelectFirstPower"),
             WizardLine::SelectSecondPower => self.loc("WIZARD:CahPowersSelectSecondPower"),
             WizardLine::SelectionComplete => self.loc("WIZARD:CahPowersSelectionComplete"),
-            WizardLine::SelectNextPower { group, level } => self
-                .loc(&format!("WIZARD:CahPowersSelectNextPower_{group}"))
-                .replace("%d", &level.to_string()),
+            WizardLine::SelectNextPower { group, level } => format_placeholder(
+                &self.loc(&format!("WIZARD:CahPowersSelectNextPower_{group}")),
+                Placeholder::Str(&level.to_string()),
+            ),
         };
         let extra = match suffix {
             Some(WizardSuffix::PalantirFull) => Some("WIZARD:CahPowersPalantirFull"),

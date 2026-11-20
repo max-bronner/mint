@@ -16,6 +16,7 @@ pub struct FormationSlot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HordeSettings {
+    pub slots: u32,
     pub melee_attack_leash_distance: f32,
     pub use_slow_horde_movement: bool,
     pub ranks_that_stop_advance: Vec<u32>,
@@ -28,6 +29,7 @@ pub struct HordeSettings {
     pub alternate_formation: Option<String>,
     pub aod: Option<crate::contain::AodSway>,
     pub eva_event_last_member_death: Option<String>,
+    pub attribute_modifiers: Vec<String>,
 }
 
 pub const DEFAULT_MELEE_ATTACK_LEASH_DISTANCE: f32 = 60.0;
@@ -35,6 +37,7 @@ pub const DEFAULT_MELEE_ATTACK_LEASH_DISTANCE: f32 = 60.0;
 impl Default for HordeSettings {
     fn default() -> Self {
         Self {
+            slots: 0,
             melee_attack_leash_distance: DEFAULT_MELEE_ATTACK_LEASH_DISTANCE,
             use_slow_horde_movement: false,
             ranks_that_stop_advance: Vec::new(),
@@ -47,6 +50,7 @@ impl Default for HordeSettings {
             alternate_formation: None,
             aod: None,
             eva_event_last_member_death: None,
+            attribute_modifiers: Vec::new(),
         }
     }
 }
@@ -55,6 +59,7 @@ impl HordeSettings {
     #[must_use]
     pub fn from_contain(def: &HordeContainDef) -> Self {
         Self {
+            slots: def.slots.unwrap_or(0),
             melee_attack_leash_distance: def
                 .melee_attack_leash_distance
                 .filter(|leash| leash.is_finite() && *leash >= 0.0)
@@ -70,6 +75,7 @@ impl HordeSettings {
             alternate_formation: def.alternate_formation.clone(),
             aod: def.aod,
             eva_event_last_member_death: def.eva_event_last_member_death.clone(),
+            attribute_modifiers: def.attribute_modifiers.clone(),
         }
     }
 }

@@ -149,10 +149,10 @@ pub struct CampaignState {
     pub mission_ended: bool,
     pub hero_record_count: i32,
     pub used: Vec<CarryoverUnit>,
-    pub money: f32,
+    pub skill_points: f32,
     pub sciences: Vec<AsciiString>,
     pub player_upgrades: UpgradeList,
-    pub cost_multiplier_b0: f32,
+    pub cash_bounty: f32,
 }
 
 impl CampaignState {
@@ -174,14 +174,14 @@ impl CampaignState {
             s.used = read_vec(r, "CarryoverUnit list", CarryoverUnit::read)?;
         }
         if version >= 3 {
-            s.money = r.f32()?;
+            s.skill_points = r.f32()?;
             s.sciences = read_vec(r, "science list", |r| r.ascii())?;
         }
         if version >= 4 {
             s.player_upgrades = UpgradeList::read(r)?;
         }
         if version >= 5 {
-            s.cost_multiplier_b0 = r.f32()?;
+            s.cash_bounty = r.f32()?;
         }
         Ok(s)
     }
@@ -196,10 +196,10 @@ impl CampaignState {
         w.bool(self.mission_ended);
         w.i32(self.hero_record_count);
         write_vec(w, &self.used, |w, u| u.write(w));
-        w.f32(self.money);
+        w.f32(self.skill_points);
         write_vec(w, &self.sciences, |w, s| w.ascii(s));
         self.player_upgrades.write(w);
-        w.f32(self.cost_multiplier_b0);
+        w.f32(self.cash_bounty);
     }
 }
 

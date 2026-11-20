@@ -14,7 +14,7 @@ pub(crate) fn milliseconds(fields: &dyn ModuleFieldSource, keyword: &str) -> Log
         Some(ms) if ms.is_finite() && ms > 0.0 => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let whole = ms.min(MAX_MILLISECONDS) as u32;
-            LogicFrames::from_milliseconds(whole)
+            crate::special_ability_update::retail_duration_ticks(whole)
         }
         _ => LogicFrames::ZERO,
     }
@@ -26,7 +26,7 @@ pub(crate) fn flag(fields: &dyn ModuleFieldSource, keyword: &str) -> Option<bool
         .and_then(mint_sage_ini::value::parse_bool)
 }
 
-fn tagged(args: &[&str], tag: &str) -> f32 {
+pub(crate) fn tagged(args: &[&str], tag: &str) -> f32 {
     let mut tokens = args.iter();
     while let Some(token) = tokens.next() {
         let Some((found, value)) = token.split_once(':') else {
@@ -90,6 +90,7 @@ impl Component for FireWeaponUpdate {
 }
 
 impl ModuleKind for FireWeaponUpdate {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::NEVER;
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::Update);
 
     fn on_attach(&mut self, now: Frame) {
@@ -263,7 +264,7 @@ fn unsigned_milliseconds(fields: &dyn ModuleFieldSource, keyword: &str) -> Logic
         Some(ms) if ms.is_finite() && ms < 0.0 && ms >= -(u32::MAX as f32) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let wrapped = (ms as i64) as u32;
-            LogicFrames::from_milliseconds(wrapped)
+            crate::special_ability_update::retail_duration_ticks(wrapped)
         }
         _ => milliseconds(fields, keyword),
     }
@@ -401,9 +402,9 @@ mod tests {
             weapons,
             vec![
                 (0, "RainOfFirePhaseInitialWeapon"),
-                (75, "RainOfFirePhaseOneWeapon")
+                (78, "RainOfFirePhaseOneWeapon")
             ],
-            "2500 ms is 75 frames"
+            "2500 ms is 13 retail frames"
         );
     }
 
@@ -421,7 +422,11 @@ mod tests {
         let module = fire_weapon_update_from_fields(&fields, Frame::ZERO).unwrap();
         let (fired, _) = run(module, "FireWeaponUpdate", 10);
         let frames: Vec<u64> = fired.iter().map(|(frame, _)| *frame).collect();
-        assert_eq!(frames, vec![3, 4, 5, 6, 7, 8, 9], "100 ms is 3 frames");
+        assert_eq!(
+            frames,
+            vec![6, 7, 8, 9],
+            "100 ms is one 200 ms retail frame, 6 ticks"
+        );
         let Effect::FireWeapon { repeat, offset, .. } = &fired[0].1 else {
             panic!();
         };
@@ -483,7 +488,7 @@ mod tests {
             Frame::ZERO,
         )
         .unwrap();
-        assert_eq!(module.data.min, LogicFrames::from_frames(128_849_019));
+        assert_eq!(module.data.min, LogicFrames::from_frames(128_849_022));
         let (_, gone) = run(module, "DeletionUpdate", 60);
         assert!(gone.is_empty(), "{gone:?}");
     }

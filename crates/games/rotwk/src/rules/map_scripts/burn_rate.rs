@@ -53,6 +53,7 @@ impl ActionVerb for ActionChangeBurnRate {
                 },
                 (at.x, at.y),
                 None,
+                &|_, _| false,
             );
         }
         Ok(())

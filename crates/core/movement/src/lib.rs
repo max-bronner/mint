@@ -21,21 +21,24 @@ pub use flight::{FlightPath, Vec3};
 pub use following::{
     depart, look_ahead, round_corners, Departure, Follower, LookAhead, Motion, MotionLimits,
     MotionPhase, MotionStatus, MoveContext, MoverState, Ramp, Route, SlidingFollower,
-    SteeringFollower, TurnCircle, TurnSlowdown,
+    SteeringFollower, TurnCircle, TurnSlowdown, WheelBacking,
 };
 pub use geom::{CellGeometry, Facing, Vec2};
 pub use grid::{
-    Asker, Cell, CellFlags, CellRect, CostGrid, GridExtent, MoverClass, Passability, Portal,
-    MAX_GRID_CELLS,
+    Asker, Cell, CellFlags, CellRect, CostGrid, GridExtent, Leg, MoverClass, Passability, Portal,
+    PortalLink, PortalNode, PortalPass, MAX_GRID_CELLS,
 };
-pub use height::{step_damped, step_level, HeightField, HeightRule};
+pub use height::{
+    attack_height, step_damped, step_level, AttackHeightInput, AttackPhase, HeightField, HeightRule,
+};
 pub use pipeline::{Pipeline, PipelineConfig, Plan, PlanOutcome, SearchMode};
 pub use reachability::Reachability;
 pub use search::{
-    AStar, CellPath, GoalId, Heuristic, NodeBudget, Octile, PathRequest, Search, SearchOutcome,
-    SearchResult, StraightLineSearch, ZeroHeuristic, COST_DIAGONAL, COST_ORTHOGONAL,
+    AStar, CellPath, GoalId, Heuristic, NodeBudget, Octile, PathRequest, PortalHop, Search,
+    SearchOutcome, SearchProgress, SearchResult, StraightLineSearch, ZeroHeuristic, COST_DIAGONAL,
+    COST_ORTHOGONAL,
 };
-pub use smoothing::{NoSmoothing, Smoothing, SmoothingMode, StringPull};
+pub use smoothing::{NoSmoothing, PortalEdge, Smoothing, SmoothingMode, StringPull};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

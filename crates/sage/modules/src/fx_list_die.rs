@@ -28,6 +28,18 @@ impl FxListDie {
     pub const fn starts_active(&self) -> bool {
         self.starts_active
     }
+
+    #[must_use]
+    pub fn plays_on(
+        &self,
+        entity: mint_sim::Entity,
+        death: &mint_sim::module::Death<'_>,
+    ) -> Option<&str> {
+        if !self.starts_active || !self.mux.gate(entity, "FXListDie", death) {
+            return None;
+        }
+        self.death_fx.as_deref()
+    }
 }
 
 impl Component for FxListDie {

@@ -10,6 +10,8 @@ Upgrade Upgrade_HeavyArmor\n  Type = OBJECT\n  BuildCost = 100\n  BuildTime = 1\
 Upgrade Upgrade_Level2\n  Type = OBJECT\n  BuildCost = 100\n  BuildTime = 1\nEnd\n\
 Upgrade Upgrade_Level3\n  Type = OBJECT\n  BuildCost = 100\n  BuildTime = 1\nEnd\n\
 Upgrade Upgrade_StructureLevel1\n  Type = OBJECT\nEnd\n\
+ExperienceLevel BarracksLevel1\n  TargetNames = Barracks\n  RequiredExperience = 1\n  Rank = 1\n  \
+  Upgrades = Upgrade_StructureLevel1\nEnd\n\
 Upgrade Upgrade_PlayerArmor\n  Type = PLAYER\n  BuildCost = 100\n  BuildTime = 1\nEnd\n\
 Object Forge\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  CommandSet = ForgeSet\n  \
   Body = StructureBody Tag_01\n    MaxHealth = 3000\n  End\n  \
@@ -180,6 +182,7 @@ fn rules(m: &Match, placed: &[(&str, f32, f32, PlayerId)]) -> RotwkRules {
         .with_menus(production.menus.clone())
         .with_upgrades(upgrade_menus, Arc::clone(&m.data.upgrade_bits))
         .with_powers(power_names, power_reload)
+        .with_experience(Arc::clone(&m.data.experience), m.data.armor_bonus_cap)
 }
 
 fn run(simulation: &mut Simulation<RotwkRules>, ticks: u32) {
@@ -310,8 +313,8 @@ fn fire_arrows_swap_the_warhead_raise_the_flag_and_show_the_tip() {
     let (horde, archers) = spawn_horde(&mut simulation, ids, "ArcherHorde", 200.0, 200.0, PLAYER);
     assert_eq!(archers.len(), 4);
     for archer in &archers {
-        let state = state_of(&simulation, *archer).expect("creation hid the tip");
-        assert_eq!(state.sub_object("FireArowTip"), Some(false));
+        let state = state_of(&simulation, *archer).unwrap_or_default();
+        assert_eq!(state.sub_object("FireArowTip"), None);
         assert!(state.weapon_set_flags.is_empty());
     }
 
@@ -601,8 +604,10 @@ fn a_barracks_level_upgrade_swaps_its_command_set_and_its_look() {
         cancel_refusal: None,
         under_construction: false,
         power_clock: &|_| None,
+        power_restricted: &|_| false,
         auto_cast_on: &|_| false,
         weapon_set_raised: &|_| false,
+        model_condition_gate: &|_, _| true,
         foreign_owner: false,
     };
     let bar = crate::command_bar::resolve_command_bar(

@@ -1,8 +1,8 @@
 use super::*;
 
 const TOGGLE_DATA: &str = "\
-SpecialPower DisguisePower\n  ReloadTime = 10\nEnd\n\
-SpecialPower MountPower\n  ReloadTime = 10\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
+SpecialPower MountPower\n  ReloadTime = 0\nEnd\n\
 CommandSet HeroSet\n  1 = Fire_Disguise\n  2 = Fire_Mount\nEnd\n\
 CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
 CommandButton Fire_Mount\n  Command = SPECIAL_POWER\n  SpecialPower = MountPower\nEnd\n\
@@ -162,6 +162,23 @@ fn the_power_sets_then_clears_disguised_with_no_fx() {
 }
 
 #[test]
+fn creation_serials_follow_spawning_and_a_disguise_swap_restamps() {
+    let m = load(TOGGLE_DATA);
+    let mut simulation = simulation(&m);
+    simulation.tick().unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let hero = only_owned_by(&simulation, ids, PLAYER);
+    let other = only_owned_by(&simulation, ids, OTHER);
+    let serial = |simulation: &Simulation<RotwkRules>, entity| {
+        simulation.state().get(ids.created, entity).unwrap().0
+    };
+    assert!(serial(&simulation, hero) < serial(&simulation, other));
+    press(&mut simulation, hero, 0);
+    fx_names_played(&mut simulation, 5);
+    assert!(serial(&simulation, hero) > serial(&simulation, other));
+}
+
+#[test]
 fn dismounting_with_the_cancel_flag_breaks_the_disguise_with_no_fx() {
     let m = load(TOGGLE_DATA);
     let mut simulation = simulation(&m);
@@ -207,7 +224,7 @@ fn dismounting_without_the_cancel_flag_leaves_the_disguise_alone() {
 }
 
 const DETECT_DATA: &str = "\
-SpecialPower DisguisePower\n  ReloadTime = 10\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
 CommandSet HeroSet\n  1 = Fire_Disguise\nEnd\n\
 CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
 Object Hero\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = HeroSet\n  \
@@ -317,8 +334,124 @@ fn taking_damage_does_not_break_the_disguise() {
     );
 }
 
+const SMITE_DATA: &str = "\
+Locomotor Feet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
+SpecialPower SmitePower\n  Enum = SPECIAL_SMITE_CANCELDISGUISE\n  ReloadTime = 0\nEnd\n\
+Weapon SmiteWeapon\n  AttackRange = 275\n  DelayBetweenShots = 3000\n  \
+  DamageNugget\n    Damage = 10\n    DamageType = SLASH\n  End\nEnd\n\
+CommandSet SmiterSet\n  1 = Fire_Disguise\n  2 = Fire_Smite\nEnd\n\
+CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
+CommandButton Fire_Smite\n  Command = SPECIAL_POWER\n  SpecialPower = SmitePower\n  \
+  Options = NEED_TARGET_ENEMY_OBJECT\nEnd\n\
+Object Smiter\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = SmiterSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 1000\n  End\n  \
+  LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Behavior = SpecialDisguiseUpdate Tag_Disguise\n    SpecialPowerTemplate = DisguisePower\n    \
+    UnpackTime = 0\n    PreparationTime = 0\n    PackTime = 0\n  End\n  \
+  Behavior = WeaponFireSpecialAbilityUpdate Tag_Smite\n    SpecialPowerTemplate = SmitePower\n    \
+    SpecialWeapon = SmiteWeapon\n    WhichSpecialWeapon = 1\n    StartAbilityRange = 275\n    \
+    UnpackTime = 1250\n    PreparationTime = 1\n    IgnoreFacingCheck = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object QuickSmiter\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = SmiterSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 1000\n  End\n  \
+  LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Behavior = SpecialDisguiseUpdate Tag_Disguise\n    SpecialPowerTemplate = DisguisePower\n    \
+    UnpackTime = 0\n    PreparationTime = 0\n    PackTime = 0\n  End\n  \
+  Behavior = WeaponFireSpecialAbilityUpdate Tag_Smite\n    SpecialPowerTemplate = SmitePower\n    \
+    SpecialWeapon = SmiteWeapon\n    WhichSpecialWeapon = 1\n    StartAbilityRange = 275\n    \
+    UnpackTime = 0\n    PreparationTime = 1\n    IgnoreFacingCheck = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object Victim\n  Side = Mordor\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100000\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
+
+fn smite_cast(caster_name: &str) -> (Option<u32>, bool, bool) {
+    let m = load_seeded(SMITE_DATA, &[caster_name, "Victim"]);
+    let production = m.kinds.production(&m.data);
+    let power_names = crate::powers::PowerNames::build(m.kinds.power_names().map(str::to_owned));
+    let power_reload = power_names.reload_table(&m.data.special_powers);
+    let cast_rules = power_names.cast_rules(&m.data.special_powers);
+    let spawns: Vec<Spawn> = [
+        (caster_name, 100.0, 100.0, PLAYER),
+        ("Victim", 700.0, 100.0, OTHER),
+    ]
+    .iter()
+    .map(|(name, x, y, owner)| {
+        m.kinds
+            .spawn(
+                &m.data.combat,
+                m.kinds.kind(name).unwrap(),
+                Vec2::new(*x, *y),
+                Facing::EAST,
+                *owner,
+            )
+            .unwrap()
+    })
+    .collect();
+    let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
+    let rules = RotwkRules::new(passability, spawns)
+        .with_combat(m.data.combat.clone())
+        .with_construction(Arc::clone(&m.kinds), production.clone())
+        .with_upgrades(m.kinds.upgrades(&m.data), Arc::clone(&m.data.upgrade_bits))
+        .with_powers(power_names, power_reload)
+        .with_power_cast_rules(cast_rules);
+    let mut simulation = Simulation::new(5, rules).unwrap();
+    simulation.tick().unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let caster = only_owned_by(&simulation, ids, PLAYER);
+    let victim = only_owned_by(&simulation, ids, OTHER);
+    press(&mut simulation, caster, 0);
+    for _ in 0..5 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        holds(&simulation, caster, "DISGUISED"),
+        "the fixture's premise"
+    );
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::FireSpecialPower {
+                button: 1,
+                target: Some(victim),
+                at: None,
+            },
+        )
+        .unwrap();
+    let mut held_until_unpack = true;
+    let mut unpacked_at = None;
+    for tick in 0..700u32 {
+        simulation.tick().unwrap();
+        if unpacked_at.is_none() && holds(&simulation, caster, "UNPACKING") {
+            unpacked_at = Some(tick);
+        }
+        if unpacked_at.is_none() && !holds(&simulation, caster, "DISGUISED") {
+            held_until_unpack = false;
+        }
+    }
+    (
+        unpacked_at,
+        held_until_unpack,
+        holds(&simulation, caster, "DISGUISED"),
+    )
+}
+
+#[test]
+fn a_smite_breaks_the_disguise_when_it_unpacks_and_not_at_the_order() {
+    let (unpacked, held_until_unpack, disguised_after) = smite_cast("Smiter");
+    assert!(
+        unpacked.is_some(),
+        "the caster reached its range and unpacked"
+    );
+    assert!(held_until_unpack, "disguised while approaching");
+    assert!(!disguised_after, "broken at the unpack start");
+    let (_, _, quick_disguised_after) = smite_cast("QuickSmiter");
+    assert!(quick_disguised_after, "no unpack, no break");
+}
+
 const KIND_DATA: &str = "\
-SpecialPower DisguisePower\n  ReloadTime = 10\nEnd\n\
+SpecialPower DisguisePower\n  ReloadTime = 0\nEnd\n\
 CommandSet HeroSet\n  1 = Fire_Disguise\nEnd\n\
 CommandButton Fire_Disguise\n  Command = SPECIAL_POWER\n  SpecialPower = DisguisePower\nEnd\n\
 Object Hero\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = HeroSet\n  \

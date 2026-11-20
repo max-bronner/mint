@@ -8,6 +8,8 @@ const I16_SCALE: f32 = 1.0 / 32768.0;
 
 const PAN_DEADZONE: f32 = 1.0e-3;
 
+const DECLICK_MS: u32 = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clip {
     sample_rate: u32,
@@ -26,6 +28,15 @@ impl Clip {
             sample_rate: pcm.sample_rate.max(1),
             channels: pcm.channels.max(1),
             samples: pcm.samples,
+        }
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            sample_rate: 1,
+            channels: 1,
+            samples: Vec::new(),
         }
     }
 
@@ -384,12 +395,14 @@ struct Voice {
     at_silence: AtSilence,
     paused: bool,
     bulk_paused: bool,
+    applied: Option<[f32; 2]>,
 }
 
 #[derive(Debug)]
 pub struct Mixer {
     config: MixerConfig,
     voices: Vec<Voice>,
+    releasing: Vec<Voice>,
     listener: Listener,
     bus_gain: [f32; MAX_BUSES],
     master: f32,
@@ -406,6 +419,7 @@ impl Mixer {
         Self {
             config,
             voices: Vec::with_capacity(capacity),
+            releasing: Vec::new(),
             listener: Listener::default(),
             bus_gain: [1.0; MAX_BUSES],
             master: 1.0,
@@ -578,6 +592,7 @@ impl Mixer {
             at_silence: AtSilence::Continue,
             paused: false,
             bulk_paused: false,
+            applied: None,
         });
         self.stats.started = self.stats.started.saturating_add(1);
         self.recount();
@@ -619,10 +634,14 @@ impl Mixer {
             .map(|voice| voice.id)
             .collect();
         for id in ids {
-            self.pause(id, 0);
-            if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
-                voice.bulk_paused = true;
-            }
+            self.pause_as_by_all(id);
+        }
+    }
+
+    pub fn pause_as_by_all(&mut self, id: VoiceId) {
+        self.pause(id, 0);
+        if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
+            voice.bulk_paused = true;
         }
     }
 
@@ -642,14 +661,15 @@ impl Mixer {
         if let Some(voice) = self.voices.iter_mut().find(|v| v.id == id) {
             voice.fade_target = target;
             voice.at_silence = at_silence;
-            if ms == 0 {
+            let silent = voice.applied.is_none() || voice.paused;
+            if ms == 0 && silent {
                 voice.fade = target;
                 voice.fade_rate = 0.0;
                 if target <= 0.0 && at_silence == AtSilence::Pause {
                     voice.paused = true;
                 }
             } else {
-                voice.fade_rate = fade_rate(ms);
+                voice.fade_rate = fade_rate(ms.max(DECLICK_MS));
             }
         }
     }
@@ -718,13 +738,28 @@ impl Mixer {
 
     pub fn stop_all(&mut self) {
         let finished = u64::try_from(self.voices.len()).unwrap_or(u64::MAX);
-        self.voices.clear();
+        for voice in std::mem::take(&mut self.voices) {
+            self.release(voice);
+        }
         self.stats.finished = self.stats.finished.saturating_add(finished);
         self.recount();
     }
 
     pub fn render(&mut self, out: &mut [f32], channels: u16, sample_rate: u32) {
+        self.render_split(out, None, channels, sample_rate);
+    }
+
+    pub fn render_split(
+        &mut self,
+        out: &mut [f32],
+        mut streams: Option<&mut [f32]>,
+        channels: u16,
+        sample_rate: u32,
+    ) {
         out.fill(0.0);
+        if let Some(stem) = streams.as_deref_mut() {
+            stem.fill(0.0);
+        }
         let channels = usize::from(channels.max(1));
         let frames = out.len().checked_div(channels).unwrap_or(0);
         if frames == 0 || sample_rate == 0 {
@@ -753,12 +788,30 @@ impl Mixer {
                 let Some(voice) = self.voices.get_mut(index) else {
                     break;
                 };
-                render_voice(voice, out, &env)
+                match streams.as_deref_mut() {
+                    Some(stem) if voice.channel == Channel::Stream => {
+                        render_voice(voice, stem, &env)
+                    }
+                    _ => render_voice(voice, out, &env),
+                }
             };
             if ended {
-                self.retire(index, false);
+                self.voices.remove(index);
+                self.stats.finished = self.stats.finished.saturating_add(1);
             } else {
                 index = index.saturating_add(1);
+            }
+        }
+        self.releasing.retain_mut(|voice| {
+            let ended = match streams.as_deref_mut() {
+                Some(stem) if voice.channel == Channel::Stream => render_voice(voice, stem, &env),
+                _ => render_voice(voice, out, &env),
+            };
+            !ended
+        });
+        if let Some(stem) = streams {
+            for (mixed, streamed) in out.iter_mut().zip(stem.iter()) {
+                *mixed += *streamed;
             }
         }
         self.recount();
@@ -782,11 +835,27 @@ impl Mixer {
         if index >= self.voices.len() {
             return;
         }
-        self.voices.remove(index);
+        let voice = self.voices.remove(index);
+        self.release(voice);
         self.stats.finished = self.stats.finished.saturating_add(1);
         if evicted {
             self.stats.evicted = self.stats.evicted.saturating_add(1);
         }
+    }
+
+    fn release(&mut self, mut voice: Voice) {
+        if voice.applied.is_none() || voice.paused || voice.fade <= 0.0 {
+            return;
+        }
+        let declick = fade_rate(DECLICK_MS);
+        voice.fade_rate = if voice.fade_target <= 0.0 {
+            voice.fade_rate.max(declick)
+        } else {
+            declick
+        };
+        voice.fade_target = 0.0;
+        voice.at_silence = AtSilence::Stop;
+        self.releasing.push(voice);
     }
 
     fn recount(&mut self) {
@@ -852,6 +921,15 @@ fn render_voice(voice: &mut Voice, out: &mut [f32], env: &Environment) -> bool {
         * f64::from(voice.pitch);
     let stereo_source = voice.clip.channels() >= 2;
 
+    let target = [left, right];
+    let from = voice.applied.unwrap_or(target);
+    voice.applied = Some(target);
+    let frames_f = env.frames as f32;
+    let ramp = [
+        (target[0] - from[0]) / frames_f,
+        (target[1] - from[1]) / frames_f,
+    ];
+
     for frame in 0..env.frames {
         if voice.position >= clip_frames_f {
             if voice.looping {
@@ -895,13 +973,14 @@ fn render_voice(voice: &mut Voice, out: &mut [f32], env: &Environment) -> bool {
             (m, m)
         };
 
+        let along = frame.saturating_add(1) as f32;
         let at = frame.saturating_mul(env.channels);
         if let Some(slot) = out.get_mut(at) {
-            *slot += l * left * voice.fade;
+            *slot += l * (from[0] + ramp[0] * along) * voice.fade;
         }
         if env.channels >= 2 {
             if let Some(slot) = out.get_mut(at.saturating_add(1)) {
-                *slot += r * right * voice.fade;
+                *slot += r * (from[1] + ramp[1] * along) * voice.fade;
             }
         }
 

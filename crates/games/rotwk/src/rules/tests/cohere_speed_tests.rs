@@ -22,6 +22,13 @@ Object Prey\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 fn build(placed: &[(&str, Vec2, PlayerId)]) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    build_with_players(placed, 4)
+}
+
+fn build_with_players(
+    placed: &[(&str, Vec2, PlayerId)],
+    players: u8,
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
@@ -47,7 +54,7 @@ fn build(placed: &[(&str, Vec2, PlayerId)]) -> (Simulation<RotwkRules>, Ids, Vec
         })
         .collect();
     let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
-    let rules = RotwkRules::new(passability, spawns)
+    let rules = group_moves(RotwkRules::new(passability, spawns).with_players(players))
         .with_combat(data.combat.clone())
         .with_construction(Arc::clone(&kinds), production);
     let simulation = Simulation::new(5, rules).unwrap();
@@ -108,7 +115,7 @@ fn capped_after_cohere(prey_distance: f32) -> (bool, bool) {
     simulation
         .submit(
             PLAYER,
-            RotwkCommand::MoveTo {
+            RotwkCommand::AttackMove {
                 x: 50.0,
                 y: 40.0,
                 queue: false,
@@ -130,46 +137,6 @@ fn a_victim_within_600_vetoes_the_whole_groups_cap() {
 #[test]
 fn a_victim_past_600_leaves_the_ordinary_cap_in_place() {
     assert_eq!(capped_after_cohere(700.0), (true, true));
-}
-
-#[test]
-fn the_group_cap_ends_when_the_capped_mover_arrives() {
-    let (mut simulation, ids, fast, slow, _prey) = scene(Vec2::new(5000.0, 5000.0));
-    simulation
-        .submit(
-            PLAYER,
-            RotwkCommand::SetSelection {
-                replace: true,
-                units: vec![fast, slow],
-            },
-        )
-        .unwrap();
-    simulation
-        .submit(
-            PLAYER,
-            RotwkCommand::MoveTo {
-                x: 90.0,
-                y: 40.0,
-                queue: false,
-            },
-        )
-        .unwrap();
-    simulation.tick().unwrap();
-    assert!(
-        simulation.state().contains(ids.formation_speed, fast),
-        "the faster mover should start out capped to the slower one"
-    );
-    for _ in 0..(20 * SIMULATION_HZ) {
-        simulation.tick().unwrap();
-    }
-    assert!(
-        !simulation.state().contains(ids.path, fast),
-        "the fast mover should have arrived by now"
-    );
-    assert!(
-        !simulation.state().contains(ids.formation_speed, fast),
-        "arrival should have dropped its group speed cap"
-    );
 }
 
 fn order(simulation: &mut Simulation<RotwkRules>, units: Vec<Entity>, command: RotwkCommand) {
@@ -209,7 +176,7 @@ fn an_acquired_target_uncoheres_the_attackers_own_group_only() {
     order(
         &mut simulation,
         vec![other_fast, other_slow],
-        RotwkCommand::MoveTo {
+        RotwkCommand::AttackMove {
             x: 800.0,
             y: 800.0,
             queue: false,
@@ -235,4 +202,65 @@ fn an_acquired_target_uncoheres_the_attackers_own_group_only() {
         ),
         (false, true)
     );
+}
+
+fn selected_move(simulation: &mut Simulation<RotwkRules>, player: PlayerId, units: Vec<Entity>) {
+    simulation
+        .submit(
+            player,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units,
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(
+            player,
+            RotwkCommand::MoveTo {
+                x: 60.0,
+                y: 40.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+}
+
+#[test]
+fn a_plain_player_move_clears_the_caps_and_sets_none() {
+    let (mut simulation, ids, found) = build(&[
+        ("Fast", Vec2::new(0.0, 0.0), PLAYER),
+        ("Slow", Vec2::new(0.0, 80.0), PLAYER),
+        ("Prey", Vec2::new(5000.0, 5000.0), OTHER),
+    ]);
+    let (fast, slow) = (found[0], found[1]);
+    order(
+        &mut simulation,
+        vec![fast, slow],
+        RotwkCommand::AttackMove {
+            x: 50.0,
+            y: 40.0,
+            queue: false,
+        },
+    );
+    assert!(simulation.state().contains(ids.formation_speed, fast));
+    selected_move(&mut simulation, PLAYER, vec![fast, slow]);
+    assert!(!simulation.state().contains(ids.formation_speed, fast));
+    assert!(!simulation.state().contains(ids.formation_speed, slow));
+}
+
+#[test]
+fn a_computer_players_group_move_sets_no_cap() {
+    let (mut simulation, ids, found) = build_with_players(
+        &[
+            ("Fast", Vec2::new(0.0, 0.0), OTHER),
+            ("Slow", Vec2::new(0.0, 80.0), OTHER),
+        ],
+        1,
+    );
+    let (fast, slow) = (found[0], found[1]);
+    selected_move(&mut simulation, OTHER, vec![fast, slow]);
+    assert!(!simulation.state().contains(ids.formation_speed, fast));
+    assert!(!simulation.state().contains(ids.formation_speed, slow));
 }

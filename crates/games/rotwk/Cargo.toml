@@ -34,6 +34,7 @@ mint-sage-w3d = { path = "../../sage/w3d" }
 mint-sage-asset = { path = "../../sage/asset" }
 mint-sage-cah = { path = "../../sage/cah" }
 mint-sage-audio = { path = "../../sage/audio" }
+mint-sage-worldmap = { path = "../../sage/worldmap" }
 mint-sage-passability = { path = "../../sage/passability" }
 mint-sage-combat = { path = "../../sage/combat" }
 mint-sage-formation = { path = "../../sage/formation" }
@@ -44,6 +45,8 @@ mint-movie = { path = "../../core/movie" }
 mint-sage-movie = { path = "../../sage/movie" }
 mint-sage-campaign = { path = "../../sage/campaign" }
 mint-sage-save = { path = "../../sage/save" }
+mint-sage-livingworld = { path = "../../sage/livingworld" }
+mint-sage-autoresolve = { path = "../../sage/autoresolve" }
 mint-sage-modules = { path = "../../sage/modules" }
 mint-ui = { path = "../../core/ui" }
 mint-sage-apt-viewer = { path = "../../sage/apt-viewer" }

@@ -15,7 +15,7 @@ mod user_data;
 mod uv_mapper;
 
 pub use catalogue::{AssetEntry, AssetRecord, Catalogue, DependencyRecord, MAX_FILE_LEN, VERSION};
-pub use hero_store::{HeroSource, HeroStore, StoredHero};
+pub use hero_store::{read_stats, write_stats, HeroSource, HeroStore, StoredHero};
 pub use kind::AssetKind;
 pub use kindof::{KindOf, PickType};
 pub use library::{AssetLibrary, ResolvedAsset};
@@ -23,7 +23,7 @@ pub use pose::{
     pivot_reach, sample_blend_into, sample_pose, sample_pose_into, PoseBuffers, SampledPose,
     Transform,
 };
-pub use resolve::{Resolver, DEFAULT_TEXTURE_EXTENSIONS};
+pub use resolve::{alpha_sidecar, Resolver, DEFAULT_TEXTURE_EXTENSIONS};
 pub use sway::{sway_index, Breeze, MAX_SWAY_TYPES, SWAY_OFFSET_COUNT};
 pub use user_data::{install_info_value, user_data_leaf, SAVE_FOLDER};
 pub use uv_mapper::{

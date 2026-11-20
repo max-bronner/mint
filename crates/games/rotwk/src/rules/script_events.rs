@@ -1,6 +1,8 @@
 use mint_sage_combat::Point3;
 use mint_sage_modules::effects::{Effect, Name};
-use mint_sage_modules::object_scripts::{BroadcastKind, Broadcaster, EventSource, ObjectFacts};
+use mint_sage_modules::object_scripts::{
+    BroadcastKind, Broadcaster, EventArg, EventSource, ObjectFacts,
+};
 use mint_sim::{Entity, PlayerId, Result, Tick};
 
 use super::{Ids, RotwkRules};
@@ -38,6 +40,7 @@ impl Broadcaster for Dispatch<'_, '_> {
                 event,
                 None,
                 Some(self.broadcaster),
+                None,
                 self.depth.saturating_add(1),
             ) {
                 self.error = Some(error);
@@ -104,9 +107,10 @@ impl RotwkRules {
         event: &str,
         data: Option<&str>,
     ) -> Result<()> {
-        self.fire_object_event_at(tick, ids, entity, event, data, None, 0)
+        self.fire_object_event_at(tick, ids, entity, event, data, None, None, 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn fire_object_event_at(
         &self,
         tick: &mut Tick<'_>,
@@ -115,6 +119,7 @@ impl RotwkRules {
         event: &str,
         data: Option<&str>,
         other: Option<Entity>,
+        third: Option<EventArg>,
         depth: u32,
     ) -> Result<()> {
         let Some(scripts) = self.object_scripts.as_ref() else {
@@ -155,6 +160,7 @@ impl RotwkRules {
         let source = EventSource {
             this: Some(entity),
             other,
+            third,
         };
         let mut dispatch = Dispatch {
             rules: self,
@@ -186,11 +192,14 @@ impl RotwkRules {
             run.function,
             run.effects.len()
         );
-        let effects = run
-            .effects
-            .into_iter()
-            .map(|effect| (entity, effect))
-            .collect();
+        let mut effects = Vec::new();
+        for effect in run.effects {
+            if let Effect::PulseOwnEmotion(kind) = effect {
+                self.pulse_emotion(tick, ids, entity, kind, other, super::emotions::ONE_FRAME)?;
+            } else {
+                effects.push((entity, effect));
+            }
+        }
         self.apply_effects(tick, ids, effects)?;
         nested_error.map_or(Ok(()), Err)
     }
@@ -206,6 +215,7 @@ impl RotwkRules {
         let Some(body) = world.get(ids.body, from) else {
             return Vec::new();
         };
+        let sender = world.get(ids.owner, from).map(|owner| owner.0);
         let origin = Point3::new(
             body.0.position.x,
             body.0.position.y,
@@ -233,6 +243,9 @@ impl RotwkRules {
                 let admitted = match kind {
                     BroadcastKind::Enemies => {
                         relation == mint_sage_combat::victim::Relation::Enemies
+                            && sender.is_none_or(|player| {
+                                self.not_hidden_from(world, ids, player, candidate)
+                            })
                     }
                     BroadcastKind::Allies => relation == mint_sage_combat::victim::Relation::Allies,
                     BroadcastKind::Civilians => {
@@ -254,7 +267,7 @@ impl RotwkRules {
         &self,
         kind: crate::unit::Kind,
         data: &str,
-    ) -> Option<Vec<(String, bool)>> {
+    ) -> Option<Vec<(String, bool, bool)>> {
         let scripts = self.object_scripts.as_ref()?;
         let list = self.kinds.get(kind)?.record.lua_events.as_deref()?;
         let run = scripts.run(
@@ -270,11 +283,19 @@ impl RotwkRules {
         }
         let mut parts = Vec::new();
         for effect in &run.effects {
-            let Effect::SubObjects { show, hide } = effect else {
+            let Effect::SubObjects {
+                show,
+                hide,
+                permanent,
+            } = effect
+            else {
                 return None;
             };
-            parts.extend(show.iter().map(|name| (name.to_string(), true)));
-            parts.extend(hide.iter().map(|name| (name.to_string(), false)));
+            parts.extend(show.iter().map(|name| (name.to_string(), true, *permanent)));
+            parts.extend(
+                hide.iter()
+                    .map(|name| (name.to_string(), false, *permanent)),
+            );
         }
         Some(parts)
     }

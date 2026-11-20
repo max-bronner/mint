@@ -163,10 +163,13 @@ fn a_clip_that_drives_no_part_still_binds() {
 }
 
 #[test]
-fn a_clip_binds_across_a_renamed_copy_of_the_same_skeleton_only() {
+fn a_clip_binds_to_a_skeleton_with_more_or_fewer_pivots_than_it_has_channels() {
     use crate::load::LoadedAnimation;
+    use mint_render::Vec3 as RVec3;
     use mint_sage_ini::AnimationSource;
-    use mint_sage_w3d::{HierarchyHeader, Pivot, Quat, Vec3 as W3dVec3};
+    use mint_sage_w3d::{
+        Channel, ChannelData, ChannelKind, HierarchyHeader, Pivot, Quat, Value, Vec3 as W3dVec3,
+    };
     use mint_vfs::VfsPath;
 
     let zero = W3dVec3 {
@@ -186,50 +189,81 @@ fn a_clip_binds_across_a_renamed_copy_of_the_same_skeleton_only() {
             w: 1.0,
         },
     };
-    let skeleton = |name: &str, child: &str| Hierarchy {
+    let skeleton = |name: &str, pivots: &[&str]| Hierarchy {
         header: HierarchyHeader {
             name: name.to_owned(),
-            num_pivots: 2,
+            num_pivots: u32::try_from(pivots.len()).unwrap(),
             center: zero,
             version: 0,
         },
-        pivots: vec![pivot("ROOT", None), pivot(child, Some(0))],
+        pivots: pivots
+            .iter()
+            .enumerate()
+            .map(|(i, n)| pivot(n, i.checked_sub(1).and_then(|p| u32::try_from(p).ok())))
+            .collect(),
     };
     let model = CachedModel {
-        name: "door".to_owned(),
-        hierarchy: Some(skeleton("DOOR", "LEAF")),
+        name: "rig".to_owned(),
+        hierarchy: Some(skeleton("RIG", &["ROOT", "A", "B"])),
         parts: Vec::new(),
         bounds: Aabb::EMPTY,
         vertices: 0,
         triangles: 0,
     };
     let declared = DefaultAnimation {
-        name: "DOOR_SKL.OPEN".to_owned(),
+        name: "OTHER.MOVE".to_owned(),
         mode: None,
         blend_frames: None,
         flags: AnimationFlags::default(),
         source: AnimationSource::IdleAnimationState,
     };
-    let loaded = |hierarchy: Hierarchy| LoadedAnimation {
-        path: VfsPath::new("door_open.w3d"),
+    let shift_x = |pivot: u32| Channel {
+        pivot,
+        kind: ChannelKind::TranslationX,
+        declared_vector_len: None,
+        data: ChannelData::Dense {
+            first_frame: 0,
+            values: vec![Value::Scalar(5.0), Value::Scalar(5.0)],
+        },
+    };
+    let clip = |pivots: &[&str], channels: Vec<Channel>| LoadedAnimation {
+        path: VfsPath::new("move.w3d"),
         animation: Animation {
-            name: "OPEN".to_owned(),
-            hierarchy_name: "DOOR_SKL".to_owned(),
+            name: "MOVE".to_owned(),
+            hierarchy_name: "OTHER".to_owned(),
             num_frames: 2,
             frame_rate: 30,
             compressed: false,
             flavor: None,
-            channels: Vec::new(),
+            channels,
             channel_chunks: 0,
         },
-        hierarchy_path: VfsPath::new("door_skl.w3d"),
-        hierarchy,
+        hierarchy_path: VfsPath::new("other.w3d"),
+        hierarchy: skeleton("OTHER", pivots),
     };
-    assert!(ModelAnimation::bind(&model, &declared, loaded(skeleton("DOOR_SKL", "LEAF"))).is_ok());
-    assert!(matches!(
-        ModelAnimation::bind(&model, &declared, loaded(skeleton("DOOR_SKL", "HINGE"))),
-        Err(BindRefusal::HierarchyMismatch { .. })
-    ));
+    let origin_of = |bound: &ModelAnimation, bone: usize| {
+        let mut bones = Vec::new();
+        bound.bones(0.0, &mut bones);
+        assert_eq!(bones.len(), 3);
+        bones[bone].transform_point(RVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        })
+    };
+
+    let more = clip(
+        &["ROOT", "A", "B", "ROCK"],
+        vec![shift_x(1), shift_x(2), shift_x(3)],
+    );
+    let bound = ModelAnimation::bind(&model, &declared, more).expect("extra channels are ignored");
+    assert!((origin_of(&bound, 1).x - 5.0).abs() < 1e-5);
+    assert!((origin_of(&bound, 2).x - 10.0).abs() < 1e-5);
+
+    let fewer = clip(&["ROOT", "A"], vec![shift_x(1)]);
+    let bound = ModelAnimation::bind(&model, &declared, fewer).expect("extra pivots keep bind");
+    assert!((origin_of(&bound, 1).x - 5.0).abs() < 1e-5);
+    assert!((origin_of(&bound, 2).x - 5.0).abs() < 1e-5);
 }
 
 #[test]

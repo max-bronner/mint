@@ -164,6 +164,25 @@ impl RotwkRules {
         Ok((factor, penalty))
     }
 
+    pub(super) fn flanked_scalar(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        event: &DamageEvent,
+    ) -> Result<Option<f32>> {
+        let Some(mint_sage_combat::Nugget::Damage(nugget)) = event
+            .weapon
+            .and_then(|weapon| self.combat.weapons.get(weapon))
+            .and_then(|template| template.nuggets.get(usize::from(event.nugget)))
+        else {
+            return Ok(None);
+        };
+        if !self.flanks(tick, ids, event.victim, event.attacker)? {
+            return Ok(None);
+        }
+        Ok(Some(nugget.shape.flanked_scalar.unwrap_or(1.0)))
+    }
+
     pub(super) fn flanks(
         &self,
         tick: &mut Tick<'_>,
@@ -279,6 +298,11 @@ impl RotwkRules {
     }
 }
 
+pub(crate) fn flanked_amount(amount: f32, scalar: f32) -> Option<f32> {
+    let scaled = amount * scalar;
+    (scaled >= 1.0).then_some(scaled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +357,13 @@ mod tests {
         assert_eq!(memory.cached(attacker), Some(None));
         memory.remember(attacker, Some(Frame::new(1000)));
         assert_eq!(memory.cached(attacker), Some(None));
+    }
+
+    #[test]
+    fn a_flanked_attackers_blow_under_one_deals_nothing() {
+        assert_eq!(flanked_amount(0.5, 1.0), None);
+        assert_eq!(flanked_amount(10.0, 0.5), Some(5.0));
+        assert_eq!(flanked_amount(2.0, 1.0), Some(2.0));
     }
 
     #[test]

@@ -521,6 +521,7 @@ impl RotwkRules {
                     player.get()
                 );
             }
+            self.abort_wind_up(tick, ids, entity)?;
         }
         Ok(())
     }
@@ -816,6 +817,7 @@ impl RotwkRules {
                 }
                 Ok(())
             }
+            CastEdge::Finish { .. } => Ok(()),
         }
     }
 

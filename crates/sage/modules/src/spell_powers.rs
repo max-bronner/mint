@@ -55,7 +55,7 @@ fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> LogicFrames {
     let ms = number(fields, keyword).min(86_400_000.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms as u32;
-    LogicFrames::from_milliseconds(whole)
+    crate::special_ability_update::retail_duration_ticks(whole)
 }
 
 fn checked_number(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<f32, FieldError> {

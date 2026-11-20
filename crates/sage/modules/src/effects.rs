@@ -20,7 +20,10 @@ pub enum Effect {
     ClearWeaponSetFlag(Name),
     LockWeaponSlot(u8),
     ReleaseWeaponLock,
+    LockWeaponSlotTemporarily(u8),
+    ReleaseTemporaryWeaponLock,
     ArmorSetFlag(Name),
+    ClearArmorSetFlag(Name),
     ModelConditions {
         add: Names,
         remove: Names,
@@ -28,6 +31,7 @@ pub enum Effect {
     SubObjects {
         show: Names,
         hide: Names,
+        permanent: bool,
     },
     Texture {
         swaps: Arc<[(Name, Name)]>,
@@ -54,6 +58,11 @@ pub enum Effect {
         location: CreateLocation,
         at: PowerPlace,
         from: OclFrom,
+    },
+    UpgradedCreateObjects {
+        create: Box<Effect>,
+        upgrade_lists: Vec<(Name, Name)>,
+        grants: Vec<Name>,
     },
     AreaHeal {
         at: PowerPlace,
@@ -88,6 +97,11 @@ pub enum Effect {
         repeat: Option<u8>,
         alive_only: bool,
         reload_slot: Option<u32>,
+    },
+    FireWeaponAtDeath {
+        weapon: Name,
+        offset: (f32, f32, f32),
+        delay: LogicFrames,
     },
     LoseStealth,
     PlayWeaponPreFireFX {
@@ -131,12 +145,19 @@ pub enum Effect {
     },
     Aura {
         list: Name,
-        radius: f32,
+        radius: Option<f32>,
         affects: Names,
-        sides: PowerSides,
+        target_enemy: bool,
+        affect_good: bool,
+        affect_evil: bool,
         allow_self: bool,
-        lasts: mint_sim::LogicFrames,
         while_dead: bool,
+        anti: Names,
+        anti_fx: Option<Name>,
+        max_active_rank: Option<f32>,
+        contained_only: bool,
+        required_mounted: bool,
+        allow_while_attacking: bool,
     },
     SetWeatherEffect {
         list: Option<Name>,
@@ -189,6 +210,7 @@ pub enum Effect {
         fx: Option<Name>,
     },
     CursePowers {
+        power: Name,
         at: PowerPlace,
         share: f32,
         fx: Option<Name>,
@@ -218,6 +240,7 @@ pub enum Effect {
         nonstackable: bool,
         skip_recently_damaged: bool,
         fx_always: bool,
+        rules: HealerRules,
     },
     MoveToObject {
         target: Entity,
@@ -231,6 +254,9 @@ pub enum Effect {
     },
     Halt,
     HoldOrders(bool),
+    IgnoreOrders(bool),
+    IgnoreOrdersFor(mint_sim::LogicFrames),
+    AiBusy(LogicFrames),
     FaceObject {
         target: Entity,
     },
@@ -239,12 +265,14 @@ pub enum Effect {
     },
     StartRecharge(Name),
     MarkSpecialPowerTriggered(Name),
+    UnpackStarted(Name),
     SelfTimedModifier {
         list: Name,
         lasts: Option<mint_sim::LogicFrames>,
     },
     ClearSelfTimedModifier(Name),
     GrantInvisibility {
+        at: PowerPlace,
         filter: Names,
         radius: f32,
         duration: mint_sim::LogicFrames,
@@ -275,6 +303,7 @@ pub enum Effect {
     },
     Die,
     EnterRampage,
+    PulseOwnEmotion(mint_sage_ini::EmotionType),
     TriggerReward {
         experience: u32,
         skill_points: u32,
@@ -285,6 +314,7 @@ pub enum Effect {
     CaptureFlash {
         target: Entity,
     },
+    Flood(Arc<crate::FloodSpec>),
     CreateSlave {
         name: Name,
         offset: (f32, f32, f32),
@@ -325,6 +355,20 @@ pub enum Effect {
         max_shots: u32,
         can_shoot_empty_ground: bool,
     },
+    ArrowStormPrepare {
+        at: PowerPlace,
+        radius: f32,
+        shots_per_target: u32,
+        max_shots: u32,
+    },
+    SenseEnemies {
+        range: f32,
+        filter: Arc<ObjectFilter>,
+    },
+    FadeAway {
+        opacity: f32,
+        first: bool,
+    },
     ClearArrowStorm,
     Fling {
         power: Name,
@@ -332,10 +376,7 @@ pub enum Effect {
         landing_warhead: Option<Name>,
     },
     RefreshOtherPowers {
-        except: Name,
-        affect_allies: bool,
-        range: f32,
-        affects: Names,
+        rule: ModifierRule,
     },
     ReplenishHorde {
         melee_free: LogicFrames,
@@ -352,12 +393,14 @@ pub enum Effect {
         lasts: LogicFrames,
     },
     ToggleStealth {
+        power: Name,
         lasts: Option<LogicFrames>,
         palantir_timer: bool,
     },
     ToggleDisguise {
         force_mounted: bool,
     },
+    LocomotorUpgraded(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -386,6 +429,7 @@ pub enum CastEdge {
     Prepare,
     Trigger,
     Abort,
+    Finish { triggers: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -426,6 +470,7 @@ pub enum CreateLocation {
     AtEdgeNearSource,
     AtEdgeNearTarget,
     AtEdgeFarthestFromTarget,
+    ClosestToSpawnPoint,
     UseSecondaryObject(Arc<ObjectFilter>),
     AtEdgeNearTargetAndMove,
     Other(Name),
@@ -441,9 +486,23 @@ impl CreateLocation {
             "CREATE_AT_EDGE_NEAR_SOURCE" => Self::AtEdgeNearSource,
             "CREATE_AT_EDGE_NEAR_TARGET" => Self::AtEdgeNearTarget,
             "CREATE_AT_EDGE_FARTHEST_FROM_TARGET" => Self::AtEdgeFarthestFromTarget,
+            "CREATE_CLOSEST_TO_SPAWN_POINT" => Self::ClosestToSpawnPoint,
             _ => Self::Other(Name::from(token)),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HealerRules {
+    pub not_under_attack: bool,
+    pub contained: bool,
+    pub add_bonus: bool,
+    pub regrow: Option<Regrow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Regrow {
+    pub fx: Option<Name>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -520,13 +579,17 @@ pub(crate) fn build_modifier_rule(fields: ModifierFieldValues) -> Option<Modifie
     {
         return None;
     }
+    Some(recipient_rule(fields))
+}
+
+pub(crate) fn recipient_rule(fields: ModifierFieldValues) -> ModifierRule {
     let sides = modifier_sides(
         fields.all_sides,
         fields.re_enable,
         fields.target_enemy,
         fields.anti.is_empty(),
     );
-    Some(ModifierRule {
+    ModifierRule {
         list: fields.list,
         radius: fields.range,
         affects: fields.affects,
@@ -539,7 +602,7 @@ pub(crate) fn build_modifier_rule(fields: ModifierFieldValues) -> Option<Modifie
         affect_good: fields.affect_good,
         affect_evil: fields.affect_evil,
         affect_allies: fields.affect_allies,
-    })
+    }
 }
 
 fn modifier_sides(
@@ -635,12 +698,20 @@ pub struct TextureSwap {
     pub exclude: Names,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubObjectWrite {
+    pub name: Name,
+    pub shown: bool,
+    pub permanent: bool,
+    pub rewrites: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UpgradeState {
     pub weapon_set_flags: Vec<Name>,
     pub armor_set_flags: Vec<Name>,
     pub model_conditions: Vec<Name>,
-    pub sub_objects: Vec<(Name, bool)>,
+    pub sub_objects: Vec<SubObjectWrite>,
     pub textures: Vec<TextureSwap>,
     pub command_set: Option<Name>,
     pub unpaused_powers: Vec<Name>,
@@ -649,10 +720,19 @@ pub struct UpgradeState {
     pub levels_gained: u32,
     pub attribute_modifiers: Vec<Name>,
     pub weapon_lock: Option<u8>,
+    pub weapon_lock_temporary: bool,
     pub revision: u32,
 }
 
 const WEAPONSET_PREFIX: &str = "WEAPONSET_";
+
+const WEAPON_LOCK_CONDITIONS: [&str; 5] = [
+    "WEAPONLOCK_PRIMARY",
+    "WEAPONLOCK_SECONDARY",
+    "WEAPONLOCK_TERTIARY",
+    "WEAPONLOCK_QUATERNARY",
+    "WEAPONLOCK_QUINARY",
+];
 
 const WEAPON_RIDER_PREFIX: &str = "WEAPON_RIDER";
 
@@ -726,6 +806,34 @@ fn show(overrides: &mut Vec<(Name, bool)>, name: &Name, shown: bool) -> bool {
     }
 }
 
+fn write_sub_object(
+    list: &mut Vec<SubObjectWrite>,
+    name: &Name,
+    shown: bool,
+    permanent: bool,
+) -> (bool, bool) {
+    match list
+        .iter_mut()
+        .find(|held| held.permanent == permanent && same(&held.name, name))
+    {
+        Some(held) => {
+            let changed = held.shown != shown;
+            held.shown = shown;
+            held.rewrites = held.rewrites.wrapping_add(1);
+            (changed, true)
+        }
+        None => {
+            list.push(SubObjectWrite {
+                name: Name::clone(name),
+                shown,
+                permanent,
+                rewrites: 0,
+            });
+            (true, false)
+        }
+    }
+}
+
 impl UpgradeState {
     pub fn apply(&mut self, effect: &Effect) -> Changed {
         let changed = self.apply_unrevised(effect);
@@ -748,18 +856,41 @@ impl UpgradeState {
                 }
             }
             Effect::LockWeaponSlot(slot) => {
-                if self.weapon_lock != Some(*slot) {
+                if self.weapon_lock != Some(*slot) || self.weapon_lock_temporary {
                     self.weapon_lock = Some(*slot);
+                    self.weapon_lock_temporary = false;
                     return Changed::WEAPON_SET;
                 }
             }
             Effect::ReleaseWeaponLock => {
+                self.weapon_lock_temporary = false;
                 if self.weapon_lock.take().is_some() {
                     return Changed::WEAPON_SET;
                 }
             }
+            Effect::LockWeaponSlotTemporarily(slot) => {
+                let permanent = self.weapon_lock.is_some() && !self.weapon_lock_temporary;
+                if !permanent && self.weapon_lock != Some(*slot) {
+                    self.weapon_lock = Some(*slot);
+                    self.weapon_lock_temporary = true;
+                    return Changed::WEAPON_SET;
+                }
+            }
+            Effect::ReleaseTemporaryWeaponLock => {
+                if self.weapon_lock_temporary {
+                    self.weapon_lock_temporary = false;
+                    if self.weapon_lock.take().is_some() {
+                        return Changed::WEAPON_SET;
+                    }
+                }
+            }
             Effect::ArmorSetFlag(flag) => {
                 if insert(&mut self.armor_set_flags, flag) {
+                    return Changed::ARMOR_SET;
+                }
+            }
+            Effect::ClearArmorSetFlag(flag) => {
+                if remove(&mut self.armor_set_flags, flag) {
                     return Changed::ARMOR_SET;
                 }
             }
@@ -785,16 +916,27 @@ impl UpgradeState {
                     return Changed::LOOK;
                 }
             }
-            Effect::SubObjects { show: shown, hide } => {
-                let mut changed = false;
-                for name in shown.iter() {
-                    changed |= show(&mut self.sub_objects, name, true);
-                }
-                for name in hide.iter() {
-                    changed |= show(&mut self.sub_objects, name, false);
+            Effect::SubObjects {
+                show: shown,
+                hide,
+                permanent,
+            } => {
+                let (mut changed, mut rewrote) = (false, false);
+                let writes = shown
+                    .iter()
+                    .map(|name| (name, true))
+                    .chain(hide.iter().map(|name| (name, false)));
+                for (name, visible) in writes {
+                    let (moved, again) =
+                        write_sub_object(&mut self.sub_objects, name, visible, *permanent);
+                    changed |= moved;
+                    rewrote |= again;
                 }
                 if changed {
                     return Changed::LOOK;
+                }
+                if rewrote {
+                    self.revision = self.revision.wrapping_add(1);
                 }
             }
             Effect::Texture { swaps, exclude } => {
@@ -867,6 +1009,7 @@ impl UpgradeState {
             }
             Effect::RemoveUpgrades(..)
             | Effect::CreateObjects { .. }
+            | Effect::UpgradedCreateObjects { .. }
             | Effect::AreaHeal { .. }
             | Effect::AreaModifier { .. }
             | Effect::AreaLevelUp { .. }
@@ -874,6 +1017,7 @@ impl UpgradeState {
             | Effect::GrantPlayerUpgrade(_)
             | Effect::GrantUpgrade(_)
             | Effect::FireWeapon { .. }
+            | Effect::FireWeaponAtDeath { .. }
             | Effect::PlayFx { .. }
             | Effect::CreateObject { .. }
             | Effect::Aura { .. }
@@ -898,10 +1042,14 @@ impl UpgradeState {
             | Effect::MoveToApproachPoint { .. }
             | Effect::Halt
             | Effect::HoldOrders(_)
+            | Effect::IgnoreOrders(_)
+            | Effect::IgnoreOrdersFor(_)
+            | Effect::AiBusy(_)
             | Effect::FaceObject { .. }
             | Effect::FacePosition { .. }
             | Effect::StartRecharge(_)
             | Effect::MarkSpecialPowerTriggered(_)
+            | Effect::UnpackStarted(_)
             | Effect::SelfTimedModifier { .. }
             | Effect::ClearSelfTimedModifier(_)
             | Effect::TimedModelCondition { .. }
@@ -911,12 +1059,14 @@ impl UpgradeState {
             | Effect::AiAttack { .. }
             | Effect::Die
             | Effect::EnterRampage
+            | Effect::PulseOwnEmotion(_)
             | Effect::TriggerReward { .. }
             | Effect::PlayObjectSound(_)
             | Effect::StartLoopSound(_)
             | Effect::StopLoopSound
             | Effect::CaptureFlash { .. }
             | Effect::CreateSlave { .. }
+            | Effect::Flood(_)
             | Effect::CommandPointBonus(_)
             | Effect::SpellRechargeCount { .. }
             | Effect::Replace { .. }
@@ -926,6 +1076,9 @@ impl UpgradeState {
             | Effect::InheritUpgrade { .. }
             | Effect::ShareUpgradesWithSlaves
             | Effect::ArrowStorm { .. }
+            | Effect::ArrowStormPrepare { .. }
+            | Effect::SenseEnemies { .. }
+            | Effect::FadeAway { .. }
             | Effect::ClearArrowStorm
             | Effect::Fling { .. }
             | Effect::RefreshOtherPowers { .. }
@@ -934,6 +1087,7 @@ impl UpgradeState {
             | Effect::EmotionPulse { .. }
             | Effect::ToggleStealth { .. }
             | Effect::ToggleDisguise { .. }
+            | Effect::LocomotorUpgraded(_)
             | Effect::Teleport { .. }
             | Effect::StoreObjects { .. }
             | Effect::TeleportGroup { .. }
@@ -949,6 +1103,7 @@ impl UpgradeState {
         matches!(
             effect,
             Effect::CreateObjects { .. }
+                | Effect::UpgradedCreateObjects { .. }
                 | Effect::AreaHeal { .. }
                 | Effect::AreaModifier { .. }
                 | Effect::AreaLevelUp { .. }
@@ -956,6 +1111,7 @@ impl UpgradeState {
                 | Effect::GrantPlayerUpgrade(_)
                 | Effect::GrantUpgrade(_)
                 | Effect::FireWeapon { .. }
+                | Effect::FireWeaponAtDeath { .. }
                 | Effect::PlayFx { .. }
                 | Effect::CreateObject { .. }
                 | Effect::Aura { .. }
@@ -981,17 +1137,23 @@ impl UpgradeState {
                 | Effect::CastEdge { .. }
                 | Effect::Spawn { .. }
                 | Effect::CreateSlave { .. }
+                | Effect::Flood(_)
                 | Effect::CommandPointBonus(_)
                 | Effect::SpellRechargeCount { .. }
                 | Effect::Replace { .. }
                 | Effect::PressCommand(_)
                 | Effect::ArrowStorm { .. }
+                | Effect::ArrowStormPrepare { .. }
+                | Effect::SenseEnemies { .. }
+                | Effect::FadeAway { .. }
                 | Effect::ClearArrowStorm
                 | Effect::Fling { .. }
                 | Effect::RefreshOtherPowers { .. }
                 | Effect::GrantInvisibility { .. }
                 | Effect::ToggleStealth { .. }
+                | Effect::PulseOwnEmotion(_)
                 | Effect::ToggleDisguise { .. }
+                | Effect::LocomotorUpgraded(_)
                 | Effect::Teleport { .. }
                 | Effect::StoreObjects { .. }
                 | Effect::TeleportGroup { .. }
@@ -1026,6 +1188,14 @@ impl UpgradeState {
                 out.push(mapped);
             }
         }
+        if let Some(lock) = self
+            .weapon_lock
+            .and_then(|slot| WEAPON_LOCK_CONDITIONS.get(usize::from(slot)))
+        {
+            if !out.iter().any(|held| held.eq_ignore_ascii_case(lock)) {
+                out.push((*lock).to_string());
+            }
+        }
         out
     }
 
@@ -1036,10 +1206,12 @@ impl UpgradeState {
 
     #[must_use]
     pub fn sub_object(&self, name: &str) -> Option<bool> {
-        self.sub_objects
-            .iter()
-            .find(|(held, _)| same(held, name))
-            .map(|(_, shown)| *shown)
+        let named = |permanent: bool| {
+            self.sub_objects
+                .iter()
+                .find(|held| held.permanent == permanent && same(&held.name, name))
+        };
+        named(true).or_else(|| named(false)).map(|held| held.shown)
     }
 
     #[must_use]
@@ -1108,7 +1280,13 @@ impl Component for UpgradeState {
             hash_names(hasher, &self.model_conditions);
         }
         if sub_objects {
-            hash_overrides(hasher, &self.sub_objects);
+            hasher.write_usize(self.sub_objects.len());
+            for write in &self.sub_objects {
+                hash_name(hasher, &write.name);
+                hasher.write_bool(write.shown);
+                hasher.write_bool(write.permanent);
+                hasher.write_u32(write.rewrites);
+            }
         }
         if textures {
             hasher.write_usize(self.textures.len());
@@ -1141,6 +1319,7 @@ impl Component for UpgradeState {
         }
         if let (true, Some(slot)) = (lock, self.weapon_lock) {
             hasher.write_u8(slot);
+            hasher.write_bool(self.weapon_lock_temporary);
         }
     }
 }
@@ -1151,6 +1330,36 @@ mod tests {
 
     fn name(text: &str) -> Name {
         Name::from(text)
+    }
+
+    #[test]
+    fn a_rewrite_of_the_same_value_changes_nothing_but_reaches_presentation() {
+        let hide = Effect::SubObjects {
+            show: list(&[]),
+            hide: list(&["Part"]),
+            permanent: true,
+        };
+        let mut state = UpgradeState::default();
+        assert_eq!(state.apply(&hide), Changed::LOOK);
+        let revision = state.revision;
+        assert_eq!(state.apply(&hide), Changed::NONE);
+        assert_ne!(state.revision, revision);
+        assert_eq!(state.sub_objects[0].rewrites, 1);
+        assert_eq!(state.sub_objects.len(), 1);
+    }
+
+    #[test]
+    fn a_name_has_one_entry_on_each_list_and_the_permanent_one_decides() {
+        let write = |shown: bool, permanent: bool| Effect::SubObjects {
+            show: if shown { list(&["Part"]) } else { list(&[]) },
+            hide: if shown { list(&[]) } else { list(&["Part"]) },
+            permanent,
+        };
+        let mut state = UpgradeState::default();
+        state.apply(&write(true, true));
+        state.apply(&write(false, false));
+        assert_eq!(state.sub_objects.len(), 2);
+        assert_eq!(state.sub_object("part"), Some(true));
     }
 
     fn list(items: &[&str]) -> Names {
@@ -1189,16 +1398,19 @@ mod tests {
         state.apply(&Effect::SubObjects {
             show: list(&[]),
             hide: list(&["V1", "V2"]),
+            permanent: true,
         });
         state.apply(&Effect::SubObjects {
             show: list(&["V1"]),
             hide: list(&["V2"]),
+            permanent: true,
         });
         assert_eq!(state.sub_object("v1"), Some(true));
         assert_eq!(state.sub_object("V2"), Some(false));
         state.apply(&Effect::SubObjects {
             show: list(&["V1", "V2"]),
             hide: list(&[]),
+            permanent: true,
         });
         assert_eq!(state.sub_object("V2"), Some(true));
         assert_eq!(state.sub_object("Tower"), None);
@@ -1210,6 +1422,7 @@ mod tests {
         state.apply(&Effect::SubObjects {
             show: list(&["Flag"]),
             hide: list(&["Flag"]),
+            permanent: true,
         });
         assert_eq!(state.sub_object("Flag"), Some(false));
     }
@@ -1291,6 +1504,15 @@ mod tests {
     }
 
     #[test]
+    fn a_weapon_lock_holds_its_slot_condition_until_released() {
+        let mut state = UpgradeState::default();
+        state.apply(&Effect::LockWeaponSlot(1));
+        assert_eq!(state.model_condition_names(), ["WEAPONLOCK_SECONDARY"]);
+        state.apply(&Effect::ReleaseWeaponLock);
+        assert!(state.model_condition_names().is_empty());
+    }
+
+    #[test]
     fn weapon_set_flags_have_the_engine_exceptions() {
         let mut rider = UpgradeState::default();
         rider.apply(&Effect::WeaponSetFlag(name("WEAPON_RIDER3")));
@@ -1346,6 +1568,7 @@ mod tests {
             Effect::SubObjects {
                 show: list(&["A"]),
                 hide: list(&[]),
+                permanent: true,
             },
             Effect::Texture {
                 swaps: Arc::from([(name("a.tga"), name("b.tga"))]),
@@ -1392,6 +1615,7 @@ mod tests {
                 Effect::SubObjects {
                     show: list(&[name_]),
                     hide: list(&[]),
+                    permanent: true,
                 },
                 Effect::Texture {
                     swaps: Arc::from([(name(name_), name("b.tga"))]),

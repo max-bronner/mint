@@ -66,6 +66,20 @@ impl ModuleKind for WeaponSetUpgrade {
     fn on_upgrade_removed(&mut self, removed: &UpgradeMask) {
         self.mux.reset_if_triggered_by(removed);
     }
+
+    fn upgrade_removed_effects(
+        &self,
+        removed: &UpgradeMask,
+        entity: mint_sim::Entity,
+        mut effects: mint_sim::Effects<'_>,
+    ) {
+        if !self.mux.undone_by(removed) {
+            return;
+        }
+        if let Some(log) = effects.get::<crate::effects::EffectLog>() {
+            log.push(entity, Effect::ClearWeaponSetFlag(Name::clone(&self.flag)));
+        }
+    }
 }
 
 pub fn weapon_set_upgrade_from_fields(
@@ -155,5 +169,44 @@ mod tests {
             log.entries()[0].1,
             Effect::WeaponSetFlag(Name::from(DEFAULT_UPGRADE_FLAG))
         );
+    }
+
+    fn taken_back(extra: &[(&'static str, &'static str)]) -> Vec<Effect> {
+        let mut all = vec![
+            ("TriggeredBy", "1"),
+            ("WeaponCondition", "PLAYER_UPGRADE_2"),
+        ];
+        all.extend_from_slice(extra);
+        let mut module =
+            weapon_set_upgrade_from_fields(&TestFields(all.into_iter().collect()), Frame::ZERO)
+                .unwrap();
+        let mut removed = UpgradeMask::EMPTY;
+        removed.set(UpgradeBit::new(1));
+        let mut fire_log = EffectLog::new();
+        let mut ctx = mint_sim::UpgradeContext {
+            entity: mint_sim::World::new().spawn().unwrap(),
+            now: Frame::ZERO,
+            effects: mint_sim::Effects::into_sink(&mut fire_log),
+        };
+        module.attempt_upgrade(&removed, &mut ctx);
+        let mut log = EffectLog::new();
+        module.upgrade_removed_effects(
+            &removed,
+            mint_sim::World::new().spawn().unwrap(),
+            mint_sim::Effects::into_sink(&mut log),
+        );
+        log.entries()
+            .iter()
+            .map(|(_, effect)| effect.clone())
+            .collect()
+    }
+
+    #[test]
+    fn losing_the_trigger_undoes_a_non_permanent_weapon_set_upgrade() {
+        assert_eq!(
+            taken_back(&[]),
+            vec![Effect::ClearWeaponSetFlag(Name::from("PLAYER_UPGRADE_2"))]
+        );
+        assert!(taken_back(&[("Permanent", "Yes")]).is_empty());
     }
 }

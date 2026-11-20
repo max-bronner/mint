@@ -8,6 +8,7 @@ pub const AI_DATA_KEYWORD: &str = "AIData";
 pub const SIDE_INFO_KEYWORD: &str = "SideInfo";
 pub const SKIRMISH_AI_DATA_KEYWORD: &str = "SkirmishAIData";
 pub const DIFFICULTY_TUNING_KEYWORD: &str = "DifficultyTuning";
+pub const BRUTAL_DIFFICULTY_CHEATS_KEYWORD: &str = "BrutalDifficultyCheats";
 pub const COMBAT_CHAIN_DEFINITION_KEYWORD: &str = "CombatChainDefinition";
 
 const DIFFICULTY_NAMES: [&str; 4] = ["EASY", "NORMAL", "HARD", "BRUTAL"];
@@ -29,6 +30,119 @@ pub fn skirmish_special_power_activation_tuning(documents: &[Document]) -> [(i64
         }
     }
     rows
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrutalCheats {
+    pub build_cost_reduction: f32,
+    pub build_time_reduction: f32,
+}
+
+impl BrutalCheats {
+    pub const NONE: Self = Self {
+        build_cost_reduction: 0.0,
+        build_time_reduction: 0.0,
+    };
+}
+
+impl Default for BrutalCheats {
+    fn default() -> Self {
+        Self {
+            build_cost_reduction: 0.0,
+            build_time_reduction: 0.1,
+        }
+    }
+}
+
+#[must_use]
+pub fn brutal_difficulty_cheats(documents: &[Document]) -> BrutalCheats {
+    let mut cheats = BrutalCheats::default();
+    for ai_data in root_blocks(documents, SKIRMISH_AI_DATA_KEYWORD) {
+        for block in ai_data.blocks_named(BRUTAL_DIFFICULTY_CHEATS_KEYWORD) {
+            let percent = |keyword: &str, default: f32| {
+                block
+                    .field(keyword)
+                    .and_then(Field::value)
+                    .and_then(crate::value::parse_float)
+                    .map_or(default, |value| value * 0.01)
+            };
+            let defaults = BrutalCheats::default();
+            cheats = BrutalCheats {
+                build_cost_reduction: percent("BuildCostReduction", defaults.build_cost_reduction),
+                build_time_reduction: percent("BuildTimeReduction", defaults.build_time_reduction),
+            };
+        }
+    }
+    cheats
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetreatTuning {
+    pub farming_threshold: i32,
+    pub army_quality_bias: i32,
+    pub army_quantity_bias: i32,
+    pub hero_quality_bias: i32,
+    pub map_control_bias: i32,
+    pub base_strength_bias: i32,
+    pub ring_ownership_bias: i32,
+    pub frames_till_checks_start: i32,
+    pub frames_between_checks: i32,
+    pub frames_till_self_destruct: i32,
+    pub disable_tactical_ai: bool,
+}
+
+const RETREAT_INT_FIELDS: [&str; 10] = [
+    "FarmingThreshold",
+    "ArmyQualityBias",
+    "ArmyQuantityBias",
+    "HeroQualityBias",
+    "MapControlBias",
+    "BaseStrengthBias",
+    "RingOwnershipBias",
+    "LogicFramesTillRetreatChecksStart",
+    "LogicFrameBetweenRetreatChecks",
+    "LogicFramesTillAISelfDestructs",
+];
+
+pub fn wotr_retreat_tuning(documents: &[Document]) -> Result<Option<RetreatTuning>, String> {
+    let mut values = [0i32; 10];
+    let mut disable = false;
+    let mut seen = false;
+    for block in root_blocks(documents, SKIRMISH_AI_DATA_KEYWORD) {
+        for (slot, name) in values.iter_mut().zip(RETREAT_INT_FIELDS) {
+            let Some(field) = block.field(name) else {
+                continue;
+            };
+            *slot = field
+                .value()
+                .and_then(crate::value::parse_int)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| format!("SkirmishAIData {name}: not an Int"))?;
+            seen = true;
+        }
+        if let Some(field) = block.field("DisableTacticalAI") {
+            disable = field
+                .value()
+                .and_then(crate::value::parse_bool)
+                .ok_or_else(|| "SkirmishAIData DisableTacticalAI: not a Bool".to_owned())?;
+            seen = true;
+        }
+    }
+    let [farming_threshold, army_quality_bias, army_quantity_bias, hero_quality_bias, map_control_bias, base_strength_bias, ring_ownership_bias, frames_till_checks_start, frames_between_checks, frames_till_self_destruct] =
+        values;
+    Ok(seen.then_some(RetreatTuning {
+        farming_threshold,
+        army_quality_bias,
+        army_quantity_bias,
+        hero_quality_bias,
+        map_control_bias,
+        base_strength_bias,
+        ring_ownership_bias,
+        frames_till_checks_start,
+        frames_between_checks,
+        frames_till_self_destruct,
+        disable_tactical_ai: disable,
+    }))
 }
 
 #[must_use]
@@ -268,5 +382,26 @@ mod tests {
         let merged = merged_game_data(&[document]);
         assert_eq!(merged.field("SellPercentage").unwrap().value(), Some("50%"));
         assert!(merged.field("Wealthy").is_none());
+    }
+
+    #[test]
+    fn retreat_tuning_merges_later_writes_and_refuses_a_wrong_type() {
+        let first = parse(
+            "a.ini",
+            "SkirmishAIData\n  FarmingThreshold = -2\n  LogicFramesTillAISelfDestructs = 600\n  DisableTacticalAI = Yes\nEnd\n",
+        );
+        let second = parse(
+            "b.ini",
+            "SkirmishAIData\n  LogicFramesTillAISelfDestructs = 90\n  DisableTacticalAI = No\nEnd\n",
+        );
+        let tuning = wotr_retreat_tuning(&[first, second]).unwrap().unwrap();
+        assert_eq!(tuning.farming_threshold, -2);
+        assert_eq!(tuning.frames_till_self_destruct, 90);
+        assert!(!tuning.disable_tactical_ai);
+        let bad = parse("c.ini", "SkirmishAIData\n  FarmingThreshold = high\nEnd\n");
+        assert!(wotr_retreat_tuning(&[bad])
+            .unwrap_err()
+            .contains("FarmingThreshold"));
+        assert_eq!(wotr_retreat_tuning(&[]), Ok(None));
     }
 }

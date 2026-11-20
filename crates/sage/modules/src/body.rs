@@ -20,6 +20,25 @@ pub fn burning_death_from_fields(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BodyGrab {
+    pub object: Option<String>,
+    pub fx: Option<String>,
+    pub damage: f32,
+    pub offset: (f32, f32),
+}
+
+impl Default for BodyGrab {
+    fn default() -> Self {
+        Self {
+            object: None,
+            fx: None,
+            damage: 200.0,
+            offset: (0.0, 0.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DamageCreation {
     pub list: String,

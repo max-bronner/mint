@@ -1,6 +1,11 @@
 use super::*;
 
 #[test]
+fn rebuild_time_seconds_truncate_to_retail_frames_with_a_one_frame_floor() {
+    assert_eq!([0.3, 2.5, 0.0].map(rebuild_time_ticks), [6, 72, 6]);
+}
+
+#[test]
 fn retail_ini_order_never_loads_an_inc_fragment_directly() {
     let mut sources = MemorySources::new();
     sources.insert(
@@ -178,6 +183,21 @@ End
 ",
     );
     assert_eq!(data.builder_cycle_timeout_ms, SHIPPED_BUILDER_CYCLE_MS);
+}
+
+#[test]
+fn the_user_data_leaf_travels_in_the_parsed_data() {
+    let table = BlockTable::corpus_path();
+    let with = mint_sage_ini::Document::parse(
+        "gamedata.ini",
+        "GameData\n  UserDataLeafName = SomeLeaf\nEnd\n",
+        &table,
+    )
+    .unwrap();
+    let (data, _) = game_data_from_documents(&[with], 0, std::time::Instant::now());
+    assert_eq!(data.user_data_leaf.as_deref(), Some("SomeLeaf"));
+    let (without, _) = game_data_from_documents(&[], 0, std::time::Instant::now());
+    assert_eq!(without.user_data_leaf, None);
 }
 
 #[test]
@@ -466,4 +486,13 @@ fn parallel_document_read_equals_the_serial_read() {
         }
     }
     assert!(serial.last().is_some_and(Result::is_err));
+}
+
+#[test]
+fn unwritten_group_gate_distances_take_the_ai_data_constructor_values() {
+    let block = mint_sage_ini::game_data::merged_ai_data(&[]);
+    let game_data = mint_sage_ini::game_data::merged_game_data(&[]);
+    let read = read_group_formation(&block, &game_data, &mint_sage_ini::ValueErrors::new());
+    assert_eq!(read.min_distance_for_group, 100.0);
+    assert_eq!(read.formation_enemy_distance, 600.0);
 }

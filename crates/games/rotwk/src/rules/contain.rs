@@ -232,7 +232,219 @@ impl ContainDamageReactions {
     }
 }
 
+const PASSENGER_FIRE_DEPTH: u8 = 8;
+
+#[derive(Clone, Copy)]
+enum PassengerFire {
+    Open,
+    Horde,
+    Never,
+    Always,
+}
+
+impl PassengerFire {
+    fn of(module: &str) -> Option<Self> {
+        const OPEN: &[&str] = &[
+            "OpenContain",
+            "CaveContain",
+            "HealContain",
+            "TransportContain",
+            "HordeTransportContain",
+            "SiegeEngineContain",
+            "HordeSiegeEngineContain",
+            "RiderChangeContain",
+        ];
+        const ALWAYS: &[&str] = &[
+            "GarrisonContain",
+            "HordeGarrisonContain",
+            "TunnelContain",
+            "SlaughterHordeContain",
+            "CitadelSlaughterHordeContain",
+            "ProductionQueueHordeContain",
+        ];
+        const NEVER: &[&str] = &["HorseHordeContain", "AODHordeContain"];
+        let is = |names: &[&str]| names.iter().any(|name| name.eq_ignore_ascii_case(module));
+        if is(OPEN) {
+            Some(Self::Open)
+        } else if is(ALWAYS) {
+            Some(Self::Always)
+        } else if is(NEVER) {
+            Some(Self::Never)
+        } else if module.eq_ignore_ascii_case("HordeContain") {
+            Some(Self::Horde)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PassengerPick {
+    Nearest,
+    HordeMember,
+    NoRoll,
+}
+
+impl PassengerPick {
+    fn of(module: &str) -> Option<Self> {
+        const NEAREST: &[&str] = &[
+            "OpenContain",
+            "CaveContain",
+            "HealContain",
+            "TransportContain",
+            "GarrisonContain",
+            "SiegeEngineContain",
+            "RiderChangeContain",
+        ];
+        const HORDE_MEMBER: &[&str] = &[
+            "HordeTransportContain",
+            "HordeSiegeEngineContain",
+            "HordeGarrisonContain",
+            "TunnelContain",
+            "SlaughterHordeContain",
+            "CitadelSlaughterHordeContain",
+            "ProductionQueueHordeContain",
+        ];
+        const NO_ROLL: &[&str] = &["HordeContain", "AODHordeContain", "HorseHordeContain"];
+        let is = |names: &[&str]| names.iter().any(|name| name.eq_ignore_ascii_case(module));
+        if is(NEAREST) {
+            Some(Self::Nearest)
+        } else if is(HORDE_MEMBER) {
+            Some(Self::HordeMember)
+        } else if is(NO_ROLL) {
+            Some(Self::NoRoll)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BlowShield {
+    Always,
+    PlainVictim,
+    Forward,
+}
+
+impl BlowShield {
+    fn of(module: &str) -> Option<Self> {
+        const ALWAYS: &[&str] = &[
+            "OpenContain",
+            "GarrisonContain",
+            "TransportContain",
+            "HealContain",
+            "CaveContain",
+            "SiegeEngineContain",
+            "RiderChangeContain",
+        ];
+        const PLAIN: &[&str] = &[
+            "HordeGarrisonContain",
+            "HordeTransportContain",
+            "HordeSiegeEngineContain",
+            "TunnelContain",
+            "SlaughterHordeContain",
+            "CitadelSlaughterHordeContain",
+            "ProductionQueueHordeContain",
+        ];
+        const FORWARD: &[&str] = &["HordeContain", "HorseHordeContain", "AODHordeContain"];
+        let is = |names: &[&str]| names.iter().any(|name| name.eq_ignore_ascii_case(module));
+        if is(ALWAYS) {
+            Some(Self::Always)
+        } else if is(PLAIN) {
+            Some(Self::PlainVictim)
+        } else if is(FORWARD) {
+            Some(Self::Forward)
+        } else {
+            None
+        }
+    }
+}
+
 impl RotwkRules {
+    pub(super) fn container_shields(&self, world: &World, ids: Ids, victim: Entity) -> bool {
+        if self.has_kind_bit(world, ids, victim, "MINE") {
+            return false;
+        }
+        let plain = self.contain_view(world, victim).is_none();
+        let mut held = world.get(ids.contained, victim).map(|held| held.container);
+        for _ in 0..PASSENGER_FIRE_DEPTH {
+            let Some(container) = held else { return false };
+            let shield = world
+                .get(ids.kind, container)
+                .and_then(|kind| self.kinds.get(*kind))
+                .and_then(|entry| {
+                    entry
+                        .record
+                        .declared_modules
+                        .iter()
+                        .find_map(|module| BlowShield::of(&module.name))
+                });
+            match shield {
+                Some(BlowShield::Always) => return true,
+                Some(BlowShield::PlainVictim) => return plain,
+                Some(BlowShield::Forward) => {
+                    held = world.get(ids.contained, container).map(|up| up.container);
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    pub(super) fn remove_from_contain(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        victim: Entity,
+    ) -> Result<()> {
+        if let Some(mut held) = tick.state().get(ids.contained, victim).copied() {
+            held.leaves_at = tick.frame();
+            tick.state_mut().insert(ids.contained, victim, held)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn lets_passengers_fire(&self, world: &World, container: Entity) -> bool {
+        self.passengers_fire_within(world, container, PASSENGER_FIRE_DEPTH)
+    }
+
+    fn passengers_fire_within(&self, world: &World, container: Entity, depth: u8) -> bool {
+        let Some(ids) = self.ids else { return false };
+        let Some(class) = world
+            .get(ids.kind, container)
+            .and_then(|kind| self.kinds.get(*kind))
+            .and_then(|entry| {
+                entry
+                    .record
+                    .declared_modules
+                    .iter()
+                    .find_map(|module| PassengerFire::of(&module.name))
+            })
+        else {
+            return false;
+        };
+        let above = world
+            .get(ids.contained, container)
+            .map(|held| held.container);
+        let ask_above = || {
+            depth > 0
+                && above.is_some_and(|up| {
+                    self.passengers_fire_within(world, up, depth.saturating_sub(1))
+                })
+        };
+        match class {
+            PassengerFire::Always => true,
+            PassengerFire::Never => false,
+            PassengerFire::Horde => ask_above(),
+            PassengerFire::Open => {
+                self.contain_view(world, container).is_some_and(|view| {
+                    ContainStatus::from_names(view.open.status_of_contained())
+                        .has(ContainStatus::CAN_ATTACK)
+                }) && (above.is_none() || ask_above())
+            }
+        }
+    }
+
     pub(crate) fn contain_view<'a>(
         &self,
         world: &'a World,
@@ -452,7 +664,7 @@ impl RotwkRules {
         thresholds.rung(fraction) >= crate::combat::DamageRung::ReallyDamaged
     }
 
-    fn passes_passenger_filter(
+    pub(super) fn passes_passenger_filter(
         &self,
         world: &World,
         ids: Ids,
@@ -527,6 +739,7 @@ impl RotwkRules {
         self.move_to_exact_goal(tick, ids, player, entry)?;
         let since = tick.frame();
         for subject in &admitted {
+            self.order_ends_factory_exit(tick, ids, *subject)?;
             tick.state_mut().insert(
                 ids.entering,
                 *subject,
@@ -1117,17 +1330,14 @@ impl RotwkRules {
         container: Entity,
         entities: &[Entity],
     ) -> Result<()> {
-        let status_names = self
-            .contain_view(tick.state(), container)
-            .map(|view| view.open.status_of_contained().to_vec())
-            .unwrap_or_default();
-        let held = Contained {
-            container,
-            status: ContainStatus::from_names(&status_names),
-            leaves_at: Frame::FOREVER,
-            grabbed_at: None,
-        };
         for &entity in entities {
+            let status_names = self.status_of_passenger(tick.state(), ids, container, entity);
+            let held = Contained {
+                container,
+                status: ContainStatus::from_names(&status_names),
+                leaves_at: Frame::FOREVER,
+                grabbed_at: None,
+            };
             self.leave_flight(tick, ids, entity)?;
             tick.state_mut().insert(ids.contained, entity, held)?;
             tick.state_mut().remove(ids.entering, entity);
@@ -1136,19 +1346,37 @@ impl RotwkRules {
             tick.state_mut().remove(ids.ignored_obstacle, entity);
             tick.state_mut().remove(ids.attack_order, entity);
             tick.state_mut().remove(ids.ground_order, entity);
-        }
-        if !status_names.is_empty() {
-            let effect = Effect::StatusBits {
-                set: status_names.into(),
-                clear: names(Vec::new()),
-            };
-            let entries = entities
-                .iter()
-                .map(|entity| (*entity, effect.clone()))
-                .collect();
-            self.apply_effects(tick, ids, entries)?;
+            if !status_names.is_empty() {
+                let effect = Effect::StatusBits {
+                    set: status_names.into(),
+                    clear: names(Vec::new()),
+                };
+                self.apply_effects(tick, ids, vec![(entity, effect)])?;
+            }
         }
         Ok(())
+    }
+
+    fn status_of_passenger(
+        &self,
+        world: &World,
+        ids: Ids,
+        container: Entity,
+        passenger: Entity,
+    ) -> Vec<std::sync::Arc<str>> {
+        let crew = self
+            .modules
+            .as_ref()
+            .and_then(|wiring| wiring.siege_contain(world, container))
+            .filter(|module| {
+                self.passes_passenger_filter(world, ids, module.crew_filter(), passenger)
+            })
+            .map(|module| module.status_of_crew().to_vec());
+        crew.unwrap_or_else(|| {
+            self.contain_view(world, container)
+                .map(|view| view.open.status_of_contained().to_vec())
+                .unwrap_or_default()
+        })
     }
 
     pub(super) fn object_and_members(world: &World, ids: Ids, object: Entity) -> Vec<Entity> {
@@ -1634,6 +1862,9 @@ impl RotwkRules {
             Some(in_frame(body.0.position, body.0.facing, point))
         });
         let members = self.take_out(tick, ids, container, object)?;
+        if is_transport && self.exits_by_landing(tick.state(), ids, container) {
+            return self.leave_by_landing(tick, ids, container, object, &members);
+        }
         if let (Some(door), Some(point)) = (door, exit) {
             self.walk_out(tick, ids, container, object, &members, door, point)?;
         }
@@ -1732,11 +1963,11 @@ impl RotwkRules {
             tick.state_mut().insert(ids.passengers, container, list)?;
             self.garrison_follows_passengers(tick, ids, container)?;
         }
-        let status_names = self
-            .contain_view(tick.state(), container)
-            .map(|view| view.open.status_of_contained().to_vec())
-            .unwrap_or_default();
         let members = Self::object_and_members(tick.state(), ids, object);
+        let statuses: Vec<Vec<std::sync::Arc<str>>> = members
+            .iter()
+            .map(|entity| self.status_of_passenger(tick.state(), ids, container, *entity))
+            .collect();
         for entity in &members {
             tick.state_mut().remove(ids.contained, *entity);
             if tick.state_mut().remove(ids.entering, *entity).is_some() {
@@ -1768,12 +1999,16 @@ impl RotwkRules {
                 )
             })
             .collect();
-        if !status_names.is_empty() {
-            let effect = Effect::StatusBits {
-                set: names(Vec::new()),
-                clear: status_names.into(),
-            };
-            released.extend(members.iter().map(|entity| (*entity, effect.clone())));
+        for (entity, status_names) in members.iter().zip(statuses) {
+            if !status_names.is_empty() {
+                released.push((
+                    *entity,
+                    Effect::StatusBits {
+                        set: names(Vec::new()),
+                        clear: status_names.into(),
+                    },
+                ));
+            }
         }
         self.apply_effects(tick, ids, released)?;
         Ok(members)
@@ -1830,6 +2065,7 @@ impl RotwkRules {
                     route: Route {
                         points: vec![door, placed],
                         extra_distance: 0.0,
+                        unsearched: false,
                         portals: Vec::new(),
                     },
                     goal: placed,
@@ -1946,40 +2182,69 @@ impl RotwkRules {
         victim: Entity,
         remove_from_other: bool,
     ) -> Result<bool> {
-        if grabber == victim || !tick.state().is_live(victim) {
+        if !self.grab_accepts(tick.state(), ids, grabber, victim, remove_from_other) {
             return Ok(false);
         }
-        let held_by = tick
-            .state()
-            .get(ids.contained, victim)
-            .map(|held| held.container);
+        self.take_into(tick, ids, grabber, victim)?;
+        Ok(true)
+    }
+
+    pub(super) fn grab_accepts(
+        &self,
+        world: &World,
+        ids: Ids,
+        grabber: Entity,
+        victim: Entity,
+        remove_from_other: bool,
+    ) -> bool {
+        if grabber == victim || !world.is_live(victim) {
+            return false;
+        }
+        let held_by = world.get(ids.contained, victim).map(|held| held.container);
         if held_by == Some(grabber) || (held_by.is_some() && !remove_from_other) {
-            return Ok(false);
+            return false;
         }
+        let grabs_structures = self
+            .modules
+            .as_ref()
+            .and_then(|wiring| wiring.transport_view(world, grabber))
+            .and_then(|module| module.grab())
+            .is_some_and(|grab| grab.structures);
+        let is_structure = world
+            .get(ids.kind, victim)
+            .and_then(|kind| self.kinds.get(*kind))
+            .is_some_and(|entry| entry.record.has_kind("STRUCTURE"));
+        if is_structure && !grabs_structures {
+            return false;
+        }
+        let Some(owner) = world.get(ids.owner, victim).map(|held| held.0) else {
+            return false;
+        };
+        self.contain_admits(world, ids, owner, grabber, victim)
+            .is_ok()
+    }
+
+    pub(super) fn take_into(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        grabber: Entity,
+        victim: Entity,
+    ) -> Result<()> {
+        let Some(owner) = tick.state().get(ids.owner, victim).map(|held| held.0) else {
+            return Ok(());
+        };
         let grab = self
             .modules
             .as_ref()
             .and_then(|wiring| wiring.transport_view(tick.state(), grabber))
             .and_then(|module| module.grab())
-            .map(|grab| (grab.weapon.clone(), grab.structures, grab.on_victim));
-        let is_structure = tick
+            .map(|grab| (grab.weapon.clone(), grab.on_victim));
+        if let Some(container) = tick
             .state()
-            .get(ids.kind, victim)
-            .and_then(|kind| self.kinds.get(*kind))
-            .is_some_and(|entry| entry.record.has_kind("STRUCTURE"));
-        if is_structure && !grab.as_ref().is_some_and(|(_, structures, _)| *structures) {
-            return Ok(false);
-        }
-        let Some(owner) = tick.state().get(ids.owner, victim).map(|held| held.0) else {
-            return Ok(false);
-        };
-        if self
-            .contain_admits(tick.state(), ids, owner, grabber, victim)
-            .is_err()
+            .get(ids.contained, victim)
+            .map(|held| held.container)
         {
-            return Ok(false);
-        }
-        if let Some(container) = held_by {
             self.release_one(tick, ids, container, victim)?;
         }
         self.leave_horde(tick, ids, victim)?;
@@ -2002,7 +2267,7 @@ impl RotwkRules {
             grab.as_ref()
                 .map_or_else(String::new, |(weapon, ..)| format!(" and fires {weapon}"))
         );
-        if let Some((weapon, _, on_victim)) = grab {
+        if let Some((weapon, on_victim)) = grab {
             let at = if on_victim {
                 mint_sage_modules::effects::PowerPlace::Object(victim)
             } else {
@@ -2020,8 +2285,7 @@ impl RotwkRules {
                 },
             ));
         }
-        self.apply_effects(tick, ids, effects)?;
-        Ok(true)
+        self.apply_effects(tick, ids, effects)
     }
 
     fn leave_horde(&self, tick: &mut Tick<'_>, ids: Ids, member: Entity) -> Result<()> {
@@ -2415,7 +2679,46 @@ impl RotwkRules {
         ids: Ids,
         container: Entity,
     ) -> Option<Entity> {
-        world.get(ids.passengers, container)?.0.first().copied()
+        let pick = world
+            .get(ids.kind, container)
+            .and_then(|kind| self.kinds.get(*kind))
+            .and_then(|entry| {
+                entry
+                    .record
+                    .declared_modules
+                    .iter()
+                    .find_map(|module| PassengerPick::of(&module.name))
+            })
+            .unwrap_or(PassengerPick::Nearest);
+        let list = world.get(ids.passengers, container)?;
+        let at = world.get(ids.body, container)?.0.position;
+        let candidates: Vec<Entity> = match pick {
+            PassengerPick::NoRoll => return None,
+            PassengerPick::Nearest => list.0.clone(),
+            PassengerPick::HordeMember => list
+                .0
+                .iter()
+                .filter_map(|held| world.get(ids.horde, *held))
+                .flat_map(|horde| horde.members.iter().copied())
+                .filter(|member| !self.plainly_hidden(world, ids, *member))
+                .collect(),
+        };
+        let mut best: Option<(Entity, f32)> = None;
+        for held in candidates {
+            let Some(body) = world.get(ids.body, held) else {
+                continue;
+            };
+            let (dx, dy) = (body.0.position.x - at.x, body.0.position.y - at.y);
+            let distance = dx * dx + dy * dy;
+            if best.is_none_or(|(_, nearest)| distance < nearest) {
+                best = Some((held, distance));
+            }
+        }
+        best.map(|(entity, _)| entity)
+    }
+
+    fn plainly_hidden(&self, world: &World, ids: Ids, member: Entity) -> bool {
+        world.contains(ids.concealed, member)
     }
 
     pub(super) fn react_evacuate_damage(

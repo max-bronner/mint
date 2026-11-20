@@ -275,6 +275,7 @@ impl ComboView {
             selected: self.selected,
             scroll_bar: Some(needs_scroll_bar(self.content.items.len(), self.max_display)),
             text_inset: 0.0,
+            scroll_to_top: false,
         }
     }
 

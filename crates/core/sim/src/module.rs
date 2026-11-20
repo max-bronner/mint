@@ -181,10 +181,35 @@ impl Component for ModuleDeclarations {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Suspensions(Vec<(Entity, u32)>);
+
+impl Suspensions {
+    #[must_use]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (Entity, u32)>) -> Self {
+        let mut held: Vec<(Entity, u32)> =
+            pairs.into_iter().filter(|(_, bits)| *bits != 0).collect();
+        held.sort_unstable_by_key(|(entity, _)| *entity);
+        held.dedup_by_key(|(entity, _)| *entity);
+        Self(held)
+    }
+
+    #[must_use]
+    pub fn classes_of(&self, entity: Entity) -> Option<u32> {
+        let at = self
+            .0
+            .binary_search_by_key(&entity, |(held, _)| *held)
+            .ok()?;
+        self.0.get(at).map(|(_, bits)| *bits)
+    }
+}
+
 pub trait ModuleKind: Component {
     const CAPABILITIES: CapabilityMask;
 
     const PHASE: Phase = Phase::Normal;
+
+    const UPDATES_UNDER: u32 = u32::MAX;
 
     fn update(&mut self, ctx: &mut UpdateContext<'_>) -> Sleep {
         let _ = ctx;
@@ -763,11 +788,18 @@ impl<T: ModuleKind> ErasedModule for Descriptor<T> {
         if !T::CAPABILITIES.contains(Capability::Update) {
             return;
         }
+        let suspensions = reads.get::<Suspensions>();
         let Some(store) = world.store_mut(self.component) else {
             return;
         };
         let due = |column: &ModuleColumn<T>| column.0.iter().any(|slot| slot.wake <= now);
         for (entity, column) in store.iter_mut_where(due) {
+            let suspended = suspensions
+                .and_then(|held| held.classes_of(entity))
+                .is_some_and(|classes| classes & T::UPDATES_UNDER == 0);
+            if suspended {
+                continue;
+            }
             for (index, slot) in column.0.iter_mut().enumerate() {
                 if slot.wake > now {
                     continue;

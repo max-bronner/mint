@@ -15,6 +15,8 @@ pub const CAMERA_SHAKER_VOLUME_KEYWORD: &str = "CameraShakerVolume";
 
 pub const EVA_EVENT_KEYWORD: &str = "EvaEvent";
 
+pub const DYNAMIC_DECAL_KEYWORD: &str = "DynamicDecal";
+
 pub const PARTICLE_DOCUMENTS: [&str; 5] = [
     "data/ini/fxparticlesystem.ini",
     "data/ini/fxparticlesystemcustom.ini",
@@ -22,6 +24,8 @@ pub const PARTICLE_DOCUMENTS: [&str; 5] = [
     "data/ini/fxlist.ini",
     "data/ini/default/fxlist.ini",
 ];
+
+pub const DEFINE_DOCUMENTS: [&str; 1] = ["data/ini/gamedata.ini"];
 
 pub const MODULE_SLOTS: [&str; 11] = [
     "System",
@@ -284,6 +288,7 @@ pub enum EmissionVolume {
         radius: f32,
         length: f32,
         offset: [f32; 3],
+        radius_rate: f32,
         hollow: bool,
     },
     Lightning {
@@ -625,9 +630,7 @@ pub struct FxParticleNugget {
     pub target_offset: [f32; 3],
 }
 
-pub const FX_DELAY_HZ: f32 = 30.0;
-
-const MILLIS_PER_SECOND: f32 = 1000.0;
+pub const FX_DELAY_FRAMES_PER_MS: f32 = 0.005;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FxNugget {
@@ -638,6 +641,93 @@ pub struct FxNugget {
     pub at_bone_pos: Option<FxAtBonePos>,
     pub camera_shaker: Option<CameraShakerVolume>,
     pub eva_event: Option<FxEvaEvent>,
+    pub dynamic_decal: Option<FxDynamicDecal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecalShader {
+    #[default]
+    Alpha,
+    Additive,
+    Subtract,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FxDynamicDecal {
+    pub texture: String,
+    pub shader: DecalShader,
+    pub size: f32,
+    pub color: [f32; 3],
+    pub offset: [f32; 2],
+    pub orient_to_object: bool,
+    pub opacity: [i64; 3],
+    pub fade_ms: [f32; 3],
+    pub starting_delay_ms: f32,
+    pub lifetime_ms: f32,
+}
+
+fn read_dynamic_decal(
+    block: &Block,
+    refusals: Refusals<'_>,
+    macros: &crate::value::MacroTable,
+) -> FxDynamicDecal {
+    let scalar = |keyword: &str| -> f32 {
+        let Some(field) = block.field(keyword) else {
+            return 0.0;
+        };
+        match field
+            .value()
+            .and_then(|token| crate::value::parse_float_or_macro(token, macros))
+        {
+            Some(value) => value,
+            None => {
+                refusals.field(field, "a number");
+                0.0
+            }
+        }
+    };
+    let shader = match block.field("Shader") {
+        None => DecalShader::Alpha,
+        Some(field) => match field.value().map(str::to_ascii_uppercase).as_deref() {
+            Some("ALPHA") => DecalShader::Alpha,
+            Some("ADDITIVE") => DecalShader::Additive,
+            Some("SUBTRACT") => DecalShader::Subtract,
+            _ => {
+                refusals.field(field, "ALPHA, ADDITIVE or SUBTRACT");
+                DecalShader::Alpha
+            }
+        },
+    };
+    let int = |keyword: &str| -> i64 {
+        let Some(field) = block.field(keyword) else {
+            return 0;
+        };
+        match field.value().and_then(crate::value::parse_int) {
+            Some(value) => value,
+            None => {
+                refusals.field(field, "an integer");
+                0
+            }
+        }
+    };
+    let [r, g, b] = refused_coord(block, "Color", refusals);
+    let [x, y, _] = refused_coord(block, "Offset", refusals);
+    FxDynamicDecal {
+        texture: name_field(block, "DecalName").unwrap_or_default(),
+        shader,
+        size: scalar("Size"),
+        color: [r, g, b],
+        offset: [x, y],
+        orient_to_object: flag_field_default(block, "OrientToObject", true),
+        opacity: [int("OpacityStart"), int("OpacityPeak"), int("OpacityEnd")],
+        fade_ms: [
+            scalar("OpacityFadeTimeOne"),
+            scalar("OpacityPeakTime"),
+            scalar("OpacityFadeTimeTwo"),
+        ],
+        starting_delay_ms: scalar("StartingDelay"),
+        lifetime_ms: scalar("Lifetime"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -840,7 +930,7 @@ fn delay_frames(millis: RandomRange) -> RandomRange {
         if !value.is_finite() {
             return 0.0;
         }
-        (value / MILLIS_PER_SECOND * FX_DELAY_HZ).max(0.0).ceil()
+        (value * FX_DELAY_FRAMES_PER_MS).max(0.0).ceil()
     };
     RandomRange {
         low: to_frames(millis.low),
@@ -875,6 +965,39 @@ impl ParticleIndex {
 
     pub fn insert_document(&mut self, document: &Document) {
         for block in document.roots() {
+            self.insert_block(block);
+        }
+    }
+
+    pub fn insert_override_document(&mut self, globals: &[Document], map: &Document) {
+        let is_system = |block: &Block| {
+            block.keyword.eq(FX_PARTICLE_SYSTEM_KEYWORD)
+                || block.keyword.eq(PARTICLE_SYSTEM_KEYWORD)
+        };
+        let mut bases: BTreeMap<String, &Block> = BTreeMap::new();
+        for block in globals
+            .iter()
+            .flat_map(Document::roots)
+            .filter(|block| is_system(block))
+        {
+            if let Some(name) = block.name() {
+                bases.insert(name.to_ascii_lowercase(), block);
+            }
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut laid: BTreeMap<String, Block> = BTreeMap::new();
+        for block in map.roots().iter().filter(|block| is_system(block)) {
+            let Some(name) = block.name() else { continue };
+            let key = name.to_ascii_lowercase();
+            let next = match laid.get(&key).or_else(|| bases.get(&key).copied()) {
+                Some(base) => base.overlaid(block),
+                None => block.clone(),
+            };
+            if laid.insert(key.clone(), next).is_none() {
+                order.push(key);
+            }
+        }
+        for block in order.iter().filter_map(|key| laid.get(key)) {
             self.insert_block(block);
         }
     }
@@ -976,11 +1099,16 @@ impl ParticleIndex {
 pub struct FxListIndex {
     lists: BTreeMap<String, FxList>,
     errors: ValueErrors,
+    macros: crate::value::MacroTable,
     definitions: usize,
     redefinitions: usize,
 }
 
 impl FxListIndex {
+    pub fn insert_defines(&mut self, defines: &[crate::tree::Define]) {
+        self.macros.insert_defines(defines);
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1043,6 +1171,16 @@ impl FxListIndex {
                         .keyword
                         .eq(EVA_EVENT_KEYWORD)
                         .then(|| read_eva_event(nugget)),
+                    dynamic_decal: nugget.keyword.eq(DYNAMIC_DECAL_KEYWORD).then(|| {
+                        read_dynamic_decal(
+                            nugget,
+                            Refusals {
+                                errors: &self.errors,
+                                context: name,
+                            },
+                            &self.macros,
+                        )
+                    }),
                 })
                 .collect(),
             particle_sys_bones: block
@@ -1381,6 +1519,7 @@ fn read_volume(block: &Block, module: &str, refusals: Refusals<'_>) -> EmissionV
             radius: refused_scalar(block, "Radius", refusals),
             length: refused_scalar(block, "Length", refusals),
             offset: refused_coord(block, "Offset", refusals),
+            radius_rate: refused_scalar(block, "RadiusRate", refusals),
             hollow: hollow(),
         }
     } else if module.eq("LightningEmission") {
@@ -1538,6 +1677,7 @@ fn read_flat_emitter(block: &Block, definition: &mut ParticleSystemDef, refusals
             radius: refused_scalar(block, "VolCylinderRadius", refusals),
             length: refused_scalar(block, "VolCylinderLength", refusals),
             offset: [0.0; 3],
+            radius_rate: 0.0,
             hollow,
         },
         other => EmissionVolume::Unread {

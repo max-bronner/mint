@@ -187,7 +187,8 @@ fn duration(
     fields: &dyn ModuleFieldSource,
     keyword: &str,
 ) -> Result<Option<LogicFrames>, FieldError> {
-    Ok(number(fields, keyword)?.map(|ms| LogicFrames::from_milliseconds(milliseconds(ms))))
+    Ok(number(fields, keyword)?
+        .map(|ms| crate::special_ability_update::retail_duration_ticks(milliseconds(ms))))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -236,7 +237,10 @@ mod tests {
             Frame::ZERO,
         )
         .unwrap();
-        assert_eq!(read.stealth_delay(), LogicFrames::from_milliseconds(500));
+        assert_eq!(
+            read.stealth_delay(),
+            crate::special_ability_update::retail_duration_ticks(500)
+        );
         assert_eq!(
             read.forbidden(),
             [StealthCondition::AwayFromTrees, StealthCondition::Attacking]

@@ -214,7 +214,9 @@ impl Game {
         if let Some(name) = text.strip_prefix("team ") {
             return Ok(DebugTarget::Team(name.trim().to_owned()));
         }
+        let rules = self.state.simulation.rules();
         if let Some(side) = text.strip_prefix("player ") {
+            rules.seated_side(side.trim())?;
             return Ok(DebugTarget::Player(side.trim().to_owned()));
         }
         if let Some(rest) = text.strip_prefix("kind ") {
@@ -222,6 +224,9 @@ impl Game {
                 Some((name, side)) => (name.trim(), Some(side.trim().to_owned())),
                 None => (rest.trim(), None),
             };
+            if let Some(side) = &side {
+                rules.seated_side(side)?;
+            }
             let kind = self
                 .state
                 .kinds
@@ -309,6 +314,34 @@ impl Game {
             .filter_map(|h| world.get(ids.horde, *h))
             .flat_map(|h| h.members.iter().copied())
             .collect()
+    }
+
+    pub(crate) fn pending_commands_for_script(&self) -> usize {
+        self.state.simulation.pending_commands()
+    }
+
+    fn nearest_tree_for_script(&self, argument: &str) -> Result<String, String> {
+        let (x, y) = self.place_for_script(if argument.trim().is_empty() {
+            "here"
+        } else {
+            argument
+        })?;
+        let ids = self.state.simulation.rules().ids().ok_or("no match")?;
+        let world = self.state.simulation.state();
+        let forest = crate::forest::singleton_of(world, ids.forest)
+            .and_then(|entity| world.get(ids.forest, entity))
+            .ok_or("this match has no forest")?;
+        let from = Vec2::new(x, y);
+        let tree = forest
+            .find_closest(from, 5000.0, true, crate::forest::TreeQuery::Grabbable)
+            .and_then(|handle| forest.tree(handle))
+            .ok_or("no grabbable tree within 5000")?;
+        Ok(format!(
+            "nearest grabbable tree at ({:.0}, {:.0}), {:.0} from ({x:.0}, {y:.0})",
+            tree.pos.x,
+            tree.pos.y,
+            tree.pos.minus(from).length()
+        ))
     }
 
     fn command_bar_report_for_script(&self) -> String {
@@ -873,6 +906,21 @@ impl Game {
         )
     }
 
+    pub(crate) fn panel_closed_for_script(&self, name: &str) -> Result<String, String> {
+        let panel = crate::rules::UiPanel::from_name(name)
+            .ok_or_else(|| format!("closed: {name:?} names no panel"))?;
+        let tick = self.sim_frame();
+        if self.state.simulation.rules().ui_panel_open(
+            self.state.simulation.state(),
+            self.acting_player,
+            panel,
+        ) {
+            Err(format!("{panel:?} open at tick {tick}"))
+        } else {
+            Ok(format!("at tick {tick}"))
+        }
+    }
+
     pub(crate) fn act_for_script(&mut self, action: &str) -> Result<String, String> {
         self.ensure_snapshot();
         let (verb, argument) = action.split_once(' ').unwrap_or((action, ""));
@@ -1144,6 +1192,24 @@ impl Game {
                 ))
             }
             "bar" => Ok(self.command_bar_report_for_script()),
+            "parts" => Ok(self
+                .state
+                .units
+                .part_lines()
+                .into_iter()
+                .filter(|line| {
+                    let name = argument.trim();
+                    let template = line.split_once(" x ").map_or("", |(_, rest)| rest);
+                    let template = template.split_once(':').map_or(template, |(head, _)| head);
+                    name.is_empty()
+                        || template.eq_ignore_ascii_case(name)
+                        || template
+                            .split_once('/')
+                            .is_some_and(|(head, _)| head.eq_ignore_ascii_case(name))
+                })
+                .collect::<Vec<_>>()
+                .join("; ")),
+            "trees" => self.nearest_tree_for_script(argument),
             "spells" => Ok(self.spell_bar_report_for_script()),
             "rank" => Ok(self.rank_ui_report_for_script()),
             "owners" => Ok(self.map_owner_report_for_script()),
@@ -1211,6 +1277,12 @@ impl Game {
                     .chain(bar.radial.iter().map(|(_, slot)| slot))
                     .find(|slot| slot.command_button.eq_ignore_ascii_case(argument))
                     .ok_or_else(|| format!("do press: no shown button {argument:?}"))?;
+                if !slot.enabled {
+                    return Ok(format!(
+                        "not pressed: {argument} is {:?}",
+                        slot.availability
+                    ));
+                }
                 let action = slot.action.clone();
                 self.slot_action(action);
                 Ok(format!("pressed {argument}"))

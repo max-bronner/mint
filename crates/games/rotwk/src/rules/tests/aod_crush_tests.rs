@@ -23,7 +23,7 @@ Object Shed\n  Side = Wild\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
 Object Spark\n  Side = Wild\n  KindOf = INERT IMMOBILE UNATTACKABLE\n  \
   Body = ActiveBody Tag_Body\n    MaxHealth = 1\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 2\n  GeometryHeight = 2\nEnd\n\
-ObjectCreationList OCL_CrushSpark\n  CreateObject\n    ObjectNames = Spark\n  End\nEnd\n\
+ObjectCreationList OCL_CrushSpark\n  CreateObject\n    ObjectNames = Spark\n    Disposition = LIKE_EXISTING\n  End\nEnd\n\
 CommandSet GhostSet\n  1 = Buy_Oath\nEnd\n\
 CommandButton Buy_Oath\n  Command = OBJECT_UPGRADE\n  Upgrade = Upgrade_Oath\nEnd\n\
 Upgrade Upgrade_Oath\n  Type = OBJECT\n  BuildCost = 0\n  BuildTime = 1\nEnd\n";
@@ -161,7 +161,7 @@ fn the_attack_look_ends_two_seconds_after_the_last_touch() {
         firing(&simulation),
         "the first touch starts the attack look"
     );
-    for _ in 0..LogicFrames::from_milliseconds(3_000).get() {
+    for _ in 0..LogicFrames::from_engine_milliseconds(3_000).get() {
         simulation.tick().unwrap();
     }
     assert!(

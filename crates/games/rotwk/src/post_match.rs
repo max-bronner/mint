@@ -202,7 +202,10 @@ fn counted(count: u32, plural: &str, single: &str) -> String {
     if count == 1 {
         single.to_owned()
     } else {
-        plural.replace("%d", &count.to_string())
+        mint_sage_str::format_placeholder(
+            plural,
+            mint_sage_str::Placeholder::Str(&count.to_string()),
+        )
     }
 }
 
@@ -427,8 +430,24 @@ impl MatchSummary {
             selected: None,
             scroll_bar: None,
             text_inset_percent: 0,
+            scroll_to_top: false,
         }
     }
+}
+
+pub(crate) fn campaign_figures(figures: &[PlayerFigures], victory: bool) -> Vec<PlayerFigures> {
+    figures
+        .iter()
+        .filter(|f| f.player == crate::game::LOCAL_PLAYER)
+        .map(|f| PlayerFigures {
+            status: if victory {
+                EndStatus::Victorious
+            } else {
+                EndStatus::Defeated
+            },
+            ..f.clone()
+        })
+        .collect()
 }
 
 #[cfg(test)]

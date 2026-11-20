@@ -51,7 +51,7 @@ pub(super) const TICKS_PER_FRAME: u32 = mint_sim::SIMULATION_HZ / crate::game_da
 
 const CHEER_PULSE_FRAMES: u32 = 10;
 
-const HERO_CHEER_COOLDOWN: LogicFrames = LogicFrames::from_milliseconds(60_000);
+const HERO_CHEER_COOLDOWN: LogicFrames = LogicFrames::from_engine_milliseconds(60_000);
 
 const RESIST_IMMUNE: f32 = 0.5;
 
@@ -63,6 +63,7 @@ pub(super) struct Pulse<'a> {
     pub(super) kind: EmotionType,
     pub(super) filter: &'a crate::defeat::ObjectFilter,
     pub(super) lasts: LogicFrames,
+    pub(super) enemies_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -385,6 +386,7 @@ impl RotwkRules {
             kind,
             filter,
             lasts,
+            enemies_only,
         } = pulse;
         let Some(wiring) = self.modules.as_ref() else {
             return Ok(());
@@ -438,6 +440,15 @@ impl RotwkRules {
                 else {
                     return false;
                 };
+                if enemies_only {
+                    if let (Some(caster), Some(other)) =
+                        (caster, Self::controller_of(world, ids, body))
+                    {
+                        if !super::spell_effects::standing(self, caster, Some(other)).2 {
+                            return false;
+                        }
+                    }
+                }
                 if !filter.passes(&record.kind_of, &record.name) {
                     return false;
                 }
@@ -525,13 +536,14 @@ impl RotwkRules {
                     kind: EmotionType::Cheer,
                     filter: &filter,
                     lasts,
+                    enemies_only: false,
                 },
             )?;
         }
         Ok(())
     }
 
-    fn is_gone(&self, world: &World, ids: Ids, entity: Entity) -> bool {
+    pub(super) fn is_gone(&self, world: &World, ids: Ids, entity: Entity) -> bool {
         world.contains(ids.doomed, entity)
             || !world.contains(ids.body, entity)
             || world
@@ -648,7 +660,9 @@ impl RotwkRules {
         let surroundings = self.surroundings(tick, ids, living);
         let mut effects: Vec<(Entity, Effect)> = Vec::new();
         for entity in trackers {
-            if self.is_gone(tick.state(), ids, entity) {
+            if self.is_gone(tick.state(), ids, entity)
+                || self.ai_disabled(tick.state(), ids, entity, now)
+            {
                 continue;
             }
             let phase = now.get().wrapping_add(u64::from(entity.index()));
@@ -945,6 +959,7 @@ impl RotwkRules {
             return None;
         }
         let own_radius = Self::mover_radius(tick, ids, entity);
+        let grid_extent = self.passability.grid.extent();
         let enemy = Standing {
             same_player: false,
             allied: false,
@@ -954,6 +969,10 @@ impl RotwkRules {
             let (dx, dy) = (foe.position.x - position.x, foe.position.y - position.y);
             let gap = ((dx * dx + dy * dy).sqrt() - own_radius - foe.radius).max(0.0);
             gap * gap
+        };
+        let centre_squared = |foe: &Foe| {
+            let (dx, dy) = (foe.position.x - position.x, foe.position.y - position.y);
+            dx * dx + dy * dy
         };
         let candidate = |index: u32| -> Option<&(Foe, PlayerId)> {
             let (foe, _) = living.get(usize::try_from(index).ok()?)?;
@@ -966,7 +985,8 @@ impl RotwkRules {
             let record = &self.kinds.get(*world.get(ids.kind, foe.entity)?)?.record;
             let admitted = !taunt_excluded(tracker, enemy, &record.kind_of, &record.name)
                 && self.sees(world, ids, owner, foe.entity)
-                && gap_squared(foe) <= reach * reach
+                && centre_squared(foe) <= reach * reach
+                && !self.taunt_wall_blocked(world, ids, grid_extent, position, foe)
                 && [EmotionType::Taunt, EmotionType::Point]
                     .into_iter()
                     .any(|kind| {
@@ -985,7 +1005,8 @@ impl RotwkRules {
                 .then(|| living.get(usize::try_from(index).ok()?))
                 .flatten()
         };
-        let passing = |index: u32| candidate(index).map(|(foe, _)| (gap_squared(foe), foe.entity));
+        let passing =
+            |index: u32| candidate(index).map(|(foe, _)| (centre_squared(foe), foe.entity));
         let nearest =
             super::auto_cast::nearest_by_expanding_scan(position, grid, 0.0, reach, 1, passing)??;
         let at = living
@@ -998,6 +1019,49 @@ impl RotwkRules {
             gap_squared(foe),
             points_at(tracker, enemy, &record.kind_of, &record.name),
         ))
+    }
+
+    fn taunt_wall_blocked(
+        &self,
+        world: &World,
+        ids: Ids,
+        extent: mint_movement::GridExtent,
+        from: Vec2,
+        foe: &Foe,
+    ) -> bool {
+        let Some(walls) = crate::wall_layer::layer_of(world, ids.wall_layer) else {
+            return false;
+        };
+        let geometry = self.passability.geometry;
+        let cell = |point: Vec2| geometry.cell_at(point, 0, extent);
+        let tag = |cell: Option<mint_movement::Cell>| cell.map(|cell| walls.tag_at(extent, cell));
+        let (from_cell, foe_cell) = (cell(from), cell(foe.position));
+        if tag(foe_cell).is_some_and(crate::wall_layer::Layer::is_wall_top) {
+            return true;
+        }
+        let scanner_on_wall = tag(from_cell).is_some_and(crate::wall_layer::Layer::is_wall_top);
+        let foe_on_ground = world
+            .get(ids.layer, foe.entity)
+            .is_none_or(|layer| *layer == crate::wall_layer::Layer::GROUND);
+        let (Some(from_cell), Some(foe_cell)) = (from_cell, foe_cell) else {
+            return false;
+        };
+        !scanner_on_wall
+            && foe_on_ground
+            && !ground_line_clear(
+                (i32::from(from_cell.x), i32::from(from_cell.y)),
+                (i32::from(foe_cell.x), i32::from(foe_cell.y)),
+                |(x, y)| {
+                    let cell = u16::try_from(x)
+                        .ok()
+                        .zip(u16::try_from(y).ok())
+                        .map(|(x, y)| mint_movement::Cell::new(x, y))
+                        .filter(|cell| extent.index(*cell).is_some());
+                    cell.is_none_or(|cell| {
+                        walls.tag_at(extent, cell) == crate::wall_layer::Layer::GROUND
+                    })
+                },
+            )
     }
 
     pub(super) fn using_ability(&self, world: &World, ids: Ids, entity: Entity) -> bool {
@@ -1333,8 +1397,10 @@ impl RotwkRules {
         tick.state_mut().insert(ids.emotion, entity, emotion)?;
         if let Some(state) = nugget.ai_state {
             if state != EmotionAiState::AvoidScarer {
-                let goal =
-                    cause.or_else(|| matches!(state, EmotionAiState::Idle).then_some(entity));
+                let goal = cause.or_else(|| {
+                    matches!(state, EmotionAiState::Idle | EmotionAiState::Quarrel)
+                        .then_some(entity)
+                });
                 if let Some(goal) = goal {
                     self.enter_emotion_state(tick, ids, entity, state, goal, 0.0, effects)?;
                 }
@@ -1451,20 +1517,8 @@ impl RotwkRules {
             diag!("emotion: ModifierList {list} is not declared");
             return Ok(());
         };
-        let mut timed = tick
-            .state()
-            .get(ids.timed_modifiers, entity)
-            .cloned()
-            .unwrap_or_default();
-        if timed.give(id, until) {
-            tick.state_mut()
-                .insert(ids.timed_modifiers, entity, timed)?;
-            self.gain_power_list(tick, ids, entity, id)?;
-        } else {
-            tick.state_mut()
-                .insert(ids.timed_modifiers, entity, timed)?;
-        }
-        self.recompute_bonuses(tick, ids, entity)
+        self.give_timed_list(tick, ids, entity, id, until)?;
+        Ok(())
     }
 
     pub(super) fn deactivate(
@@ -1540,10 +1594,7 @@ impl RotwkRules {
                 .as_deref()
                 .and_then(|list| self.combat.modifiers.id(list))
             {
-                if let Some(timed) = tick.state_mut().get_mut(ids.timed_modifiers, entity) {
-                    timed.0.retain(|(held, _)| *held != id);
-                }
-                self.recompute_bonuses(tick, ids, entity)?;
+                self.remove_timed_list(tick, ids, entity, id)?;
             }
         }
         diag!(
@@ -1581,6 +1632,27 @@ impl RotwkRules {
             ));
         }
     }
+}
+
+pub(super) fn ground_line_clear(
+    from: (i32, i32),
+    to: (i32, i32),
+    ground: impl Fn((i32, i32)) -> bool,
+) -> bool {
+    let (dx, dy) = (to.0.saturating_sub(from.0), to.1.saturating_sub(from.1));
+    let steps = dx.abs().max(dy.abs());
+    (0..=steps).all(|step| {
+        let along = |delta: i32, origin: i32| {
+            if steps == 0 {
+                origin
+            } else {
+                let scaled = i64::from(delta) * i64::from(step) * 2 + i64::from(steps);
+                let rounded = scaled.div_euclid(i64::from(steps) * 2);
+                origin.saturating_add(i32::try_from(rounded).unwrap_or(0))
+            }
+        };
+        ground((along(dx, from.0), along(dy, from.1)))
+    })
 }
 
 fn set_flag(table: &mut EmotionTable, kind: u8, on: bool) {

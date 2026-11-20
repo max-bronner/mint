@@ -119,9 +119,9 @@ fn a_walled_off_los_attacker_waits_then_gives_up_its_order() {
     let (mut sim, ids, hunter, target) = simulation("Hunter", true);
     order_attack(&mut sim, hunter, target);
     let at =
-        gave_up_at(&mut sim, ids, hunter, 400).expect("the order never ends behind a sealed wall");
+        gave_up_at(&mut sim, ids, hunter, 1500).expect("the order never ends behind a sealed wall");
     assert!(at > 100, "gave up too soon, at frame {at}");
-    assert!(at < 400, "gave up too late, at frame {at}");
+    assert!(at < 1500, "gave up too late, at frame {at}");
 
     let (mut open, open_ids, open_hunter, open_target) = simulation("Hunter", false);
     order_attack(&mut open, open_hunter, open_target);

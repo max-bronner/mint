@@ -1,5 +1,5 @@
 use mint_movement::{Facing, Vec2};
-use mint_sage_economy::ItemId;
+use mint_sage_economy::{ItemId, ItemTable};
 use mint_sage_modules::{
     CreateLocation, Effect, EffectLog, ModifierRule, OclFrom, PowerPlace, ReplaceCarry,
 };
@@ -64,6 +64,13 @@ impl RotwkRules {
         self
     }
 
+    pub(crate) fn ranks_of(&self, player: PlayerId) -> &crate::sciences::Ranks {
+        self.spell_plans
+            .get(usize::from(player.get()))
+            .and_then(|plan| plan.ranks.as_deref())
+            .unwrap_or(&self.ranks)
+    }
+
     pub(super) fn setup_spell_books(
         &self,
         tick: &mut Tick<'_>,
@@ -86,7 +93,7 @@ impl RotwkRules {
             };
             let mut state = PlayerScience::start(
                 &plan.intrinsic,
-                &self.ranks,
+                self.ranks_of(player),
                 plan.rank_cap,
                 plan.intrinsic_purchase_points,
             );
@@ -153,7 +160,7 @@ impl RotwkRules {
             .get(usize::from(player.get()))
             .map_or(0, |plan| plan.intrinsic_purchase_points);
         let level = u16::try_from(level.max(1)).unwrap_or(u16::MAX);
-        let granted = state.set_rank_level(level, &self.ranks, extra);
+        let granted = state.set_rank_level(level, self.ranks_of(player), extra);
         diag!(
             "rank: script set player {} to rank {} - {} power point(s) to spend",
             player.get(),
@@ -183,8 +190,9 @@ impl RotwkRules {
             return Ok(());
         };
         let rank = state.rank;
+        let award = self.wotr_scaled_award(tick.state(), player, rank, award);
         let power_before = state.purchase_points;
-        let granted = state.add_skill_points(award, &self.ranks);
+        let granted = state.add_skill_points(award, self.ranks_of(player));
         #[allow(clippy::cast_precision_loss)]
         self.note_points(
             tick,
@@ -560,7 +568,13 @@ impl RotwkRules {
         let target_ok = match target_kind {
             TargetKind::None | TargetKind::Confirm => target.is_none() && at.is_none(),
             TargetKind::Position => at.is_some() && target.is_none(),
-            TargetKind::Object => target.is_some() && at.is_none(),
+            TargetKind::Object => {
+                (target.is_some() && at.is_none())
+                    || (target.is_none()
+                        && at.is_some_and(|at| {
+                            self.grabs_map_tree(world, ids, source, power_name, at)
+                        }))
+            }
         };
         if !target_ok {
             return Err("wrong target kind");
@@ -788,12 +802,16 @@ impl RotwkRules {
             .kinds
             .get(kind)
             .and_then(|entry| entry.record.power(power_name));
-        let paused = slot.is_some_and(|slot| slot.starts_paused)
-            && !self.power_released(tick.state(), source, power_name);
         let Some(power_id) = self.power_names.id(power_name) else {
             diag!("power: {power_name} has no ReloadTime table entry - refused");
             return Ok(false);
         };
+        let paused = (slot.is_some_and(|slot| slot.starts_paused)
+            && !self.power_released(tick.state(), source, power_name))
+            || tick
+                .state()
+                .get(ids.stealth, source)
+                .is_some_and(|state| state.paused_since(power_id).is_some());
         let (_, shared) = self
             .power_reload
             .get(usize::from(power_id.get()))
@@ -839,7 +857,7 @@ impl RotwkRules {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn release_power(
+    pub(super) fn release_power(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
@@ -887,6 +905,35 @@ impl RotwkRules {
             .is_some_and(|slot| slot.defers_recharge)
     }
 
+    pub(super) fn measured_reload(
+        &self,
+        world: &World,
+        ids: Ids,
+        holder: Entity,
+        power: crate::powers::PowerId,
+        reload: LogicFrames,
+    ) -> LogicFrames {
+        let reload =
+            crate::experience::recharge_time(reload, self.bonuses_of(world, ids, holder).recharge);
+        let discounted = self
+            .power_cast_rules
+            .get(usize::from(power.get()))
+            .is_some_and(|rule| rule.recharge_discount);
+        let modifier = world
+            .get(ids.owner, holder)
+            .and_then(|owner| crate::economy::player_entity(world, Self::economy_ids(ids), owner.0))
+            .filter(|_| discounted)
+            .and_then(|pe| world.get(ids.spell_recharge, pe))
+            .map(|spell| spell.modifier)
+            .filter(|modifier| *modifier != 0.0);
+        match modifier {
+            Some(modifier) => LogicFrames::from_frames(
+                crate::experience::scaled_frames(reload.get(), 1.0 + modifier).max(1),
+            ),
+            None => reload,
+        }
+    }
+
     pub(super) fn begin_recharge(
         &self,
         tick: &mut Tick<'_>,
@@ -907,25 +954,13 @@ impl RotwkRules {
         let player_entity = player.and_then(|player| {
             crate::economy::player_entity(tick.state(), Self::economy_ids(ids), player)
         });
-        let reload = crate::experience::recharge_time(
+        let reload = self.measured_reload(
+            tick.state(),
+            ids,
+            source,
+            power_id,
             reload.unwrap_or(LogicFrames::ZERO),
-            self.bonuses_of(tick.state(), ids, source).recharge,
         );
-        let discounted = self
-            .power_cast_rules
-            .get(usize::from(power_id.get()))
-            .is_some_and(|rule| rule.recharge_discount);
-        let modifier = player_entity
-            .filter(|_| discounted)
-            .and_then(|pe| tick.state().get(ids.spell_recharge, pe))
-            .map(|spell| spell.modifier)
-            .filter(|modifier| *modifier != 0.0);
-        let reload = match modifier {
-            Some(modifier) => LogicFrames::from_frames(
-                crate::experience::scaled_frames(reload.get(), 1.0 + modifier).max(1),
-            ),
-            None => reload,
-        };
         let new_available = start_recharge(now, reload);
         if shared {
             if let Some(pe) = player_entity {
@@ -950,6 +985,23 @@ impl RotwkRules {
         Ok(())
     }
 
+    pub(crate) fn button_readiness_power<'a>(
+        &'a self,
+        world: &World,
+        ids: Ids,
+        source: Entity,
+        power: &'a str,
+    ) -> &'a str {
+        world
+            .get(ids.kind, source)
+            .and_then(|kind| self.kinds.get(*kind))
+            .and_then(|entry| entry.record.power(power))
+            .and_then(|slot| slot.chained_button.as_deref())
+            .and_then(|button| self.ai_power_buttons.get(button))
+            .and_then(|button| button.special_power.as_deref())
+            .unwrap_or(power)
+    }
+
     pub(crate) fn power_ready_report(
         &self,
         world: &World,
@@ -968,6 +1020,17 @@ impl RotwkRules {
                 now.get()
             ),
         }
+    }
+
+    pub(crate) fn power_restricted(&self, world: &World, source: Entity, power: &str) -> bool {
+        self.power_names
+            .id(power)
+            .and_then(|id| self.power_cast_rules.get(usize::from(id.get())))
+            .is_some_and(|rule| {
+                rule.prevent_activation
+                    .iter()
+                    .any(|status| self.holds_status(world, source, status))
+            })
     }
 
     pub(super) fn power_is_ready(
@@ -1002,8 +1065,11 @@ impl RotwkRules {
             .kinds
             .get(kind)
             .and_then(|entry| entry.record.power(power_name));
-        let paused = slot.is_some_and(|slot| slot.starts_paused)
-            && !self.power_released(world, source, power_name);
+        let paused = (slot.is_some_and(|slot| slot.starts_paused)
+            && !self.power_released(world, source, power_name))
+            || world
+                .get(ids.stealth, source)
+                .is_some_and(|state| state.paused_since(power_id).is_some());
         let (_, shared) = self
             .power_reload
             .get(usize::from(power_id.get()))
@@ -1372,6 +1438,1158 @@ impl RotwkRules {
         self.apply_effects(tick, ids, log.drain())
     }
 
+    fn apply_create_objects_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::CreateObjects {
+            list,
+            location,
+            at,
+            from,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(target) = self.place_of(tick.state(), ids, source, *at) else {
+            diag!("power: {list} has nowhere to land - its source has no position");
+            return Ok(());
+        };
+        let mut secondary = None;
+        let (list_source, owner, variant) = match *from {
+            OclFrom::Location => (source, owner, CreationVariant::At),
+            OclFrom::Object { secondary: other } => {
+                secondary = other
+                    .and_then(|other| tick.state().get(ids.body, other))
+                    .map(|body| body.0.position);
+                (source, owner, CreationVariant::Object)
+            }
+            OclFrom::For { primary, min_gap } => {
+                let Some(primary_owner) = tick.state().get(ids.owner, primary).map(|o| o.0) else {
+                    return Ok(());
+                };
+                let now = tick.frame();
+                if let Some(gap) = min_gap {
+                    let quiet = tick
+                        .state()
+                        .get(ids.die_ocl_stamp, primary)
+                        .is_none_or(|stamp| {
+                            stamp
+                                .0
+                                .checked_add(LogicFrames::from_frames(gap))
+                                .is_some_and(|end| now > end)
+                        });
+                    if !quiet {
+                        return Ok(());
+                    }
+                    tick.state_mut().insert(
+                        ids.die_ocl_stamp,
+                        primary,
+                        super::damage_creation::DieOclStamp(now),
+                    )?;
+                }
+                (primary, primary_owner, CreationVariant::At)
+            }
+        };
+        let location = if matches!(at, PowerPlace::Source) {
+            &CreateLocation::AtLocation
+        } else {
+            location
+        };
+        let (anchor, move_goal) = match location {
+            CreateLocation::AtEdgeNearSource => {
+                let source_pos = tick
+                    .state()
+                    .get(ids.body, source)
+                    .map_or(target, |body| body.0.position);
+                secondary = Some(target);
+                (self.closest_edge_point(source_pos), None)
+            }
+            CreateLocation::AtEdgeNearTarget => (self.closest_edge_point(target), None),
+            CreateLocation::AtEdgeFarthestFromTarget => {
+                secondary = Some(target);
+                (self.farthest_edge_point(target), None)
+            }
+            CreateLocation::AtEdgeNearTargetAndMove => {
+                secondary = Some(target);
+                (self.closest_edge_point(target), Some(target))
+            }
+            CreateLocation::ClosestToSpawnPoint => {
+                secondary = Some(target);
+                (self.closest_spawn_point(target), None)
+            }
+            CreateLocation::UseSecondaryObject(filter) => {
+                secondary = self.nearest_object_passing(tick, ids, owner, filter, target);
+                if secondary.is_none() {
+                    diag!(
+                        "power: {list}'s USE_SECONDARY_OBJECT_LOCATION found nothing \
+                             passing NearestSecondaryObjectFilter"
+                    );
+                }
+                (target, None)
+            }
+            CreateLocation::Other(name) => {
+                diag!("power: {list}'s CreateLocation {name} is created at the target");
+                (target, None)
+            }
+            CreateLocation::AtLocation
+            | CreateLocation::AboveLocation
+            | CreateLocation::UseOwnerObject => (target, None),
+        };
+        let mut created = Vec::new();
+        let sink = move_goal.is_some().then_some(&mut created);
+        let made = self.run_creation_list(
+            tick,
+            ids,
+            list_source,
+            list,
+            anchor,
+            variant,
+            owner,
+            secondary,
+            sink,
+        )?;
+        if let Some(goal) = move_goal {
+            for entity in created {
+                let mut budgets = super::movement::PathBudgets::new(Some(entity), Vec::new());
+                self.walk_toward_ordered(tick, ids, entity, anchor, goal, &mut budgets, true)?;
+            }
+        }
+        diag!(
+            "power: {list} created {made} object(s) for player {} at ({:.0}, {:.0})",
+            owner.get(),
+            anchor.x,
+            anchor.y
+        );
+        Ok(())
+    }
+
+    fn apply_teleport_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::Teleport { to, face } = effect else {
+            return Ok(());
+        };
+        let Some(at) = self.place_of(tick.state(), ids, source, *to) else {
+            diag!("power: teleport has nowhere to land - its target has no position");
+            return Ok(());
+        };
+        let Some(mut body) = tick.state().get(ids.body, source).copied() else {
+            return Ok(());
+        };
+        let from = body.0.position;
+        if *face {
+            if let Some(facing) = Facing::from_vector(at.minus(from)) {
+                body.0.facing = facing;
+            }
+        }
+        body.0.position = at;
+        body.0.waypoint = 0;
+        tick.state_mut().insert(ids.body, source, body)?;
+        tick.state_mut().remove(ids.path, source);
+        if tick.state().contains(ids.horde, source) {
+            self.snap_horde_members_to_slots(tick, ids, source)?;
+        }
+        diag!(
+            "power: entity {} teleported from ({:.0},{:.0}) to ({:.0},{:.0})",
+            source.index(),
+            from.x,
+            from.y,
+            at.x,
+            at.y
+        );
+        Ok(())
+    }
+
+    fn apply_store_objects_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::StoreObjects {
+            power,
+            radius,
+            at,
+            slot,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let found =
+            self.store_objects_scan(tick.state(), ids, source, owner, power, centre, *radius);
+        let mut lists = tick
+            .state()
+            .get(ids.stored_objects, source)
+            .cloned()
+            .unwrap_or_default();
+        diag!(
+            "power: {power} stored {} object(s) within {radius:.0} of ({:.0}, {:.0})",
+            found.len(),
+            centre.x,
+            centre.y
+        );
+        lists.store(*slot, found);
+        tick.state_mut().insert(ids.stored_objects, source, lists)?;
+        Ok(())
+    }
+
+    fn apply_teleport_group_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::TeleportGroup {
+            power,
+            radius,
+            min_ring,
+            max_ring,
+            trigger_fx,
+            target_fx,
+            at,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(target_point) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let Some(caster_pos) = tick.state().get(ids.body, source).map(|b| b.0.position) else {
+            return Ok(());
+        };
+        let mut lists = tick
+            .state()
+            .get(ids.stored_objects, source)
+            .cloned()
+            .unwrap_or_default();
+        let (list, dest) = if let Some(stored) = lists.first_non_empty() {
+            let list = std::mem::take(stored);
+            tick.state_mut().insert(ids.stored_objects, source, lists)?;
+            (list, target_point)
+        } else {
+            let gathered = self.teleport_gather_scan(
+                tick.state(),
+                ids,
+                source,
+                owner,
+                power,
+                target_point,
+                *radius,
+            );
+            (gathered, caster_pos)
+        };
+        if let Some(fx) = target_fx {
+            for entity in &list {
+                self.emit_fx_on_horde_or_object(tick, ids, fx, crate::fx::FxSource::Power, *entity);
+            }
+        }
+        let moved = self.teleport_list(tick, ids, &list, dest, *min_ring, *max_ring)?;
+        if let Some(fx) = target_fx {
+            for entity in &moved {
+                self.emit_fx_on_horde_or_object(tick, ids, fx, crate::fx::FxSource::Power, *entity);
+            }
+        }
+        if let Some(fx) = trigger_fx {
+            self.emit_fx_named(
+                tick,
+                ids,
+                fx,
+                caster_pos,
+                crate::fx::FxSource::Power,
+                source,
+            );
+        }
+        diag!(
+            "power: {power} teleported {} of {} object(s) to ({:.0}, {:.0})",
+            moved.len(),
+            list.len(),
+            dest.x,
+            dest.y
+        );
+        Ok(())
+    }
+
+    fn apply_replace_in_area_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::ReplaceInArea {
+            entries,
+            radius,
+            fx,
+            scatter,
+            at,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let Some(neutral) = self.neutral_player() else {
+            diag!("power: replace-in-area needs a neutral player, which this match has none of");
+            return Ok(());
+        };
+        let mut replaced = 0usize;
+        let mut killed = Vec::new();
+        for entry in entries.iter() {
+            let victims = self.replace_in_area_scan(
+                tick.state(),
+                ids,
+                source,
+                owner,
+                &entry.filter,
+                centre,
+                *radius,
+            );
+            for victim in victims {
+                let Some((pos, facing)) = tick
+                    .state()
+                    .get(ids.body, victim)
+                    .map(|body| (body.0.position, body.0.facing))
+                else {
+                    continue;
+                };
+                let Ok(n) = u32::try_from(entry.replacements.len()) else {
+                    continue;
+                };
+                if let Some(name) = (n > 0)
+                    .then(|| tick.rng().below(n))
+                    .and_then(|roll| entry.replacements.get(roll as usize))
+                {
+                    if let Some(kind) = self.kinds.kind(name) {
+                        let made = self.spawn_kind_at(tick, ids, kind, pos, facing, neutral)?;
+                        if let Some(animal) = made {
+                            if let Some(fx) = fx {
+                                self.emit_fx_object_named(
+                                    tick,
+                                    ids,
+                                    fx,
+                                    pos,
+                                    crate::fx::FxSource::Power,
+                                    animal,
+                                    None,
+                                );
+                            }
+                            if *scatter {
+                                let flee_distance = tick
+                                    .state()
+                                    .get(ids.kind, animal)
+                                    .copied()
+                                    .and_then(|kind| self.kinds.get(kind))
+                                    .and_then(|kind_entry| kind_entry.record.ai.animal_wander)
+                                    .map(|wander| wander.flee_distance);
+                                if let Some(flee_distance) = flee_distance {
+                                    self.start_animal_flee(
+                                        tick,
+                                        ids,
+                                        animal,
+                                        source,
+                                        flee_distance,
+                                    )?;
+                                }
+                            }
+                            replaced += 1;
+                        }
+                    } else {
+                        diag!("power: {name} is not in this match's templates");
+                    }
+                }
+                killed.extend(self.kill(
+                    tick,
+                    ids,
+                    victim,
+                    Some(source),
+                    crate::combat::DeathNaming::Normal,
+                )?);
+            }
+        }
+        self.resolve_deaths(tick, ids, &killed)?;
+        diag!(
+            "power: replace-in-area replaced {replaced} object(s) around ({:.0}, {:.0})",
+            centre.x,
+            centre.y
+        );
+        Ok(())
+    }
+
+    fn apply_area_heal_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::AreaHeal {
+            at,
+            radius,
+            amount,
+            as_percent,
+            affects,
+            fx,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let (admitted, healed) = self.area_heal(
+            tick,
+            ids,
+            owner,
+            centre,
+            *radius,
+            *amount,
+            *as_percent,
+            affects,
+        )?;
+        if let Some(list) = fx {
+            for entity in &admitted {
+                if let Some(at) = tick.state().get(ids.body, *entity).map(|b| b.0.position) {
+                    self.emit_fx_object_named(
+                        tick,
+                        ids,
+                        list,
+                        at,
+                        crate::fx::FxSource::Power,
+                        *entity,
+                        None,
+                    );
+                }
+            }
+        }
+        diag!(
+            "power: healed {healed} of {} object(s) of player {} or an ally within \
+                 {radius:.0} of ({:.0}, {:.0})",
+            admitted.len(),
+            owner.get(),
+            centre.x,
+            centre.y
+        );
+        Ok(())
+    }
+
+    fn apply_area_level_up_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::AreaLevelUp {
+            at,
+            radius,
+            experience,
+            affects,
+            fx,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let granted = self.level_grant(
+            tick,
+            ids,
+            source,
+            owner,
+            centre,
+            *radius,
+            *experience,
+            affects,
+        )?;
+        if let Some(list) = fx {
+            for entity in &granted {
+                self.emit_fx_on_horde_or_object(
+                    tick,
+                    ids,
+                    list,
+                    crate::fx::FxSource::Power,
+                    *entity,
+                );
+            }
+        }
+        diag!(
+            "power: granted {experience} experience to {} object(s) within {radius:.0} \
+                 of ({:.0}, {:.0})",
+            granted.len(),
+            centre.x,
+            centre.y
+        );
+        Ok(())
+    }
+
+    fn apply_trigger_module_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::TriggerModule { tag, target, at } = effect else {
+            return Ok(());
+        };
+        let Some(kind) = tick.state().get(ids.kind, source).copied() else {
+            return Ok(());
+        };
+        let power_name = self.kinds.get(kind).and_then(|entry| {
+            entry
+                .record
+                .declared_modules
+                .iter()
+                .find(|module| module.tag.as_deref() == Some(tag.as_ref()))
+                .and_then(|module| module.field("SpecialPowerTemplate"))
+                .and_then(|field| field.args.first())
+                .cloned()
+        });
+        let Some(power_name) = power_name else {
+            if !self.flip_detector(tick, ids, source, tag)? {
+                diag!(
+                    "power: TriggerSpecialPower names tag {tag}, which entity {} declares \
+                         no module for",
+                    source.index()
+                );
+            }
+            return Ok(());
+        };
+        diag!(
+            "power: {tag} triggers {power_name} on entity {}",
+            source.index()
+        );
+        self.activate_power(tick, ids, source, &power_name, *target, *at, false)?;
+        Ok(())
+    }
+
+    fn apply_self_timed_modifier_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::SelfTimedModifier { list, lasts } = effect else {
+            return Ok(());
+        };
+        let Some(id) = self.combat.modifiers.id(list) else {
+            diag!("power: ModifierList {list} is not declared");
+            return Ok(());
+        };
+        let until = match lasts {
+            Some(lasts) => tick.frame().checked_add(*lasts).unwrap_or(Frame::FOREVER),
+            None => self
+                .combat
+                .modifiers
+                .get(id)
+                .and_then(|list| list.duration_ms)
+                .filter(|ms| *ms > 0)
+                .map_or(Frame::FOREVER, |ms| {
+                    tick.frame()
+                        .checked_add(mint_sage_modules::retail_duration_ticks(ms))
+                        .unwrap_or(Frame::FOREVER)
+                }),
+        };
+        self.give_timed_list(tick, ids, source, id, until)?;
+        diag!(
+            "power: {list} given to entity {} until frame {}",
+            source.index(),
+            until.get()
+        );
+        Ok(())
+    }
+
+    fn apply_clear_self_timed_modifier_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::ClearSelfTimedModifier(list) = effect else {
+            return Ok(());
+        };
+        let Some(id) = self.combat.modifiers.id(list) else {
+            diag!("power: ModifierList {list} is not declared");
+            return Ok(());
+        };
+        if self.remove_timed_list(tick, ids, source, id)? {
+            diag!("power: {list} dropped early from entity {}", source.index());
+        }
+        Ok(())
+    }
+
+    fn apply_timed_model_condition_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::TimedModelCondition {
+            flag,
+            lasts,
+            only_if_absent,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(wiring) = self.modules.as_ref() else {
+            return Ok(());
+        };
+        let already_held = tick
+            .state()
+            .get(wiring.state, source)
+            .is_some_and(|state| state.has_model_condition(flag));
+        if *only_if_absent && already_held {
+            return Ok(());
+        }
+        let until = tick.frame().checked_add(*lasts).unwrap_or(Frame::FOREVER);
+        let mut timed = tick
+            .state()
+            .get(ids.timed_conditions, source)
+            .cloned()
+            .unwrap_or_default();
+        let new = timed.give(mint_sage_modules::effects::Name::clone(flag), until);
+        tick.state_mut()
+            .insert(ids.timed_conditions, source, timed)?;
+        if new {
+            self.apply_effects(
+                tick,
+                ids,
+                vec![(
+                    source,
+                    Effect::ModelConditions {
+                        add: mint_sage_modules::effects::names(vec![flag.to_string()]),
+                        remove: mint_sage_modules::effects::names(Vec::new()),
+                    },
+                )],
+            )?;
+        }
+        diag!(
+            "power: model state [{flag}] on entity {} until frame {}",
+            source.index(),
+            until.get()
+        );
+        Ok(())
+    }
+
+    fn apply_fire_weapon_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::FireWeapon {
+            weapon,
+            at,
+            offset,
+            repeat,
+            alive_only,
+            reload_slot,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(weapon_id) = self.combat.weapons.id(weapon) else {
+            diag!("power: weapon {weapon} is not declared");
+            return Ok(());
+        };
+        let Some(point) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let point = self.offset_in_frame(tick.state(), ids, source, point, *offset);
+        let victim = match at {
+            PowerPlace::Object(target) if reload_slot.is_some() => Some(*target),
+            _ => None,
+        };
+        self.queue_shot(
+            tick,
+            ids,
+            crate::spell_state::PendingShot {
+                source,
+                weapon: weapon_id,
+                at: point,
+                repeat: *repeat,
+                alive_only: *alive_only,
+                reload_slot: *reload_slot,
+                owner_if_gone: None,
+                victim,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn apply_play_fx_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::PlayFx {
+            list,
+            at,
+            on_object,
+            secondary,
+        } = effect
+        else {
+            return Ok(());
+        };
+        if let Some(point) = self.place_of(tick.state(), ids, source, *at) {
+            if *on_object {
+                self.emit_fx_object_named(
+                    tick,
+                    ids,
+                    list,
+                    point,
+                    crate::fx::FxSource::Power,
+                    source,
+                    *secondary,
+                );
+            } else {
+                self.emit_fx_named(tick, ids, list, point, crate::fx::FxSource::Power, source);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_create_object_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::CreateObject { name, at } = effect else {
+            return Ok(());
+        };
+        let Some(point) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let Some(kind) = self.kinds.kind(name) else {
+            diag!("power: {name} is not in this match's templates");
+            return Ok(());
+        };
+        let facing = tick
+            .state()
+            .get(ids.body, source)
+            .map_or(Facing::EAST, |body| body.0.facing);
+        let made = self.spawn_kind_at(tick, ids, kind, point, facing, owner)?;
+        diag!(
+            "power: {name} {} for player {} at ({:.0}, {:.0})",
+            if made.is_some() {
+                "created"
+            } else {
+                "not created"
+            },
+            owner.get(),
+            point.x,
+            point.y
+        );
+        Ok(())
+    }
+
+    fn apply_spell_recharge_count_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::SpellRechargeCount {
+            player,
+            delta,
+            percentages,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let player = player.unwrap_or(owner);
+        if let Some(player_entity) =
+            crate::economy::player_entity(tick.state(), Self::economy_ids(ids), player)
+        {
+            let moved = tick
+                .state()
+                .get(ids.spell_recharge, player_entity)
+                .copied()
+                .unwrap_or_default()
+                .moved(*delta, percentages);
+            tick.state_mut()
+                .insert(ids.spell_recharge, player_entity, moved)?;
+            diag!(
+                "power: player {} counts {} spell recharge modifier(s), modifier {}",
+                player.get(),
+                moved.count,
+                moved.modifier
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_command_point_bonus_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::CommandPointBonus(points) = effect else {
+            return Ok(());
+        };
+        if let Some(player_entity) =
+            crate::economy::player_entity(tick.state(), Self::economy_ids(ids), owner)
+        {
+            tick.state_mut().insert(
+                ids.player_point_bonus,
+                player_entity,
+                crate::spell_state::PointBonus(*points),
+            )?;
+            diag!(
+                "power: player {} gains {points} command point(s)",
+                owner.get()
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_set_weather_effect_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::SetWeatherEffect {
+            list,
+            anti,
+            affects,
+            affect_good,
+            affect_evil,
+            lasts,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let given = self.set_weather_effect(
+            tick,
+            ids,
+            owner,
+            list.as_ref(),
+            anti,
+            affects,
+            *affect_good,
+            *affect_evil,
+            *lasts,
+        )?;
+        diag!(
+            "power: weather effect given to {given} object(s) for {} frame(s)",
+            lasts.get()
+        );
+        Ok(())
+    }
+
+    fn apply_add_object_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::AddObject { name, at } = effect else {
+            return Ok(());
+        };
+        let Some(point) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let Some(kind) = self.kinds.kind(name) else {
+            diag!("power: {name} is not in this match's templates");
+            return Ok(());
+        };
+        if !self.plant_tree(tick, ids, kind, point) {
+            let facing = tick
+                .state()
+                .get(ids.body, source)
+                .map_or(Facing::EAST, |body| body.0.facing);
+            self.spawn_kind_at(tick, ids, kind, point, facing, owner)?;
+        }
+        Ok(())
+    }
+
+    fn apply_dominate_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::Dominate {
+            at,
+            radius,
+            affects,
+            permanent,
+            fx,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let taken = if let PowerPlace::Object(target) = *at {
+            self.dominate_clicked(tick, ids, source, owner, target, affects, *permanent)?
+        } else {
+            self.dominate(
+                tick, ids, source, owner, centre, *radius, affects, *permanent,
+            )?
+        };
+        if let Some(list) = fx {
+            for entity in &taken {
+                self.emit_fx_on_horde_or_object(
+                    tick,
+                    ids,
+                    list,
+                    crate::fx::FxSource::Power,
+                    *entity,
+                );
+            }
+        }
+        diag!(
+            "power: {} object(s) within {radius:.0} of ({:.0}, {:.0}) dominated by \
+                 player {}{}",
+            taken.len(),
+            centre.x,
+            centre.y,
+            owner.get(),
+            if *permanent { "" } else { ", temporarily" }
+        );
+        Ok(())
+    }
+
+    fn apply_curse_powers_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::CursePowers {
+            power,
+            at,
+            share,
+            fx,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(owner) = tick.state().get(ids.owner, source).map(|owner| owner.0) else {
+            return Ok(());
+        };
+        let targets = match *at {
+            PowerPlace::Object(target) => vec![target],
+            PowerPlace::Source => Vec::new(),
+            place => {
+                let radius = self
+                    .power_names
+                    .id(power)
+                    .and_then(|id| self.power_cast_rules.get(usize::from(id.get())))
+                    .and_then(|rule| rule.radius_cursor)
+                    .unwrap_or(0.0);
+                match self.place_of(tick.state(), ids, source, place) {
+                    Some(centre) => self.admitted_within(
+                        tick.state(),
+                        ids,
+                        owner,
+                        centre,
+                        radius,
+                        &ObjectFilter::default(),
+                    ),
+                    None => Vec::new(),
+                }
+            }
+        };
+        for target in targets {
+            if !self.curse_may_reach(tick.state(), ids, source, owner, target) {
+                continue;
+            }
+            let cursed = self.curse_powers(tick, ids, target, *share)?;
+            if let Some(list) = fx {
+                if let Some(at) = tick.state().get(ids.body, target).map(|b| b.0.position) {
+                    self.emit_fx_object_named(
+                        tick,
+                        ids,
+                        list,
+                        at,
+                        crate::fx::FxSource::Power,
+                        target,
+                        None,
+                    );
+                }
+            }
+            diag!(
+                "power: entity {} has {cursed} power(s) set back by {:.0}% of their reload",
+                target.index(),
+                share * 100.0
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_defect_for_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::DefectFor { back_to, lasts } = effect else {
+            return Ok(());
+        };
+        if tick.state().contains(ids.defect_revert, source) {
+            diag!(
+                "capture: entity {} is already defecting - the new dominate does not \
+                     refresh it",
+                source.index()
+            );
+            return Ok(());
+        }
+        let since = tick.frame();
+        let until = since
+            .checked_add(*lasts)
+            .unwrap_or(mint_sim::Frame::FOREVER);
+        tick.state_mut().insert(
+            ids.defect_revert,
+            source,
+            crate::rules::capture::DefectRevert {
+                to: *back_to,
+                by: source,
+                since,
+                until,
+            },
+        )?;
+        diag!(
+            "capture: entity {} defects to player {} for {} frame(s)",
+            source.index(),
+            owner.get(),
+            lasts.get()
+        );
+        Ok(())
+    }
+
+    fn apply_arrow_storm_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::ArrowStorm {
+            weapon,
+            at,
+            radius,
+            shots_per_burst,
+            shots_per_target,
+            max_shots,
+            can_shoot_empty_ground,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
+            return Ok(());
+        };
+        let fired = self.arrow_storm_burst(
+            tick,
+            ids,
+            source,
+            weapon,
+            centre,
+            *radius,
+            *shots_per_burst,
+            *shots_per_target,
+            *max_shots,
+            *can_shoot_empty_ground,
+        )?;
+        diag!(
+            "power: arrow storm fired {fired} shot(s) of {weapon} within {radius:.0} of \
+                 ({:.0}, {:.0})",
+            centre.x,
+            centre.y
+        );
+        Ok(())
+    }
+
+    fn apply_grant_invisibility_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::GrantInvisibility {
+            at,
+            filter,
+            radius,
+            duration,
+            nugget,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let world = tick.state();
+        let Some(owner) = world.get(ids.owner, source).map(|o| o.0) else {
+            return Ok(());
+        };
+        let admitted = match *at {
+            PowerPlace::Source => Vec::new(),
+            PowerPlace::Object(_) => vec![source],
+            place => match self.place_of(world, ids, source, place) {
+                Some(centre) => self.admitted_within(
+                    world,
+                    ids,
+                    owner,
+                    centre,
+                    *radius,
+                    &super::spell_effects::filter_of(filter),
+                ),
+                None => Vec::new(),
+            },
+        };
+        let granted = self.grant_invisibility(tick, ids, &admitted, *duration, nugget)?;
+        diag!(
+            "power: InvisibilitySpecialPower granted {granted} of {} admitted entity(ies)",
+            admitted.len()
+        );
+        Ok(())
+    }
+
     pub(super) fn apply_power_effect(
         &self,
         tick: &mut Tick<'_>,
@@ -1383,396 +2601,26 @@ impl RotwkRules {
             return Ok(());
         };
         match effect {
-            Effect::CreateObjects {
-                list,
-                location,
-                at,
-                from,
-            } => {
-                let Some(target) = self.place_of(tick.state(), ids, source, *at) else {
-                    diag!("power: {list} has nowhere to land - its source has no position");
-                    return Ok(());
-                };
-                let mut secondary = None;
-                let (list_source, owner, variant) = match *from {
-                    OclFrom::Location => (source, owner, CreationVariant::At),
-                    OclFrom::Object { secondary: other } => {
-                        secondary = other
-                            .and_then(|other| tick.state().get(ids.body, other))
-                            .map(|body| body.0.position);
-                        (source, owner, CreationVariant::Object)
-                    }
-                    OclFrom::For { primary, min_gap } => {
-                        let Some(primary_owner) = tick.state().get(ids.owner, primary).map(|o| o.0)
-                        else {
-                            return Ok(());
-                        };
-                        let now = tick.frame();
-                        if let Some(gap) = min_gap {
-                            let quiet =
-                                tick.state()
-                                    .get(ids.die_ocl_stamp, primary)
-                                    .is_none_or(|stamp| {
-                                        stamp
-                                            .0
-                                            .checked_add(LogicFrames::from_frames(gap))
-                                            .is_some_and(|end| now >= end)
-                                    });
-                            if !quiet {
-                                return Ok(());
-                            }
-                            tick.state_mut().insert(
-                                ids.die_ocl_stamp,
-                                primary,
-                                super::damage_creation::DieOclStamp(now),
-                            )?;
-                        }
-                        (primary, primary_owner, CreationVariant::At)
-                    }
-                };
-                let (anchor, move_goal) = match location {
-                    CreateLocation::AtEdgeNearSource => {
-                        let source_pos = tick
-                            .state()
-                            .get(ids.body, source)
-                            .map_or(target, |body| body.0.position);
-                        (self.closest_edge_point(source_pos), None)
-                    }
-                    CreateLocation::AtEdgeNearTarget => (self.closest_edge_point(target), None),
-                    CreateLocation::AtEdgeFarthestFromTarget => {
-                        (self.farthest_edge_point(target), None)
-                    }
-                    CreateLocation::AtEdgeNearTargetAndMove => {
-                        (self.closest_edge_point(target), Some(target))
-                    }
-                    CreateLocation::UseSecondaryObject(filter) => {
-                        secondary = self.nearest_object_passing(tick, ids, owner, filter, target);
-                        if secondary.is_none() {
-                            diag!(
-                                "power: {list}'s USE_SECONDARY_OBJECT_LOCATION found nothing \
-                                 passing NearestSecondaryObjectFilter"
-                            );
-                        }
-                        (target, None)
-                    }
-                    CreateLocation::Other(name) => {
-                        diag!("power: {list}'s CreateLocation {name} is created at the target");
-                        (target, None)
-                    }
-                    CreateLocation::AtLocation
-                    | CreateLocation::AboveLocation
-                    | CreateLocation::UseOwnerObject => (target, None),
-                };
-                let mut created = Vec::new();
-                let sink = move_goal.is_some().then_some(&mut created);
-                let made = self.run_creation_list(
-                    tick,
-                    ids,
-                    list_source,
-                    list,
-                    anchor,
-                    variant,
-                    owner,
-                    secondary,
-                    sink,
-                )?;
-                if let Some(goal) = move_goal {
-                    for entity in created {
-                        let mut budgets =
-                            super::movement::PathBudgets::new(Some(entity), Vec::new());
-                        self.walk_toward_ordered(tick, ids, entity, anchor, goal, &mut budgets)?;
-                    }
-                }
-                diag!(
-                    "power: {list} created {made} object(s) for player {} at ({:.0}, {:.0})",
-                    owner.get(),
-                    anchor.x,
-                    anchor.y
-                );
+            Effect::CreateObjects { .. } => {
+                return self.apply_create_objects_effect(tick, ids, source, owner, effect);
             }
-            Effect::Teleport { to, face } => {
-                let Some(at) = self.place_of(tick.state(), ids, source, *to) else {
-                    diag!("power: teleport has nowhere to land - its target has no position");
-                    return Ok(());
-                };
-                let Some(mut body) = tick.state().get(ids.body, source).copied() else {
-                    return Ok(());
-                };
-                let from = body.0.position;
-                if *face {
-                    if let Some(facing) = Facing::from_vector(at.minus(from)) {
-                        body.0.facing = facing;
-                    }
-                }
-                body.0.position = at;
-                body.0.waypoint = 0;
-                tick.state_mut().insert(ids.body, source, body)?;
-                tick.state_mut().remove(ids.path, source);
-                if tick.state().contains(ids.horde, source) {
-                    self.snap_horde_members_to_slots(tick, ids, source)?;
-                }
-                diag!(
-                    "power: entity {} teleported from ({:.0},{:.0}) to ({:.0},{:.0})",
-                    source.index(),
-                    from.x,
-                    from.y,
-                    at.x,
-                    at.y
-                );
+            Effect::UpgradedCreateObjects { .. } => {
+                return self.apply_upgraded_create_effect(tick, ids, source, owner, effect);
             }
-            Effect::StoreObjects {
-                power,
-                radius,
-                at,
-                slot,
-            } => {
-                let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let found = self.store_objects_scan(
-                    tick.state(),
-                    ids,
-                    source,
-                    owner,
-                    power,
-                    centre,
-                    *radius,
-                );
-                let mut lists = tick
-                    .state()
-                    .get(ids.stored_objects, source)
-                    .cloned()
-                    .unwrap_or_default();
-                diag!(
-                    "power: {power} stored {} object(s) within {radius:.0} of ({:.0}, {:.0})",
-                    found.len(),
-                    centre.x,
-                    centre.y
-                );
-                lists.store(*slot, found);
-                tick.state_mut().insert(ids.stored_objects, source, lists)?;
+            Effect::Teleport { .. } => {
+                return self.apply_teleport_effect(tick, ids, source, effect);
             }
-            Effect::TeleportGroup {
-                power,
-                radius,
-                min_ring,
-                max_ring,
-                trigger_fx,
-                target_fx,
-                at,
-            } => {
-                let Some(target_point) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let Some(caster_pos) = tick.state().get(ids.body, source).map(|b| b.0.position)
-                else {
-                    return Ok(());
-                };
-                let mut lists = tick
-                    .state()
-                    .get(ids.stored_objects, source)
-                    .cloned()
-                    .unwrap_or_default();
-                let (list, dest) = if let Some(stored) = lists.first_non_empty() {
-                    let list = std::mem::take(stored);
-                    tick.state_mut().insert(ids.stored_objects, source, lists)?;
-                    (list, target_point)
-                } else {
-                    let gathered = self.teleport_gather_scan(
-                        tick.state(),
-                        ids,
-                        source,
-                        owner,
-                        power,
-                        target_point,
-                        *radius,
-                    );
-                    (gathered, caster_pos)
-                };
-                if let Some(fx) = target_fx {
-                    for entity in &list {
-                        self.emit_fx_on_horde_or_object(
-                            tick,
-                            ids,
-                            fx,
-                            crate::fx::FxSource::Power,
-                            *entity,
-                        );
-                    }
-                }
-                let moved = self.teleport_list(tick, ids, &list, dest, *min_ring, *max_ring)?;
-                if let Some(fx) = target_fx {
-                    for entity in &moved {
-                        self.emit_fx_on_horde_or_object(
-                            tick,
-                            ids,
-                            fx,
-                            crate::fx::FxSource::Power,
-                            *entity,
-                        );
-                    }
-                }
-                if let Some(fx) = trigger_fx {
-                    self.emit_fx_named(
-                        tick,
-                        ids,
-                        fx,
-                        caster_pos,
-                        crate::fx::FxSource::Power,
-                        source,
-                    );
-                }
-                diag!(
-                    "power: {power} teleported {} of {} object(s) to ({:.0}, {:.0})",
-                    moved.len(),
-                    list.len(),
-                    dest.x,
-                    dest.y
-                );
+            Effect::StoreObjects { .. } => {
+                return self.apply_store_objects_effect(tick, ids, source, owner, effect);
             }
-            Effect::ReplaceInArea {
-                entries,
-                radius,
-                fx,
-                scatter,
-                at,
-            } => {
-                let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let Some(neutral) = self.neutral_player() else {
-                    diag!("power: replace-in-area needs a neutral player, which this match has none of");
-                    return Ok(());
-                };
-                let mut replaced = 0usize;
-                let mut killed = Vec::new();
-                for entry in entries.iter() {
-                    let victims = self.replace_in_area_scan(
-                        tick.state(),
-                        ids,
-                        source,
-                        owner,
-                        &entry.filter,
-                        centre,
-                        *radius,
-                    );
-                    for victim in victims {
-                        let Some((pos, facing)) = tick
-                            .state()
-                            .get(ids.body, victim)
-                            .map(|body| (body.0.position, body.0.facing))
-                        else {
-                            continue;
-                        };
-                        let Ok(n) = u32::try_from(entry.replacements.len()) else {
-                            continue;
-                        };
-                        if let Some(name) = (n > 0)
-                            .then(|| tick.rng().below(n))
-                            .and_then(|roll| entry.replacements.get(roll as usize))
-                        {
-                            if let Some(kind) = self.kinds.kind(name) {
-                                let made =
-                                    self.spawn_kind_at(tick, ids, kind, pos, facing, neutral)?;
-                                if let Some(animal) = made {
-                                    if let Some(fx) = fx {
-                                        self.emit_fx_object_named(
-                                            tick,
-                                            ids,
-                                            fx,
-                                            pos,
-                                            crate::fx::FxSource::Power,
-                                            animal,
-                                            None,
-                                        );
-                                    }
-                                    if *scatter {
-                                        let flee_distance = tick
-                                            .state()
-                                            .get(ids.kind, animal)
-                                            .copied()
-                                            .and_then(|kind| self.kinds.get(kind))
-                                            .and_then(|kind_entry| {
-                                                kind_entry.record.ai.animal_wander
-                                            })
-                                            .map(|wander| wander.flee_distance);
-                                        if let Some(flee_distance) = flee_distance {
-                                            self.start_animal_flee(
-                                                tick,
-                                                ids,
-                                                animal,
-                                                source,
-                                                flee_distance,
-                                            )?;
-                                        }
-                                    }
-                                    replaced += 1;
-                                }
-                            } else {
-                                diag!("power: {name} is not in this match's templates");
-                            }
-                        }
-                        killed.extend(self.kill(
-                            tick,
-                            ids,
-                            victim,
-                            Some(source),
-                            crate::combat::DeathNaming::Normal,
-                        )?);
-                    }
-                }
-                self.resolve_deaths(tick, ids, &killed)?;
-                diag!(
-                    "power: replace-in-area replaced {replaced} object(s) around ({:.0}, {:.0})",
-                    centre.x,
-                    centre.y
-                );
+            Effect::TeleportGroup { .. } => {
+                return self.apply_teleport_group_effect(tick, ids, source, owner, effect);
             }
-            Effect::AreaHeal {
-                at,
-                radius,
-                amount,
-                as_percent,
-                affects,
-                fx,
-            } => {
-                let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let (admitted, healed) = self.area_heal(
-                    tick,
-                    ids,
-                    owner,
-                    centre,
-                    *radius,
-                    *amount,
-                    *as_percent,
-                    affects,
-                )?;
-                if let Some(list) = fx {
-                    for entity in &admitted {
-                        if let Some(at) = tick.state().get(ids.body, *entity).map(|b| b.0.position)
-                        {
-                            self.emit_fx_object_named(
-                                tick,
-                                ids,
-                                list,
-                                at,
-                                crate::fx::FxSource::Power,
-                                *entity,
-                                None,
-                            );
-                        }
-                    }
-                }
-                diag!(
-                    "power: healed {healed} of {} object(s) of player {} or an ally within \
-                     {radius:.0} of ({:.0}, {:.0})",
-                    admitted.len(),
-                    owner.get(),
-                    centre.x,
-                    centre.y
-                );
+            Effect::ReplaceInArea { .. } => {
+                return self.apply_replace_in_area_effect(tick, ids, source, owner, effect);
+            }
+            Effect::AreaHeal { .. } => {
+                return self.apply_area_heal_effect(tick, ids, source, owner, effect);
             }
             Effect::AreaModifier { at, rule } => {
                 let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
@@ -1787,175 +2635,27 @@ impl RotwkRules {
                     centre.y
                 );
             }
-            Effect::AreaLevelUp {
-                at,
-                radius,
-                experience,
-                affects,
-                fx,
-            } => {
-                let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let granted =
-                    self.level_grant(tick, ids, owner, centre, *radius, *experience, affects)?;
-                if let Some(list) = fx {
-                    for entity in &granted {
-                        if let Some(at) = tick.state().get(ids.body, *entity).map(|b| b.0.position)
-                        {
-                            self.emit_fx_named(
-                                tick,
-                                ids,
-                                list,
-                                at,
-                                crate::fx::FxSource::Power,
-                                *entity,
-                            );
-                        }
-                    }
-                }
-                diag!(
-                    "power: granted {experience} experience to {} object(s) within {radius:.0} \
-                     of ({:.0}, {:.0})",
-                    granted.len(),
-                    centre.x,
-                    centre.y
-                );
+            Effect::AreaLevelUp { .. } => {
+                return self.apply_area_level_up_effect(tick, ids, source, owner, effect);
             }
-            Effect::TriggerModule { tag, target, at } => {
-                let Some(kind) = tick.state().get(ids.kind, source).copied() else {
-                    return Ok(());
-                };
-                let power_name = self.kinds.get(kind).and_then(|entry| {
-                    entry
-                        .record
-                        .declared_modules
-                        .iter()
-                        .find(|module| module.tag.as_deref() == Some(tag.as_ref()))
-                        .and_then(|module| module.field("SpecialPowerTemplate"))
-                        .and_then(|field| field.args.first())
-                        .cloned()
-                });
-                let Some(power_name) = power_name else {
-                    if !self.flip_detector(tick, ids, source, tag)? {
-                        diag!(
-                            "power: TriggerSpecialPower names tag {tag}, which entity {} declares \
-                             no module for",
-                            source.index()
-                        );
-                    }
-                    return Ok(());
-                };
-                diag!(
-                    "power: {tag} triggers {power_name} on entity {}",
-                    source.index()
-                );
-                self.activate_power(tick, ids, source, &power_name, *target, *at, false)?;
+            Effect::TriggerModule { .. } => {
+                return self.apply_trigger_module_effect(tick, ids, source, effect);
             }
             Effect::ToggleStealth {
+                power,
                 lasts,
                 palantir_timer,
             } => {
-                self.toggle_stealth(tick, ids, source, *lasts, *palantir_timer)?;
+                self.toggle_stealth(tick, ids, source, power, *lasts, *palantir_timer)?;
             }
-            Effect::SelfTimedModifier { list, lasts } => {
-                let Some(id) = self.combat.modifiers.id(list) else {
-                    diag!("power: ModifierList {list} is not declared");
-                    return Ok(());
-                };
-                let until = match lasts {
-                    Some(lasts) => tick.frame().checked_add(*lasts).unwrap_or(Frame::FOREVER),
-                    None => self
-                        .combat
-                        .modifiers
-                        .get(id)
-                        .and_then(|list| list.duration_ms)
-                        .filter(|ms| *ms > 0)
-                        .map_or(Frame::FOREVER, |ms| {
-                            tick.frame()
-                                .checked_add(LogicFrames::from_milliseconds(ms))
-                                .unwrap_or(Frame::FOREVER)
-                        }),
-                };
-                let mut timed = tick
-                    .state()
-                    .get(ids.timed_modifiers, source)
-                    .cloned()
-                    .unwrap_or_default();
-                let new = timed.give(id, until);
-                tick.state_mut()
-                    .insert(ids.timed_modifiers, source, timed)?;
-                if new {
-                    self.gain_power_list(tick, ids, source, id)?;
-                }
-                self.recompute_bonuses(tick, ids, source)?;
-                diag!(
-                    "power: {list} given to entity {} until frame {}",
-                    source.index(),
-                    until.get()
-                );
+            Effect::SelfTimedModifier { .. } => {
+                return self.apply_self_timed_modifier_effect(tick, ids, source, effect);
             }
-            Effect::ClearSelfTimedModifier(list) => {
-                let Some(id) = self.combat.modifiers.id(list) else {
-                    diag!("power: ModifierList {list} is not declared");
-                    return Ok(());
-                };
-                let Some(mut timed) = tick.state().get(ids.timed_modifiers, source).cloned() else {
-                    return Ok(());
-                };
-                if timed.remove(id) {
-                    if timed.0.is_empty() {
-                        tick.state_mut().remove(ids.timed_modifiers, source);
-                    } else {
-                        tick.state_mut()
-                            .insert(ids.timed_modifiers, source, timed)?;
-                    }
-                    self.recompute_bonuses(tick, ids, source)?;
-                    diag!("power: {list} dropped early from entity {}", source.index());
-                }
+            Effect::ClearSelfTimedModifier(..) => {
+                return self.apply_clear_self_timed_modifier_effect(tick, ids, source, effect);
             }
-            Effect::TimedModelCondition {
-                flag,
-                lasts,
-                only_if_absent,
-            } => {
-                let Some(wiring) = self.modules.as_ref() else {
-                    return Ok(());
-                };
-                let already_held = tick
-                    .state()
-                    .get(wiring.state, source)
-                    .is_some_and(|state| state.has_model_condition(flag));
-                if *only_if_absent && already_held {
-                    return Ok(());
-                }
-                let until = tick.frame().checked_add(*lasts).unwrap_or(Frame::FOREVER);
-                let mut timed = tick
-                    .state()
-                    .get(ids.timed_conditions, source)
-                    .cloned()
-                    .unwrap_or_default();
-                let new = timed.give(mint_sage_modules::effects::Name::clone(flag), until);
-                tick.state_mut()
-                    .insert(ids.timed_conditions, source, timed)?;
-                if new {
-                    self.apply_effects(
-                        tick,
-                        ids,
-                        vec![(
-                            source,
-                            Effect::ModelConditions {
-                                add: mint_sage_modules::effects::names(vec![flag.to_string()]),
-                                remove: mint_sage_modules::effects::names(Vec::new()),
-                            },
-                        )],
-                    )?;
-                }
-                diag!(
-                    "power: model state [{flag}] on entity {} until frame {}",
-                    source.index(),
-                    until.get()
-                );
+            Effect::TimedModelCondition { .. } => {
+                return self.apply_timed_model_condition_effect(tick, ids, source, effect);
             }
             Effect::GrantPlayerUpgrade(name) => match self.upgrade_bits.bit(name) {
                 Some(bit) => self.grant_player_upgrade(tick, ids, owner, bit)?,
@@ -1968,33 +2668,47 @@ impl RotwkRules {
                 Some(bit) => self.grant_object_upgrade(tick, ids, source, bit)?,
                 None => diag!("upgrade: {name} is not an Upgrade - nothing granted"),
             },
-            Effect::FireWeapon {
+            Effect::FireWeapon { .. } => {
+                return self.apply_fire_weapon_effect(tick, ids, source, effect);
+            }
+            Effect::FireWeaponAtDeath {
                 weapon,
-                at,
                 offset,
-                repeat,
-                alive_only,
-                reload_slot,
+                delay,
             } => {
                 let Some(weapon_id) = self.combat.weapons.id(weapon) else {
-                    diag!("power: weapon {weapon} is not declared");
+                    diag!("death: weapon {weapon} is not declared");
                     return Ok(());
                 };
-                let Some(point) = self.place_of(tick.state(), ids, source, *at) else {
+                let Some(body) = tick.state().get(ids.body, source).copied() else {
                     return Ok(());
                 };
-                let point = self.offset_in_frame(tick.state(), ids, source, point, *offset);
-                self.queue_shot(
+                let at = self.offset_in_frame(
+                    tick.state(),
+                    ids,
+                    source,
+                    body.0.position,
+                    (offset.0, offset.1),
+                );
+                let ground = self.ground_height(at.x, at.y);
+                let feet = tick
+                    .state()
+                    .get(ids.ground_offset, source)
+                    .map_or(0.0, |lift| lift.0);
+                let due = tick.frame().checked_add(*delay).unwrap_or(Frame::FOREVER);
+                self.queue_delayed(
                     tick,
                     ids,
-                    crate::spell_state::PendingShot {
+                    crate::spell_state::DelayedHit {
                         source,
                         weapon: weapon_id,
-                        at: point,
-                        repeat: *repeat,
-                        alive_only: *alive_only,
-                        reload_slot: *reload_slot,
-                        owner_if_gone: None,
+                        victim: None,
+                        at,
+                        height: ground + feet + offset.2,
+                        due,
+                        nugget: None,
+                        owner_if_gone: Some(owner),
+                        blow: None,
                     },
                 )?;
             }
@@ -2010,34 +2724,8 @@ impl RotwkRules {
                     self.emit_weapon_pre_attack_fx(tick, ids, weapon_id, point, source);
                 }
             }
-            Effect::PlayFx {
-                list,
-                at,
-                on_object,
-                secondary,
-            } => {
-                if let Some(point) = self.place_of(tick.state(), ids, source, *at) {
-                    if *on_object {
-                        self.emit_fx_object_named(
-                            tick,
-                            ids,
-                            list,
-                            point,
-                            crate::fx::FxSource::Power,
-                            source,
-                            *secondary,
-                        );
-                    } else {
-                        self.emit_fx_named(
-                            tick,
-                            ids,
-                            list,
-                            point,
-                            crate::fx::FxSource::Power,
-                            source,
-                        );
-                    }
-                }
+            Effect::PlayFx { .. } => {
+                return self.apply_play_fx_effect(tick, ids, source, effect);
             }
             Effect::Spawn {
                 name,
@@ -2046,30 +2734,11 @@ impl RotwkRules {
             } => {
                 self.spawn_for_module(tick, ids, (source, owner), name, *requester, *ordinal)?;
             }
-            Effect::CreateObject { name, at } => {
-                let Some(point) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let Some(kind) = self.kinds.kind(name) else {
-                    diag!("power: {name} is not in this match's templates");
-                    return Ok(());
-                };
-                let facing = tick
-                    .state()
-                    .get(ids.body, source)
-                    .map_or(Facing::EAST, |body| body.0.facing);
-                let made = self.spawn_kind_at(tick, ids, kind, point, facing, owner)?;
-                diag!(
-                    "power: {name} {} for player {} at ({:.0}, {:.0})",
-                    if made.is_some() {
-                        "created"
-                    } else {
-                        "not created"
-                    },
-                    owner.get(),
-                    point.x,
-                    point.y
-                );
+            Effect::CreateObject { .. } => {
+                return self.apply_create_object_effect(tick, ids, source, owner, effect);
+            }
+            Effect::Flood(spec) => {
+                self.make_flood(tick, ids, source, owner, spec)?;
             }
             Effect::CreateSlave {
                 name,
@@ -2078,69 +2747,14 @@ impl RotwkRules {
             } => {
                 self.spawn_slave_at_offset(tick, ids, source, name, *offset, *destroy_when_sold)?;
             }
-            Effect::SpellRechargeCount {
-                player,
-                delta,
-                percentages,
-            } => {
-                let player = player.unwrap_or(owner);
-                if let Some(player_entity) =
-                    crate::economy::player_entity(tick.state(), Self::economy_ids(ids), player)
-                {
-                    let moved = tick
-                        .state()
-                        .get(ids.spell_recharge, player_entity)
-                        .copied()
-                        .unwrap_or_default()
-                        .moved(*delta, percentages);
-                    tick.state_mut()
-                        .insert(ids.spell_recharge, player_entity, moved)?;
-                    diag!(
-                        "power: player {} counts {} spell recharge modifier(s), modifier {}",
-                        player.get(),
-                        moved.count,
-                        moved.modifier
-                    );
-                }
+            Effect::SpellRechargeCount { .. } => {
+                return self.apply_spell_recharge_count_effect(tick, ids, owner, effect);
             }
-            Effect::CommandPointBonus(points) => {
-                if let Some(player_entity) =
-                    crate::economy::player_entity(tick.state(), Self::economy_ids(ids), owner)
-                {
-                    tick.state_mut().insert(
-                        ids.player_point_bonus,
-                        player_entity,
-                        crate::spell_state::PointBonus(*points),
-                    )?;
-                    diag!(
-                        "power: player {} gains {points} command point(s)",
-                        owner.get()
-                    );
-                }
+            Effect::CommandPointBonus(..) => {
+                return self.apply_command_point_bonus_effect(tick, ids, owner, effect);
             }
-            Effect::SetWeatherEffect {
-                list,
-                anti,
-                affects,
-                affect_good,
-                affect_evil,
-                lasts,
-            } => {
-                let given = self.set_weather_effect(
-                    tick,
-                    ids,
-                    owner,
-                    list.as_ref(),
-                    anti,
-                    affects,
-                    *affect_good,
-                    *affect_evil,
-                    *lasts,
-                )?;
-                diag!(
-                    "power: weather effect given to {given} object(s) for {} frame(s)",
-                    lasts.get()
-                );
+            Effect::SetWeatherEffect { .. } => {
+                return self.apply_set_weather_effect_effect(tick, ids, owner, effect);
             }
             Effect::ClearWeatherEffect => {
                 let lifted = self.clear_weather_effect(tick, ids)?;
@@ -2157,22 +2771,11 @@ impl RotwkRules {
                 let made = self.spaced_objects(tick, ids, name, *spacing)?;
                 diag!("power: {made} {name}(s) placed {spacing:.0} apart over the map");
             }
-            Effect::CashBounty(fraction) => self.raise_cash_bounty(tick, ids, owner, *fraction)?,
-            Effect::AddObject { name, at } => {
-                let Some(point) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let Some(kind) = self.kinds.kind(name) else {
-                    diag!("power: {name} is not in this match's templates");
-                    return Ok(());
-                };
-                if !self.plant_tree(tick, ids, kind, point) {
-                    let facing = tick
-                        .state()
-                        .get(ids.body, source)
-                        .map_or(Facing::EAST, |body| body.0.facing);
-                    self.spawn_kind_at(tick, ids, kind, point, facing, owner)?;
-                }
+            Effect::CashBounty(fraction) => {
+                self.set_cash_bounty(tick, ids, source, owner, *fraction)?;
+            }
+            Effect::AddObject { .. } => {
+                return self.apply_add_object_effect(tick, ids, source, owner, effect);
             }
             Effect::FellTreesForMoney {
                 at,
@@ -2202,98 +2805,14 @@ impl RotwkRules {
                     self.morph_trees(tick, ids, centre, *radius, *tainted);
                 }
             }
-            Effect::Dominate {
-                at,
-                radius,
-                affects,
-                permanent,
-                fx,
-            } => {
-                let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let taken = if let PowerPlace::Object(target) = *at {
-                    self.dominate_clicked(tick, ids, source, owner, target, affects, *permanent)?
-                } else {
-                    self.dominate(
-                        tick, ids, source, owner, centre, *radius, affects, *permanent,
-                    )?
-                };
-                if let Some(list) = fx {
-                    for entity in &taken {
-                        self.emit_fx_on_horde_or_object(
-                            tick,
-                            ids,
-                            list,
-                            crate::fx::FxSource::Power,
-                            *entity,
-                        );
-                    }
-                }
-                diag!(
-                    "power: {} object(s) within {radius:.0} of ({:.0}, {:.0}) dominated by \
-                     player {}{}",
-                    taken.len(),
-                    centre.x,
-                    centre.y,
-                    owner.get(),
-                    if *permanent { "" } else { ", temporarily" }
-                );
+            Effect::Dominate { .. } => {
+                return self.apply_dominate_effect(tick, ids, source, owner, effect);
             }
-            Effect::CursePowers { at, share, fx } => {
-                let PowerPlace::Object(target) = *at else {
-                    diag!("power: a curse with no object target curses nothing");
-                    return Ok(());
-                };
-                let cursed = self.curse_powers(tick, ids, target, *share)?;
-                if let Some(list) = fx {
-                    if let Some(at) = tick.state().get(ids.body, target).map(|b| b.0.position) {
-                        self.emit_fx_object_named(
-                            tick,
-                            ids,
-                            list,
-                            at,
-                            crate::fx::FxSource::Power,
-                            target,
-                            None,
-                        );
-                    }
-                }
-                diag!(
-                    "power: entity {} has {cursed} power(s) set back by {:.0}% of their reload",
-                    target.index(),
-                    share * 100.0
-                );
+            Effect::CursePowers { .. } => {
+                return self.apply_curse_powers_effect(tick, ids, source, effect);
             }
-            Effect::DefectFor { back_to, lasts } => {
-                if tick.state().contains(ids.defect_revert, source) {
-                    diag!(
-                        "capture: entity {} is already defecting - the new dominate does not \
-                         refresh it",
-                        source.index()
-                    );
-                    return Ok(());
-                }
-                let since = tick.frame();
-                let until = since
-                    .checked_add(*lasts)
-                    .unwrap_or(mint_sim::Frame::FOREVER);
-                tick.state_mut().insert(
-                    ids.defect_revert,
-                    source,
-                    crate::rules::capture::DefectRevert {
-                        to: *back_to,
-                        by: source,
-                        since,
-                        until,
-                    },
-                )?;
-                diag!(
-                    "capture: entity {} defects to player {} for {} frame(s)",
-                    source.index(),
-                    owner.get(),
-                    lasts.get()
-                );
+            Effect::DefectFor { .. } => {
+                return self.apply_defect_for_effect(tick, ids, source, owner, effect);
             }
             Effect::Capture {
                 at,
@@ -2336,37 +2855,31 @@ impl RotwkRules {
                 self.replace_object(tick, ids, source, template, *carry)?;
             }
             Effect::PressCommand(name) => self.press_command(tick, ids, source, name)?,
-            Effect::ArrowStorm {
-                weapon,
+            Effect::ArrowStorm { .. } => {
+                return self.apply_arrow_storm_effect(tick, ids, source, effect);
+            }
+            Effect::SenseEnemies { range, filter } => {
+                self.sense_enemies(tick, ids, source, *range, filter)?;
+            }
+            Effect::FadeAway { opacity, first } => {
+                self.fade_away(tick, ids, source, *opacity, *first)?;
+            }
+            Effect::ArrowStormPrepare {
                 at,
                 radius,
-                shots_per_burst,
                 shots_per_target,
                 max_shots,
-                can_shoot_empty_ground,
             } => {
-                let Some(centre) = self.place_of(tick.state(), ids, source, *at) else {
-                    return Ok(());
-                };
-                let fired = self.arrow_storm_burst(
-                    tick,
-                    ids,
-                    owner,
-                    source,
-                    weapon,
-                    centre,
-                    *radius,
-                    *shots_per_burst,
-                    *shots_per_target,
-                    *max_shots,
-                    *can_shoot_empty_ground,
-                )?;
-                diag!(
-                    "power: arrow storm fired {fired} shot(s) of {weapon} within {radius:.0} of \
-                     ({:.0}, {:.0})",
-                    centre.x,
-                    centre.y
-                );
+                if let Some(centre) = self.place_of(tick.state(), ids, source, *at) {
+                    self.arrow_storm_prepare(
+                        tick,
+                        ids,
+                        owner,
+                        source,
+                        (centre, *radius),
+                        (*shots_per_target, *max_shots),
+                    )?;
+                }
             }
             Effect::Fling {
                 power,
@@ -2385,50 +2898,15 @@ impl RotwkRules {
             Effect::ClearArrowStorm => {
                 tick.state_mut().remove(ids.arrow_storm_hits, source);
             }
-            Effect::RefreshOtherPowers {
-                except,
-                affect_allies,
-                range,
-                affects,
-            } => {
-                let refreshed = self.refresh_other_powers(
-                    tick,
-                    ids,
-                    source,
-                    except,
-                    (*affect_allies).then_some((*range, affects)),
-                )?;
+            Effect::RefreshOtherPowers { rule } => {
+                let refreshed = self.refresh_other_powers(tick, ids, source, rule)?;
                 diag!(
-                    "power: {except} refreshed {refreshed} other power(s) from entity {}",
+                    "power: entity {} refreshed {refreshed} power(s) on its recipients",
                     source.index()
                 );
             }
-            Effect::GrantInvisibility {
-                filter,
-                radius,
-                duration,
-                nugget,
-            } => {
-                let world = tick.state();
-                if let (Some(owner), Some(centre)) = (
-                    world.get(ids.owner, source).map(|o| o.0),
-                    world.get(ids.body, source).map(|body| body.0.position),
-                ) {
-                    let admitted = self.admitted_within(
-                        world,
-                        ids,
-                        owner,
-                        centre,
-                        *radius,
-                        &super::spell_effects::filter_of(filter),
-                    );
-                    let granted =
-                        self.grant_invisibility(tick, ids, &admitted, *duration, nugget)?;
-                    diag!(
-                        "power: InvisibilitySpecialPower granted {granted} of {} admitted entity(ies)",
-                        admitted.len()
-                    );
-                }
+            Effect::GrantInvisibility { .. } => {
+                return self.apply_grant_invisibility_effect(tick, ids, source, effect);
             }
             _ => {}
         }
@@ -2491,6 +2969,67 @@ impl RotwkRules {
         let x = if from.x < high.x * 0.5 { high.x } else { 0.0 };
         let y = if from.y < high.y * 0.5 { high.y } else { 0.0 };
         Vec2::new(x, y)
+    }
+
+    fn closest_spawn_point(&self, from: Vec2) -> Vec2 {
+        const SPAWN_POINTS: [&str; 4] = [
+            "TopArmySpawnPoint",
+            "BottomArmySpawnPoint",
+            "LeftArmySpawnPoint",
+            "RightArmySpawnPoint",
+        ];
+        let Some(engine) = self.map_scripts.as_ref() else {
+            return from;
+        };
+        SPAWN_POINTS
+            .iter()
+            .filter_map(|name| engine.waypoint(name))
+            .min_by(|a, b| a.minus(from).length().total_cmp(&b.minus(from).length()))
+            .unwrap_or(from)
+    }
+
+    fn apply_upgraded_create_effect(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        effect: &Effect,
+    ) -> Result<()> {
+        let Effect::UpgradedCreateObjects {
+            create,
+            upgrade_lists,
+            grants,
+        } = effect
+        else {
+            return Ok(());
+        };
+        let held = crate::economy::player_entity(tick.state(), Self::economy_ids(ids), owner)
+            .and_then(|player| tick.state().get(ids.player_upgrades, player))
+            .map(|held| held.0.clone());
+        let chosen = upgrade_lists.iter().find_map(|(upgrade, list)| {
+            let bit = self.upgrade_bits.bit(upgrade)?;
+            held.as_ref()
+                .is_some_and(|mask| mask.contains(bit))
+                .then_some(list)
+        });
+        let mut create = (**create).clone();
+        if let (Some(list), Effect::CreateObjects { list: slot, .. }) = (chosen, &mut create) {
+            *slot = list.clone();
+        }
+        self.apply_create_objects_effect(tick, ids, source, owner, &create)?;
+        let located = matches!(&create, Effect::CreateObjects { at, .. } if !matches!(at, PowerPlace::Source));
+        if located {
+            for name in grants {
+                match self.upgrade_bits.bit(name) {
+                    Some(bit) if self.upgrade_bits.is_player(bit) => {
+                        self.grant_player_upgrade(tick, ids, owner, bit)?;
+                    }
+                    _ => diag!("power: {name} is not a player Upgrade - nothing granted"),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn nearest_object_passing(
@@ -2619,6 +3158,17 @@ impl RotwkRules {
                 let facing = placement.facing_degrees.map_or(creation_angle, |degrees| {
                     Facing::from_radians(degrees.to_radians())
                 });
+                let has = |flag: &str| {
+                    entry
+                        .disposition
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(flag))
+                };
+                let facing = if has(mint_sage_ini::DEFAULT_DISPOSITION) && !has("ANIMATED") {
+                    Facing::from_radians(tick.rng().next_f32() * core::f32::consts::TAU)
+                } else {
+                    facing
+                };
                 let facing = match secondary {
                     Some(target) if entry.orient_in_secondary_direction => {
                         Facing::from_vector(target.minus(position)).map_or(facing, |toward| {
@@ -2643,7 +3193,8 @@ impl RotwkRules {
                 }
                 if let Some(ms) = entry.invulnerable_time_ms.filter(|ms| *ms > 0.0) {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let lasts = LogicFrames::from_milliseconds(ms.min(86_400_000.0) as u32);
+                    let lasts =
+                        mint_sage_modules::retail_duration_ticks(ms.min(86_400_000.0) as u32);
                     let until = tick.frame().checked_add(lasts).unwrap_or(Frame::FOREVER);
                     tick.state_mut().insert(
                         ids.undetected_defector,
@@ -2865,6 +3416,8 @@ impl RotwkRules {
             &self.upgrade_buildables,
             &gate,
             self.production_cost_change_percent(owner),
+            self.brutal_cheats_for(owner).build_cost_reduction,
+            &|world, builder, bit| self.sub_upgrade_counted(world, ids, builder, bit),
         )? {
             diag!("{line}");
         }
@@ -2947,44 +3500,7 @@ impl RotwkRules {
         rule: &ModifierRule,
     ) -> Result<usize> {
         let now = tick.frame();
-        let tokens: Vec<String> = rule.affects.iter().map(|name| name.to_string()).collect();
-        let filter = crate::defeat::ObjectFilter::parse(&tokens);
-        let reach = rule.radius * rule.radius;
-        let world = tick.state();
-        let mut targets: Vec<Entity> = world
-            .store(ids.kind)
-            .map(|store| {
-                store
-                    .iter()
-                    .filter(|(entity, kind)| {
-                        *entity != source
-                            && self.admits(world, ids, *entity, owner, &filter, rule.sides)
-                            && !self.kinds.get(**kind).is_some_and(|entry| {
-                                entry
-                                    .record
-                                    .kind_of
-                                    .iter()
-                                    .any(|flag| flag == "IGNORED_IN_GUI")
-                            })
-                            && world.get(ids.body, *entity).is_some_and(|body| {
-                                let dx = body.0.position.x - centre.x;
-                                let dy = body.0.position.y - centre.y;
-                                dx * dx + dy * dy <= reach
-                            })
-                    })
-                    .map(|(entity, _)| entity)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if rule.affects_self {
-            if world.contains(ids.horde, source) {
-                targets.extend(self.horde_members(tick, ids, &[source]));
-            } else {
-                targets.push(source);
-            }
-            targets.sort_unstable_by_key(|entity| entity.index());
-            targets.dedup();
-        }
+        let targets = self.modifier_recipients(tick, ids, source, owner, centre, rule);
         let anti_stamp = (!rule.anti.is_empty()).then(|| match &rule.list {
             None => now,
             Some(list_name) => self
@@ -2995,7 +3511,7 @@ impl RotwkRules {
                 .and_then(|list| list.duration_ms)
                 .filter(|ms| *ms > 0)
                 .map_or(Frame::FOREVER, |ms| {
-                    now.checked_add(LogicFrames::from_milliseconds(ms))
+                    now.checked_add(mint_sage_modules::retail_duration_ticks(ms))
                         .unwrap_or(Frame::FOREVER)
                 }),
         });
@@ -3003,41 +3519,11 @@ impl RotwkRules {
         for &entity in &targets {
             let other_owner = tick.state().get(ids.owner, entity).map(|o| o.0);
             let evil = other_owner.is_some_and(|player| self.is_evil_owner(player));
-            if rule.affect_good && evil {
-                continue;
-            }
-            if rule.affect_evil && !evil {
-                continue;
-            }
-            if !rule.affect_allies && other_owner != Some(owner) {
-                continue;
-            }
             if let Some(list_name) = &rule.list {
                 match self.combat.modifiers.id(list_name) {
                     Some(id) => {
-                        let refused = self.combat.modifiers.get(id).is_some_and(|list| {
-                            list.ignore_if_anti_category_active
-                                && list.category.as_deref().is_some_and(|category| {
-                                    self.category_suppressed(
-                                        tick.state(),
-                                        ids,
-                                        entity,
-                                        Some(category),
-                                    )
-                                })
-                        });
-                        if !refused {
-                            let until = self
-                                .combat
-                                .modifiers
-                                .get(id)
-                                .and_then(|list| list.duration_ms)
-                                .filter(|ms| *ms > 0)
-                                .map_or(Frame::FOREVER, |ms| {
-                                    now.checked_add(LogicFrames::from_milliseconds(ms))
-                                        .unwrap_or(Frame::FOREVER)
-                                });
-                            self.give_timed_list(tick, ids, entity, id, until)?;
+                        let until = self.list_end(now, id);
+                        if self.give_timed_list(tick, ids, entity, id, until)? {
                             given = given.saturating_add(1);
                         }
                     }
@@ -3083,6 +3569,84 @@ impl RotwkRules {
         Ok(given)
     }
 
+    pub(super) fn modifier_recipients(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        centre: Vec2,
+        rule: &ModifierRule,
+    ) -> Vec<Entity> {
+        let tokens: Vec<String> = rule.affects.iter().map(|name| name.to_string()).collect();
+        let filter = crate::defeat::ObjectFilter::parse(&tokens);
+        let reach = rule.radius * rule.radius;
+        let world = tick.state();
+        let mut targets: Vec<Entity> = world
+            .store(ids.kind)
+            .map(|store| {
+                store
+                    .iter()
+                    .filter(|(entity, kind)| {
+                        *entity != source
+                            && self.admits(world, ids, *entity, owner, &filter, rule.sides)
+                            && !self.kinds.get(**kind).is_some_and(|entry| {
+                                entry
+                                    .record
+                                    .kind_of
+                                    .iter()
+                                    .any(|flag| flag == "IGNORED_IN_GUI")
+                            })
+                            && world.get(ids.body, *entity).is_some_and(|body| {
+                                let dx = body.0.position.x - centre.x;
+                                let dy = body.0.position.y - centre.y;
+                                dx * dx + dy * dy <= reach
+                            })
+                    })
+                    .map(|(entity, _)| entity)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if rule.affects_self {
+            if world.contains(ids.horde, source) {
+                targets.extend(self.horde_members(tick, ids, &[source]));
+            } else {
+                targets.push(source);
+            }
+            targets.sort_unstable_by_key(|entity| entity.index());
+            targets.dedup();
+        }
+        targets.retain(|&entity| {
+            let other_owner = world.get(ids.owner, entity).map(|o| o.0);
+            let evil = other_owner.is_some_and(|player| self.is_evil_owner(player));
+            (!rule.affect_good || !evil)
+                && (!rule.affect_evil || evil)
+                && (rule.affect_allies || other_owner == Some(owner))
+        });
+        targets
+    }
+
+    pub(super) fn power_is_paused(
+        &self,
+        world: &World,
+        ids: Ids,
+        entity: Entity,
+        power_name: &str,
+    ) -> bool {
+        let Some(power_id) = self.power_names.id(power_name) else {
+            return false;
+        };
+        let starts_paused = world
+            .get(ids.kind, entity)
+            .and_then(|kind| self.kinds.get(*kind))
+            .and_then(|entry| entry.record.power(power_name))
+            .is_some_and(|slot| slot.starts_paused);
+        (starts_paused && !self.power_released(world, entity, power_name))
+            || world
+                .get(ids.stealth, entity)
+                .is_some_and(|state| state.paused_since(power_id).is_some())
+    }
+
     pub(super) fn gain_power_list(
         &self,
         tick: &mut Tick<'_>,
@@ -3111,16 +3675,21 @@ impl RotwkRules {
             .map(|store| {
                 store
                     .iter()
-                    .filter(|(_, timed)| timed.0.iter().any(|(_, until)| *until <= now))
+                    .filter(|(_, timed)| {
+                        timed.0.iter().any(|(_, until)| *until <= now)
+                            || timed.1.iter().any(|(_, at)| *at <= now)
+                    })
                     .map(|(entity, _)| entity)
                     .collect()
             })
             .unwrap_or_default();
         for entity in due {
+            self.give_due_list_upgrades(tick, ids, entity, now)?;
             let Some(mut timed) = tick.state().get(ids.timed_modifiers, entity).cloned() else {
                 continue;
             };
-            timed.expire(now);
+            let ended = timed.take_ended(now);
+            let remaining = timed.0.clone();
             if timed.0.is_empty() {
                 tick.state_mut().remove(ids.timed_modifiers, entity);
             } else {
@@ -3128,6 +3697,17 @@ impl RotwkRules {
                     .insert(ids.timed_modifiers, entity, timed)?;
             }
             self.recompute_bonuses(tick, ids, entity)?;
+            for (at, id) in ended.iter().enumerate() {
+                let category = self
+                    .combat
+                    .modifiers
+                    .get(*id)
+                    .and_then(|list| list.category.clone());
+                let mut still = remaining.clone();
+                still.extend(ended.iter().skip(at).map(|ended| (*ended, now)));
+                let counter = self.held_in_category(&still, category.as_deref());
+                self.list_ended(tick, ids, entity, *id, counter)?;
+            }
         }
         Ok(())
     }
@@ -3389,7 +3969,7 @@ impl RotwkRules {
             points: state.purchase_points,
             rank: state.rank,
             skill_points: state.skill_points,
-            next_rank_at: state.next_rank_at(&self.ranks),
+            next_rank_at: state.next_rank_at(self.ranks_of(player)),
             entries: plan
                 .store
                 .iter()
@@ -3596,6 +4176,10 @@ impl RotwkRules {
     ) -> Option<u8> {
         let power_id = self.power_names.id(power)?;
         let &(_, shared) = self.power_reload.get(usize::from(power_id.get()))?;
+        let now = world
+            .get(ids.stealth, source)
+            .and_then(|state| state.paused_since(power_id))
+            .unwrap_or(now);
         let (available_on, reload) = if shared {
             let player = world.get(ids.owner, source)?.0;
             let pe = crate::economy::player_entity(world, Self::economy_ids(ids), player)?;
@@ -3652,10 +4236,10 @@ impl RotwkRules {
         let Some(state) = self.science_of(world, ids, player) else {
             return 1.0;
         };
-        let Some(next) = state.next_rank_at(&self.ranks) else {
+        let Some(next) = state.next_rank_at(self.ranks_of(player)) else {
             return 1.0;
         };
-        let start = self.ranks.needed(state.rank).unwrap_or(0);
+        let start = self.ranks_of(player).needed(state.rank).unwrap_or(0);
         let span = next.saturating_sub(start).max(1);
         let progressed = state.skill_points.saturating_sub(start);
         #[allow(clippy::cast_precision_loss)]
@@ -3677,7 +4261,7 @@ impl RotwkRules {
             .get(usize::from(button))?;
         producer
             .queue
-            .first_of(ItemId::new(u32::from(item)))
+            .first_of(ItemTable::Objects, ItemId::new(u32::from(item)))
             .map(|entry| entry.fraction())
     }
 
@@ -3700,7 +4284,7 @@ impl RotwkRules {
             .queue
             .entries()
             .iter()
-            .filter(|entry| entry.item == item)
+            .filter(|entry| entry.makes(ItemTable::Objects, item))
             .count()
     }
 
@@ -3718,7 +4302,7 @@ impl RotwkRules {
             .get(usize::from(button))?;
         upgrade_producer
             .queue
-            .first_of(ItemId::new(u32::from(item)))
+            .first_of(ItemTable::Upgrades, ItemId::new(u32::from(item)))
             .map(|entry| entry.fraction())
     }
 
@@ -3736,7 +4320,7 @@ impl RotwkRules {
             .get(usize::from(button))?;
         upgrade_producer
             .queue
-            .first_of(ItemId::new(u32::from(item)))
+            .first_of(ItemTable::Upgrades, ItemId::new(u32::from(item)))
             .map(|entry| entry.fraction())
     }
 }

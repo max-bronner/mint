@@ -16,6 +16,7 @@ fn param(string: &str, int: i32, real: f32) -> Parameter {
 fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -37,6 +38,7 @@ fn run(actions: Vec<ScriptAction>, objectives: &[(&str, bool)], ticks: u32) -> S
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: "CONDITION_TRUE".to_owned(),
                 params: vec![],

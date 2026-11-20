@@ -167,8 +167,16 @@ impl RotwkRules {
                 continue;
             };
             if victim.entity == crusher
-                || !self.object_hostile(tick.state(), crusher, victim.entity)
+                || tick.state().contains(ids.doomed, victim.entity)
+                || tick
+                    .state()
+                    .get(ids.health, victim.entity)
+                    .is_some_and(|health| health.0.is_dead())
             {
+                continue;
+            }
+            let hostile = self.object_hostile(tick.state(), crusher, victim.entity);
+            if !self.crush_pass_arm(tick, ids, crusher, hostile) {
                 continue;
             }
             if victim.z > floor + height || floor > victim.z + victim.height {

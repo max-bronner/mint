@@ -294,7 +294,7 @@ fn a_move_order_unhides_at_once_and_the_hiding_returns_after_one_update_period()
 
 const DETECT_DATA: &str = "\
 Locomotor ZFeet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\
-SpecialPower ZCloakPower\n  ReloadTime = 1000\nEnd\n\
+SpecialPower ZCloakPower\n  ReloadTime = 1000\n  PreventActivationConditions = HIDDEN\nEnd\n\
 CommandSet ZCloakSet\n  1 = ZFire_Cloak\nEnd\n\
 CommandButton ZFire_Cloak\n  Command = SPECIAL_POWER\n  SpecialPower = ZCloakPower\nEnd\n\
 Object ZStealthHider\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE\n  \
@@ -332,6 +332,12 @@ Object ZTimedCloak\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE\n  CommandS
 ChildObject ZQuietCloak ZTimedCloak\n  \
   Behavior = ToggleHiddenSpecialAbilityUpdate Tag_CloakButton\n    \
     SpecialPowerTemplate = ZCloakPower\n    EffectDuration = 4000\n  End\nEnd\n\
+ChildObject ZUntoggleCloak ZCloaked\n  \
+  Behavior = InvisibilityUpdate Tag_Cloak\n    \
+    InvisibilityNugget\n      InvisibilityType = STEALTH\n      \
+      ForbiddenConditions = MOVING FIRING_ANY\n      \
+      Options = UNTOGGLE_HIDDEN_WHEN_LEAVING_STEALTH\n    End\n    \
+    UpdatePeriod = 1000\n    StartsActive = No\n  End\nEnd\n\
 Object ZSeeker\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_Body\n    MaxHealth = 400\n  End\n  \
   LocomotorSet\n    Locomotor = ZFeet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
@@ -403,12 +409,14 @@ fn detect_scene(
         .collect();
     let power_names = crate::powers::PowerNames::build(kinds.power_names().map(str::to_owned));
     let power_reload = power_names.reload_table(&game.special_powers);
+    let cast_rules = power_names.cast_rules(&game.special_powers);
     let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
     let rules = RotwkRules::new(passability, spawns)
         .with_combat(game.combat.clone())
         .with_construction(Arc::clone(&kinds), production)
         .with_upgrades(kinds.upgrades(&game), Arc::clone(&game.upgrade_bits))
-        .with_powers(power_names, power_reload);
+        .with_powers(power_names, power_reload)
+        .with_power_cast_rules(cast_rules);
     let mut simulation = Simulation::new(5, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
     let entities = simulation
@@ -682,11 +690,15 @@ fn a_hit_reveals_a_stealthed_object_forbidding_taking_damage_and_it_hides_again_
             RotwkCommand::Debug(DebugCommand::Damage { percent: 10 }),
         )
         .unwrap();
-    simulation.tick().unwrap();
-    assert!(
-        !hidden(&simulation, ids, hider),
-        "stayed hidden after a hit"
-    );
+    let mut revealed = false;
+    for _ in 0..31 {
+        simulation.tick().unwrap();
+        if !hidden(&simulation, ids, hider) {
+            revealed = true;
+            break;
+        }
+    }
+    assert!(revealed, "stayed hidden after a hit");
 
     for _ in 0..90 {
         simulation.tick().unwrap();
@@ -772,7 +784,7 @@ fn voiced(simulation: &Simulation<RotwkRules>, entity: Entity) -> Vec<crate::voi
 #[test]
 fn hiding_and_its_end_are_each_heard_once_on_their_own_tick() {
     let (mut simulation, ids, hider, _) = scene(true, 300.0);
-    let mut on = Vec::new();
+    let mut on = voiced(&simulation, hider);
     for _ in 0..60 {
         simulation.tick().unwrap();
         on.extend(voiced(&simulation, hider));
@@ -811,4 +823,285 @@ fn hiding_and_its_end_are_each_heard_once_on_their_own_tick() {
         }
     }
     assert_eq!(off, [crate::voice::VoiceKind::StealthOff]);
+}
+
+fn press_cloak(simulation: &mut Simulation<RotwkRules>, entity: Entity) {
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![entity],
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::FireSpecialPower {
+                button: 0,
+                target: None,
+                at: None,
+            },
+        )
+        .unwrap();
+}
+
+fn hide_status(simulation: &Simulation<RotwkRules>, entity: Entity) -> bool {
+    simulation
+        .rules()
+        .holds_status(simulation.state(), entity, "HIDDEN")
+}
+
+fn cloak_power_ready(simulation: &Simulation<RotwkRules>, ids: Ids, entity: Entity) -> bool {
+    simulation.rules().power_is_ready(
+        simulation.state(),
+        ids,
+        simulation.frame(),
+        entity,
+        "ZCloakPower",
+    )
+}
+
+#[test]
+fn a_hide_press_raises_hidden_three_ways_and_greys_the_button() {
+    let (mut simulation, ids, entities) =
+        detect_scene(&["ZCloaked"], &[Vec2::new(300.0, 300.0)], &[PLAYER]);
+    let cloaked = entities[0];
+    settle(&mut simulation);
+    assert!(!simulation
+        .rules()
+        .power_restricted(simulation.state(), cloaked, "ZCloakPower"));
+    press_cloak(&mut simulation, cloaked);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    let flagged = simulation
+        .rules()
+        .modules
+        .as_ref()
+        .and_then(|wiring| simulation.state().get(wiring.state, cloaked))
+        .is_some_and(|state| state.has_weapon_set_flag("HIDDEN"));
+    assert!(hide_status(&simulation, cloaked), "status");
+    assert!(flagged, "weapon-set flag");
+    assert!(
+        simulation
+            .rules()
+            .holds_condition_in(simulation.state(), cloaked, "HIDDEN"),
+        "model condition"
+    );
+    assert!(simulation
+        .rules()
+        .power_restricted(simulation.state(), cloaked, "ZCloakPower"));
+    let _ = ids;
+}
+
+#[test]
+fn a_hide_press_pauses_the_powers_countdown() {
+    let (mut simulation, ids, entities) =
+        detect_scene(&["ZCloaked"], &[Vec2::new(300.0, 300.0)], &[PLAYER]);
+    let cloaked = entities[0];
+    settle(&mut simulation);
+    press_cloak(&mut simulation, cloaked);
+    for _ in 0..120 {
+        simulation.tick().unwrap();
+    }
+    assert!(!cloak_power_ready(&simulation, ids, cloaked));
+}
+
+#[test]
+fn a_timed_hide_ends_at_its_effect_duration() {
+    let (mut simulation, ids, entities) =
+        detect_scene(&["ZTimedCloak"], &[Vec2::new(300.0, 300.0)], &[PLAYER]);
+    let cloaked = entities[0];
+    settle(&mut simulation);
+    press_cloak(&mut simulation, cloaked);
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        hide_status(&simulation, cloaked),
+        "hidden inside the duration"
+    );
+    for _ in 0..200 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        !hide_status(&simulation, cloaked),
+        "marks cleared after 4 s"
+    );
+    assert!(
+        cloak_power_ready(&simulation, ids, cloaked),
+        "countdown resumed"
+    );
+}
+
+#[test]
+fn a_detector_reveal_ends_a_cloak_that_untoggles_when_leaving_stealth() {
+    let (mut simulation, ids, entities) = detect_scene(
+        &["ZUntoggleCloak", "ZSeeker"],
+        &[Vec2::new(300.0, 300.0), Vec2::new(500.0, 300.0)],
+        &[PLAYER, OTHER],
+    );
+    let cloaked = entities[0];
+    settle(&mut simulation);
+    press_cloak(&mut simulation, cloaked);
+    for _ in 0..240 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        !hide_status(&simulation, cloaked),
+        "the hide ended with the stealth"
+    );
+    assert!(cloak_power_ready(&simulation, ids, cloaked));
+}
+
+#[test]
+fn a_nugget_hides_on_the_next_one_second_pass_after_it_stops() {
+    let (mut simulation, ids, hider, _) = scene(true, 300.0);
+    for _ in 0..60 {
+        simulation.tick().unwrap();
+    }
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![hider],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::MoveTo {
+                x: 460.0,
+                y: 300.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    let mut stopped_at = None;
+    for step in 0..400u32 {
+        simulation.tick().unwrap();
+        let moving = simulation
+            .state()
+            .get(ids.body, hider)
+            .is_some_and(|body| body.0.speed > 0.0);
+        if stopped_at.is_none() && step > 5 && !moving {
+            stopped_at = Some(simulation.frame().get());
+        }
+        if stopped_at.is_some() && hidden(&simulation, ids, hider) {
+            break;
+        }
+    }
+    let stopped_at = stopped_at.expect("the walk ends");
+    let hid_at = simulation.frame().get();
+    assert!(hidden(&simulation, ids, hider), "never hid again");
+    assert_eq!((hid_at - 1) % 30, 0, "on a pass, not {hid_at}");
+    assert!(
+        hid_at - stopped_at < 30,
+        "stopped {stopped_at}, hid {hid_at}"
+    );
+}
+
+#[test]
+fn stealth_update_hides_two_objects_on_the_same_frame() {
+    let data = "\
+Object ZSeven\n  Side = Neutral\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 400\n  End\n  \
+  Behavior = StealthUpdate Tag_Stalk\n    StealthDelay = 500\n    StartsActive = Yes\n    \
+    ForbiddenConditions = MOVING\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
+    let doc =
+        mint_sage_ini::Document::parse("t.ini", data, &mint_sage_ini::BlockTable::corpus_path())
+            .unwrap();
+    let (game, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
+    let (kinds, missing) = KindTable::closure(&game, &["ZSeven".to_owned()]);
+    assert!(missing.is_empty(), "{missing:?}");
+    let kinds = Arc::new(kinds);
+    let production = kinds.production(&game);
+    let spawns = (0..8u8)
+        .map(|n| {
+            kinds
+                .spawn(
+                    &game.combat,
+                    kinds.kind("ZSeven").unwrap(),
+                    Vec2::new(300.0 + f32::from(n) * 40.0, 300.0),
+                    Facing::EAST,
+                    PLAYER,
+                )
+                .unwrap()
+        })
+        .collect();
+    let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
+    let rules = RotwkRules::new(passability, spawns)
+        .with_combat(game.combat.clone())
+        .with_construction(Arc::clone(&kinds), production)
+        .with_upgrades(kinds.upgrades(&game), Arc::clone(&game.upgrade_bits));
+    let mut simulation = Simulation::new(5, rules).unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let entities = simulation
+        .state()
+        .store(ids.body)
+        .unwrap()
+        .entities()
+        .to_vec();
+    let (first, seventh) = (entities[0], entities[7]);
+    let mut frames = [None, None];
+    for _ in 0..60 {
+        simulation.tick().unwrap();
+        for (slot, entity) in frames.iter_mut().zip([first, seventh]) {
+            if slot.is_none() && hidden(&simulation, ids, entity) {
+                *slot = Some(simulation.frame().get());
+            }
+        }
+    }
+    assert!(frames[0].is_some_and(|frame| frame <= 20), "{frames:?}");
+    assert_eq!(frames[0], frames[1]);
+}
+
+#[test]
+fn a_held_forbidden_weapon_flag_refuses_hiding() {
+    let modded = data(true)
+        .replace(
+            "ForbiddenConditions = MOVING FIRING_ANY",
+            "ForbiddenConditions = MOVING FIRING_ANY\n      ForbiddenWeaponConditions = CLOSE_RANGE",
+        )
+        .replace(
+            "Behavior = InvisibilityUpdate Tag_Camo",
+            "Behavior = WeaponSetUpgrade Tag_Closer\n    TriggeredBy = Upgrade_Closer\n    \
+             WeaponCondition = CLOSE_RANGE\n  End\n  Behavior = InvisibilityUpdate Tag_Camo",
+        )
+        .replace(
+            "Object ZHider\n",
+            "Upgrade Upgrade_Closer\n  Type = OBJECT\nEnd\nObject ZHider\n",
+        );
+    let hides = |flagged: bool| {
+        let (mut simulation, ids, hider, _) = scene_of(&modded, 300.0, Vec::new(), false);
+        if flagged {
+            simulation
+                .submit(
+                    PLAYER,
+                    RotwkCommand::SetSelection {
+                        replace: true,
+                        units: vec![hider],
+                    },
+                )
+                .unwrap();
+            simulation
+                .submit(
+                    PLAYER,
+                    RotwkCommand::Debug(DebugCommand::GrantUpgrade {
+                        upgrade: "Upgrade_Closer".to_owned(),
+                    }),
+                )
+                .unwrap();
+        }
+        settle(&mut simulation);
+        hidden(&simulation, ids, hider)
+    };
+    assert!(hides(false), "no flag: it hides");
+    assert!(!hides(true), "the flag is held: it does not");
 }

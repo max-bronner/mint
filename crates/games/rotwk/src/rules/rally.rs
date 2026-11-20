@@ -191,7 +191,7 @@ impl RotwkRules {
         }
     }
 
-    fn rally_path_exists(&self, from: Vec2, to: Vec2) -> bool {
+    pub(super) fn rally_path_exists(&self, from: Vec2, to: Vec2) -> bool {
         let (Some(start), Some(goal)) =
             (self.passability.cell_at(from), self.passability.cell_at(to))
         else {

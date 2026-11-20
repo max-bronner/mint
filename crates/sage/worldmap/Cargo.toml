@@ -1,0 +1,22 @@
+[package]
+name = "mint-sage-worldmap"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.mint]
+layer = 3
+tier = "sage"
+
+[lints]
+workspace = true
+
+[dependencies]
+mint-sage-livingworld = { path = "../livingworld" }
+mint-sage-ini = { path = "../ini" }
+mint-sage-model = { path = "../model" }
+mint-render = { path = "../../core/render" }
+mint-vfs = { path = "../../core/vfs" }
+mint-math = { path = "../../core/math" }

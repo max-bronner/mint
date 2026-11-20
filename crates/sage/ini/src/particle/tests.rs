@@ -743,6 +743,7 @@ fn the_flat_form_reads_the_volumes_the_block_form_gained() {
             radius: 30.0,
             length: 8.0,
             offset: [0.0; 3],
+            radius_rate: 0.0,
             hollow: true,
         }
     );
@@ -766,6 +767,7 @@ fn a_cylinder_and_an_outward_velocity_are_decoded() {
              \x20   Radius = 30\n\
              \x20   Length = 12\n\
              \x20   Offset = X:0.0 Y:0.0 Z:5.0\n\
+             \x20   RadiusRate = 0.5\n\
              \x20   IsHollow = Yes\n\
              \x20 End\n\
              \x20 EmissionVelocity = OutwardEmissionVelocity\n\
@@ -781,6 +783,7 @@ fn a_cylinder_and_an_outward_velocity_are_decoded() {
             radius: 30.0,
             length: 12.0,
             offset: [0.0, 0.0, 5.0],
+            radius_rate: 0.5,
             hollow: true,
         }
     );
@@ -1042,8 +1045,8 @@ fn a_nugget_delay_is_milliseconds_rounded_up_and_ignores_its_distribution() {
             .unwrap()
             .initial_delay
     };
-    assert_eq!(delay(0), RandomRange::constant(30.0), "1000 ms at 30 Hz");
-    assert_eq!(delay(1), RandomRange::constant(9.0), "300 ms, CONSTANT");
+    assert_eq!(delay(0), RandomRange::constant(5.0), "1000 ms is 5 frames");
+    assert_eq!(delay(1), RandomRange::constant(2.0), "300 ms, CONSTANT");
     assert_eq!(delay(2), RandomRange::constant(1.0), "1 ms rounds up to 1");
     assert_eq!(delay(3), RandomRange::default(), "an unexpanded macro");
     assert_eq!(delay(4), RandomRange::default(), "no field at all");

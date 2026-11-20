@@ -316,6 +316,7 @@ enum Volume {
         radius: f32,
         length: f32,
         offset: [f32; 3],
+        radius_rate: f32,
         hollow: bool,
     },
     Lightning {
@@ -336,11 +337,13 @@ impl Volume {
                 radius,
                 length,
                 offset,
+                radius_rate,
                 hollow,
             } => Self::Cylinder {
                 radius,
                 length,
                 offset,
+                radius_rate,
                 hollow,
             },
             EmissionVolume::Lightning { start, end, waves } => {
@@ -483,6 +486,8 @@ pub struct CollisionEvent {
     pub fires: Vec<FxSpawn>,
     pub height_offset: f32,
     pub kill_after: bool,
+    pub follow_up: Option<u32>,
+    pub orient: bool,
 }
 
 pub const MAX_COMPOUND_DEPTH: u32 = 4;
@@ -537,6 +542,7 @@ struct LiveSystem {
     buffer: Option<Buffer>,
     filled: usize,
     particles: Vec<Particle>,
+    radius: f32,
     delay_left: f32,
     burst_left: f32,
     age: u32,
@@ -551,6 +557,8 @@ struct LiveSystem {
 }
 
 const MAX_SIZE_BONUS: f32 = 50.0;
+
+const MIN_CYLINDER_RADIUS: f32 = 0.1;
 
 #[derive(Debug, Clone, Copy)]
 struct Buffer {
@@ -592,10 +600,20 @@ pub struct ParticleWorld {
     scratch: MeshData,
     slots: BTreeMap<u64, usize>,
     scratch_follows: Vec<(SystemId, Vec3, bool)>,
-    scratch_events: Vec<Vec3>,
+    scratch_events: Vec<(Vec3, [f32; 2])>,
     scratch_placements: Vec<Mat4>,
     model_draws: Vec<ModelDraw>,
+    collisions: Vec<Collision>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Collision {
+    pub follow_up: u32,
+    pub at: Vec3,
+    pub heading: Option<[f32; 2]>,
+}
+
+const MAX_PENDING_COLLISIONS: usize = 1024;
 
 impl Default for ParticleWorld {
     fn default() -> Self {
@@ -644,7 +662,12 @@ impl ParticleWorld {
             scratch_events: Vec::new(),
             scratch_placements: Vec::new(),
             model_draws: Vec::new(),
+            collisions: Vec::new(),
         }
+    }
+
+    pub fn take_collisions(&mut self, out: &mut Vec<Collision>) {
+        out.append(&mut self.collisions);
     }
 
     pub fn register(
@@ -912,6 +935,10 @@ impl ParticleWorld {
             buffer: None,
             filled: 0,
             particles: Vec::with_capacity(capacity),
+            radius: match emission.volume {
+                Volume::Cylinder { radius, .. } => radius,
+                _ => 0.0,
+            },
             delay_left: (self.rng.range(emission.initial_delay) + extra_delay).max(0.0),
             burst_left: 0.0,
             age: 0,
@@ -979,6 +1006,7 @@ impl ParticleWorld {
             .extend(self.systems.iter().filter_map(|system| system.buffer));
         self.systems.clear();
         self.slots.clear();
+        self.collisions.clear();
     }
 
     pub fn remove(&mut self, id: SystemId) -> bool {
@@ -1390,8 +1418,10 @@ impl ParticleWorld {
 
         if system.emitting && !system.driven && !system.suppressed {
             if system.burst_left > 0.0 {
-                if let Some(system) = self.systems.get_mut(index) {
-                    system.burst_left -= 1.0;
+                if !emission.one_shot {
+                    if let Some(system) = self.systems.get_mut(index) {
+                        system.burst_left -= 1.0;
+                    }
                 }
             } else {
                 let count = burst_size(self.rng.range(emission.burst_count), capacity);
@@ -1426,6 +1456,7 @@ impl ParticleWorld {
                     let behind = 1.0 - number as f32 / count as f32;
                     let place = Placement {
                         origin: system.origin,
+                        radius: Some(system.radius),
                         orientation: system.orientation,
                         lag: scale(moved, behind),
                         bolt_point: bolt.map(|bolt| bolt.point(number, count)),
@@ -1461,14 +1492,17 @@ impl ParticleWorld {
                     }
                     self.push_slave_particle(index, slave_born);
                 }
-                let delay = self.rng.range(emission.burst_delay).max(0.0);
+                let delay = self.rng.range(emission.burst_delay).max(0.0).trunc();
                 if let Some(system) = self.systems.get_mut(index) {
                     system.burst_left = delay;
-                    if emission.one_shot {
-                        system.emitting = false;
-                    }
                 }
             }
+        }
+
+        if let (Volume::Cylinder { radius_rate, .. }, Some(system)) =
+            (emission.volume, self.systems.get_mut(index))
+        {
+            system.radius = advance_radius(system.radius, radius_rate);
         }
 
         let wind = match &emission.wind {
@@ -1507,7 +1541,10 @@ impl ParticleWorld {
                 if let Some(event) = &event {
                     if !particle.collided && reached_ground(particle, event, ground) {
                         particle.collided = true;
-                        events.push(particle.position);
+                        events.push((
+                            particle.position,
+                            [particle.velocity.x, particle.velocity.y],
+                        ));
                         if event.kill_after {
                             alive = false;
                         }
@@ -1545,11 +1582,20 @@ impl ParticleWorld {
                 .map_or(0, |system| system.depth)
                 .saturating_add(1);
             for index in 0..events.len() {
-                let Some(at) = events.get(index).copied() else {
+                let Some((at, velocity)) = events.get(index).copied() else {
                     continue;
                 };
                 self.refusals.collisions = self.refusals.collisions.saturating_add(1);
                 self.fire_at_depth(&event.fires, FxFrame::at(at), depth, ground);
+                if let Some(follow_up) = event.follow_up {
+                    if self.collisions.len() < MAX_PENDING_COLLISIONS {
+                        self.collisions.push(Collision {
+                            follow_up,
+                            at,
+                            heading: event.orient.then_some(velocity),
+                        });
+                    }
+                }
             }
         }
         self.scratch_follows = follows;
@@ -1596,7 +1642,11 @@ impl ParticleWorld {
             self.refusals.refused = self.refusals.refused.saturating_add(1);
             return;
         }
-        let mut particle = birth(&emission, &Placement::at(add(at, offset)), &mut self.rng);
+        let place = Placement {
+            radius: self.systems.get(slot).map(|system| system.radius),
+            ..Placement::at(add(at, offset))
+        };
+        let mut particle = birth(&emission, &place, &mut self.rng);
         let Some(slot) = self.slots.get(&slave.0).copied() else {
             return;
         };
@@ -2095,7 +2145,16 @@ fn capacity_from(
     clamped
 }
 
-fn volume_offset(volume: &Volume, rng: &mut ClientRng) -> Vec3 {
+fn advance_radius(radius: f32, rate: f32) -> f32 {
+    let grown = radius + rate;
+    if MIN_CYLINDER_RADIUS > grown {
+        MIN_CYLINDER_RADIUS
+    } else {
+        grown
+    }
+}
+
+fn volume_offset(volume: &Volume, running_radius: Option<f32>, rng: &mut ClientRng) -> Vec3 {
     match *volume {
         Volume::Point => Vec3::ZERO,
         Volume::Line { start, end } | Volume::Lightning { start, end, .. } => {
@@ -2134,11 +2193,13 @@ fn volume_offset(volume: &Volume, rng: &mut ClientRng) -> Vec3 {
             Vec3::new(x * reach, y * reach, z * reach)
         }
         Volume::Cylinder {
-            radius,
+            radius: authored,
             length,
             offset,
             hollow,
+            ..
         } => {
+            let radius = running_radius.unwrap_or(authored);
             let [x, y] = rng.direction_xy();
             let reach = if hollow { radius } else { radius * rng.unit() };
             let axis = |slot: usize| offset.get(slot).copied().unwrap_or(0.0);
@@ -2271,6 +2332,7 @@ fn bolt_bend(waves: &[[f32; 3]; 3], t: f32) -> f32 {
 
 struct Placement {
     origin: Vec3,
+    radius: Option<f32>,
     orientation: Option<Mat4>,
     lag: Vec3,
     bolt_point: Option<Vec3>,
@@ -2280,6 +2342,7 @@ impl Placement {
     const fn at(origin: Vec3) -> Self {
         Self {
             origin,
+            radius: None,
             orientation: None,
             lag: Vec3::ZERO,
             bolt_point: None,
@@ -2290,7 +2353,7 @@ impl Placement {
 fn birth(emission: &Emission, place: &Placement, rng: &mut ClientRng) -> Particle {
     let local = match place.bolt_point {
         Some(_) => Vec3::ZERO,
-        None => volume_offset(&emission.volume, rng),
+        None => volume_offset(&emission.volume, place.radius, rng),
     };
     let local_velocity = birth_velocity(emission, local, rng);
     let (offset, velocity) = match place.orientation {
@@ -2415,7 +2478,7 @@ fn aim_frame(caller: Mat4, primary: Vec3, secondary: Vec3, length: BeamLengthMod
 fn up_away_from(position: Vec3, emitter: Vec3) -> f32 {
     use std::f32::consts::{PI, TAU};
     let (x, y) = (position.x - emitter.x, position.y - emitter.y);
-    if y == 0.0 {
+    if y.abs() < f32::EPSILON {
         return if x > 0.0 { TAU } else { PI };
     }
     let length = (x * x + y * y).sqrt();
@@ -2582,7 +2645,7 @@ fn wind_falloff(distance: f32, full: f32, zero: f32) -> f32 {
 }
 
 fn reached_ground(particle: &Particle, event: &CollisionEvent, ground: &dyn Ground) -> bool {
-    if event.fires.is_empty() && !event.kill_after {
+    if event.fires.is_empty() && !event.kill_after && event.follow_up.is_none() {
         return false;
     }
     let Some(height) = ground.height_at(particle.position.x, particle.position.y) else {

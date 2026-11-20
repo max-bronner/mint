@@ -8,7 +8,7 @@ use crate::templates::KindTable;
 use super::*;
 
 const DATA: &str = "\
-Locomotor ClimberLocomotor\n  Surfaces = GROUND OBSTACLE\n  ScalesWalls = Yes\n  \
+Locomotor ClimberLocomotor\n  Surfaces = GROUND OBSTACLE\n  ScalesWalls = Yes\n  ZAxisBehavior = SCALING_WALLS\n  \
   Acceleration = 5000\n  Braking = 5000\n  TurnTime = 1\nEnd\n\
 Object Climber\n  Side = Men\n  KindOf = CAN_CLIMB_WALLS SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \

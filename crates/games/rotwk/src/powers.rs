@@ -52,7 +52,8 @@ impl PowerNames {
             if let Some(slot) = table.get_mut(usize::from(id.get())) {
                 if let Some(def) = special_powers.get(name) {
                     *slot = (
-                        def.reload_time_ms.map(LogicFrames::from_milliseconds),
+                        def.reload_time_ms
+                            .map(mint_sage_modules::retail_duration_ticks),
                         def.shared_synced_timer,
                     );
                 }
@@ -106,21 +107,23 @@ impl PowerNames {
                 .power_enum
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case(CAPTURE_BUILDING_ENUM));
-            slot.grabs_passenger = def
-                .power_enum
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case(GRAB_PASSENGER_ENUM));
+            slot.grab = def.power_enum.as_deref().and_then(GrabEnum::of);
             slot.charge_attack = def
                 .power_enum
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case(CHARGE_ATTACK_ENUM));
             slot.effect = PowerEnumEffect::of(def.power_enum.as_deref());
-            slot.cancels_disguise = def.power_enum.as_deref().is_some_and(|value| {
-                value.eq_ignore_ascii_case(SMITE_CANCEL_DISGUISE_ENUM)
-                    || value.eq_ignore_ascii_case(ATTRIBUTEMOD_CANCEL_DISGUISE_ENUM)
-            });
+            slot.cancels_disguise = def
+                .power_enum
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(ATTRIBUTEMOD_CANCEL_DISGUISE_ENUM));
+            slot.smite_cancels_disguise = def
+                .power_enum
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(SMITE_CANCEL_DISGUISE_ENUM));
             slot.initiate_sound = def.initiate_sound.clone();
             slot.initiate_at_location_sound = def.initiate_at_location_sound.clone();
+            slot.prevent_activation = def.prevent_activation_conditions.clone();
             slot.radius_cursor = def.radius_cursor_radius;
             slot.recharge_discount = def.flags.respect_recharge_time_discount;
             slot.water_ok = def.flags.water_ok;
@@ -146,7 +149,7 @@ pub(crate) struct PowerCastRule {
     pub(crate) object_filter: Option<crate::defeat::ObjectFilter>,
     pub(crate) forbidden: Option<(crate::defeat::ObjectFilter, f32)>,
     pub(crate) captures: bool,
-    pub(crate) grabs_passenger: bool,
+    pub(crate) grab: Option<GrabEnum>,
     pub(crate) charge_attack: bool,
     pub(crate) effect: PowerEnumEffect,
     pub(crate) radius_cursor: Option<f32>,
@@ -155,8 +158,10 @@ pub(crate) struct PowerCastRule {
     pub(crate) needs_object_filter: bool,
     pub(crate) shroud: ShroudNeed,
     pub(crate) cancels_disguise: bool,
+    pub(crate) smite_cancels_disguise: bool,
     pub(crate) initiate_sound: Option<String>,
     pub(crate) initiate_at_location_sound: Option<String>,
+    pub(crate) prevent_activation: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,7 +277,30 @@ const SCREECH_ENUM: &str = "SPECIAL_SCREECH";
 
 pub(crate) const CAPTURE_BUILDING_ENUM: &str = "SPECIAL_INFANTRY_CAPTURE_BUILDING";
 
-const GRAB_PASSENGER_ENUM: &str = "SPECIAL_GRAB_PASSENGER";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrabEnum {
+    Passenger,
+    Chunk,
+}
+
+impl GrabEnum {
+    fn of(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("SPECIAL_GRAB_PASSENGER") {
+            Some(Self::Passenger)
+        } else if value.eq_ignore_ascii_case("SPECIAL_GRAB_CHUNK") {
+            Some(Self::Chunk)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn vendor_kind(self) -> &'static str {
+        match self {
+            Self::Passenger => "ROCK_VENDOR",
+            Self::Chunk => "CHUNK_VENDOR",
+        }
+    }
+}
 
 const CHARGE_ATTACK_ENUM: &str = "SPECIAL_CHARGE_ATTACK";
 

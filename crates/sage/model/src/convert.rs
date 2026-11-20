@@ -63,6 +63,7 @@ pub struct Part {
     pub dcg_lighting_disabled: bool,
     pub dcg_multiplies_result: bool,
     pub modulate2x: Modulate2x,
+    pub effect_lit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,6 +298,7 @@ pub fn convert_model(model: &Model<'_>, hierarchy: Option<&Hierarchy>) -> Result
             dcg_lighting_disabled: dcg.lighting_disabled,
             dcg_multiplies_result: dcg.dcg_multiplies_result,
             modulate2x: wants_modulate2x(mesh),
+            effect_lit: !mesh.shader_materials.is_empty() || wants_effect_path(mesh),
         };
 
         match material_split(mesh, part.mesh.vertices.len())? {
@@ -1253,6 +1255,11 @@ fn bone_binding(model: &Model<'_>, mesh_name: &str, bones: &[Mat4]) -> (Mat4, Op
             }
             let Some(index) = usize::try_from(sub.bone_index).ok() else {
                 return (Mat4::IDENTITY, None);
+            };
+            let index = if bones.is_empty() || index < bones.len() {
+                index
+            } else {
+                0
             };
             let transform = bones.get(index).copied().unwrap_or(Mat4::IDENTITY);
             return (transform, Some(index));

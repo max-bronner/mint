@@ -37,6 +37,22 @@ pub const OBJECT_LIGHT_SET: u8 = 1;
 
 pub const INFANTRY_LIGHT_SET: u8 = 2;
 
+const FIXED_FUNCTION_SET_OFFSET: u8 = 2;
+
+#[must_use]
+pub fn part_light_set(rig: u8, effect_lit: bool) -> u8 {
+    if effect_lit {
+        rig
+    } else {
+        rig.saturating_add(FIXED_FUNCTION_SET_OFFSET)
+    }
+}
+
+#[must_use]
+pub fn instance_effect_lit(instance: &Instance) -> bool {
+    instance.light_set <= INFANTRY_LIGHT_SET
+}
+
 #[must_use]
 pub fn part_instance(part: &Part, mesh: MeshHandle, textures: PartTextures) -> Instance {
     Instance {
@@ -48,7 +64,7 @@ pub fn part_instance(part: &Part, mesh: MeshHandle, textures: PartTextures) -> I
         alpha_cutoff: if part.alpha_test { ALPHA_CUTOFF } else { 0.0 },
         blend: part.blend,
         fog: !part.fog_disabled,
-        light_set: OBJECT_LIGHT_SET,
+        light_set: part_light_set(OBJECT_LIGHT_SET, part.effect_lit),
         cull: part.cull,
         texture2: textures.texture2,
         detail_combine: part.detail_combine,
@@ -81,6 +97,7 @@ pub struct CachedPart {
     pub uv_mapper: Option<crate::convert::UvMapperState>,
     pub texture_name: Option<String>,
     pub texture_address: (AddressMode, AddressMode),
+    pub hidden: bool,
 }
 
 #[must_use]
@@ -221,7 +238,7 @@ impl ModelCache {
         if let Some(entry) = self.models.get(&key) {
             return entry.clone();
         }
-        let entry = match self.load(renderer, vfs, resolver, name) {
+        let entry = match self.load(renderer, vfs, resolver, name, false) {
             Ok(model) => {
                 self.stats.loaded = self.stats.loaded.saturating_add(1);
                 Some(Arc::new(model))
@@ -244,7 +261,7 @@ impl ModelCache {
         name: &str,
     ) -> Option<Arc<CachedModel>> {
         self.stats.requests = self.stats.requests.saturating_add(1);
-        match self.load(renderer, vfs, resolver, name) {
+        match self.load(renderer, vfs, resolver, name, false) {
             Ok(model) => {
                 self.stats.loaded = self.stats.loaded.saturating_add(1);
                 Some(Arc::new(model))
@@ -257,12 +274,24 @@ impl ModelCache {
         }
     }
 
+    pub fn load_with_hidden(
+        &mut self,
+        renderer: &mut Renderer,
+        vfs: &Vfs,
+        resolver: &Resolver,
+        name: &str,
+    ) -> Result<CachedModel> {
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        self.load(renderer, vfs, resolver, name, true)
+    }
+
     fn load(
         &mut self,
         renderer: &mut Renderer,
         vfs: &Vfs,
         resolver: &Resolver,
         name: &str,
+        keep_hidden: bool,
     ) -> Result<CachedModel> {
         let loaded = load_model(vfs, resolver, name)?;
         let compressed_ok = renderer.supports_block_compression();
@@ -276,7 +305,7 @@ impl ModelCache {
                 self.stats.skipped_pick = self.stats.skipped_pick.saturating_add(1);
                 continue;
             }
-            if part.hidden {
+            if part.hidden && !keep_hidden {
                 self.stats.skipped_hidden = self.stats.skipped_hidden.saturating_add(1);
                 continue;
             }
@@ -350,6 +379,7 @@ impl ModelCache {
                 house_mask,
                 texture_name: part.texture.clone(),
                 texture_address: (part.address_u, part.address_v),
+                hidden: part.hidden,
             });
         }
 

@@ -3,17 +3,25 @@ use super::*;
 const DATA: &str = "\
 Weapon PassBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
   HitPercentage = 100\n  HitPassengerPercentage = 100%\n  \
-  DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+  DamageNugget\n    Damage = 10\n    DamageType = PASSENGER\n  End\nEnd\n\
+Weapon SlashBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
+  HitPercentage = 100\n  HitPassengerPercentage = 100%\n  \
+  DamageNugget\n    Damage = 10\n    DamageType = SLASH\n  End\nEnd\n\
+Object SlashArcher\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 400\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY SlashBow\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    MoodAttackCheckRate = 100\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Weapon PlainBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
   HitPercentage = 100\n  \
-  DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+  DamageNugget\n    Damage = 10\n    DamageType = PASSENGER\n  End\nEnd\n\
 Weapon LaunchBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  WeaponSpeed = 600\n  \
   HitPercentage = 100\n  HitPassengerPercentage = 100%\n  \
   ProjectileNugget\n    WarheadTemplateName = PlainHead\n  End\nEnd\n\
 Weapon PlainLaunchBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  WeaponSpeed = 600\n  \
   HitPercentage = 100\n  \
   ProjectileNugget\n    WarheadTemplateName = PlainHead\n  End\nEnd\n\
-Weapon PlainHead\n  DamageNugget\n    Damage = 10\n    DamageType = PIERCE\n  End\nEnd\n\
+Weapon PlainHead\n  DamageNugget\n    Damage = 10\n    DamageType = PASSENGER\n  End\nEnd\n\
 Object LaunchArcher\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 400\n  \
   Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
   WeaponSet\n    Conditions = None\n    Weapon = PRIMARY LaunchBow\n  End\n  \
@@ -39,16 +47,36 @@ Object PassRider\n  Side = Wild\n  KindOf = INFANTRY SELECTABLE\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object PassBoat\n  Side = Wild\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
   Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
-  Behavior = HordeTransportContain Tag_Boat\n    \
+  Behavior = TransportContain Tag_Boat\n    \
     ObjectStatusOfContained = UNSELECTABLE UNATTACKABLE\n    Slots = 1\n    \
     PassengerFilter = NONE +PassRider\n    InitialPayload = PassRider 1\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 60\nEnd\n\
 Object EmptyBoat\n  Side = Wild\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
   Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
-  Behavior = HordeTransportContain Tag_Boat\n    \
+  Behavior = TransportContain Tag_Boat\n    \
     ObjectStatusOfContained = UNSELECTABLE UNATTACKABLE\n    Slots = 1\n    \
     PassengerFilter = NONE +PassRider\n  End\n  \
-  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 60\nEnd\n";
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 60\nEnd\n\
+Object HordeBoat\n  Side = Wild\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+  Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = HordeTransportContain Tag_Boat\n    \
+    ObjectStatusOfContained = UNSELECTABLE UNATTACKABLE\n    Slots = 1\n    \
+    PassengerFilter = NONE +PassRider\n    InitialPayload = PassRider 1\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 60\nEnd\n\
+Object SealedBoat\n  Side = Wild\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  \
+  Body = StructureBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  Behavior = TransportContain Tag_Boat\n    \
+    ObjectStatusOfContained = UNSELECTABLE ENCLOSED\n    Slots = 1\n    \
+    PassengerFilter = NONE +PassRider\n    InitialPayload = PassRider 1\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 20\n  GeometryHeight = 60\nEnd\n\
+Weapon AreaBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
+  HitPercentage = 100\n  HitPassengerPercentage = 100%\n  \
+  DamageNugget\n    Damage = 10\n    DamageType = PASSENGER\n    Radius = 30\n  End\nEnd\n\
+Object AreaArcher\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 400\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY AreaBow\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    MoodAttackCheckRate = 100\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 const ARCHER_AT: Vec2 = Vec2::new(300.0, 300.0);
 const BOAT_AT: Vec2 = Vec2::new(500.0, 300.0);
@@ -138,20 +166,32 @@ fn damage_dealt(simulation: &Simulation<RotwkRules>, ids: Ids, entity: Entity, m
 }
 
 #[test]
-fn a_full_hit_passenger_chance_hurts_the_passenger_every_hit() {
+fn a_full_hit_passenger_chance_strikes_the_passenger_instead_of_the_container() {
     let (mut simulation, ids, archer, boat) = scene("PassArcher", "PassBoat");
     run(&mut simulation, 1);
     let rider = first_passenger(&simulation, ids, boat);
     attack(&mut simulation, archer, boat);
     run(&mut simulation, 90);
-    assert!(
-        damage_dealt(&simulation, ids, boat, 1000.0) > 0.0,
-        "the container itself must still take the hit"
+    assert_eq!(
+        damage_dealt(&simulation, ids, boat, 1000.0),
+        0.0,
+        "the container is not fired at"
     );
     assert!(
         damage_dealt(&simulation, ids, rider, 500.0) > 0.0,
-        "a 100% HitPassengerPercentage weapon must hurt the passenger"
+        "a 100% HitPassengerPercentage weapon must strike the passenger"
     );
+}
+
+#[test]
+fn a_contained_victim_ignores_blows_that_are_not_passenger_typed() {
+    let (mut simulation, ids, archer, boat) = scene("SlashArcher", "PassBoat");
+    run(&mut simulation, 1);
+    let rider = first_passenger(&simulation, ids, boat);
+    attack(&mut simulation, archer, boat);
+    run(&mut simulation, 90);
+    assert_eq!(damage_dealt(&simulation, ids, rider, 500.0), 0.0);
+    assert_eq!(damage_dealt(&simulation, ids, boat, 1000.0), 0.0);
 }
 
 #[test]
@@ -191,14 +231,44 @@ fn a_launchers_hit_passenger_chance_carries_to_its_warheads_landing() {
     let rider = first_passenger(&simulation, ids, boat);
     attack(&mut simulation, archer, boat);
     run(&mut simulation, 90);
-    let on_boat = damage_dealt(&simulation, ids, boat, 1000.0);
-    assert!(on_boat > 0.0, "the arrows must land on the boat");
-    assert_eq!(damage_dealt(&simulation, ids, rider, 500.0), on_boat);
+    assert_eq!(damage_dealt(&simulation, ids, boat, 1000.0), 0.0);
+    assert!(damage_dealt(&simulation, ids, rider, 500.0) > 0.0);
 }
 
 #[test]
 fn a_launcher_without_hit_passenger_chance_never_reaches_the_passenger() {
     let (mut simulation, ids, archer, boat) = scene("PlainLaunchArcher", "PassBoat");
+    run(&mut simulation, 1);
+    let rider = first_passenger(&simulation, ids, boat);
+    attack(&mut simulation, archer, boat);
+    run(&mut simulation, 90);
+    assert!(damage_dealt(&simulation, ids, boat, 1000.0) > 0.0);
+    assert_eq!(damage_dealt(&simulation, ids, rider, 500.0), 0.0);
+}
+
+#[test]
+fn a_horde_transport_holding_a_loose_passenger_is_struck_itself() {
+    let (mut simulation, ids, archer, boat) = scene("PassArcher", "HordeBoat");
+    run(&mut simulation, 1);
+    let rider = first_passenger(&simulation, ids, boat);
+    attack(&mut simulation, archer, boat);
+    run(&mut simulation, 90);
+    assert!(damage_dealt(&simulation, ids, boat, 1000.0) > 0.0);
+    assert_eq!(damage_dealt(&simulation, ids, rider, 500.0), 0.0);
+}
+
+#[test]
+fn a_radius_warhead_aimed_at_a_passenger_still_strikes_the_container() {
+    let (mut simulation, ids, archer, boat) = scene("AreaArcher", "PassBoat");
+    run(&mut simulation, 1);
+    attack(&mut simulation, archer, boat);
+    run(&mut simulation, 90);
+    assert!(damage_dealt(&simulation, ids, boat, 1000.0) > 0.0);
+}
+
+#[test]
+fn a_radius_area_does_not_reach_an_enclosed_passenger() {
+    let (mut simulation, ids, archer, boat) = scene("AreaArcher", "SealedBoat");
     run(&mut simulation, 1);
     let rider = first_passenger(&simulation, ids, boat);
     attack(&mut simulation, archer, boat);

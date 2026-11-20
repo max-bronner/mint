@@ -203,19 +203,25 @@ impl WallLayer {
         z: f32,
     ) -> Layer {
         let on_ramp = self.ramp_at(point).is_some();
-        let new_layer = self.layer_at(geometry, extent, point).0;
-        match new_layer {
-            RAMP_TAG => {
-                if on_ramp {
-                    Layer::RAMPS
-                } else if current == Layer::RAMPS {
-                    Layer::GROUND
-                } else {
-                    current
-                }
+        let offered = geometry
+            .cell_at(point, 0, extent)
+            .map_or(Layer::GROUND, |cell| self.tag_at(extent, cell))
+            .0;
+        let ramp_row = || {
+            if on_ramp {
+                Layer::RAMPS
+            } else if current == Layer::RAMPS {
+                Layer::GROUND
+            } else {
+                current
             }
+        };
+        match offered {
+            RAMP_TAG => ramp_row(),
             GROUND_TAG => {
                 if current.is_wall_top() {
+                    ramp_row()
+                } else if current == Layer::RAMPS && on_ramp {
                     current
                 } else {
                     Layer::GROUND
@@ -226,12 +232,20 @@ impl WallLayer {
                     .tag_height(Layer(tag))
                     .is_some_and(|height| (height - z).abs() <= STICKY_LAYER_TOLERANCE);
                 if current == Layer::GROUND || !within_tolerance {
-                    current
+                    ramp_row()
+                } else if on_ramp {
+                    Layer::RAMPS
                 } else {
                     Layer(tag)
                 }
             }
-            other => Layer(other),
+            other => {
+                if current == Layer::RAMPS && on_ramp {
+                    current
+                } else {
+                    Layer(other)
+                }
+            }
         }
     }
 
@@ -1262,8 +1276,8 @@ mod tests {
         let far_below = layer.sticky_layer(geometry, extent, top_point, Layer::RAMPS, 0.0);
         assert_eq!(
             far_below,
-            Layer::RAMPS,
-            "outside the 10.0 tolerance, keeps the ramp layer"
+            Layer::GROUND,
+            "outside the 10.0 tolerance and off any ramp object, a ramp-layer unit becomes ground"
         );
         let from_ground = layer.sticky_layer(geometry, extent, top_point, Layer::GROUND, 30.0);
         assert_eq!(
@@ -1271,6 +1285,52 @@ mod tests {
             Layer::GROUND,
             "a ground unit never picks up a wall top without a ramp"
         );
+    }
+
+    #[test]
+    fn a_ground_unit_inside_a_ramp_object_on_a_ground_tagged_cell_stays_ground() {
+        let (geometry, extent) = geometry_and_extent();
+        let mut world = World::new();
+        let ramp = world.spawn().unwrap();
+        let mut layer = WallLayer::empty(usize::try_from(extent.cell_count()).unwrap());
+        let heights = flat_heights(geometry, extent);
+        layer.stamp_ramp(
+            geometry,
+            extent,
+            ramp,
+            Ramp {
+                from_left: (95.0, 100.0, 0.0),
+                from_right: (95.0, 112.0, 0.0),
+                to_left: (125.0, 100.0, 30.0),
+                to_right: (125.0, 112.0, 30.0),
+            },
+            &heights,
+            &[],
+        );
+        let mut probed = 0;
+        for x in 95..125u8 {
+            for y in 100..112u8 {
+                let point = Vec2::new(f32::from(x) + 0.5, f32::from(y) + 0.5);
+                let Some(cell) = geometry.cell_at(point, 0, extent) else {
+                    continue;
+                };
+                if layer.ramp_at(point).is_none() || layer.tag_at(extent, cell) != Layer::GROUND {
+                    continue;
+                }
+                probed += 1;
+                assert_eq!(
+                    layer.sticky_layer(geometry, extent, point, Layer::GROUND, 0.0),
+                    Layer::GROUND,
+                    "{point:?}"
+                );
+                assert_eq!(
+                    layer.sticky_layer(geometry, extent, point, Layer::RAMPS, 0.0),
+                    Layer::RAMPS,
+                    "{point:?}"
+                );
+            }
+        }
+        assert!(probed > 0, "the ramp left no ground-tagged cell under it");
     }
 
     #[test]

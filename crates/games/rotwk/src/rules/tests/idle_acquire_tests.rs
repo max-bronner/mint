@@ -122,7 +122,7 @@ fn an_idle_lone_unit_attacks_only_a_hostile_unit_in_reach_when_its_data_says_yes
 fn an_ordered_unit_does_not_acquire_until_it_is_idle_again() {
     let (mut simulation, ids, entities) = simulation(&[
         ("Sentry", 300.0, 300.0, PLAYER),
-        ("Target", 340.0, 300.0, OTHER),
+        ("Target", 335.0, 300.0, OTHER),
     ]);
     let (sentry, target) = (entities[0], entities[1]);
     simulation

@@ -28,6 +28,13 @@ End
 PlayerTemplate FactionBooked
   SpellBookMp = ZBook
 End
+PlayerTemplate FactionTwoBooks
+  SpellBook = ZBook
+  SpellBookMp = ZMpBook
+End
+Object ZMpBook
+  KindOf = IMMOBILE UNATTACKABLE
+End
 Object ZBook
   KindOf = IMMOBILE UNATTACKABLE
 End
@@ -1062,9 +1069,19 @@ fn map_start(data: &GameData, seed: u64) -> Start {
 }
 
 fn map_start_with(data: &GameData, seed: u64, map_cast: crate::map_players::MapCast) -> Start {
+    map_start_in(data, seed, map_cast, Default::default())
+}
+
+fn map_start_in(
+    data: &GameData,
+    seed: u64,
+    map_cast: crate::map_players::MapCast,
+    mode: crate::game_mode::GameMode,
+) -> Start {
     let map = flat();
     let inputs = Inputs {
         map_cast,
+        mode,
         ..inputs(data, ["FactionA", "FactionB"])
     };
     build(
@@ -1135,6 +1152,28 @@ fn a_map_player_owns_its_factions_spell_book() {
         .map(|(entity, _)| world.get(ids.owner, entity).unwrap().0)
         .collect();
     assert_eq!(book_owners, [gaia]);
+}
+
+#[test]
+fn the_spell_book_field_follows_the_game_mode() {
+    use crate::game_mode::GameMode;
+    let data = data();
+    let books = |mode| {
+        let start = map_start_in(&data, 1, map_cast_with(&data, "FactionTwoBooks"), mode);
+        let ids = ids(&start);
+        let world = start.simulation.state();
+        let mut names: Vec<String> = world
+            .store(ids.kind)
+            .unwrap()
+            .iter()
+            .map(|(_, kind)| start.kinds.get(*kind).unwrap().record.name.clone())
+            .filter(|name| name.ends_with("Book"))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(books(GameMode::SinglePlayer), ["ZBook"]);
+    assert_eq!(books(GameMode::Skirmish), ["ZMpBook"]);
 }
 
 #[test]
@@ -1242,6 +1281,126 @@ fn a_different_seed_or_faction_changes_the_hash_sequence() {
     assert_ne!(base, hashes(&data, ["FactionB", "FactionA"], 7));
 }
 
+fn seat(data: &GameData, i: usize, name: &str) -> crate::match_values::PlayerSeat {
+    let slot = u8::try_from(i).unwrap();
+    crate::match_values::PlayerSeat {
+        player: PlayerId::new(slot),
+        template: name.to_owned(),
+        team: None,
+        colour: slot,
+        handicap: 0,
+        at: crate::match_values::StartAt::Waypoint(slot),
+        ai: None,
+        hero: None,
+        starting: data
+            .players
+            .get(name)
+            .map(crate::match_values::StartingEntities::of_template)
+            .unwrap_or_default(),
+        cash: None,
+        command_points: None,
+    }
+}
+
+fn start_waypoint(name: &str, x: f32, y: f32) -> Object {
+    Object {
+        x,
+        y,
+        z: 0.0,
+        angle: 0.0,
+        flags: 0,
+        template_name: String::from(mint_sage_map::WAYPOINT_TEMPLATE),
+        properties: mint_sage_map::Dictionary::from_pairs(vec![(
+            String::from(mint_sage_map::WAYPOINT_NAME_KEY),
+            mint_sage_map::Value::Str(name.to_owned()),
+        )]),
+    }
+}
+
+#[test]
+fn a_hand_built_match_start_builds_the_match_it_names() {
+    use crate::match_values::{MatchDifficulty, MatchStart, StartingEntities};
+    let data = data();
+    let objects = vec![
+        start_waypoint("Player_1_Start", 300.0, 300.0),
+        start_waypoint("Player_2_Start", 700.0, 700.0),
+    ];
+    let mut bare = seat(&data, 0, "FactionA");
+    bare.starting = StartingEntities::default();
+    let value = MatchStart {
+        mode: crate::game_mode::GameMode::Skirmish,
+        map_label: String::new(),
+        players: vec![bare, seat(&data, 1, "FactionB")],
+        rules: crate::lobby::MatchRules {
+            starting_money: 777,
+            ..crate::lobby::MatchRules::default()
+        },
+        difficulty: MatchDifficulty::Multiplayer,
+        carried_in: None,
+        deploy: crate::match_values::DevDeploy::default(),
+        wotr: None,
+    };
+    let referenced = std::collections::BTreeSet::new();
+    let inputs = crate::match_values::inputs(
+        &value,
+        &data,
+        crate::match_values::MapFacts {
+            objects: &objects,
+            sides: &[],
+            scripts: None,
+            script_lines: Vec::new(),
+            referenced_unit_names: &referenced,
+            snowy: false,
+        },
+        |_| None,
+    )
+    .unwrap();
+    let map = flat();
+    let start = build(
+        &data,
+        None,
+        &inputs,
+        &inert_blend_tile(),
+        |obstacles| {
+            Passability::builder(&map, 5.0 / 128.0)
+                .obstacles(obstacles)
+                .build()
+                .map(|p| (p, Vec::new()))
+        },
+        &|_, _| Vec::new(),
+        &|_| Vec::new(),
+        &|_| None,
+        &|_| Vec::new(),
+        &|_| false,
+        1,
+        &[],
+    )
+    .unwrap();
+    let owned = |player: PlayerId| -> Vec<String> {
+        let mut names: Vec<String> = placed(&start)
+            .into_iter()
+            .filter(|(_, owner, _)| *owner == player)
+            .map(|(name, _, _)| name)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let economy = RotwkRules::economy_ids(ids(&start));
+    let purses: Vec<i64> = [A, B]
+        .iter()
+        .map(|p| crate::economy::purse_of(start.simulation.state(), economy, *p).amount())
+        .collect();
+    assert_eq!(
+        (owned(A), owned(B), purses),
+        (
+            Vec::<String>::new(),
+            vec![String::from("BKeep"), String::from("BPorter")],
+            vec![777, 777]
+        )
+    );
+}
+
 #[test]
 fn resolve_finds_the_start_waypoints_and_names_what_is_missing() {
     let data = data();
@@ -1265,18 +1424,7 @@ fn resolve_finds_the_start_waypoints_and_names_what_is_missing() {
         [a, b]
             .iter()
             .enumerate()
-            .map(|(i, name)| crate::lobby::ResolvedPlayer {
-                slot: i,
-                player: PlayerId::new(u8::try_from(i).unwrap()),
-                faction: (*name).to_owned(),
-                hero_pick: crate::lobby::HeroPick::None,
-                hero: None,
-                team: None,
-                colour: u8::try_from(i).unwrap(),
-                handicap: 0,
-                start: u8::try_from(i).unwrap(),
-                ai: None,
-            })
+            .map(|(i, name)| seat(&data, i, name))
             .collect::<Vec<_>>()
     };
     let inputs = resolve(
@@ -1288,6 +1436,7 @@ fn resolve_finds_the_start_waypoints_and_names_what_is_missing() {
         None,
         Vec::new(),
         true,
+        &[],
     )
     .unwrap();
     assert_eq!(inputs.players[0].at, Vec2::new(100.0, 50.0));
@@ -1308,6 +1457,7 @@ fn resolve_finds_the_start_waypoints_and_names_what_is_missing() {
         None,
         Vec::new(),
         true,
+        &[],
     )
     .unwrap_err();
     assert!(
@@ -1325,6 +1475,7 @@ fn resolve_finds_the_start_waypoints_and_names_what_is_missing() {
         None,
         Vec::new(),
         true,
+        &[],
     )
     .unwrap_err();
     assert!(
@@ -1340,6 +1491,7 @@ fn resolve_finds_the_start_waypoints_and_names_what_is_missing() {
         None,
         Vec::new(),
         true,
+        &[],
     )
     .unwrap();
     assert!(hidden
@@ -1428,7 +1580,7 @@ fn the_plan_skips_an_entry_that_already_stands_and_orders_the_rest_by_priority()
     assert!(
         matches!(
             progress.tasks[0],
-            crate::skirmish_ai::AiTaskState::Ordered(_)
+            crate::skirmish_ai::AiTaskState::Ordered(..)
         ),
         "the lower-priority-number task must be ordered first: {:?}",
         progress.tasks
@@ -1896,10 +2048,12 @@ End
         let mut lines: Vec<String> = Vec::new();
         let mut rng = Pcg32::new(seed);
         let inputs = Inputs {
+            mode: Default::default(),
             players: Vec::new(),
             heroes: Vec::new(),
             starts: Vec::new(),
             castle_layouts: crate::castle::CastleLayouts::new(),
+            snowy: false,
             first_obstacle_id: 0,
             map_scripts: None,
             route_markers: Vec::new(),
@@ -1908,9 +2062,13 @@ End
             handicaps: Vec::new(),
             starting_money: None,
             command_point_factor: None,
+            cash: Vec::new(),
+            command_points: Vec::new(),
+            defeat_mode: crate::defeat::DefeatMode::default(),
             allow_ring_heroes: false,
             test_seeds: Vec::new(),
             ai_difficulty: Vec::new(),
+            forfeit: None,
             difficulty: Default::default(),
             map_cast: crate::map_players::MapCast {
                 contestants: Vec::new(),
@@ -1996,10 +2154,12 @@ End
         keys: Default::default(),
     };
     let inputs = Inputs {
+        mode: Default::default(),
         players: Vec::new(),
         heroes: Vec::new(),
         starts: Vec::new(),
         castle_layouts: crate::castle::CastleLayouts::new(),
+        snowy: false,
         first_obstacle_id: 0,
         map_scripts: None,
         route_markers: Vec::new(),
@@ -2008,9 +2168,13 @@ End
         handicaps: Vec::new(),
         starting_money: None,
         command_point_factor: None,
+        cash: Vec::new(),
+        command_points: Vec::new(),
+        defeat_mode: crate::defeat::DefeatMode::default(),
         allow_ring_heroes: false,
         test_seeds: Vec::new(),
         ai_difficulty: Vec::new(),
+        forfeit: None,
         difficulty: Default::default(),
         map_cast: crate::map_players::MapCast {
             contestants: Vec::new(),
@@ -2052,10 +2216,12 @@ fn a_map_placed_horde_template_becomes_a_placed_horde() {
     assert!(missing.is_empty(), "{missing:?}");
     let production = kinds.production(&data);
     let inputs = Inputs {
+        mode: Default::default(),
         players: Vec::new(),
         heroes: Vec::new(),
         starts: Vec::new(),
         castle_layouts: crate::castle::CastleLayouts::new(),
+        snowy: false,
         first_obstacle_id: 0,
         map_scripts: None,
         route_markers: Vec::new(),
@@ -2064,9 +2230,13 @@ fn a_map_placed_horde_template_becomes_a_placed_horde() {
         handicaps: Vec::new(),
         starting_money: None,
         command_point_factor: None,
+        cash: Vec::new(),
+        command_points: Vec::new(),
+        defeat_mode: crate::defeat::DefeatMode::default(),
         allow_ring_heroes: false,
         test_seeds: Vec::new(),
         ai_difficulty: Vec::new(),
+        forfeit: None,
         difficulty: Default::default(),
         map_cast: crate::map_players::MapCast {
             contestants: Vec::new(),
@@ -2315,4 +2485,248 @@ fn a_linked_librarys_owned_teams_join_the_linking_side_unless_the_name_is_taken(
     );
     let owned: Vec<(String, String)> = teams.into_iter().map(|t| (t.owner, t.name)).collect();
     assert_eq!(owned, [("PlyrElves".to_owned(), "End Team".to_owned())]);
+}
+
+fn wotr_spec(
+    skills: [mint_sage_livingworld::Skill; 2],
+) -> (
+    mint_sage_livingworld::battle::BattleSpec,
+    crate::lobby::SkirmishSetup,
+) {
+    use mint_sage_livingworld::battle::{BattleSpec, Participant, SpecArmy, SpecUnit};
+    use mint_sage_livingworld::{ArmyId, Bonus, PlayerId as Lw, PlayerKind, RegionId};
+    let unit = |template: &str| SpecUnit {
+        template: template.to_owned(),
+        count: 1,
+        level: 1,
+        upgraded: false,
+        hero: false,
+    };
+    let participant =
+        |player: u8, faction: &str, defender: bool, armies: Vec<SpecArmy>| Participant {
+            player: Lw(player),
+            side_name: String::new(),
+            faction: Some(faction.to_owned()),
+            team: i32::from(player),
+            kind: PlayerKind::Computer,
+            defender,
+            cash: 1000 + i32::from(player),
+            command_points: 50,
+            skill: skills[usize::from(player)],
+            skill_points: 1.0,
+            sciences: Vec::new(),
+            upgrades: Vec::new(),
+            bonus: Bonus::default(),
+            legendary: 0,
+            armies,
+            structures: Vec::new(),
+            bonus_units: if defender {
+                Vec::new()
+            } else {
+                vec![("APorter".to_owned(), 2)]
+            },
+            fallen: Vec::new(),
+        };
+    let army = |id: u32, arrives_after: Option<u32>, primary: bool| SpecArmy {
+        army: ArmyId(id),
+        hero: None,
+        origin: String::new(),
+        units: vec![unit("AHorde")],
+        arrives_after,
+        primary,
+    };
+    let spec = BattleSpec {
+        battle: 1,
+        region: RegionId(0),
+        owner: None,
+        sides: Vec::new(),
+        map: None,
+        region_name: String::from("Here"),
+        neighbours: Vec::new(),
+        participants: vec![
+            participant(
+                0,
+                "FactionA",
+                false,
+                vec![army(7, None, true), army(8, Some(300), false)],
+            ),
+            participant(1, "FactionB", true, vec![army(9, None, true)]),
+        ],
+        seed: 0,
+        weapon_scale: Vec::new(),
+        round_cap: None,
+        revival_multipliers: (1.0, 1.0),
+    };
+    let setup = crate::lobby::SkirmishSetup::two_player(
+        String::from("FactionA"),
+        String::from("FactionB"),
+        String::new(),
+        [false, false],
+        None,
+    );
+    (spec, setup)
+}
+
+#[test]
+fn a_wotr_battle_spec_produces_a_match_start_with_its_seats_cash_and_armies() {
+    use mint_sage_livingworld::Skill;
+    let data = data();
+    let (spec, setup) = wotr_spec([Skill::Medium; 2]);
+    let start = crate::match_values::MatchStart::for_wotr_battle(&spec, &setup, &data).unwrap();
+    let seats: Vec<_> = start
+        .players
+        .iter()
+        .map(|p| {
+            (
+                p.template.clone(),
+                p.at.clone(),
+                p.cash,
+                p.command_points,
+                p.starting.units.len(),
+            )
+        })
+        .collect();
+    let battle = start.wotr.unwrap();
+    let first = &battle.seats[0];
+    let arrivals: Vec<_> = first
+        .armies
+        .iter()
+        .map(|a| (a.army, a.arrives_after, a.units.len()))
+        .collect();
+    let objects = vec![start_waypoint("Player_1_Start", 300.0, 300.0)];
+    let resolved = crate::wotr_battle::resolve(&battle, &objects);
+    let ticks: Vec<u32> = resolved.seats[0].armies.iter().map(|a| a.arrives).collect();
+    assert_eq!(
+        (seats, arrivals, ticks),
+        (
+            vec![
+                (
+                    String::from("FactionA"),
+                    crate::match_values::StartAt::Waypoint(1),
+                    Some(1000),
+                    Some(50),
+                    0
+                ),
+                (
+                    String::from("FactionB"),
+                    crate::match_values::StartAt::Waypoint(0),
+                    Some(1001),
+                    Some(50),
+                    0
+                ),
+            ],
+            vec![(7, None, 2), (8, Some(300), 1)],
+            vec![0, 300 * mint_sim::SIMULATION_HZ],
+        )
+    );
+}
+
+#[test]
+fn a_computer_seat_plays_at_its_slots_difficulty() {
+    use crate::lobby::Difficulty;
+    use mint_sage_livingworld::Skill;
+    let data = data();
+    let (spec, setup) = wotr_spec([Skill::Hard, Skill::Easy]);
+    let start = crate::match_values::MatchStart::for_wotr_battle(&spec, &setup, &data).unwrap();
+    let levels: Vec<_> = start.players.iter().map(|p| p.ai).collect();
+    assert_eq!(levels, vec![Some(Difficulty::Hard), Some(Difficulty::Easy)]);
+}
+
+fn plain_seat(
+    player: u8,
+    owner: bool,
+    owner_side: bool,
+    origins: &[&str],
+    structures: Vec<(u8, String, u32)>,
+) -> crate::wotr_battle::BattleSeat {
+    use crate::wotr_battle::{BattleArmy, BattleSeat};
+    BattleSeat {
+        player: mint_sim::PlayerId::new(player),
+        owner,
+        owner_side,
+        armies: origins
+            .iter()
+            .enumerate()
+            .map(|(i, origin)| BattleArmy {
+                army: u32::from(player) * 10 + u32::try_from(i).unwrap(),
+                origin: (*origin).to_owned(),
+                units: Vec::new(),
+                arrives_after: None,
+            })
+            .collect(),
+        structures,
+        modifiers: mint_sage_combat::ModifierList {
+            name: String::new(),
+            category: None,
+            modifiers: Vec::new(),
+            duration_ms: Some(0),
+            ..mint_sage_combat::ModifierList::default()
+        },
+        purchase_points: 0,
+        skill_points: 1.0,
+        sciences: Vec::new(),
+        upgrades: Vec::new(),
+        fallen: Vec::new(),
+    }
+}
+
+#[test]
+fn a_missing_build_plot_is_created_280_from_the_start_in_plot_order() {
+    let plots = (1..=5).map(|k| (k, String::from("APorter"), 5)).collect();
+    let battle = crate::wotr_battle::WotrBattle {
+        region: String::from("Here"),
+        neighbours: Vec::new(),
+        seats: vec![plain_seat(0, true, true, &["Here"], plots)],
+        skill_scalars: Vec::new(),
+        seed: 0,
+        two_by_one: true,
+        revival_multipliers: (1.0, 1.0),
+    };
+    let placed = |objects: &[mint_sage_map::Object]| -> Vec<(f32, f32)> {
+        let resolved = crate::wotr_battle::resolve(&battle, objects);
+        resolved.seats[0]
+            .structures
+            .iter()
+            .map(|s| (s.at.x, s.at.y))
+            .collect()
+    };
+    let start = start_waypoint("Player_1_Start", 300.0, 300.0);
+    let own = start_waypoint("Player_1_BuildPlot_3", 11.0, 12.0);
+    assert_eq!(
+        placed(&[start, own]),
+        vec![(300.0, 580.0), (580.0, 300.0), (11.0, 12.0), (20.0, 300.0)]
+    );
+    assert!(placed(&[start_waypoint("Player_1_BuildPlot_1", 1.0, 2.0)]).is_empty());
+}
+
+#[test]
+fn a_battle_of_three_sides_spawns_each_army_at_its_origin_regions_points() {
+    let battle = crate::wotr_battle::WotrBattle {
+        region: String::from("Here"),
+        neighbours: vec![String::from("North"), String::from("South")],
+        seats: vec![
+            plain_seat(0, true, true, &["Here"], Vec::new()),
+            plain_seat(1, false, false, &["North"], Vec::new()),
+            plain_seat(2, false, false, &["South"], Vec::new()),
+        ],
+        skill_scalars: Vec::new(),
+        seed: 0,
+        two_by_one: false,
+        revival_multipliers: (1.0, 1.0),
+    };
+    let objects = vec![
+        start_waypoint("Player_1_Start", 0.0, 0.0),
+        start_waypoint("Player_1_Start_Rally", 10.0, 0.0),
+        start_waypoint("WOTRSpawnPoint_North_1", 900.0, 0.0),
+        start_waypoint("WOTRGatherPoint_North_1", 800.0, 0.0),
+        start_waypoint("WOTRSpawnPoint_South_1", -100.0, 0.0),
+        start_waypoint("WOTRGatherPoint_South_1", -50.0, 0.0),
+    ];
+    let resolved = crate::wotr_battle::resolve(&battle, &objects);
+    let stands: Vec<f32> = resolved
+        .seats
+        .iter()
+        .map(|seat| seat.armies[0].stand[0])
+        .collect();
+    assert_eq!(stands, vec![0.0, 800.0, -50.0]);
 }

@@ -196,7 +196,7 @@ impl ShellApp {
     fn save_error_box(&mut self, label: &str, file: &str) {
         let text = self.strings.get(label).map_or_else(
             || label.to_owned(),
-            |t| t.replace("%ls", file).replace("%s", file),
+            |t| mint_sage_str::format_placeholder(t, mint_sage_str::Placeholder::Str(file)),
         );
         let title = self
             .strings

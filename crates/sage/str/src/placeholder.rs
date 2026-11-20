@@ -24,9 +24,14 @@ enum ValueSpec {
 
 #[must_use]
 pub fn format_placeholder(template: &str, value: Placeholder<'_>) -> String {
+    format_placeholders(template, &[value])
+}
+
+#[must_use]
+pub fn format_placeholders(template: &str, values: &[Placeholder<'_>]) -> String {
     let mut out = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
-    let mut filled = false;
+    let mut next = values.iter();
     while let Some(c) = chars.next() {
         if c != '%' {
             out.push(c);
@@ -34,11 +39,11 @@ pub fn format_placeholder(template: &str, value: Placeholder<'_>) -> String {
         }
         match parse_spec(&mut chars) {
             Some(Spec::Percent) => out.push('%'),
-            Some(Spec::Value(spec)) if !filled => {
-                filled = true;
-                render(&mut out, &spec, &value);
+            Some(Spec::Value(spec)) => {
+                if let Some(value) = next.next() {
+                    render(&mut out, &spec, value);
+                }
             }
-            Some(Spec::Value(_)) => {}
             None => out.push('%'),
         }
     }
@@ -123,7 +128,13 @@ fn parse_spec(chars: &mut Peekable<Chars<'_>>) -> Option<Spec> {
         probe.next();
         precision_digits = Some(take_digits(&mut probe));
     }
-    let conv = probe.next()?;
+    let mut conv = probe.next()?;
+    if matches!(conv, 'l' | 'h') {
+        conv = probe.next()?;
+        if !matches!(conv, 's' | 'd') {
+            return None;
+        }
+    }
     let spec = match conv {
         'd' if precision_digits.is_none() && width_digits.is_empty() => Spec::Value(ValueSpec::Int),
         'd' if precision_digits.is_none() && width_digits.starts_with('0') => {
@@ -138,7 +149,9 @@ fn parse_spec(chars: &mut Peekable<Chars<'_>>) -> Option<Spec> {
                 precision: digits.parse().ok()?,
             })
         }
-        's' if width_digits.is_empty() && precision_digits.is_none() => Spec::Value(ValueSpec::Str),
+        's' | 'S' if width_digits.is_empty() && precision_digits.is_none() => {
+            Spec::Value(ValueSpec::Str)
+        }
         '%' if width_digits.is_empty() && precision_digits.is_none() => Spec::Percent,
         _ => return None,
     };
@@ -160,10 +173,34 @@ mod tests {
     }
 
     #[test]
+    fn several_values_fill_the_specifiers_in_order() {
+        assert_eq!(
+            format_placeholders("CP: %d/%d", &[Placeholder::Int(7), Placeholder::Int(9)]),
+            "CP: 7/9"
+        );
+        assert_eq!(format_placeholder("%d/%d", Placeholder::Int(7)), "7/");
+    }
+
+    #[test]
     fn percent_s_substitutes_a_string() {
         assert_eq!(
             format_placeholder("Shortcut: %s", Placeholder::Str("B")),
             "Shortcut: B"
+        );
+    }
+
+    #[test]
+    fn length_modified_string_and_integer_specifiers_fill() {
+        for template in ["+%ls", "+%hs", "+%ld", "+%hd"] {
+            assert_eq!(format_placeholder(template, Placeholder::Int(5)), "+5");
+        }
+    }
+
+    #[test]
+    fn percent_percent_beside_a_length_modified_specifier_gives_one_percent() {
+        assert_eq!(
+            format_placeholder("+%ls%% income", Placeholder::Int(10)),
+            "+10% income"
         );
     }
 

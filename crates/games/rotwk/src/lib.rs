@@ -6,6 +6,7 @@ mod apt_overlay;
 mod army;
 mod audio;
 mod base_install;
+mod bink_surface;
 mod button_flash;
 mod cah_edit;
 mod cah_examine;
@@ -30,6 +31,7 @@ mod command_bar;
 mod construction;
 mod crash;
 mod create_a_hero;
+mod credits;
 mod cursors;
 mod death_phase;
 mod defeat;
@@ -49,12 +51,15 @@ mod ghosts;
 mod goal_cells;
 mod handicap;
 mod help_box;
+mod hero_stats;
 mod heroes;
 mod horde;
+mod horde_climb;
 mod horde_trail;
 mod hud;
 mod in_game_menu;
 mod intro;
+mod kill_credit;
 mod letterbox;
 mod level_up;
 mod list_sort;
@@ -68,6 +73,7 @@ mod mapcache;
 mod match_loader;
 mod match_start;
 mod match_stats;
+mod match_values;
 mod melee;
 mod military_caption;
 mod mode;
@@ -115,10 +121,12 @@ mod shell_map;
 mod shroud;
 mod skirmish;
 mod skirmish_ai;
+mod skirmish_preset;
 mod snapshot;
 mod spawn;
 mod spell_book;
 mod spell_state;
+mod startup;
 mod stress;
 mod summons;
 mod tdfx;
@@ -140,6 +148,21 @@ mod voice_chain;
 mod wall_layer;
 mod wall_meshes;
 mod weapon_use;
+mod wotr_battle;
+mod wotr_dev;
+mod wotr_dialog;
+mod wotr_drive;
+mod wotr_end;
+mod wotr_flow;
+mod wotr_hud;
+mod wotr_movies;
+mod wotr_narration;
+mod wotr_resolve;
+mod wotr_save;
+mod wotr_screens;
+mod wotr_setup;
+mod wotr_tutorial;
+mod wotr_voice;
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -173,6 +196,7 @@ struct Options {
     queue: u32,
     ticks: u32,
     hash_every: Option<u32>,
+    pool_threads: Option<usize>,
     order: Option<(f32, f32)>,
     look_at: Option<(f32, f32)>,
     particle_flipbook: Option<mint_sage_scene::FlipbookMode>,
@@ -223,6 +247,8 @@ struct Options {
     dummies: Option<String>,
     dummies_attack: bool,
     money: Option<i64>,
+    wotr_battle: Option<(usize, String)>,
+    wotr: Option<std::sync::Arc<crate::wotr_battle::DevBattle>>,
     control: Option<String>,
     drive: Option<String>,
     drive_dt: std::time::Duration,
@@ -278,6 +304,7 @@ fn parse_args() -> Result<Options, String> {
     let mut queue = 0u32;
     let mut ticks = 0u32;
     let mut hash_every = None;
+    let mut pool_threads = None;
     let mut order = None;
     let mut look_at = None;
     let mut particle_flipbook = None;
@@ -325,6 +352,7 @@ fn parse_args() -> Result<Options, String> {
     let mut drive = None;
     let mut drive_dt = std::time::Duration::from_micros(16_667);
     let mut money = None;
+    let mut wotr_battle = None;
     let mut ini_census: Option<PathBuf> = None;
     let mut replay = None;
     let (mut campaign_name, mut campaign_mission, mut campaign_difficulty) = (None, None, None);
@@ -413,6 +441,14 @@ fn parse_args() -> Result<Options, String> {
                 dummies = Some(spec.unwrap_or_default());
             }
             "--dummiesAttack" => dummies_attack = true,
+            "--wotr-battle" => {
+                let index = args
+                    .next()
+                    .and_then(|raw| raw.parse().ok())
+                    .ok_or("--wotr-battle wants a campaign index and a region")?;
+                let region = args.next().ok_or("--wotr-battle wants a region")?;
+                wotr_battle = Some((index, region));
+            }
             "--money" => {
                 money = Some(parse_money(
                     &args.next().ok_or("--money wants an amount, e.g. 10000")?,
@@ -488,6 +524,14 @@ fn parse_args() -> Result<Options, String> {
                         .ok_or_else(|| {
                             format!("--hash-every wants a positive number, got {value}")
                         })?,
+                );
+            }
+            "--pool-threads" => {
+                let value = args.next().ok_or("--pool-threads wants a number")?;
+                pool_threads = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("--pool-threads wants a number, got {value}"))?,
                 );
             }
             "--order" => {
@@ -822,6 +866,7 @@ fn parse_args() -> Result<Options, String> {
         queue,
         ticks,
         hash_every,
+        pool_threads,
         order,
         look_at,
         particle_flipbook,
@@ -872,6 +917,8 @@ fn parse_args() -> Result<Options, String> {
         dummies,
         dummies_attack,
         money,
+        wotr_battle,
+        wotr: None,
         control,
         drive,
         drive_dt,
@@ -885,11 +932,13 @@ fn mount<'a>(installs: impl IntoIterator<Item = &'a Path>) -> Vfs {
     let mut archives = 0usize;
     for install in installs {
         let mut here = 0usize;
-        for path in mint_sage_big::archives_under(install) {
-            if let Ok(archive) = BigArchive::open(&path) {
-                vfs.mount(Arc::new(archive));
-                here = here.saturating_add(1);
-            }
+        let paths = mint_sage_big::archives_under(install);
+        for archive in mint_pool::map_ordered(&paths, |path| BigArchive::open(path).ok())
+            .into_iter()
+            .flatten()
+        {
+            vfs.mount(Arc::new(archive));
+            here = here.saturating_add(1);
         }
         println!("{here} archive(s) mounted from {}", install.display());
         archives = archives.saturating_add(here);
@@ -899,8 +948,13 @@ fn mount<'a>(installs: impl IntoIterator<Item = &'a Path>) -> Vfs {
 }
 
 pub(crate) fn load_game_data_or_exit(vfs: &Vfs) -> (crate::game_data::GameData, String) {
-    match crate::game_data::load_game_data(vfs) {
-        Ok(loaded) => loaded,
+    let loaded =
+        crate::game_data::preload::take().unwrap_or_else(|| crate::game_data::load_game_data(vfs));
+    match loaded {
+        Ok((data, line)) => {
+            crate::user_data::note_game_data_leaf(data.user_data_leaf.as_deref());
+            (data, line)
+        }
         Err(refusal) => {
             refusal.report();
             std::process::exit(2);
@@ -1797,6 +1851,7 @@ fn check_capture_command(args: &[String]) -> ExitCode {
 
 #[must_use]
 pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
+    crate::startup::begin();
     crate::title::register(title);
     crate::crash::install();
     mint_sage_apt_player::set_trace_sink(Some(Box::new(|name, args, result| {
@@ -1810,6 +1865,15 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
     }
     if rest.first().map(String::as_str) == Some("--play-movie") {
         return movie_cmd::play_movie_command(rest.get(1..).unwrap_or_default());
+    }
+    if rest.iter().any(|arg| arg == "--wotr-tutorial") {
+        if rest.iter().any(|arg| arg == "--hud" || arg == "--drive") {
+            return wotr_dev::command(&rest);
+        }
+        return wotr_tutorial::command(&rest);
+    }
+    if rest.iter().any(|arg| arg == "--wotr-session") {
+        return wotr_dev::command(&rest);
     }
     if rest.first().map(String::as_str) == Some("--check-kind") {
         return check_kind_command(rest.get(1..).unwrap_or_default());
@@ -1827,18 +1891,23 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
         return check_cancel_fx_command(rest.get(1..).unwrap_or_default());
     }
 
-    let options = match parse_args() {
+    let mut options = match parse_args() {
         Ok(options) => options,
         Err(message) => {
             eprintln!("error: {message}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(threads) = options.pool_threads {
+        mint_pool::set_threads(threads);
+        println!("pool: {} worker threads", mint_pool::threads());
+    }
 
     let vfs = Arc::new(mount_primary_last(
         &options.primary,
         &options.extra_installs,
     ));
+    crate::startup::mark("archives mounted");
 
     if let Some(dev) = &options.campaign_dev {
         if let Err(message) = dev.validate(&vfs) {
@@ -1858,6 +1927,21 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+
+    if let Some((index, region)) = options.wotr_battle.clone() {
+        let (data, line) = crate::load_game_data_or_exit(&vfs);
+        println!("{line}");
+        match crate::wotr_battle::dev_battle(&vfs, &data, index, &region) {
+            Ok(dev) => {
+                options.map = dev.spec.map.clone();
+                options.wotr = Some(std::sync::Arc::new(dev));
+            }
+            Err(message) => {
+                eprintln!("error: --wotr-battle: {message}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     let needle = Some(
@@ -1952,6 +2036,7 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
         };
     }
 
+    crate::game_data::preload::start(Arc::clone(&vfs));
     let config = WindowConfig {
         title: format!("{} - {map_label}", title.binary),
         pipeline_cache_dir: crate::user_data::pipeline_cache_dir(),
@@ -2015,6 +2100,11 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
         },
         campaign_dev: options.campaign_dev.clone(),
         tutorial_dev: options.tutorial_dev,
+        drive_templates: options
+            .drive
+            .as_deref()
+            .map(crate::drive::named_templates)
+            .unwrap_or_default(),
         skip_campaign_movies: options.shell_cli.intro != Some(true)
             && (options.drive.is_some() || options.ticks > 0 || options.screenshot.is_some()),
         match_config,
@@ -2045,10 +2135,34 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
                 (width, height),
                 options.drive_dt,
                 &steps,
-                |app, verb, argument| match &mut app.app_mut().screen {
-                    AppScreen::Match(game) if verb == "do" => game.act_for_script(argument),
-                    AppScreen::Match(game) => game.select_for_script(argument),
-                    AppScreen::Shell(_) => Err(format!("{verb}: not in a match")),
+                |app, verb, argument| {
+                    if let Some(answer) = app.app_mut().wotr_hook(verb, argument) {
+                        return answer;
+                    }
+                    match &mut app.app_mut().screen {
+                        AppScreen::Match(_) if verb == "screen" => argument
+                            .eq_ignore_ascii_case("Match")
+                            .then(String::new)
+                            .ok_or_else(|| "in a match".to_owned()),
+                        AppScreen::Shell(shell) if verb == "screen" => {
+                            let shown = shell.screen_name();
+                            if shown.eq_ignore_ascii_case(argument) {
+                                Ok(shown)
+                            } else {
+                                Err(shown)
+                            }
+                        }
+                        AppScreen::Match(game) if verb == "closed" => {
+                            game.panel_closed_for_script(argument)
+                        }
+                        AppScreen::Match(game) if verb == "pending" => {
+                            Ok(game.pending_commands_for_script().to_string())
+                        }
+                        AppScreen::Match(game) if verb == "do" => game.act_for_script(argument),
+                        AppScreen::Match(game) => game.select_for_script(argument),
+                        AppScreen::Shell(shell) if verb == "do" => shell.act_for_script(argument),
+                        AppScreen::Shell(_) => Err(format!("{verb}: not in a match")),
+                    }
                 },
                 |app| match &app.app().screen {
                     AppScreen::Match(game) => Some(game.sim_frame()),
@@ -2065,7 +2179,26 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
                 if let Some(every) = options.hash_every {
                     print_tick_hashes(game.tick_hashes(), every);
                 }
+                if let Some(dev) = &options.wotr {
+                    crate::wotr_battle::apply_dev_result(game, dev);
+                }
                 crate::perf::report();
+            }
+            let teardown = std::time::Instant::now();
+            if app.exit_requested() && app.abandon_on_exit() {
+                #[allow(clippy::mem_forget)]
+                {
+                    std::mem::forget(app);
+                    std::mem::forget(renderer);
+                }
+                println!("drive: left without tearing the app down");
+            } else {
+                drop(app);
+                drop(renderer);
+                println!(
+                    "drive: app and renderer dropped in {:.0} ms",
+                    teardown.elapsed().as_secs_f64() * 1000.0
+                );
             }
             Ok(())
         };
@@ -2082,6 +2215,7 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
             "renderer: pipeline cache {:?}",
             renderer.pipeline_cache_state()
         );
+        crate::startup::mark("renderer ready");
         start
             .build(renderer, viewport)
             .map(|app| crate::crash::Dumping::new(app, crate::crash::root()))
@@ -2106,30 +2240,40 @@ pub fn run(title: &'static title::TitleRegistration) -> ExitCode {
 }
 
 fn match_config(options: &Options, map_label: &str) -> crate::game::MatchConfig {
-    crate::game::MatchConfig::Skirmish(
-        crate::lobby::SkirmishSetup::two_player(
-            options
-                .faction
-                .clone()
-                .unwrap_or_else(|| String::from(crate::skirmish::DEFAULT_FACTION)),
-            options
-                .opponent
-                .clone()
-                .unwrap_or_else(|| String::from(crate::skirmish::DEFAULT_OPPONENT)),
-            map_label.to_owned(),
-            [options.player_ai, options.opponent_ai.is_ai()],
-            options.army,
-        )
-        .with_more_opponents(&options.more_opponents, options.opponent_ai.is_ai())
-        .with_spawn_flags(
-            options.spawn.clone(),
-            options.spawn_buildings.clone(),
-            options.dummies.clone(),
-        )
-        .with_cah_hero(options.cah_hero.clone())
-        .with_dummies_attack(options.dummies_attack)
-        .with_starting_money(options.money),
+    let mut setup = crate::lobby::SkirmishSetup::two_player(
+        options
+            .faction
+            .clone()
+            .unwrap_or_else(|| String::from(crate::skirmish::DEFAULT_FACTION)),
+        options
+            .opponent
+            .clone()
+            .unwrap_or_else(|| String::from(crate::skirmish::DEFAULT_OPPONENT)),
+        map_label.to_owned(),
+        [options.player_ai, options.opponent_ai.is_ai()],
+        options.army,
     )
+    .with_more_opponents(&options.more_opponents, options.opponent_ai.is_ai())
+    .with_spawn_flags(
+        options.spawn.clone(),
+        options.spawn_buildings.clone(),
+        options.dummies.clone(),
+    )
+    .with_cah_hero(options.cah_hero.clone())
+    .with_dummies_attack(options.dummies_attack)
+    .with_drive_templates(
+        options
+            .drive
+            .as_deref()
+            .map(crate::drive::named_templates)
+            .unwrap_or_default(),
+    )
+    .with_starting_money(options.money);
+    setup.wotr = options
+        .wotr
+        .as_ref()
+        .map(|dev| crate::wotr_battle::SpecHandle(std::sync::Arc::new(dev.spec.clone())));
+    crate::game::MatchConfig::Skirmish(setup)
 }
 
 fn parse_money(raw: &str) -> Result<i64, String> {
@@ -2195,6 +2339,7 @@ struct AppStart {
     campaign_dev: Option<crate::campaign_dev::CampaignDev>,
     tutorial_dev: Option<crate::tutorial::TutorialKind>,
     skip_campaign_movies: bool,
+    drive_templates: Vec<String>,
     match_config: crate::game::MatchConfig,
     map_label: String,
     control: crate::game::ControlSet,
@@ -2233,11 +2378,13 @@ impl AppStart {
                 self.sources,
                 self.scale_mode,
                 viewport,
+                None,
             )?;
             state.boot_shell(viewport, &self.shell_cli);
             state
                 .campaign_flow
                 .set_skip_movies(self.skip_campaign_movies);
+            state.drive_templates = self.drive_templates;
             if let Some(dev) = self.campaign_dev {
                 state.campaign_flow.set_dev_entry(dev);
             }
@@ -2309,14 +2456,22 @@ struct AppState {
     flow: crate::shell_game::ShellFlow,
     menu_held: bool,
     shell_map_name: String,
-    campaign_flow: crate::campaign_flow::CampaignFlow,
+    campaign_flow: Box<crate::campaign_flow::CampaignFlow>,
+    drive_templates: Vec<String>,
     intro: Option<crate::intro::Intro>,
     pending_boot: Option<bool>,
     shell_hold: Option<ShellLoadHold>,
     shell_preloading: bool,
+    score_wait: Option<(std::time::Instant, String)>,
+    shell_cache: Option<crate::shell::ShellCache>,
     preload_warm: u32,
-    loading_ring: Option<crate::loading_ring::LoadingRing>,
+    loading_ring: Option<Box<crate::loading_ring::LoadingRing>>,
+    wotr: Option<Box<crate::wotr_dev::WotrApp>>,
+    wotr_battle: Option<crate::wotr_flow::BattleHop>,
+    wotr_load: Option<std::path::PathBuf>,
     frame_dt: f32,
+    retired: Option<crate::game::MatchRemains>,
+    teardown: Option<std::thread::JoinHandle<()>>,
 }
 
 struct ShellLoadHold {
@@ -2352,6 +2507,7 @@ impl AppState {
         sources: crate::game::PassabilitySources,
         scale_mode: mint_sage_apt_viewer::ScaleMode,
         viewport: (u32, u32),
+        cache: Option<crate::shell::ShellCache>,
     ) -> Result<Self, String> {
         #[allow(clippy::cast_precision_loss)]
         let window_size = (viewport.0 as f32, viewport.1 as f32);
@@ -2361,16 +2517,19 @@ impl AppState {
             window_size,
             scale_mode,
             renderer,
+            cache,
         )?;
+        let shell_cache = shell.cache();
         let cursors = crate::cursors::Cursors::load(&vfs, &install_roots)?;
         Ok(Self {
             vfs,
             install_roots,
             sources,
             scale_mode,
-            screen: AppScreen::Shell(Box::new(shell)),
+            screen: AppScreen::Shell(shell),
             cursors,
             last_match: None,
+            drive_templates: Vec::new(),
             loading: None,
             shell_game: None,
             shell_loading: None,
@@ -2378,14 +2537,21 @@ impl AppState {
             flow: crate::shell_game::ShellFlow::default(),
             menu_held: false,
             shell_map_name: String::new(),
-            campaign_flow: crate::campaign_flow::CampaignFlow::default(),
+            campaign_flow: Box::default(),
             intro: None,
             pending_boot: None,
             shell_hold: None,
             shell_preloading: false,
+            score_wait: None,
+            shell_cache,
             preload_warm: 0,
             loading_ring: None,
             frame_dt: 0.0,
+            wotr: None,
+            wotr_battle: None,
+            wotr_load: None,
+            retired: None,
+            teardown: None,
         })
     }
 
@@ -2405,6 +2571,7 @@ impl AppState {
             screen: AppScreen::Match(game),
             cursors,
             last_match: None,
+            drive_templates: Vec::new(),
             loading: None,
             shell_game: None,
             shell_loading: None,
@@ -2412,18 +2579,26 @@ impl AppState {
             flow: crate::shell_game::ShellFlow::default(),
             menu_held: false,
             shell_map_name: String::new(),
-            campaign_flow: crate::campaign_flow::CampaignFlow::default(),
+            campaign_flow: Box::default(),
             intro: None,
             pending_boot: None,
             shell_hold: None,
             shell_preloading: false,
+            score_wait: None,
+            shell_cache: None,
             preload_warm: 0,
             loading_ring: None,
             frame_dt: 0.0,
+            wotr: None,
+            wotr_battle: None,
+            wotr_load: None,
+            retired: None,
+            teardown: None,
         })
     }
 
     fn enter_shell(&mut self, renderer: &mut Renderer, viewport: (u32, u32)) -> Result<(), String> {
+        let began = std::time::Instant::now();
         let fresh = Self::new_shell(
             renderer,
             Arc::clone(&self.vfs),
@@ -2431,12 +2606,54 @@ impl AppState {
             self.sources,
             self.scale_mode,
             viewport,
+            self.shell_cache.clone(),
         )?;
-        self.screen = fresh.screen;
+        let loaded = began.elapsed();
+        let old = std::mem::replace(&mut self.screen, fresh.screen);
+        let dropping = std::time::Instant::now();
+        if let AppScreen::Match(game) = old {
+            self.retired = Some(game.into_remains());
+        }
+        println!(
+            "shell: left the match - shell loaded in {:.0} ms, old screen dropped in {:.0} ms",
+            loaded.as_secs_f64() * 1000.0,
+            dropping.elapsed().as_secs_f64() * 1000.0,
+        );
         self.last_match = None;
         let actions = self.flow.on(crate::shell_game::FlowEvent::ReturnToShell);
         self.apply_flow(viewport, actions);
         Ok(())
+    }
+
+    fn finish_teardown(&mut self) {
+        drop(self.retired.take());
+        if let Some(thread) = self.teardown.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn release_retired(&mut self) {
+        let Some(remains) = self.retired.take() else {
+            return;
+        };
+        if let Some(thread) = self.teardown.take() {
+            let _ = thread.join();
+        }
+        self.teardown = remains.free_elsewhere();
+    }
+
+    fn teardown_running(&mut self) -> bool {
+        if self
+            .teardown
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return true;
+        }
+        if let Some(thread) = self.teardown.take() {
+            let _ = thread.join();
+        }
+        false
     }
 
     fn boot_shell(&mut self, viewport: (u32, u32), cli: &ShellCli) {
@@ -2626,7 +2843,9 @@ impl AppState {
                 }
                 FlowAction::RestartShellGame => {
                     self.shell_game = None;
-                    self.hold_for_shell_load();
+                    if let AppScreen::Shell(shell) = &mut self.screen {
+                        shell.set_shell_map_running(false);
+                    }
                     self.start_shell_game(viewport);
                 }
                 FlowAction::DropShellGame => {
@@ -2802,6 +3021,9 @@ impl AppState {
     }
 
     fn advance_loading(&mut self, renderer: &mut Renderer) {
+        if self.loading.is_none() || self.teardown_running() {
+            return;
+        }
         let Some(loading) = self.loading.as_mut() else {
             return;
         };
@@ -2834,6 +3056,7 @@ impl AppState {
             Err(error) => {
                 eprintln!("shell: could not start the match ({error}) - back to the menu");
                 self.loading = None;
+                self.wotr_battle_failed();
             }
         }
     }
@@ -2842,8 +3065,15 @@ impl AppState {
         self.intro_step(renderer);
         self.shell_hold_step();
         self.campaign_step(renderer);
+        self.wotr_step(renderer);
+        if self.wotr.is_some() {
+            return;
+        }
         if self.loading.is_some() {
             self.advance_loading(renderer);
+            return;
+        }
+        if self.wotr_battle_ended(renderer) {
             return;
         }
         self.sync_cah_scene();
@@ -2863,18 +3093,25 @@ impl AppState {
         }
         match &mut self.screen {
             AppScreen::Match(game) if game.wants_shell() => {
+                self.score_wait = Some((std::time::Instant::now(), String::new()));
                 let viewport = game.viewport();
+                let stage = std::time::Instant::now();
                 let score = game.score_figures();
-                let mission_end = game.mission_end();
-                let carried = if mission_end == Some(mint_sage_campaign::MissionEnd::Victory) {
-                    game.capture_carryover()
-                } else {
-                    None
-                };
+                let figures_ms = stage.elapsed().as_secs_f64() * 1000.0;
+                let result = game.match_result();
+                let result_ms = stage.elapsed().as_secs_f64() * 1000.0 - figures_ms;
+                let mission_end = result.end;
                 let was_campaign = matches!(
                     self.last_match.as_ref().map(|start| &start.config),
                     Some(crate::game::MatchConfig::Campaign(_))
                 );
+                if was_campaign {
+                    println!(
+                        "campaign: mission left at tick {} ({mission_end:?}), state hash {:#018x}",
+                        game.sim_frame(),
+                        game.state_hash()
+                    );
+                }
                 let setup = match self.last_match.as_ref().map(|start| &start.config) {
                     Some(crate::game::MatchConfig::Skirmish(setup)) => Some(setup.clone()),
                     _ => None,
@@ -2887,10 +3124,13 @@ impl AppState {
                 }
                 if was_campaign {
                     if self.campaign_running() {
-                        self.campaign_match_ended(mission_end, carried);
+                        self.campaign_match_ended(&result);
                     }
                     if let AppScreen::Shell(shell) = &mut self.screen {
-                        shell.show_campaign_score(&score.unwrap_or_default());
+                        shell.show_campaign_score(
+                            &score.unwrap_or_default(),
+                            mission_end == Some(mint_sage_campaign::MissionEnd::Victory),
+                        );
                     }
                     return;
                 }
@@ -2898,6 +3138,12 @@ impl AppState {
                     (score, setup, &mut self.screen)
                 {
                     shell.show_score(&figures, setup);
+                }
+                if let Some((began, _)) = &self.score_wait {
+                    println!(
+                        "score-wait: shell and score screen set up {:.0} ms after the match ended                          (figures {figures_ms:.0} ms, result {result_ms:.0} ms)",
+                        began.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
             }
             AppScreen::Match(game) if game.wants_restart() => {
@@ -2911,6 +3157,7 @@ impl AppState {
                     self.last_match = Some(start);
                     return;
                 }
+                self.finish_teardown();
                 let actions = self.flow.on(crate::shell_game::FlowEvent::MatchStart);
                 self.apply_flow(viewport, actions);
                 let (data, ui) = match &mut self.screen {
@@ -2947,8 +3194,15 @@ impl AppState {
                 let actions = self.flow.on(crate::shell_game::FlowEvent::MatchStart);
                 let map_label = pending.setup.map_label.clone();
                 let config = match pending.campaign {
-                    Some(campaign) => crate::game::MatchConfig::Campaign(campaign),
-                    None => crate::game::MatchConfig::Skirmish(pending.setup),
+                    Some(mut campaign) => {
+                        campaign.drive_templates.clone_from(&self.drive_templates);
+                        crate::game::MatchConfig::Campaign(campaign)
+                    }
+                    None => {
+                        let mut setup = pending.setup;
+                        setup.drive_templates.clone_from(&self.drive_templates);
+                        crate::game::MatchConfig::Skirmish(setup)
+                    }
                 };
                 let start = MatchStart {
                     sources: pending.passability_sources,
@@ -2968,6 +3222,9 @@ impl AppState {
                         crate::match_loader::FRAME_BUDGET,
                         std::time::Duration::from_millis,
                     );
+                if let Some(remains) = self.retired.take() {
+                    self.teardown = remains.free_elsewhere();
+                }
                 let loader = crate::match_loader::MatchLoader::new(
                     Arc::clone(&self.vfs),
                     self.install_roots.clone(),
@@ -3017,6 +3274,15 @@ impl crate::crash::Subject for AppState {
 
 impl App for AppState {
     fn input(&mut self, event: &InputEvent) {
+        if let Some(run) = self.wotr.as_mut() {
+            if matches!(event, InputEvent::Resized { .. }) {
+                if let AppScreen::Shell(shell) = &mut self.screen {
+                    shell.input(event);
+                }
+            }
+            run.input(event);
+            return;
+        }
         if matches!(event, InputEvent::Resized { .. }) {
             match &mut self.screen {
                 AppScreen::Shell(shell) => shell.input(event),
@@ -3072,6 +3338,10 @@ impl App for AppState {
 
     fn frame(&mut self, dt: f32) {
         self.frame_dt = dt;
+        if let Some(run) = self.wotr.as_mut() {
+            run.frame(dt);
+            return;
+        }
         let preloading = self.shell_preloading;
         self.cursors.advance(dt);
         self.campaign_flow.advance(dt);
@@ -3100,6 +3370,9 @@ impl App for AppState {
 
     fn draw(&mut self, renderer: &mut Renderer, blend: f32) -> mint_render::Result<()> {
         self.check_transitions(renderer);
+        if let Some(run) = self.wotr.as_mut() {
+            return run.draw(renderer, blend);
+        }
         if let Some(result) = self.draw_movie(renderer) {
             return result;
         }
@@ -3154,7 +3427,8 @@ impl App for AppState {
                                 library,
                                 &self.install_roots,
                                 crate::campaign_flow::LANGUAGE,
-                            );
+                            )
+                            .map(Box::new);
                         }
                         self.loading_ring
                             .as_mut()
@@ -3165,6 +3439,7 @@ impl App for AppState {
                         None
                     }
                 };
+                let shown_screen = shell.screen_name();
                 let mut draws = match boot {
                     Some(screen) => shell.boot_draws(renderer, screen),
                     None if campaign_still => still_quad
@@ -3174,6 +3449,19 @@ impl App for AppState {
                     None if self.menu_held => Vec::new(),
                     None => shell.build_and_draw(renderer),
                 };
+                if let Some((began, last)) = self.score_wait.as_mut() {
+                    let now = format!("{shown_screen} boot={boot:?} held={}", self.menu_held);
+                    if *last != now {
+                        println!(
+                            "score-wait: {:.0} ms after the match ended, drawing {now}",
+                            began.elapsed().as_secs_f64() * 1000.0
+                        );
+                        *last = now;
+                    }
+                    if boot.is_none() && !self.menu_held && shown_screen == "TimeLine" {
+                        self.score_wait = None;
+                    }
+                }
                 draws.extend(ring.map(mint_render::ScreenDraw::Quad));
                 draws.extend(foreground.map(mint_render::ScreenDraw::Quad));
                 if cover > 0.0 {
@@ -3238,6 +3526,10 @@ impl App for AppState {
             AppScreen::Match(_) => false,
         }
     }
+
+    fn abandon_on_exit(&self) -> bool {
+        self.wotr.is_none() && self.exit_requested()
+    }
 }
 
 fn print_tick_hashes(hashes: &[u64], every: u32) {
@@ -3268,6 +3560,7 @@ fn open_offscreen_renderer((width, height): (u32, u32)) -> Result<Renderer, Stri
         started.elapsed().as_secs_f64() * 1000.0,
         renderer.pipeline_cache_state()
     );
+    crate::startup::mark("renderer ready");
     Ok(renderer)
 }
 
@@ -3668,6 +3961,7 @@ fn render_shell_screenshot(
         window_size,
         options.scale_mode,
         &mut renderer,
+        None,
     )?;
     shell.force_screen(screen)?;
     shell.set_text_anchor(options.text_anchor);
@@ -4122,7 +4416,7 @@ fn render_screenshot(
         shroud_source: None,
         kinds: Arc::clone(&setup.kinds),
         local_evil: setup.local_evil,
-        local_faction_icon: setup.local_faction_icon.clone(),
+        local_faction: setup.local_faction.clone(),
         local_heroes: setup.local_heroes.clone(),
         local_side: setup.local_side.clone(),
         local_template: setup.local_template.clone(),
@@ -4134,6 +4428,7 @@ fn render_screenshot(
         floating: crate::floating_text::FloatingTexts::default(),
         caption_points: crate::game_data::SHIPPED_DRAWABLE_CAPTION_POINTS,
         named_timer_style: crate::named_timer::TimerStyle::default(),
+        downwind_angle: data.downwind_angle,
         fonts: Arc::clone(&fonts),
         strings: Arc::clone(&strings),
     };
@@ -4489,6 +4784,7 @@ fn render_screenshot(
             move_hint_model.as_ref(),
             crate::game::LOCAL_PLAYER,
             None,
+            false,
             false,
         )
         .map_err(|e| e.to_string())?;

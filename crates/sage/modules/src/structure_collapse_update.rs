@@ -179,6 +179,7 @@ impl Component for StructureCollapseUpdate {
 }
 
 impl ModuleKind for StructureCollapseUpdate {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::USER_FROZEN;
     const CAPABILITIES: CapabilityMask =
         CapabilityMask::single(Capability::Update).union(CapabilityMask::single(Capability::Die));
 
@@ -349,7 +350,9 @@ fn optional_duration_ms(
         return Err(FieldError::new(format!("{keyword} is negative")));
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(LogicFrames::from_milliseconds(ms as u32))
+    Ok(crate::special_ability_update::retail_duration_ticks(
+        ms as u32,
+    ))
 }
 
 #[cfg(test)]

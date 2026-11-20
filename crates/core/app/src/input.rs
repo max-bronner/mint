@@ -25,6 +25,7 @@ pub enum Key {
     CtrlShiftDigit(u8),
     Shift,
     Alt,
+    Numpad(u8),
     Other,
 }
 
@@ -34,6 +35,10 @@ pub enum InputEvent {
     PointerMoved {
         x: f32,
         y: f32,
+    },
+    PointerLeft,
+    PointerDoubleClick {
+        button: PointerButton,
     },
     PointerButton {
         button: PointerButton,
@@ -58,6 +63,38 @@ pub enum InputEvent {
     },
 }
 
+pub const DOUBLE_CLICK_TIME: std::time::Duration = std::time::Duration::from_millis(500);
+
+pub const DOUBLE_CLICK_SPAN: f32 = 4.0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct DoubleClicks {
+    last: Option<(PointerButton, std::time::Duration, [f32; 2])>,
+}
+
+impl DoubleClicks {
+    pub(crate) fn press(
+        &mut self,
+        button: PointerButton,
+        at: std::time::Duration,
+        pos: [f32; 2],
+    ) -> bool {
+        let half = DOUBLE_CLICK_SPAN * 0.5;
+        let double = self.last.is_some_and(|(b, t, p)| {
+            b == button
+                && at.saturating_sub(t) <= DOUBLE_CLICK_TIME
+                && (pos[0] - p[0]).abs() <= half
+                && (pos[1] - p[1]).abs() <= half
+        });
+        self.last = if double {
+            None
+        } else {
+            Some((button, at, pos))
+        };
+        double
+    }
+}
+
 const PIXELS_PER_LINE: f32 = 50.0;
 
 #[must_use]
@@ -71,6 +108,19 @@ pub(crate) fn lines_from_pixels(pixels: f64) -> f32 {
 #[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_press_close_in_time_and_place_is_a_double_click_and_a_third_is_not() {
+        use std::time::Duration;
+        let mut clicks = DoubleClicks::default();
+        let ms = Duration::from_millis;
+        assert!(!clicks.press(PointerButton::Middle, ms(0), [100.0, 100.0]));
+        assert!(clicks.press(PointerButton::Middle, ms(400), [101.0, 102.0]));
+        assert!(!clicks.press(PointerButton::Middle, ms(500), [101.0, 102.0]));
+        assert!(!clicks.press(PointerButton::Middle, ms(1100), [101.0, 102.0]));
+        assert!(!clicks.press(PointerButton::Primary, ms(1200), [101.0, 102.0]));
+        assert!(!clicks.press(PointerButton::Primary, ms(1300), [104.0, 102.0]));
+    }
 
     #[test]
     fn a_touchpad_delta_becomes_a_fraction_of_a_wheel_detent() {

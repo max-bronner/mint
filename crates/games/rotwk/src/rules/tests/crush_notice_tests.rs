@@ -1,15 +1,25 @@
 use super::*;
 
-fn data() -> String {
-    String::from(
+fn data(weapon: &str) -> String {
+    let weapon_set = if weapon.is_empty() {
+        String::new()
+    } else {
+        format!("WeaponSet\n    Conditions = None\n    Weapon = PRIMARY {weapon}\n  End\n  ")
+    };
+    format!(
         "Locomotor ZHooves\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  \
            TurnTime = 100\nEnd\n\
          EmotionNugget ZBrace\n  \
            Type = BRACE_FOR_BEING_CRUSHED\n  ModelConditions = EMOTION_AFRAID\n  \
            Duration = 3000\nEnd\n\
+         Weapon ZHoof\n  AttackRange = 10\n  DelayBetweenShots = 500\n  MeleeWeapon = Yes\n  \
+           DamageNugget\n    Damage = 1\n    DamageType = CRUSH\n  End\nEnd\n\
+         Weapon ZBow\n  AttackRange = 300\n  DelayBetweenShots = 500\n  \
+           DamageNugget\n    Damage = 1\n    DamageType = PIERCE\n  End\nEnd\n\
          Object ZRider\n  Side = Neutral\n  KindOf = CAVALRY SELECTABLE\n  \
            CrusherLevel = 2\n  CrushableLevel = 2\n  \
            Body = ActiveBody Tag_Body\n    MaxHealth = 2000\n  End\n  \
+           {weapon_set}\
            LocomotorSet\n    Locomotor = ZHooves\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
            Behavior = NotifyTargetsOfImminentProbableCrushingUpdate Tag_Notify\n    \
              TimeBetweenUpdatesMS = 400\n  End\n  \
@@ -24,10 +34,13 @@ fn data() -> String {
     )
 }
 
-fn scene() -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
-    let doc =
-        mint_sage_ini::Document::parse("t.ini", &data(), &mint_sage_ini::BlockTable::corpus_path())
-            .unwrap();
+fn scene(weapon: &str) -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
+    let doc = mint_sage_ini::Document::parse(
+        "t.ini",
+        &data(weapon),
+        &mint_sage_ini::BlockTable::corpus_path(),
+    )
+    .unwrap();
     assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
     let errors = mint_sage_ini::ValueErrors::new();
     let mut emotions = mint_sage_ini::EmotionIndex::new();
@@ -102,7 +115,7 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Entity, Entity) {
 
 #[test]
 fn only_the_crushable_enemy_ahead_of_a_charging_crusher_braces() {
-    let (mut simulation, ids, ahead, aside) = scene();
+    let (mut simulation, ids, ahead, aside) = scene("ZHoof");
     let mut braced = false;
     for _ in 0..40 {
         simulation.tick().unwrap();
@@ -118,4 +131,32 @@ fn only_the_crushable_enemy_ahead_of_a_charging_crusher_braces() {
         );
     }
     assert!(braced, "the footman ahead never braced");
+}
+
+#[test]
+fn a_crusher_with_no_weapon_warns_the_unit_ahead() {
+    let (mut simulation, ids, ahead, _) = scene("");
+    let mut braced = false;
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+        braced |= simulation
+            .state()
+            .get(ids.emotion, ahead)
+            .is_some_and(|emotion| {
+                emotion.kind == mint_sage_ini::EmotionType::BraceForBeingCrushed.code()
+            });
+    }
+    assert!(braced, "the footman ahead never braced");
+}
+
+#[test]
+fn a_crusher_holding_a_ranged_weapon_warns_nobody() {
+    let (mut simulation, ids, ahead, _) = scene("ZBow");
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+        assert!(
+            simulation.state().get(ids.emotion, ahead).is_none(),
+            "the footman ahead braced"
+        );
+    }
 }

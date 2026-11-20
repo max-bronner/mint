@@ -25,6 +25,7 @@ fn data() -> String {
            Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
          ChildObject ZFar ZNear\nEnd\n\
          ChildObject ZGuarded ZNear\nEnd\n\
+         ChildObject ZAlly ZNear\nEnd\n\
          Object ZRider\n  Side = Neutral\n  KindOf = CAVALRY SELECTABLE IMMOBILE\n  \
            Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
            Behavior = EmotionTrackerUpdate Tag_Emotion\n    \
@@ -60,6 +61,7 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
         "ZRider",
         "ZImmune",
         "ZGuarded",
+        "ZAlly",
     ];
     let places = [
         RADIATOR_AT,
@@ -69,7 +71,9 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
         Vec2::new(300.0, 390.0),
         Vec2::new(300.0, 210.0),
         Vec2::new(370.0, 370.0),
+        Vec2::new(390.0, 320.0),
     ];
+    let owners = [PLAYER, OTHER, OTHER, OTHER, OTHER, OTHER, OTHER, PLAYER];
     let (kinds, missing) = KindTable::closure(
         &data,
         &roots
@@ -83,20 +87,22 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
     let spawns = roots
         .iter()
         .zip(places)
-        .map(|(name, at)| {
+        .zip(owners)
+        .map(|((name, at), owner)| {
             kinds
                 .spawn(
                     &data.combat,
                     kinds.kind(name).unwrap(),
                     at,
                     Facing::EAST,
-                    PLAYER,
+                    owner,
                 )
                 .unwrap()
         })
         .collect();
     let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
     let rules = RotwkRules::new(passability, spawns)
+        .with_players(2)
         .with_combat(data.combat.clone())
         .with_emotions(Arc::new(emotions))
         .with_construction(Arc::clone(&kinds), production.clone())
@@ -168,4 +174,15 @@ fn a_resist_terror_leadership_shrugs_off_a_terror_pulse() {
         "the statue's aura reached it"
     );
     assert!(!felt(&mut simulation, ids, guarded, 40));
+}
+
+#[test]
+fn a_radiator_frightens_enemies_only() {
+    let (mut simulation, ids, entities) = scene();
+    let (enemy, ally) = (entities[2], entities[7]);
+    assert!(felt(&mut simulation, ids, enemy, 40));
+    assert!(
+        simulation.state().get(ids.emotion, ally).is_none(),
+        "a unit of its own player"
+    );
 }

@@ -467,18 +467,15 @@ fn sample_dense(
     if local < 0.0 {
         return Some(dense_identity(kind, *values.first()?));
     }
-    if local == 0.0 {
-        return values.first().copied();
-    }
     #[allow(clippy::cast_precision_loss)]
     let last = last_index as f32;
     if local > last {
         return Some(dense_identity(kind, *values.first()?));
     }
-    if local == last {
-        return values.get(last_index).copied();
-    }
-    interpolate_within(values, last_index, local)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let nearest = local.round_ties_even() as usize;
+    let index = if nearest > last_index { 0 } else { nearest };
+    values.get(index).copied()
 }
 
 fn sample_dense_clamped(values: &[Value], frame: f32) -> Option<Value> {

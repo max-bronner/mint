@@ -76,6 +76,15 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_upgrade_with_a_cost_but_no_build_time_is_still_priced() {
+        let upgrades = index("Upgrade Upgrade_Sub\n  BuildCost = 70\nEnd\n");
+        assert!(build_upgrade_records(&upgrades, &MacroTable::new()).is_empty());
+        let costs = build_upgrade_costs(&upgrades, &MacroTable::new());
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].cost, 70.0);
+    }
+
+    #[test]
     fn object_type_and_unset_type_both_default_to_object_scope() {
         let upgrades = index(
             "Upgrade Upgrade_A\n  Type = OBJECT\n  BuildCost = 1\n  BuildTime = 1\nEnd\n\
@@ -112,4 +121,32 @@ mod tests {
         let records = build_upgrade_records(&upgrades, &MacroTable::new());
         assert!(records.is_empty());
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpgradeCost {
+    pub name: String,
+    pub cost: f32,
+    pub sub_upgrade_template_names: Vec<String>,
+}
+
+#[must_use]
+pub fn build_upgrade_costs(upgrades: &UpgradeIndex, macros: &MacroTable) -> Vec<UpgradeCost> {
+    upgrades
+        .names()
+        .filter_map(|name| {
+            let def = upgrades.get(name)?;
+            let cost = def
+                .build_cost_raw
+                .as_deref()
+                .and_then(|raw| parse_float_or_macro(raw, macros))
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(0.0);
+            Some(UpgradeCost {
+                name: name.to_owned(),
+                cost,
+                sub_upgrade_template_names: def.sub_upgrade_template_names.clone(),
+            })
+        })
+        .collect()
 }

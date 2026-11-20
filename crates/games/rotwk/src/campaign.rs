@@ -31,6 +31,7 @@ pub(crate) struct CampaignMatch {
     pub(crate) carryover: Carryover,
     pub(crate) delayed: Vec<String>,
     pub(crate) mode: crate::game_mode::GameMode,
+    pub(crate) drive_templates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +136,7 @@ impl CampaignRun {
                 carryover: self.carry.clone(),
                 delayed: mission.delay_carryover_spawning_of.clone(),
                 mode: crate::game_mode::GameMode::SinglePlayer,
+                drive_templates: Vec::new(),
             },
             presentation: MatchStartPresentation::for_mission(mission, play_intro_movie),
         })

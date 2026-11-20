@@ -1,9 +1,11 @@
 use mint_render::Mat4;
 
+use super::index::DrawableKeys;
 use super::{Ride, UnitDrawable, UnitPose};
 
 pub(super) fn carry_riders(
     drawables: &mut [UnitDrawable],
+    keys: &DrawableKeys,
     paired: &[Option<usize>],
     poses: &[UnitPose],
 ) {
@@ -13,9 +15,9 @@ pub(super) fn carry_riders(
         .filter_map(|(at, pose)| Some((at, poses.get((*pose)?)?.ride?)))
         .collect();
     for (at, ride) in rides {
-        let motion = drawables
-            .iter()
-            .find(|drawable| drawable.id == ride.container)
+        let motion = keys
+            .by_id(ride.container)
+            .and_then(|container| drawables.get(container))
             .and_then(|container| bone_motion(container, usize::from(ride.pivot)));
         if let (Some(motion), Some(rider)) = (motion, drawables.get_mut(at)) {
             rider.placement = motion.mul_mat4(rider.placement);

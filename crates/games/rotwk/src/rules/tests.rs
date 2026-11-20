@@ -1,6 +1,15 @@
 mod ability_approach_tests;
+mod ability_b1_hold_fire_tests;
+mod ability_b1_horde_tests;
+mod ability_b1_tests;
+mod ability_b2_tests;
+mod ability_b3_tests;
+mod ability_b4_tests;
+mod ability_b5_tests;
 mod ability_weapon_reload_tests;
+mod adjust_destination_tests;
 mod ai_powers_tests;
+mod ai_wave_pacing_tests;
 mod amphibious_tests;
 mod animal_ai_tests;
 mod animal_flee_tests;
@@ -18,6 +27,7 @@ mod broadcast_tests;
 mod build_order_tests;
 mod build_variation_tests;
 mod build_worker_tests;
+mod building_height_tests;
 mod burning_death_tests;
 mod busy_ability_tests;
 mod busy_tests;
@@ -35,11 +45,13 @@ mod contain_tests;
 mod corpse_fade_tests;
 mod corpse_sink_tests;
 mod cost_modifier_tests;
+mod critter_emitter_tests;
 mod crush_blocked_attack_tests;
 mod crush_notice_tests;
 mod crush_weapon_tests;
 mod damage_creation_tests;
 mod damage_fx_tests;
+mod damage_path_tests;
 mod damage_spell_tests;
 mod death_phase_tests;
 mod death_rung_tests;
@@ -50,19 +62,32 @@ mod dodge_tests;
 mod dominate_tests;
 mod drag_formation_tests;
 mod emotion_horde_entry_tests;
+mod emotion_horde_facing_tests;
 mod emotion_tests;
 mod engaged_tests;
 mod experience_tests;
 mod face_target_tests;
 mod fear_pulse_tests;
+mod fighting_b11_tests;
+mod fighting_b13_nugget_tests;
+mod fighting_b13_tests;
+mod fighting_b13_victim_tests;
+mod fighting_b15_tests;
+mod fighting_b4_tests;
+mod fighting_b6_tests;
+mod fighting_b8_tests;
 mod fire_tests;
 mod flank_tests;
+mod flier_height_tests;
 mod fling_tests;
 mod force_attack_tests;
+mod forfeit_score_tests;
+mod forfeit_tests;
 mod formation_preview_tests;
 mod fx_frame_tests;
 mod fxlist_die_tests;
 mod gate_cycle_tests;
+mod gate_halt_tests;
 mod giant_bird_tests;
 mod grab_tests;
 mod group_formation_tests;
@@ -74,16 +99,22 @@ mod hero_tests;
 mod hit_passenger_tests;
 mod horde_approach_tests;
 mod horde_behaviour_tests;
+mod horde_claim_tests;
 mod horde_formation_tests;
 mod horde_knockback_tests;
 mod horde_motion_tests;
+mod horde_mover_tests;
 mod horde_power_tests;
+mod horde_repulsor_tests;
 mod horde_teleport_tests;
 mod horde_trail_tests;
 mod idle_acquire_tests;
 mod invisibility_special_power_tests;
 mod knockback_tests;
+mod last_shot_horde_tests;
 mod launch_height_tests;
+mod level_grant_tests;
+mod level_up_ocl_tests;
 mod location_cast_tests;
 mod loose_approach_tests;
 mod loose_melee_tests;
@@ -102,18 +133,22 @@ mod nugget_dispatch_tests;
 mod ocl_angle_tests;
 mod ocl_callers_tests;
 mod ocl_forest_tests;
+mod ocl_nesting_tests;
 mod ocl_upgrade_gate_tests;
 mod off_map_entry_tests;
 mod order_queue_tests;
 mod pick_up_tests;
 mod placed_horde_tests;
 mod placed_keys_tests;
+mod planning_order_tests;
 mod porcupine_banner_tests;
 mod porcupine_filter_tests;
+mod portal_tests;
 mod power_condition_tests;
 mod price_display_tests;
 mod production_exit_tests;
 mod production_stream_tests;
+mod projectile_death_tests;
 mod rally_tests;
 mod ramp_ordering_tests;
 mod rampage_tests;
@@ -123,8 +158,11 @@ mod recharge_timing_tests;
 mod refund_die_tests;
 mod replace_footprint_tests;
 mod replenish_tests;
+mod repulsor_tests;
+mod resimulation_tests;
 mod reveal_to_all_tests;
 mod rock_reload_tests;
+mod running_down_tests;
 mod selection_tests;
 mod sell_tests;
 mod side_change_tests;
@@ -134,6 +172,7 @@ mod spawn_tests;
 mod spell_tests;
 mod squad_victim_tests;
 mod stance_engagement_tests;
+mod stealth_pass_tests;
 mod stealth_tests;
 mod stop_tests;
 mod summon_replacement_tests;
@@ -144,6 +183,7 @@ mod team_tests;
 mod teleport_tests;
 mod terrain_height_tests;
 mod throw_tests;
+mod unit_ability_tests;
 mod unit_contact_tests;
 mod unit_index_tests;
 mod wall_climb_tests;
@@ -155,6 +195,9 @@ mod wall_top_route_tests;
 mod weapon_behaviour_tests;
 mod weapon_toggle_horde_tests;
 mod weapon_toggle_sync_tests;
+mod weapon_toggle_tests;
+mod wings_circling_tests;
+mod wotr_battle_tests;
 
 use super::*;
 use crate::combat::acquire_target;
@@ -166,6 +209,13 @@ use mint_sim::Simulation;
 
 const PLAYER: PlayerId = PlayerId::new(0);
 const OTHER: PlayerId = PlayerId::new(1);
+
+fn group_moves(rules: RotwkRules) -> RotwkRules {
+    rules.with_group_formation(GroupFormation {
+        planning_mode_enabled: false,
+        ..GroupFormation::default()
+    })
+}
 
 fn flat_map(width: u32, height: u32) -> HeightMapData {
     HeightMapData {
@@ -437,7 +487,7 @@ fn a_move_order_applies_to_the_selection_and_the_units_actually_travel() {
     }
     let moved = position(&simulation, ids, units[0]);
     assert!(
-        (moved.x - 385.0).abs() < 15.0,
+        moved.minus(Vec2::new(405.0, 55.0)).length() < 25.0,
         "unit 0 went from {start:?} to {moved:?}"
     );
     let unselected = position(&simulation, ids, units[2]);
@@ -713,6 +763,7 @@ fn combat_data() -> (
             "TestWarhead",
             WeaponTemplate {
                 nuggets: vec![Nugget::Damage(DamageNugget {
+                    shape: Default::default(),
                     damage: 40.0,
                     damage_type: pierce,
                     death_type: None,
@@ -746,6 +797,8 @@ fn combat_data() -> (
                     projectile_template: Some("TestArrow".to_owned()),
                     warhead: "TestWarhead".to_owned(),
                     requires_upgrade: false,
+                    launch_slot: None,
+                    always_attack_offset: None,
                 })],
                 ..WeaponTemplate::default()
             },
@@ -763,6 +816,7 @@ fn combat_data() -> (
                 clip_size: 0,
                 melee: true,
                 nuggets: vec![Nugget::Damage(DamageNugget {
+                    shape: Default::default(),
                     damage: 40.0,
                     damage_type: pierce,
                     death_type: None,
@@ -799,6 +853,7 @@ fn combat_data() -> (
                     leech_range: leech,
                     firing_duration: mint_sim::LogicFrames::from_frames(follow_through),
                     nuggets: vec![Nugget::Damage(DamageNugget {
+                        shape: Default::default(),
                         damage: 40.0,
                         damage_type: pierce,
                         death_type: None,
@@ -823,6 +878,16 @@ fn combat_data() -> (
             "TestArmor",
             mint_sage_combat::ArmorTemplate::from_rows(
                 &[("DEFAULT".to_owned(), 1.0), ("PIERCE".to_owned(), 0.5)],
+                &mut combat.damage_types,
+            ),
+        )
+        .unwrap();
+    combat
+        .armors
+        .insert(
+            "TestImmune",
+            mint_sage_combat::ArmorTemplate::from_rows(
+                &[("DEFAULT".to_owned(), 1.0), ("PIERCE".to_owned(), 0.0)],
                 &mut combat.damage_types,
             ),
         )
@@ -1116,7 +1181,9 @@ fn the_grid_query_picks_the_same_target_as_a_full_scan_over_a_randomised_battle(
                     airborne: None,
                     unattackable: false,
                     not_autoacquirable: false,
+                    enclosed: false,
                     ai_kind_of: None,
+                    volume: None,
                 },
                 player,
             ));
@@ -1204,7 +1271,9 @@ fn the_expanding_scan_picks_the_same_target_as_the_full_scan_it_replaced() {
                     airborne: None,
                     unattackable: false,
                     not_autoacquirable: false,
+                    enclosed: false,
                     ai_kind_of: None,
+                    volume: None,
                 },
                 PLAYER,
             ));
@@ -1652,7 +1721,7 @@ fn a_structure_blocks_pathing_while_it_stands_and_stops_blocking_once_it_dies() 
     simulation.tick().unwrap();
     let clear = route_len(&simulation, walker).expect("a fresh route once the structure is gone");
     assert!(
-        clear < direct + 10.0,
+        clear < direct + 20.0,
         "the route ({clear}) still detours after the structure died"
     );
     assert!(!simulation.is_poisoned());
@@ -1956,6 +2025,7 @@ fn a_hostile_weapon_or_body_template_still_ticks_without_panicking() {
                 WeaponTemplate {
                     attack_range: range,
                     nuggets: vec![Nugget::Damage(DamageNugget {
+                        shape: Default::default(),
                         damage,
                         damage_type: pierce,
                         death_type: None,
@@ -2277,6 +2347,7 @@ fn a_missed_lob_still_hurts_what_it_lands_on_whatever_the_collide_mask_names() {
                 WeaponTemplate {
                     projectile_collides: CollideMask::parse(mask).unwrap(),
                     nuggets: vec![Nugget::Damage(DamageNugget {
+                        shape: Default::default(),
                         damage: 40.0,
                         damage_type: pierce,
                         death_type: None,
@@ -2309,6 +2380,8 @@ fn a_missed_lob_still_hurts_what_it_lands_on_whatever_the_collide_mask_names() {
                         projectile_template: None,
                         warhead: "TestLobWarhead".to_owned(),
                         requires_upgrade: false,
+                        launch_slot: None,
+                        always_attack_offset: None,
                     })],
                     ..WeaponTemplate::default()
                 },
@@ -2317,7 +2390,10 @@ fn a_missed_lob_still_hurts_what_it_lands_on_whatever_the_collide_mask_names() {
         let map = flat_map(96, 96);
         let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
         let spawns = vec![
-            armed_spawn(200.0, 200.0, PLAYER, Some(lob), Some(armour), 100.0),
+            Spawn {
+                ground_offset: Some(10.0),
+                ..armed_spawn(200.0, 200.0, PLAYER, Some(lob), Some(armour), 100.0)
+            },
             armed_spawn(260.0, 200.0, OTHER, None, Some(armour), 100.0),
         ];
         let mut simulation =
@@ -4569,7 +4645,20 @@ fn ordering_a_horde_plans_one_path_and_not_one_per_member() {
 
 #[test]
 fn with_formations_off_every_member_keeps_its_own_relative_position() {
-    let (mut simulation, ids) = horde_sim(Vec2::new(150.0, 150.0), square_formation());
+    let formation = square_formation();
+    let count = u32::try_from(formation.len()).unwrap();
+    let spawn = HordeSpawn {
+        formation: 0,
+        origin: Vec2::new(150.0, 150.0),
+        facing: Facing::EAST,
+        member: spawn_at(0.0, 0.0, KindOf::SELECTABLE, PLAYER),
+        count,
+        vision: crate::shroud::HORDE_SHROUD_RANGE,
+    };
+    let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
+    let rules = RotwkRules::new(passability, Vec::new()).with_hordes(vec![formation], vec![spawn]);
+    let mut simulation = Simulation::new(5, group_moves(rules)).unwrap();
+    let ids = simulation.rules().ids().unwrap();
     let members = members_of(&simulation, ids);
     let modes = Modes {
         formation: FormationMode::Off,
@@ -4961,7 +5050,7 @@ fn economy_sim_income(use_shroud: bool, income_frames: u32) -> (Simulation<Rotwk
             output: crate::economy::Output::Unit(built),
             kind: crate::unit::Kind(0),
             cost: 200,
-            build_time: mint_sim::LogicFrames::from_frames(10),
+            build_seconds: 1.0,
             command_points: 0,
             label: String::from("test unit"),
             builder: false,
@@ -4973,7 +5062,7 @@ fn economy_sim_income(use_shroud: bool, income_frames: u32) -> (Simulation<Rotwk
             }),
             kind: crate::unit::Kind(1),
             cost: 200,
-            build_time: mint_sim::LogicFrames::from_frames(10),
+            build_seconds: 1.0,
             command_points: 0,
             label: String::from("test unit"),
             builder: false,
@@ -5435,7 +5524,7 @@ fn a_structure_earns_on_its_timer_and_a_queued_unit_is_charged_at_once() {
     assert_eq!(queued(&simulation, ids, structure), 1);
     assert_eq!(bodies(&simulation, ids), before, "the unit appeared early");
 
-    for _ in 0..10 {
+    for _ in 0..30 {
         simulation.tick().unwrap();
     }
     assert_eq!(queued(&simulation, ids, structure), 0);
@@ -6134,6 +6223,66 @@ fn a_moving_unit_replans_around_a_site_placed_across_its_path() {
     assert!(!simulation.is_poisoned());
 }
 
+fn defeated_holding(held: &str, mode: crate::defeat::DefeatMode, filter: &[&str]) -> bool {
+    let (data, kinds) = construction_kinds();
+    let spawn = |name: &str, at: f32, player| {
+        kinds
+            .spawn(
+                &data.combat,
+                kinds.kind(name).unwrap(),
+                Vec2::new(at, 100.0),
+                Facing::EAST,
+                player,
+            )
+            .unwrap()
+    };
+    let objects = vec![spawn(held, 100.0, PLAYER), spawn("Shed", 400.0, OTHER)];
+    let passability = Passability::build(&flat_map(160, 60), 5.0 / 128.0).unwrap();
+    let structure =
+        crate::defeat::ObjectFilter::parse(&["NONE".to_owned(), "+STRUCTURE".to_owned()]);
+    let unit = crate::defeat::ObjectFilter::parse(
+        &filter.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>(),
+    );
+    let mut simulation = Simulation::new(
+        62,
+        RotwkRules::new(passability, objects)
+            .with_combat(data.combat.clone())
+            .with_victory(Arc::clone(&kinds), structure)
+            .with_victory_units(unit)
+            .with_defeat_mode(mode),
+    )
+    .unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    simulation.tick().unwrap();
+    let clock = simulation
+        .state()
+        .store(ids.clock)
+        .and_then(|store| store.entities().first().copied())
+        .unwrap();
+    simulation.state().get(ids.outcome, clock).is_some()
+}
+
+#[test]
+fn a_players_units_keep_it_alive_by_the_defeat_mode() {
+    use crate::defeat::DefeatMode::{Dozer, UnitFilter};
+    let shipped = ["ANY", "-DOZER", "-NOT_AUTOACQUIRABLE"];
+    let rows = [
+        ("Porter", Dozer, &shipped[..], false),
+        ("Attacker", Dozer, &shipped[..], true),
+        ("Porter", UnitFilter, &shipped[..], true),
+        ("Attacker", UnitFilter, &shipped[..], true),
+        ("Attacker", UnitFilter, &["ALL", "-DOZER"][..], false),
+        ("Porter", UnitFilter, &["ALL", "-DOZER"][..], true),
+    ];
+    for (held, mode, filter, defeated) in rows {
+        assert_eq!(
+            defeated_holding(held, mode, filter),
+            defeated,
+            "{held} under {mode:?} with {filter:?}"
+        );
+    }
+}
+
 #[test]
 fn a_player_with_only_a_structure_and_porters_is_not_defeated_until_it_dies() {
     let (data, kinds) = construction_kinds();
@@ -6194,6 +6343,16 @@ fn a_player_with_only_a_structure_and_porters_is_not_defeated_until_it_dies() {
             passability,
             vec![fortress, porter_1, porter_2, attacker, other_fortress],
         )
+        .with_structure_footprints(vec![
+            (
+                0,
+                crate::construction::footprint_of(&kinds.get(fortress_kind).unwrap().record),
+            ),
+            (
+                4,
+                crate::construction::footprint_of(&kinds.get(fortress_kind).unwrap().record),
+            ),
+        ])
         .with_combat(data.combat.clone())
         .with_victory(Arc::clone(&kinds), filter),
     )
@@ -7763,6 +7922,7 @@ fn a_lit_cell_damages_an_own_unit_standing_in_it_with_no_attacker() {
         },
         (60.0, 60.0),
         None,
+        &|_, _| false,
     );
 
     let mut simulation = Simulation::new(

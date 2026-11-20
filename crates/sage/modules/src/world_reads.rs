@@ -18,6 +18,21 @@ impl Positions {
 }
 
 #[derive(Debug, Default)]
+pub struct ArrowStormShots(HashMap<Entity, u32>);
+
+impl ArrowStormShots {
+    #[must_use]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (Entity, u32)>) -> Self {
+        Self(pairs.into_iter().collect())
+    }
+
+    #[must_use]
+    pub fn left(&self, caster: Entity) -> u32 {
+        self.0.get(&caster).copied().unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct ModelConditions(HashMap<Entity, crate::effects::Names>);
 
 impl ModelConditions {
@@ -64,6 +79,24 @@ impl StillMoving {
     #[must_use]
     pub fn contains(&self, mover: Entity) -> bool {
         self.0.binary_search(&mover).is_ok()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InCombat(Vec<Entity>);
+
+impl InCombat {
+    #[must_use]
+    pub fn from_entities(entities: impl IntoIterator<Item = Entity>) -> Self {
+        let mut entities: Vec<Entity> = entities.into_iter().collect();
+        entities.sort_unstable();
+        entities.dedup();
+        Self(entities)
+    }
+
+    #[must_use]
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.0.binary_search(&entity).is_ok()
     }
 }
 

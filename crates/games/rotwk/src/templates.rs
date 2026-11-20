@@ -8,7 +8,7 @@ use mint_sage_modules::{ObjectRecord, UpgradeBits};
 use mint_sim::{LogicFrames, PlayerId, UpgradeMask};
 
 use crate::defeat::ObjectFilter;
-use crate::economy::{Buildable, Output, UpgradeBuildable};
+use crate::economy::{Buildable, Output, SubUpgrade, UpgradeBuildable};
 use crate::game_data::GameData;
 use crate::unit::{Kind, Kinematics, ProducerSpawn, Shape, Spawn};
 
@@ -168,7 +168,7 @@ impl KindFacts {
             large_footprint: record
                 .kind_of
                 .iter()
-                .any(|flag| flag == "MONSTER" || flag == "HORDE"),
+                .any(|flag| matches!(flag.as_str(), "MONSTER" | "HORDE" | "SHIP")),
         }
     }
 }
@@ -216,6 +216,15 @@ pub(crate) struct AutoButton {
     pub(crate) need_damaged_target: bool,
     pub(crate) enable_on_model_condition: Vec<String>,
     pub(crate) disable_on_model_condition: Vec<String>,
+    pub(crate) trigger_when_ready: bool,
+    pub(crate) mount_gate: MountGate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountGate {
+    Either,
+    MountedOnly,
+    UnmountedOnly,
 }
 
 impl KindEntry {
@@ -252,6 +261,21 @@ impl KindEntry {
     }
 }
 
+fn mount_gate(options: &[String]) -> MountGate {
+    let has = |name: &str| {
+        options
+            .iter()
+            .any(|option| option.eq_ignore_ascii_case(name))
+    };
+    if has("MOUNTED_ONLY") {
+        MountGate::MountedOnly
+    } else if has("UNMOUNTED_ONLY") {
+        MountGate::UnmountedOnly
+    } else {
+        MountGate::Either
+    }
+}
+
 fn power_set_of(
     set: &str,
     command_sets: &mint_sage_ini::CommandSetIndex,
@@ -271,6 +295,8 @@ fn power_set_of(
             need_damaged_target: button.need_damaged_target,
             enable_on_model_condition: button.enable_on_model_condition.clone(),
             disable_on_model_condition: button.disable_on_model_condition.clone(),
+            trigger_when_ready: button.trigger_when_ready,
+            mount_gate: mount_gate(&button.options),
         })
         .collect();
     let (power_buttons, power_needs) = buttons
@@ -789,6 +815,7 @@ impl KindTable {
             health: record
                 .max_health
                 .filter(|health| *health > 0.0 && *health <= MAX_HEALTH),
+            initial_health: record.initial_health,
             weapon: record
                 .weapon
                 .as_deref()
@@ -975,10 +1002,8 @@ impl KindTable {
                     cost,
                     &mint_sage_economy::CostModifiers::default(),
                 ),
-                build_time: mint_sage_economy::time_to_build(
-                    record.build_time_seconds,
-                    &mint_sage_economy::TimeModifiers::default(),
-                ),
+                subs: sub_upgrades_of(data, &record.sub_upgrade_template_names, 0),
+                build_time: mint_sage_economy::upgrade_time_to_build(record.build_time_seconds),
                 command_button: command_button.to_owned(),
             });
             upgrade_of.insert(key, index);
@@ -1175,10 +1200,7 @@ impl KindTable {
                 cost,
                 &mint_sage_economy::CostModifiers::default(),
             ),
-            build_time: mint_sage_economy::time_to_build(
-                seconds,
-                &mint_sage_economy::TimeModifiers::default(),
-            ),
+            build_seconds: seconds,
             command_points: points,
             label: record.name.clone(),
             builder: KindOf::parse(&record.kind_of.join(" "))
@@ -1338,7 +1360,10 @@ pub(crate) fn income(record: &ObjectRecord) -> Option<(LogicFrames, i64)> {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let timing = timing as u32;
-    Some((LogicFrames::from_milliseconds(timing), whole(amount)?))
+    Some((
+        mint_sage_modules::retail_duration_ticks(timing),
+        whole(amount)?,
+    ))
 }
 
 pub(crate) fn claimant(record: &ObjectRecord) -> Option<crate::claims::Claimant> {
@@ -1427,8 +1452,44 @@ const DEFAULT_TURN_TIME_MS: f32 = 1000.0;
 
 const DEFAULT_FAST_TURN_RADIUS: f32 = 20.0;
 
+const DEFAULT_BACKING_UP_SPEED: f32 = 0.75;
+
+const DEFAULT_BACKING_UP_ANGLE: f32 = 0.5;
+
 #[allow(clippy::cast_precision_loss)]
 pub(crate) const RETAIL_FRAME_SECONDS: f32 = 1.0 / crate::game_data::RETAIL_LOGIC_HZ as f32;
+
+const MAX_SUB_UPGRADE_DEPTH: u8 = 4;
+
+fn sub_upgrades_of(data: &GameData, names: &[String], depth: u8) -> Vec<SubUpgrade> {
+    if depth >= MAX_SUB_UPGRADE_DEPTH {
+        return Vec::new();
+    }
+    names
+        .iter()
+        .filter_map(|name| {
+            let bit = data.upgrade_bits.bit(name)?;
+            let record = data
+                .upgrade_costs
+                .iter()
+                .find(|u| u.name.eq_ignore_ascii_case(name));
+            let cost = record.map_or(0, |record| {
+                let own = sub_upgrades_of(
+                    data,
+                    &record.sub_upgrade_template_names,
+                    depth.saturating_add(1),
+                );
+                if own.is_empty() {
+                    whole(record.cost).unwrap_or(0)
+                } else {
+                    own.iter()
+                        .fold(0_i64, |sum, sub| sum.saturating_add(sub.cost))
+                }
+            });
+            Some(SubUpgrade { bit, cost })
+        })
+        .collect()
+}
 
 fn whole_frames(ms: f32) -> f32 {
     (ms / (RATE_UNIT_MS * RETAIL_FRAME_SECONDS)).ceil().max(1.0) * RETAIL_FRAME_SECONDS
@@ -1471,11 +1532,7 @@ fn turn_circle(def: &mint_sage_ini::LocomotorDef) -> Option<mint_movement::TurnC
 
 const LEGS_APPEARANCES: [&str; 3] = ["TWO_LEGS", "FOUR_LEGS_HUGE", "HUGE_TWO_LEGS"];
 
-fn turn_slowdown(
-    def: &mint_sage_ini::LocomotorDef,
-    speed: f32,
-    turn_rate: f32,
-) -> mint_movement::TurnSlowdown {
+fn turn_slowdown(def: &mint_sage_ini::LocomotorDef) -> mint_movement::TurnSlowdown {
     use mint_movement::TurnSlowdown;
     let appearance = def.appearance.as_deref().unwrap_or("");
     let is = |name: &str| appearance.eq_ignore_ascii_case(name);
@@ -1487,9 +1544,10 @@ fn turn_slowdown(
     } else if is("SHIP") {
         TurnSlowdown {
             cap: 0.9,
-            full_at: 3.5 * turn_rate * RETAIL_FRAME_SECONDS,
-            unhindered_above: None,
-            pivot_below: speed / acceleration_frames(def),
+            full_at_turn_steps: 3.5,
+            turn_step_seconds: RETAIL_FRAME_SECONDS,
+            pivot_below: 1.0 / acceleration_frames(def),
+            ..TurnSlowdown::PROPORTIONAL
         }
     } else if !(is("FOUR_WHEELS") || is("TREADS")) {
         TurnSlowdown {
@@ -1498,12 +1556,30 @@ fn turn_slowdown(
         }
     } else {
         TurnSlowdown {
-            full_at: core::f32::consts::FRAC_PI_4,
-            cap: 1.0,
-            unhindered_above: Some(0.25 * speed),
-            pivot_below: speed / acceleration_frames(def),
+            unhindered_above: Some(0.25),
+            pivot_below: 1.0 / acceleration_frames(def),
+            ..TurnSlowdown::PROPORTIONAL
         }
     }
+}
+
+fn wheel_backing(
+    def: &mint_sage_ini::LocomotorDef,
+    wheeled: bool,
+) -> Option<mint_movement::WheelBacking> {
+    if !wheeled || def.can_move_backwards != Some(true) {
+        return None;
+    }
+    let read =
+        |field: Option<f32>, default: f32| field.filter(|v| v.is_finite()).unwrap_or(default);
+    Some(mint_movement::WheelBacking {
+        distance_min: read(def.backing_up_distance_min, 0.0),
+        distance_max: read(def.backing_up_distance_max, 0.0),
+        angle: read(def.backing_up_angle, DEFAULT_BACKING_UP_ANGLE) * core::f32::consts::PI,
+        stop_when_turning: def.backing_up_stop_when_turning.unwrap_or(false),
+        moved_since_order: 0.0,
+        turning: false,
+    })
 }
 
 fn acceleration_frames(def: &mint_sage_ini::LocomotorDef) -> f32 {
@@ -1548,6 +1624,8 @@ fn limits_for_slot(
     let limits = MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: wheel_backing(def, is_wheels || is_appearance("SHIP")),
         max_speed: speed,
         desired_speed: f32::INFINITY,
         stops_dead,
@@ -1571,9 +1649,10 @@ fn limits_for_slot(
             .min_speed
             .filter(|v| v.is_finite())
             .unwrap_or(0.0)
-            .max(0.0),
+            .max(0.0)
+            * speed,
         turn_circle,
-        turn_slowdown: turn_slowdown(def, speed, turn),
+        turn_slowdown: turn_slowdown(def),
         frame: RETAIL_FRAME_SECONDS,
         turn_while_moving: !is_horde || def.turn_while_moving.unwrap_or(true),
         walk_distance: def
@@ -1631,6 +1710,7 @@ fn limits_for_slot(
                 .turn_threshold_hs
                 .filter(|v| v.is_finite())
                 .map_or(core::f32::consts::PI, f32::to_radians),
+            backs_out: def.can_move_backwards == Some(true) && is_appearance("FOUR_WHEELS"),
         },
         turn_pivot_offset: if is_wheels {
             0.0
@@ -1640,13 +1720,29 @@ fn limits_for_slot(
                 .unwrap_or(0.0)
         },
         backs_in_terror: def.can_move_backwards == Some(true) && (is_horde || stops_dead),
+        backing_speed: def
+            .backing_up_speed
+            .filter(|fraction| fraction.is_finite())
+            .unwrap_or(DEFAULT_BACKING_UP_SPEED)
+            .max(0.0)
+            * speed,
         crew_powered: def.crew_powered.unwrap_or(false),
         scales_walls: def.scales_walls.unwrap_or(false),
+        scaling_walls: def
+            .z_axis_behavior
+            .as_deref()
+            .is_some_and(|behaviour| behaviour.eq_ignore_ascii_case("SCALING_WALLS")),
         wander_radius: def
             .wander_about_point_radius
             .filter(|radius| radius.is_finite())
             .unwrap_or(0.0)
             .max(0.0),
+        wander_width: def
+            .wander_width_factor
+            .filter(|factor| factor.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0),
+        crosses_air: def.surfaces.iter().any(|s| s.eq_ignore_ascii_case("AIR")),
     })
 }
 
@@ -1666,6 +1762,8 @@ fn surface_mask(
     )
 }
 
+const MACHINE_TAIL_CELLS: u16 = 4;
+
 fn mover_class(
     record: &ObjectRecord,
     locomotors: &mint_sage_ini::LocomotorIndex,
@@ -1675,6 +1773,11 @@ fn mover_class(
     let def = locomotors.get(slot.locomotor.as_deref()?)?;
     let mover =
         mint_sage_passability::mover_class(&def.surfaces, def.scales_walls.unwrap_or(false))?;
+    let mover = if record.has_kind("MACHINE") {
+        mover.straight_tailed(MACHINE_TAIL_CELLS)
+    } else {
+        mover
+    };
     Some(if record.can_path_through_gates == Some(false) {
         mint_movement::MoverClass {
             blocked_by: mover
@@ -1849,19 +1952,9 @@ pub(crate) struct Airborne {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DiveProfile {
-    pub(crate) level: f32,
-    pub(crate) reach: f32,
-    pub(crate) slope: f32,
-}
-
-const DEFAULT_SWOOP_STANDOFF: f32 = 200.0;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FlightProfile {
     pub(crate) airborne: Option<Airborne>,
     pub(crate) preferred_height: Option<f32>,
-    pub(crate) dive: Option<DiveProfile>,
     pub(crate) charge_speed_fraction: Option<f32>,
     pub(crate) charge_available: bool,
     pub(crate) uncollided: bool,
@@ -1869,8 +1962,15 @@ pub(crate) struct FlightProfile {
     pub(crate) lift: f32,
     pub(crate) swoop: Option<SwoopProfile>,
     pub(crate) height: mint_movement::HeightRule,
+    pub(crate) no_z_motive_force: bool,
+    pub(crate) wades: bool,
+    pub(crate) over_structures: bool,
     pub(crate) formation_priority: u8,
     pub(crate) river_modifier: f32,
+    pub(crate) wings_circling: Option<f32>,
+    pub(crate) attack_height: f32,
+    pub(crate) circling_radius: f32,
+    pub(crate) works_when_dead: bool,
 }
 
 pub(crate) const DEFAULT_FORMATION_PRIORITY: u8 = 7;
@@ -1904,7 +2004,12 @@ fn height_rule(def: &mint_sage_ini::LocomotorDef) -> mint_movement::HeightRule {
             above: preferred,
             damping: None,
         }
-    } else if is("FIXED_SURFACE_RELATIVE_HEIGHT") || is("FIXED_RELATIVE_TO_GROUND_AND_BUILDINGS") {
+    } else if is("FIXED_RELATIVE_TO_GROUND_AND_BUILDINGS") {
+        HeightRule::Fixed {
+            height: preferred,
+            damping: None,
+        }
+    } else if is("FIXED_SURFACE_RELATIVE_HEIGHT") {
         HeightRule::Surface {
             above: preferred,
             damping: None,
@@ -1919,6 +2024,14 @@ fn height_rule(def: &mint_sage_ini::LocomotorDef) -> mint_movement::HeightRule {
     } else {
         HeightRule::ON_SURFACE
     }
+}
+
+fn wades(z_axis_behavior: Option<&str>) -> bool {
+    z_axis_behavior.is_none_or(|name| {
+        ["NO_Z_MOTIVE_FORCE", "FLOATING_Z", "SCALING_WALLS"]
+            .iter()
+            .any(|wading| name.eq_ignore_ascii_case(wading))
+    })
 }
 
 pub(crate) fn flight_profile(
@@ -1958,7 +2071,6 @@ pub(crate) fn flight_profile(
     Some(FlightProfile {
         airborne,
         preferred_height: def.preferred_height,
-        dive: dive_profile(def, height),
         charge_speed_fraction: def.charge_speed,
         charge_available: def.charge_available.unwrap_or(false),
         uncollided: def.non_dirty_transform.unwrap_or(false),
@@ -1972,41 +2084,52 @@ pub(crate) fn flight_profile(
             .unwrap_or(1.0),
         swoop,
         height,
+        over_structures: def.z_axis_behavior.as_deref().is_some_and(|name| {
+            name.eq_ignore_ascii_case("FIXED_RELATIVE_TO_GROUND_AND_BUILDINGS")
+        }),
+        no_z_motive_force: def
+            .z_axis_behavior
+            .as_deref()
+            .is_none_or(|name| name.eq_ignore_ascii_case("NO_Z_MOTIVE_FORCE")),
+        wades: wades(def.z_axis_behavior.as_deref()),
         formation_priority: def.formation_priority.unwrap_or(DEFAULT_FORMATION_PRIORITY),
         river_modifier: def
             .river_modifier
             .filter(|share| share.is_finite() && *share >= 0.0)
             .unwrap_or(1.0),
-    })
-}
-
-fn dive_profile(
-    def: &mint_sage_ini::LocomotorDef,
-    height: mint_movement::HeightRule,
-) -> Option<DiveProfile> {
-    let level = def.preferred_attack_height.filter(|h| h.is_finite())?;
-    if height == mint_movement::HeightRule::ON_SURFACE {
-        return None;
-    }
-    let reach = def
-        .swoop_standoff_radius
-        .filter(|r| r.is_finite())
-        .unwrap_or(DEFAULT_SWOOP_STANDOFF);
-    let standoff = def
-        .swoop_standoff_height
-        .filter(|h| h.is_finite())
-        .unwrap_or(DEFAULT_SWOOP_STANDOFF);
-    Some(DiveProfile {
-        level,
-        reach,
-        slope: (standoff - level).abs() / reach,
+        wings_circling: def
+            .appearance
+            .as_deref()
+            .is_some_and(|appearance| appearance.eq_ignore_ascii_case("WINGS"))
+            .then(|| def.circling_radius.filter(|r| r.is_finite()).unwrap_or(0.0)),
+        attack_height: def
+            .preferred_attack_height
+            .filter(|h| h.is_finite() && *h > 0.0)
+            .unwrap_or(0.0),
+        circling_radius: def.circling_radius.filter(|r| r.is_finite()).unwrap_or(0.0),
+        works_when_dead: def.works_when_dead.unwrap_or(false),
     })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::float_cmp)]
 mod motion_limits_tests {
-    use super::{motion_limits, ObjectRecord, NORMAL_CONDITION};
+    use super::{motion_limits, wades, ObjectRecord, NORMAL_CONDITION};
+
+    #[test]
+    fn only_three_z_behaviours_wade() {
+        for (name, expected) in [
+            (None, true),
+            (Some("NO_Z_MOTIVE_FORCE"), true),
+            (Some("floating_z"), true),
+            (Some("SCALING_WALLS"), true),
+            (Some("ABSOLUTE_HEIGHT"), false),
+            (Some("SURFACE_RELATIVE_HEIGHT"), false),
+            (Some("SEA_LEVEL"), false),
+        ] {
+            assert_eq!(wades(name), expected, "{name:?}");
+        }
+    }
     use mint_sage_ini::{BlockTable, Document, LocomotorIndex};
     use mint_sage_modules::TemplateIndex;
 
@@ -2044,6 +2167,26 @@ mod motion_limits_tests {
         assert!((limits.braking - 75.0).abs() < 0.01);
         assert!((limits.turn_rate - core::f32::consts::PI).abs() < 0.001);
         assert!((limits.turn_threshold - core::f32::consts::FRAC_PI_2).abs() < 0.001);
+    }
+
+    #[test]
+    fn unwritten_backing_fields_take_the_constructor_defaults() {
+        let text = "\
+            Locomotor Test\n  \
+              Surfaces = GROUND\n  Appearance = FOUR_WHEELS\n  CanMoveBackwards = Yes\n  \
+              MinSpeed = 50%\n\
+            End\n\
+            Object Wagon\n  \
+              LocomotorSet\n    Locomotor = Test\n    Condition = SET_NORMAL\n    Speed = 40\n  End\n\
+            End\n";
+        let (record, locomotors) = record_and_locomotors(text, "Wagon");
+        let kinematics = motion_limits(&record, &locomotors, NORMAL_CONDITION).unwrap();
+        let wheels = kinematics.limits.wheel_backing.unwrap();
+        assert_eq!((wheels.distance_min, wheels.distance_max), (0.0, 0.0));
+        assert!((wheels.angle - core::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert!(!wheels.stop_when_turning);
+        assert_eq!(kinematics.backing_speed, 30.0);
+        assert_eq!(kinematics.limits.min_speed, 20.0);
     }
 
     #[test]
@@ -2184,8 +2327,7 @@ mod flight_profile_tests {
             (AirborneCategory::Monster, 25.0)
         );
         assert_eq!(flight.preferred_height, Some(121.0));
-        let dive = flight.dive.unwrap();
-        assert_eq!((dive.level, dive.reach), (5.0, 310.0));
+        assert_eq!(flight.attack_height, 5.0);
         let swoop = flight.swoop.unwrap();
         assert_eq!(swoop.standoff_radius, 310.0);
         assert_eq!(swoop.terminal_velocity, 0.18);
@@ -2281,7 +2423,7 @@ mod flight_profile_tests {
     }
 
     #[test]
-    fn sea_level_adds_preferred_height_and_is_never_damped() {
+    fn sea_level_adds_its_preferred_height_and_is_never_damped() {
         let text = "\
             Locomotor SubLocomotor\n  \
               Surfaces = WATER\n  \

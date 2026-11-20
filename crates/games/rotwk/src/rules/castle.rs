@@ -1,15 +1,105 @@
+use std::sync::Arc;
+
+use mint_sage_modules::effects::Names;
 use mint_sage_modules::Effect;
-use mint_sim::{Entity, PlayerId, Result, Tick, World};
+use mint_sim::{Entity, Frame, PlayerId, Result, Tick, World};
 
 use super::spawning::Placement;
+use super::terrain_fire::{singleton_of, FireLighting};
 use super::{Ids, RotwkRules};
-use crate::castle::{pad_is_occupied, CastleMember, PadOccupant};
+use crate::castle::{pad_is_occupied, CastleMember, PadOccupant, PendingUnpack};
 use crate::construction::{footprint_of, Construction};
 use crate::diag::diag;
 use crate::economy::Purse;
 use crate::unit::Kind;
 
 impl RotwkRules {
+    pub(super) fn castle_build_complete(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        site: Entity,
+        created: Frame,
+    ) -> Result<()> {
+        let Some(castle) = tick
+            .state()
+            .get(ids.kind, site)
+            .and_then(|kind| self.kinds.get(*kind))
+            .and_then(|entry| entry.record.castle.as_ref())
+        else {
+            return Ok(());
+        };
+        let (instant, max_radius) = (castle.instant_unpack, castle.max_radius);
+        let names = |name: &str| -> Names { vec![Arc::<str>::from(name)].into() };
+        self.apply_effects(
+            tick,
+            ids,
+            vec![
+                (
+                    site,
+                    Effect::StatusBits {
+                        set: names("UNATTACKABLE"),
+                        clear: Vec::new().into(),
+                    },
+                ),
+                (
+                    site,
+                    Effect::ModelConditions {
+                        add: names("INVULNERABLE"),
+                        remove: Vec::new().into(),
+                    },
+                ),
+            ],
+        )?;
+        if let (Some(radius), Some(position)) = (
+            max_radius,
+            tick.state().get(ids.body, site).map(|body| body.0.position),
+        ) {
+            if let Some(grid) = singleton_of(tick.state(), ids.fire_grid) {
+                if let Some(grid) = tick.state_mut().get_mut(ids.fire_grid, grid) {
+                    grid.light(
+                        &FireLighting::clear_fuel(radius),
+                        (position.x, position.y),
+                        None,
+                        &|x, y| self.passability.underwater(mint_movement::Vec2::new(x, y)),
+                    );
+                }
+            }
+        }
+        let completed = tick.frame();
+        if instant {
+            tick.state_mut().insert(
+                ids.pending_unpack,
+                site,
+                PendingUnpack::after_creation(created, completed),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn step_castle_unpack(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
+        let now = tick.frame();
+        let mut due: Vec<Entity> = tick
+            .state()
+            .store(ids.pending_unpack)
+            .map(|store| {
+                store
+                    .iter()
+                    .filter(|(_, pending)| pending.due(now))
+                    .map(|(entity, _)| entity)
+                    .collect()
+            })
+            .unwrap_or_default();
+        due.sort_unstable_by_key(|entity| entity.index());
+        for castle in due {
+            tick.state_mut().remove(ids.pending_unpack, castle);
+            if tick.state().is_live(castle) {
+                self.unpack_castle(tick, ids, castle)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn unpack_castle(&self, tick: &mut Tick<'_>, ids: Ids, site: Entity) -> Result<()> {
         let world = tick.state();
         let (Some(&castle_kind), Some(owner), Some(body)) = (
@@ -288,7 +378,7 @@ impl RotwkRules {
         spawn.weapon = None;
         spawn.vision = Some(spawn.shape.radius.max(1.0));
         let site = tick.state_mut().spawn()?;
-        Self::insert_spawn(tick, ids, site, &spawn, &self.combat)?;
+        self.insert_spawn(tick, ids, site, &spawn, &self.combat)?;
         self.apply_weather_to_new_object(tick, ids, site)?;
         if let Some(mut health) = tick.state().get(ids.health, site).copied() {
             health.0.set_current(1.0);
@@ -300,6 +390,7 @@ impl RotwkRules {
         }
         let worker_kind = self.getting_built_worker(record, player);
         let worker = self.spawn_site_worker(tick, ids, worker_kind, site, player)?;
+        let created = tick.frame();
         tick.state_mut().insert(
             ids.construction,
             site,
@@ -309,6 +400,7 @@ impl RotwkRules {
                 rebuild: None,
                 worker,
                 delay: 0,
+                created,
             },
         )?;
         tick.state_mut()

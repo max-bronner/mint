@@ -20,6 +20,7 @@ pub struct SpecialPowerDef {
     pub power_enum: Option<String>,
     pub initiate_sound: Option<String>,
     pub initiate_at_location_sound: Option<String>,
+    pub prevent_activation_conditions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,6 +133,17 @@ pub fn read_special_power(block: &Block, macros: &MacroTable) -> SpecialPowerDef
             .and_then(Field::value)
             .filter(|name| !crate::value::is_none(name))
             .map(str::to_owned),
+        prevent_activation_conditions: block
+            .field("PreventActivationConditions")
+            .map(|field| {
+                field
+                    .args
+                    .iter()
+                    .filter(|name| !crate::value::is_none(name))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

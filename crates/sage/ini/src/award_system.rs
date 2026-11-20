@@ -20,11 +20,32 @@ pub struct AwardDef {
     pub triggers: Vec<AwardTrigger>,
 }
 
+impl AwardDef {
+    #[must_use]
+    pub fn earned(&self, stats: &std::collections::BTreeMap<String, i32>) -> bool {
+        !self.triggers.is_empty()
+            && self.triggers.iter().all(|trigger| {
+                let sum: i64 = trigger
+                    .stats
+                    .iter()
+                    .map(|name| i64::from(stats.get(name).copied().unwrap_or(0)))
+                    .sum();
+                sum >= trigger.threshold.unwrap_or(0)
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThingStatDef {
     pub stat_name: Option<String>,
     pub name_tag: Option<String>,
     pub description_tag: Option<String>,
+    pub thing_template_names: Vec<String>,
+    pub excluded_things: Vec<String>,
+    pub kind_of: Vec<String>,
+    pub excluded_kind_of: Vec<String>,
+    pub primary_key: i64,
+    pub secondary_key: i64,
 }
 
 fn text(block: &Block, keyword: &str) -> Option<String> {
@@ -74,14 +95,38 @@ pub fn read_award_system(block: &Block, errors: &ValueErrors) -> Vec<AwardDef> {
         .collect()
 }
 
+fn names(block: &Block, keyword: &str) -> Vec<String> {
+    block
+        .fields_named(keyword)
+        .flat_map(|field| field.args.iter())
+        .filter(|name| !is_none(name))
+        .cloned()
+        .collect()
+}
+
+fn key(block: &Block, keyword: &str, errors: &ValueErrors) -> i64 {
+    block.field(keyword).map_or(0, |field| {
+        field.value().and_then(parse_int).unwrap_or_else(|| {
+            errors.field("ThingStat", field, "an integer");
+            0
+        })
+    })
+}
+
 #[must_use]
-pub fn read_thing_stats(block: &Block) -> Vec<ThingStatDef> {
+pub fn read_thing_stats(block: &Block, errors: &ValueErrors) -> Vec<ThingStatDef> {
     block
         .blocks_named("ThingStat")
         .map(|stat| ThingStatDef {
             stat_name: text(stat, "StatName"),
             name_tag: text(stat, "NameTag"),
             description_tag: text(stat, "DescriptionTag"),
+            thing_template_names: names(stat, "ThingTemplateNames"),
+            excluded_things: names(stat, "ExcludedThings"),
+            kind_of: names(stat, "KindOf"),
+            excluded_kind_of: names(stat, "ExcludedKindOf"),
+            primary_key: key(stat, "PrimaryKey", errors),
+            secondary_key: key(stat, "SecondaryKey", errors),
         })
         .collect()
 }
@@ -121,6 +166,11 @@ mod tests {
   NameTag = Test:CountName
               DescriptionTag = Test:CountDesc
   MultiPlayerOnly = Yes
+  ThingTemplateNames = TestA TestB
+  KindOf = HERO
+  ExcludedKindOf = SUMMONED
+  ExcludedThings = TestC
+  PrimaryKey = 2
 End
             ObjectAward AwardTestOne
 End
@@ -129,10 +179,15 @@ End
         let doc = Document::parse("a.ini", text, &BlockTable::corpus_path()).unwrap();
         assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
         let block = doc.roots_named(AWARD_SYSTEM_KEYWORD).next().unwrap();
-        let stats = read_thing_stats(block);
+        let stats = read_thing_stats(block, &ValueErrors::new());
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].stat_name.as_deref(), Some("TEST_COUNT"));
         assert_eq!(stats[0].name_tag.as_deref(), Some("Test:CountName"));
         assert_eq!(stats[0].description_tag.as_deref(), Some("Test:CountDesc"));
+        assert_eq!(stats[0].thing_template_names, ["TestA", "TestB"]);
+        assert_eq!(stats[0].kind_of, ["HERO"]);
+        assert_eq!(stats[0].excluded_kind_of, ["SUMMONED"]);
+        assert_eq!(stats[0].excluded_things, ["TestC"]);
+        assert_eq!((stats[0].primary_key, stats[0].secondary_key), (2, 0));
     }
 }

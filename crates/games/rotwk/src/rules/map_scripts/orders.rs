@@ -1,18 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use mint_movement::Vec2;
+use mint_movement::{Route, Vec2};
 use mint_sage_map::Parameter;
 use mint_sim::{Entity, PlayerId, Result, StateHasher, Tick, World};
 
 use super::team::TeamId;
 use super::{
-    parameter_string, ActionVerb, MapScriptEngine, MapScriptState, ParseCtx, ATTITUDE_AGGRESSIVE,
-    ATTITUDE_ALERT,
+    parameter_int, parameter_string, ActionVerb, MapScriptEngine, MapScriptState, ParseCtx,
+    ATTITUDE_AGGRESSIVE, ATTITUDE_ALERT,
 };
 use crate::combat::{acquire_target, Foe};
 use crate::diag::diag;
-use crate::rules::busy::HeldOrder;
+use crate::rules::busy::{HeldOrder, MovePath};
 use crate::rules::{Ids, RotwkRules};
 use crate::unit::{Owner, Selected};
 
@@ -54,7 +54,7 @@ impl Hunters {
         self.scans.get(&entity).copied()
     }
 
-    pub(super) fn contains(&self, entity: Entity) -> bool {
+    pub(crate) fn contains(&self, entity: Entity) -> bool {
         self.set.contains(&entity)
     }
 
@@ -80,9 +80,14 @@ impl Hunters {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum ScriptOrder {
+pub(in crate::rules) enum ScriptOrder {
     Move(Vec2, bool),
+    MoveLeg(Vec2, bool),
+    MoveFollow(Vec2, bool),
     AttackMove(Vec2, bool),
+    AttackFollow(Vec2, bool),
+    AttackFollowLeg(Vec2, bool),
+    AttackMoveObject(Entity),
     Attack(Entity),
     Enter(Entity),
     Stop,
@@ -98,12 +103,21 @@ enum Subject {
 enum What {
     MoveTo(Option<Vec2>),
     AttackMoveTo(Option<Vec2>),
-    FollowPath { path: String, attack: bool },
+    FollowPath {
+        path: String,
+        attack: bool,
+        as_team: bool,
+        in_formation: bool,
+        exact: bool,
+    },
     Stop,
     Hunt,
     AttackNamed(String),
     AttackMoveToNamed(String),
-    AttackTeam { name: String, side: String },
+    AttackTeam {
+        name: String,
+        side: String,
+    },
 }
 
 struct ActionOrder {
@@ -157,7 +171,15 @@ impl RotwkRules {
             .copied()
             .filter(|&member| !self.mood_asleep(tick.state(), ids, member))
             .collect();
-        if let ScriptOrder::Move(to, queue) = order {
+        if let ScriptOrder::Move(to, queue)
+        | ScriptOrder::MoveLeg(to, queue)
+        | ScriptOrder::MoveFollow(to, queue) = order
+        {
+            let attack = match order {
+                ScriptOrder::MoveLeg(..) => ScriptOrder::AttackFollowLeg(to, queue),
+                ScriptOrder::MoveFollow(..) => ScriptOrder::AttackFollow(to, queue),
+                _ => ScriptOrder::AttackMove(to, queue),
+            };
             let (hot, calm): (Vec<Entity>, Vec<Entity>) = awake.iter().copied().partition(|&m| {
                 matches!(
                     self.mood_attitude(tick.state(), ids, m),
@@ -165,32 +187,73 @@ impl RotwkRules {
                 )
             });
             if !hot.is_empty() {
-                self.issue_order_to(tick, ids, &hot, ScriptOrder::AttackMove(to, queue))?;
+                self.issue_order_to(tick, ids, &hot, attack)?;
                 return self.issue_order_to(tick, ids, &calm, order);
             }
         }
         self.issue_order_to(tick, ids, &awake, order)
     }
 
-    pub(super) fn issue_order_to(
+    pub(in crate::rules) fn issue_order_to(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         members: &[Entity],
         order: ScriptOrder,
     ) -> Result<()> {
+        if let ScriptOrder::AttackMoveObject(object) = order {
+            let Some(at) = self.position_of_entity(tick, ids, object) else {
+                return Ok(());
+            };
+            self.issue_order_to(tick, ids, members, ScriptOrder::AttackMove(at, false))?;
+            let height = self.object_z(tick.state(), ids, object);
+            for &member in members {
+                let mover = self.approach_mover(tick, ids, member);
+                if let Some(held) = tick.state_mut().get_mut(ids.attack_move_order, mover) {
+                    held.object = Some((object, at, height));
+                }
+            }
+            return Ok(());
+        }
         self.as_owner_selection(tick, ids, members, |rules, tick, actor| match order {
-            ScriptOrder::Move(to, queue) => {
-                rules.issue_order(tick, ids, actor, HeldOrder::MoveTo(to, queue))
-            }
-            ScriptOrder::AttackMove(to, queue) => {
-                rules.issue_order(tick, ids, actor, HeldOrder::AttackMove(to, queue))
-            }
+            ScriptOrder::Move(to, queue) | ScriptOrder::MoveFollow(to, queue) => rules.issue_order(
+                tick,
+                ids,
+                actor,
+                HeldOrder::MoveTo(to, queue, MovePath::Group),
+            ),
+            ScriptOrder::AttackFollow(to, queue) => rules.issue_order(
+                tick,
+                ids,
+                actor,
+                HeldOrder::AttackMove(to, queue, MovePath::AttackFollow),
+            ),
+            ScriptOrder::AttackFollowLeg(to, queue) => rules.issue_order(
+                tick,
+                ids,
+                actor,
+                HeldOrder::AttackMove(to, queue, MovePath::AttackFollowLeg),
+            ),
+            ScriptOrder::MoveLeg(to, queue) => rules.issue_order(
+                tick,
+                ids,
+                actor,
+                HeldOrder::MoveTo(to, queue, MovePath::GroupLeg),
+            ),
+            ScriptOrder::AttackMove(to, queue) => rules.issue_order(
+                tick,
+                ids,
+                actor,
+                HeldOrder::AttackMove(to, queue, MovePath::Group),
+            ),
+            ScriptOrder::AttackMoveObject(_) => Ok(()),
             ScriptOrder::Attack(target) => {
-                rules.issue_order(tick, ids, actor, HeldOrder::AttackObject(target))
+                rules.issue_order(tick, ids, actor, HeldOrder::ScriptAttackObject(target))
             }
-            ScriptOrder::Enter(container) => rules.enter_container(tick, ids, actor, container),
-            ScriptOrder::Stop => rules.stop(tick, ids, actor),
+            ScriptOrder::Enter(container) => {
+                rules.issue_order(tick, ids, actor, HeldOrder::Enter(container))
+            }
+            ScriptOrder::Stop => rules.issue_order(tick, ids, actor, HeldOrder::Stop),
         })
     }
 
@@ -246,6 +309,74 @@ impl RotwkRules {
             .map(|body| body.0.position)
     }
 
+    pub(super) fn follow_exactly(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        member: Entity,
+        walk: &[Vec2],
+        offset: Vec2,
+    ) -> Result<()> {
+        let Some(&last) = walk.last() else {
+            return Ok(());
+        };
+        self.issue_script_order(
+            tick,
+            ids,
+            &[member],
+            ScriptOrder::Move(last.plus(offset), false),
+        )?;
+        let carrier = Self::pather(tick, ids, member);
+        let Some(mut path) = tick.state().get(ids.path, carrier).cloned() else {
+            return Ok(());
+        };
+        let Some(start) = self.position_of_entity(tick, ids, carrier) else {
+            return Ok(());
+        };
+        let mut points: Vec<Vec2> = std::iter::once(start)
+            .chain(walk.iter().map(|point| point.plus(offset)))
+            .collect();
+        let geometry = self.passability.geometry;
+        if let Some(end) = points.last_mut() {
+            let extent = self.passability.grid.extent();
+            if let Some(cell) = geometry.cell_at(*end, 0, extent) {
+                *end = geometry.centre_of(cell);
+            }
+        }
+        path.goal = last.plus(offset);
+        path.route = Route {
+            portals: vec![None; points.len()],
+            points,
+            extra_distance: 0.0,
+            unsearched: true,
+        };
+        crate::unit::give_path(tick.state_mut(), (ids.body, ids.path), carrier, path)
+    }
+
+    pub(super) fn nearest_on_path(
+        engine: &MapScriptEngine,
+        label: &str,
+        from: Vec2,
+    ) -> Option<usize> {
+        engine
+            .path_points()
+            .iter()
+            .enumerate()
+            .filter(|(_, point)| {
+                point
+                    .labels
+                    .iter()
+                    .flatten()
+                    .any(|found| found.eq_ignore_ascii_case(label))
+            })
+            .min_by(|a, b| {
+                let da = distance_squared(a.1.position, from);
+                let db = distance_squared(b.1.position, from);
+                da.total_cmp(&db)
+            })
+            .map(|(index, _)| index)
+    }
+
     pub(super) fn path_from(
         &self,
         tick: &mut Tick<'_>,
@@ -254,23 +385,7 @@ impl RotwkRules {
         from: Vec2,
     ) -> Vec<Vec2> {
         let points = engine.path_points();
-        let on_path = |point: &PathPoint| {
-            point
-                .labels
-                .iter()
-                .flatten()
-                .any(|found| found.eq_ignore_ascii_case(label))
-        };
-        let nearest = points
-            .iter()
-            .enumerate()
-            .filter(|(_, point)| on_path(point))
-            .min_by(|a, b| {
-                let da = distance_squared(a.1.position, from);
-                let db = distance_squared(b.1.position, from);
-                da.total_cmp(&db)
-            })
-            .map(|(index, _)| index);
+        let nearest = Self::nearest_on_path(engine, label, from);
         let mut walk = Vec::new();
         let mut seen = BTreeSet::new();
         let mut at = nearest;
@@ -424,6 +539,11 @@ impl RotwkRules {
                 found
             };
             if let Some(target) = target {
+                let target = if Some(target) == team_victim {
+                    target
+                } else {
+                    self.horde_member_pick(tick, ids, hunter, target)
+                };
                 self.issue_script_order(tick, ids, &[hunter], ScriptOrder::Attack(target))?;
             }
         }
@@ -567,6 +687,18 @@ pub(super) const HUNT_RANGE: f32 = 9999.9;
 const HUNT_SCAN_FRAMES: u64 = 15;
 const HUNT_SCAN_FRAMES_SPREAD: u32 = 16;
 
+const TEAM_OFFSET_MAX: f32 = 150.0;
+
+fn team_offset(at: Vec2, center: Vec2) -> Vec2 {
+    let offset = at.minus(center);
+    let length = offset.length();
+    if length > TEAM_OFFSET_MAX {
+        offset.scale(TEAM_OFFSET_MAX / length)
+    } else {
+        offset
+    }
+}
+
 fn distance_squared(a: Vec2, b: Vec2) -> f32 {
     let (dx, dy) = (a.x - b.x, a.y - b.y);
     dx * dx + dy * dy
@@ -601,8 +733,7 @@ impl ActionVerb for ActionOrder {
                 .map(ScriptOrder::Attack),
             What::AttackMoveToNamed(unit) => rules
                 .object_named(tick, ids, &state.rt, unit, "")
-                .and_then(|found| rules.position_of_entity(tick, ids, found))
-                .map(|at| ScriptOrder::AttackMove(at, false)),
+                .map(ScriptOrder::AttackMoveObject),
             What::AttackTeam { name, side } => rules
                 .subject_members(tick, ids, state, name, Some(side))
                 .first()
@@ -621,26 +752,81 @@ impl ActionVerb for ActionOrder {
                 );
                 return Ok(());
             }
-            What::FollowPath { path, attack } => {
+            What::FollowPath {
+                path,
+                attack,
+                as_team,
+                in_formation,
+                exact,
+            } => {
                 let positions: Vec<Vec2> = members
                     .iter()
                     .filter_map(|&m| rules.position_of_entity(tick, ids, m))
                     .collect();
-                let Some(from) = super::cinematic::mean_position(&positions) else {
+                let Some(center) = super::cinematic::mean_position(&positions) else {
                     return Ok(());
                 };
-                let walk = rules.path_from(tick, engine, path, from);
-                for (step, &to) in walk.iter().enumerate() {
-                    let order = if *attack {
-                        ScriptOrder::AttackMove(to, step > 0)
-                    } else {
-                        ScriptOrder::Move(to, step > 0)
-                    };
-                    rules.issue_script_order(tick, ids, &members, order)?;
-                }
+                let walk = rules.path_from(tick, engine, path, center);
+                let offsets: Vec<(Entity, Vec2)> = if *in_formation {
+                    let first = walk.first().copied().unwrap_or(center);
+                    rules.column_slots(tick, ids, &members, center, first)
+                } else {
+                    members
+                        .iter()
+                        .map(|&m| {
+                            let offset = if *as_team {
+                                rules
+                                    .position_of_entity(tick, ids, m)
+                                    .map_or(Vec2::ZERO, |at| team_offset(at, center))
+                            } else {
+                                Vec2::ZERO
+                            };
+                            (m, offset)
+                        })
+                        .collect()
+                };
                 for &member in &members {
-                    state.rt.walks.begin(member, path);
                     state.rt.wanderers.forget(member);
+                    tick.state_mut().remove(ids.formation_slot, member);
+                }
+                if (*as_team || *in_formation) && !*exact {
+                    state
+                        .rt
+                        .walks
+                        .begin_team(&offsets, path, walk.clone(), *attack);
+                    if let Some(&(key, _)) = offsets.first() {
+                        for &(member, _) in &offsets {
+                            rules.retarget_team_member(tick, ids, state, key, member)?;
+                        }
+                    }
+                } else {
+                    for &(member, offset) in &offsets {
+                        if *exact {
+                            rules.follow_exactly(tick, ids, member, &walk, offset)?;
+                        } else {
+                            for (step, &to) in walk.iter().enumerate() {
+                                let to = to.plus(offset);
+                                let more = step + 1 < walk.len();
+                                let order = match (*attack, more) {
+                                    (true, true) => ScriptOrder::AttackFollowLeg(to, step > 0),
+                                    (true, false) => ScriptOrder::AttackFollow(to, step > 0),
+                                    (false, true) => ScriptOrder::MoveLeg(to, step > 0),
+                                    (false, false) => ScriptOrder::MoveFollow(to, step > 0),
+                                };
+                                rules.issue_script_order(tick, ids, &[member], order)?;
+                            }
+                        }
+                        state.rt.walks.begin(member, path);
+                    }
+                }
+                if *in_formation {
+                    for &(member, offset) in &offsets {
+                        tick.state_mut().insert(
+                            ids.formation_slot,
+                            member,
+                            crate::unit::FormationSlot(offset),
+                        )?;
+                    }
                 }
                 diag!(
                     "script: {} sends {} unit(s) along {path:?} ({} waypoint(s))",
@@ -745,13 +931,20 @@ fn follow(
     ctx: &ParseCtx<'_>,
     named: bool,
     attack: bool,
+    exact: bool,
     verb: &'static str,
 ) -> Option<Arc<dyn ActionVerb>> {
+    let flag = |index| !named && parameter_int(params, index).is_some_and(|flag| flag != 0);
+    let as_team = flag(2);
+    let in_formation = flag(3) && !exact;
     build(
         subject(params, ctx, named)?,
         What::FollowPath {
             path: parameter_string(params, 1)?,
             attack,
+            as_team,
+            in_formation,
+            exact,
         },
         verb,
     )
@@ -761,35 +954,56 @@ pub(super) fn parse_follow_named(
     params: &[Parameter],
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
-    follow(params, ctx, true, false, "NAMED_FOLLOW_WAYPOINTS")
+    follow(params, ctx, true, false, false, "NAMED_FOLLOW_WAYPOINTS")
 }
 
 pub(super) fn parse_follow_named_exact(
     params: &[Parameter],
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
-    follow(params, ctx, true, false, "NAMED_FOLLOW_WAYPOINTS_EXACT")
+    follow(
+        params,
+        ctx,
+        true,
+        false,
+        true,
+        "NAMED_FOLLOW_WAYPOINTS_EXACT",
+    )
 }
 
 pub(super) fn parse_attack_follow_named(
     params: &[Parameter],
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
-    follow(params, ctx, true, true, "NAMED_ATTACK_FOLLOW_WAYPOINTS")
+    follow(
+        params,
+        ctx,
+        true,
+        true,
+        false,
+        "NAMED_ATTACK_FOLLOW_WAYPOINTS",
+    )
 }
 
 pub(super) fn parse_follow_team(
     params: &[Parameter],
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
-    follow(params, ctx, false, false, "TEAM_FOLLOW_WAYPOINTS")
+    follow(params, ctx, false, false, false, "TEAM_FOLLOW_WAYPOINTS")
 }
 
 pub(super) fn parse_follow_team_exact(
     params: &[Parameter],
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
-    follow(params, ctx, false, false, "TEAM_FOLLOW_WAYPOINTS_EXACT")
+    follow(
+        params,
+        ctx,
+        false,
+        false,
+        true,
+        "TEAM_FOLLOW_WAYPOINTS_EXACT",
+    )
 }
 
 pub(super) fn parse_attack_follow_team(
@@ -801,6 +1015,7 @@ pub(super) fn parse_attack_follow_team(
         ctx,
         false,
         true,
+        false,
         "TEAM_ATTACK_MOVE_FOLLOW_WAYPOINTS",
     )
 }

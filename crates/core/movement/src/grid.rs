@@ -145,6 +145,10 @@ pub struct MoverClass {
     pub crosses_layers: bool,
     pub barred_by: CellFlags,
     pub confined_to: Option<CellRect>,
+    pub portal_pass: PortalPass,
+    pub line_barred: CellFlags,
+    pub straight_tail: u16,
+    pub object_flags: CellFlags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -197,6 +201,52 @@ impl MoverClass {
             crosses_layers: false,
             barred_by: CellFlags::NONE,
             confined_to: None,
+            portal_pass: PortalPass::NONE,
+            line_barred: CellFlags::NONE,
+            straight_tail: 0,
+            object_flags: CellFlags::NONE,
+        }
+    }
+
+    #[must_use]
+    pub const fn object_stamped(self, object_flags: CellFlags) -> Self {
+        Self {
+            object_flags,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn objects_only(self) -> Self {
+        Self {
+            blocked_by: CellFlags::from_bits(self.blocked_by.bits() & self.object_flags.bits()),
+            requires: CellFlags::NONE,
+            excused_by: CellFlags::NONE,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn line_barring(self, line_barred: CellFlags) -> Self {
+        Self {
+            line_barred,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn straight_tailed(self, cells: u16) -> Self {
+        Self {
+            straight_tail: cells,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn passing(self, portal_pass: PortalPass) -> Self {
+        Self {
+            portal_pass,
+            ..self
         }
     }
 
@@ -251,15 +301,78 @@ impl MoverClass {
             asker: Asker::NOBODY,
             barred_by: CellFlags::NONE,
             confined_to: None,
+            portal_pass: PortalPass::NONE,
+            straight_tail: 0,
+            object_flags: CellFlags::NONE,
             ..self
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Leg {
+    #[default]
+    Through,
+    Walk,
+    Climb,
+    Bare,
+    Halt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Portal {
     pub id: u32,
     pub kind: u8,
+    pub leg: Leg,
+    pub rise: f32,
+}
+
+impl Portal {
+    #[must_use]
+    pub const fn new(id: u32, kind: u8) -> Self {
+        Self {
+            id,
+            kind,
+            leg: Leg::Through,
+            rise: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalNode {
+    pub position: crate::geom::Vec2,
+    pub tag: Option<Portal>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortalLink {
+    pub entry: Cell,
+    pub exit: Cell,
+    pub slot: u8,
+    pub nodes: Vec<PortalNode>,
+    pub after: Option<Portal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct PortalPass(u128);
+
+impl PortalPass {
+    pub const NONE: Self = Self(0);
+    pub const SLOTS: u8 = 128;
+
+    #[must_use]
+    pub const fn with(self, slot: u8) -> Self {
+        if slot >= Self::SLOTS {
+            return self;
+        }
+        Self(self.0 | (1u128 << slot))
+    }
+
+    #[must_use]
+    pub const fn has(self, slot: u8) -> bool {
+        slot < Self::SLOTS && (self.0 >> slot) & 1 == 1
+    }
 }
 
 pub trait Passability {
@@ -268,6 +381,14 @@ pub trait Passability {
     fn flags(&self, cell: Cell) -> CellFlags;
 
     fn extra_cost(&self, cell: Cell) -> u32;
+
+    fn goal_extra_cost(&self, _cell: Cell, _goal: Option<Cell>) -> u32 {
+        0
+    }
+
+    fn step_extra_cost(&self, _from: Cell, _to: Cell) -> u32 {
+        0
+    }
 
     fn is_passable(&self, cell: Cell, mover: MoverClass) -> bool {
         if !self.extent().contains(cell) {
@@ -294,11 +415,23 @@ pub trait Passability {
     }
 
     fn line_clear(&self, cell: Cell, mover: MoverClass) -> bool {
+        self.is_passable(cell, mover) && !self.flags(cell).intersects(mover.line_barred)
+    }
+
+    fn straight_clear(&self, cell: Cell, mover: MoverClass) -> bool {
         self.is_passable(cell, mover)
+    }
+
+    fn tail_clear(&self, cell: Cell, mover: MoverClass) -> bool {
+        self.line_clear(cell, mover)
     }
 
     fn portal_at(&self, _cell: Cell) -> Option<Portal> {
         None
+    }
+
+    fn portal_links(&self, _cell: Cell) -> &[PortalLink] {
+        &[]
     }
 
     fn admits_step(&self, _from: Cell, _to: Cell, _mover: MoverClass) -> bool {

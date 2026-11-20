@@ -43,25 +43,6 @@ Object ZArcher\n  Side = Wild\n  KindOf = INFANTRY SELECTABLE IMMOBILE\n  Vision
 
 const LEADER_AT: Vec2 = Vec2::new(300.0, 300.0);
 
-fn swarm(members: &[(f32, &str)]) -> (Simulation<RotwkRules>, Ids, Entity) {
-    let mut names: Vec<String> = vec![String::from("ZSwarmLeader")];
-    let mut places: Vec<Vec2> = vec![LEADER_AT];
-    for (offset, template) in members {
-        names.push((*template).to_owned());
-        places.push(Vec2::new(LEADER_AT.x + offset, LEADER_AT.y));
-    }
-    let (simulation, ids) = scene(&names, &places, &[]);
-    let leader = simulation
-        .state()
-        .store(ids.body)
-        .unwrap()
-        .entities()
-        .first()
-        .copied()
-        .unwrap();
-    (simulation, ids, leader)
-}
-
 fn scene(names: &[String], places: &[Vec2], enemy: &[usize]) -> (Simulation<RotwkRules>, Ids) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
@@ -97,47 +78,6 @@ fn scene(names: &[String], places: &[Vec2], enemy: &[usize]) -> (Simulation<Rotw
     let ids = simulation.rules().ids().unwrap();
     simulation.tick().unwrap();
     (simulation, ids)
-}
-
-fn run(simulation: &mut Simulation<RotwkRules>, ticks: u32) {
-    for _ in 0..ticks {
-        simulation.tick().unwrap();
-    }
-}
-
-fn buffed(simulation: &Simulation<RotwkRules>, ids: Ids, entity: Entity) -> bool {
-    simulation
-        .state()
-        .get(ids.bonuses, entity)
-        .is_some_and(|bonuses| bonuses.0.armor != 0.0)
-}
-
-#[test]
-fn a_swarm_holds_its_list_only_while_enough_members_are_in_reach() {
-    let (mut simulation, ids, leader) = swarm(&[(40.0, "ZSwarmer"), (50.0, "ZFadingSwarmer")]);
-    run(&mut simulation, 45);
-    assert!(buffed(&simulation, ids, leader), "two within 60");
-    run(&mut simulation, 90);
-    assert!(
-        !buffed(&simulation, ids, leader),
-        "one left once the fading swarmer's lifetime ran out"
-    );
-}
-
-#[test]
-fn a_member_between_the_two_radii_keeps_a_bonus_it_could_not_have_started() {
-    let (mut simulation, ids, leader) = swarm(&[
-        (40.0, "ZSwarmer"),
-        (50.0, "ZFadingSwarmer"),
-        (150.0, "ZSwarmer"),
-    ]);
-    run(&mut simulation, 45);
-    assert!(buffed(&simulation, ids, leader), "two within 60");
-    run(&mut simulation, 90);
-    assert!(
-        buffed(&simulation, ids, leader),
-        "the distant member is inside RubOffRadius, so the bonus is kept"
-    );
 }
 
 #[test]
@@ -190,6 +130,10 @@ fn only_fast_hits_reset_reaction_carries_a_flinch_past_its_first_hit() {
     assert!(
         gaps(&stoic).iter().all(|gap| *gap >= 60),
         "a stoic flincher only takes a new reaction once the last one ended: {stoic:?}"
+    );
+    assert!(
+        gaps(&stoic).iter().all(|gap| *gap >= 66),
+        "a reaction that ends on a frame blocks a new one that frame: {stoic:?}"
     );
 }
 

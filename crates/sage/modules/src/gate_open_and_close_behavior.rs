@@ -12,6 +12,8 @@ struct Data {
     reset_time: LogicFrames,
     percent_open_for_pathing: f32,
     repel_colliding_units: bool,
+    geometry_for_open: Vec<String>,
+    geometry_for_closed: Vec<String>,
     sound_opening_loop: Option<String>,
     sound_closing_loop: Option<String>,
     sound_finished_opening: Option<String>,
@@ -44,6 +46,16 @@ impl GateOpenAndCloseBehavior {
     #[must_use]
     pub fn repel_colliding_units(&self) -> bool {
         self.data.repel_colliding_units
+    }
+
+    #[must_use]
+    pub fn geometry_for_open(&self) -> &[String] {
+        &self.data.geometry_for_open
+    }
+
+    #[must_use]
+    pub fn geometry_for_closed(&self) -> &[String] {
+        &self.data.geometry_for_closed
     }
 
     #[must_use]
@@ -95,6 +107,8 @@ pub fn gate_open_and_close_behavior_from_fields(
             reset_time: duration(fields, "ResetTimeInMilliseconds")?,
             percent_open_for_pathing: percentage(fields, "PercentOpenForPathing")?.unwrap_or(0.0),
             repel_colliding_units: boolean(fields, "RepelCollidingUnits")?.unwrap_or(false),
+            geometry_for_open: names(fields, "GeometryForOpen", &["OpenLeft", "OpenRight"]),
+            geometry_for_closed: names(fields, "GeometryForClosed", &["Closed"]),
             sound_opening_loop: name(fields, "SoundOpeningGateLoop"),
             sound_closing_loop: name(fields, "SoundClosingGateLoop"),
             sound_finished_opening: name(fields, "SoundFinishedOpeningGate"),
@@ -103,6 +117,20 @@ pub fn gate_open_and_close_behavior_from_fields(
             time_before_closed_sound: duration(fields, "TimeBeforePlayingClosedSound")?,
         }),
     })
+}
+
+fn names(fields: &dyn ModuleFieldSource, keyword: &str, default: &[&str]) -> Vec<String> {
+    let written: Vec<String> = fields
+        .field_args(keyword)
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .map(str::to_owned)
+        .collect();
+    if written.is_empty() {
+        default.iter().map(|name| (*name).to_owned()).collect()
+    } else {
+        written
+    }
 }
 
 fn name(fields: &dyn ModuleFieldSource, keyword: &str) -> Option<String> {
@@ -134,7 +162,7 @@ fn duration(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<LogicFrames
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms.min(MAX_MILLISECONDS) as u32;
-    Ok(LogicFrames::from_milliseconds(whole))
+    Ok(crate::special_ability_update::retail_duration_ticks(whole))
 }
 
 fn percentage(fields: &dyn ModuleFieldSource, keyword: &str) -> Result<Option<f32>, FieldError> {

@@ -9,9 +9,12 @@ use mint_sim::{Component, Entity, Frame, LogicFrames, PlayerId, Result, StateHas
 use super::{Ids, RotwkRules};
 use crate::combat::{grid_cell, grid_radius_cells, Foe, TargetGrid};
 use crate::diag::diag;
+use crate::powers::PowerId;
 use crate::unit::Kind;
 
 const HIDDEN_CONDITION: &str = "INVISIBLE_STEALTH";
+
+const HIDDEN_STATUS: &str = "HIDDEN";
 
 const DEFAULT_DETECTION_MULTIPLIER: f32 = 1.0;
 
@@ -21,7 +24,7 @@ pub(crate) enum HiderSource {
     Invisibility,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Hiding {
     forbidden: Vec<StealthCondition>,
     source: HiderSource,
@@ -31,7 +34,9 @@ pub(crate) struct Hiding {
     starts_active: bool,
     required_upgrades: UpgradeMask,
     forbidden_upgrades: UpgradeMask,
+    forbidden_weapon_flags: Vec<String>,
     allow_near_trees: bool,
+    untoggle: bool,
     token: &'static str,
     detected_enemy: Option<String>,
     detected_ally: Option<String>,
@@ -67,7 +72,12 @@ impl Hiding {
         hasher.write_bool(self.starts_active);
         self.required_upgrades.hash_into(hasher);
         self.forbidden_upgrades.hash_into(hasher);
+        hasher.write_usize(self.forbidden_weapon_flags.len());
+        for flag in &self.forbidden_weapon_flags {
+            hasher.write_bytes(flag.as_bytes());
+        }
         hasher.write_bool(self.allow_near_trees);
+        hasher.write_bool(self.untoggle);
         hasher.write_bytes(self.token.as_bytes());
         for name in [
             &self.detected_enemy,
@@ -91,7 +101,14 @@ impl Hiding {
             starts_active: false,
             required_upgrades: UpgradeMask::default(),
             forbidden_upgrades: UpgradeMask::default(),
+            forbidden_weapon_flags: nugget
+                .forbidden_weapon_conditions
+                .iter()
+                .map(|flag| flag.to_string())
+                .collect(),
             allow_near_trees: nugget.has(mint_sage_modules::InvisibilityOption::AllowNearTrees),
+            untoggle: nugget
+                .has(mint_sage_modules::InvisibilityOption::UntoggleHiddenWhenLeavingStealth),
             token: nugget.kind.token(),
             detected_enemy: None,
             detected_ally: None,
@@ -120,7 +137,9 @@ impl Hiding {
             starts_active: module.starts_active() && !module.disguises_as_team(),
             required_upgrades: module.required_upgrades().clone(),
             forbidden_upgrades: UpgradeMask::default(),
+            forbidden_weapon_flags: Vec::new(),
             allow_near_trees: false,
+            untoggle: false,
             token: InvisibilityType::Stealth.token(),
             detected_enemy: None,
             detected_ally: None,
@@ -136,6 +155,8 @@ pub(crate) struct StealthTables {
     widest_multiplier: f32,
 }
 
+const NUGGET_PASS_FRAMES: u32 = mint_sim::SIMULATION_HZ;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Stealth {
     pub(crate) hidden: bool,
@@ -147,9 +168,22 @@ pub(crate) struct Stealth {
     activated_until: Frame,
     timer: Option<(Frame, Frame)>,
     detectors_flipped: u16,
+    power_paused: Option<(PowerId, Frame)>,
+    hidden_since: Frame,
+    seen: u8,
 }
 
 impl Stealth {
+    pub(crate) fn paused_since(&self, power: PowerId) -> Option<Frame> {
+        self.power_paused
+            .filter(|(held, _)| *held == power)
+            .map(|(_, since)| since)
+    }
+
+    pub(crate) fn detected_at(&self, now: Frame) -> bool {
+        self.marked != 0 && self.marked_until > now
+    }
+
     fn revealed_to(self, player: PlayerId) -> bool {
         slot_bit(player).is_some_and(|bit| (self.revealed | self.marked) & bit != 0)
     }
@@ -168,6 +202,15 @@ impl Component for Stealth {
         hasher.write_u64(from.get());
         hasher.write_u64(until.get());
         hasher.write_u16(self.detectors_flipped);
+        let (power, since) = self
+            .power_paused
+            .map_or((u16::MAX, Frame::FOREVER), |(power, since)| {
+                (power.get(), since)
+            });
+        hasher.write_u16(power);
+        hasher.write_u64(since.get());
+        hasher.write_u64(self.hidden_since.get());
+        hasher.write_u8(self.seen);
     }
 }
 
@@ -184,15 +227,21 @@ fn slot_bit(player: PlayerId) -> Option<u16> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct GrantedHiding {
+pub(crate) struct Grant {
     hiding: Hiding,
     until: Frame,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GrantedHiding(Vec<Grant>);
+
 impl Component for GrantedHiding {
     fn hash_into(&self, hasher: &mut StateHasher) {
-        self.hiding.hash_into(hasher);
-        hasher.write_u64(self.until.get());
+        hasher.write_usize(self.0.len());
+        for grant in &self.0 {
+            grant.hiding.hash_into(hasher);
+            hasher.write_u64(grant.until.get());
+        }
     }
 }
 
@@ -420,6 +469,63 @@ impl RotwkRules {
             .is_some_and(|stealth| stealth.hidden)
     }
 
+    pub(super) fn hold_back_stealth_scan(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        unit: Entity,
+        now: Frame,
+    ) -> Result<()> {
+        use mint_sage_modules::AutoAcquire;
+        let Some(kind) = tick.state().get(ids.kind, unit).copied() else {
+            return Ok(());
+        };
+        let auto = self
+            .kinds
+            .get(kind)
+            .map_or(AutoAcquire::default(), |entry| entry.record.auto_acquire);
+        if auto == AutoAcquire::default() || auto.contains(AutoAcquire::STEALTHED) {
+            return Ok(());
+        }
+        let Some(delay) = self
+            .stealth
+            .kinds
+            .get(usize::from(kind.0))
+            .and_then(|declared| {
+                declared
+                    .iter()
+                    .find(|declaration| declaration.hiding.source == HiderSource::Stealth)
+            })
+            .map(|declaration| declaration.hiding.period)
+        else {
+            return Ok(());
+        };
+        if tick
+            .state()
+            .get(ids.stealth, unit)
+            .is_some_and(|stealth| stealth.hidden || stealth.marked != 0)
+        {
+            return Ok(());
+        }
+        let per_frame = mint_sim::SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ;
+        let extra = tick
+            .rng()
+            .below(crate::game_data::RETAIL_LOGIC_HZ.saturating_add(1))
+            .saturating_mul(per_frame);
+        let until = now
+            .checked_add(LogicFrames::from_frames(delay.get().saturating_add(extra)))
+            .unwrap_or(now);
+        if let Some(mut armed) = tick.state().get(ids.armed, unit).copied() {
+            armed.next_acquire = until;
+            tick.state_mut().insert(ids.armed, unit, armed)?;
+        }
+        if let Some(mut guard) = tick.state().get(ids.guard, unit).copied() {
+            guard.next_scan = until;
+            tick.state_mut().insert(ids.guard, unit, guard)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn hidden_undetected(&self, world: &World, ids: Ids, entity: Entity) -> bool {
         world
             .get(ids.stealth, entity)
@@ -486,28 +592,85 @@ impl RotwkRules {
         living: &[(Foe, PlayerId)],
         grid: &TargetGrid,
     ) -> Result<()> {
-        if self.stealth.kinds.is_empty() {
-            return self.advance_granted_hiding(tick, ids, living, grid);
-        }
         let now = tick.frame();
-        let Some(store) = tick.state().store(ids.kind) else {
-            return self.advance_granted_hiding(tick, ids, living, grid);
-        };
-        let carriers: Vec<(Entity, Kind)> = store
-            .iter()
-            .filter(|(_, kind)| {
-                self.stealth
-                    .kinds
-                    .get(usize::from(kind.0))
-                    .is_some_and(|declared| !declared.is_empty())
+        let mut carriers: Vec<(Entity, Option<Kind>)> = tick
+            .state()
+            .store(ids.kind)
+            .filter(|_| !self.stealth.kinds.is_empty())
+            .map(|store| {
+                store
+                    .iter()
+                    .filter(|(_, kind)| {
+                        self.stealth
+                            .kinds
+                            .get(usize::from(kind.0))
+                            .is_some_and(|declared| !declared.is_empty())
+                    })
+                    .map(|(entity, kind)| (entity, Some(*kind)))
+                    .collect()
             })
-            .map(|(entity, kind)| (entity, *kind))
-            .collect();
+            .unwrap_or_default();
+        let granted: Vec<Entity> = tick
+            .state()
+            .store(ids.granted_hiding)
+            .map(|store| store.iter().map(|(entity, _)| entity).collect())
+            .unwrap_or_default();
+        for entity in granted {
+            if !carriers.iter().any(|(held, _)| *held == entity) {
+                carriers.push((entity, None));
+            }
+        }
         let mut effects: Vec<(Entity, Effect)> = Vec::new();
+        let mut untoggle: Vec<Entity> = Vec::new();
+        let mut scratch: Vec<u32> = Vec::new();
+        let alliance_only = self.views_are_alliance_stances(tick.state(), ids);
         for (entity, kind) in carriers {
-            let Some(declared) = self.stealth.kinds.get(usize::from(kind.0)) else {
+            let own: &[StealthKind] = kind
+                .and_then(|kind| self.stealth.kinds.get(usize::from(kind.0)))
+                .filter(|_| {
+                    self.runs_when_disabled(
+                        tick.state(),
+                        ids,
+                        entity,
+                        now,
+                        mint_sage_modules::disabled_masks::HELD,
+                    )
+                })
+                .map_or(<&[StealthKind]>::default(), Vec::as_slice);
+            let held: Vec<Grant> = tick
+                .state()
+                .get(ids.granted_hiding, entity)
+                .map(|held| held.0.clone())
+                .unwrap_or_default();
+            let live: Vec<StealthKind> = held
+                .iter()
+                .filter(|grant| now < grant.until)
+                .map(|grant| StealthKind {
+                    hiding: grant.hiding.clone(),
+                    unmodelled: grant
+                        .hiding
+                        .forbidden
+                        .iter()
+                        .copied()
+                        .find(|condition| !modelled(*condition)),
+                })
+                .collect();
+            if live.len() != held.len() {
+                if live.is_empty() {
+                    tick.state_mut().remove(ids.granted_hiding, entity);
+                } else {
+                    let kept = GrantedHiding(
+                        held.iter()
+                            .filter(|grant| now < grant.until)
+                            .cloned()
+                            .collect(),
+                    );
+                    tick.state_mut().insert(ids.granted_hiding, entity, kept)?;
+                }
+            }
+            if own.is_empty() && live.is_empty() && kind.is_some() {
                 continue;
-            };
+            }
             let mut state = tick
                 .state()
                 .get(ids.stealth, entity)
@@ -516,21 +679,40 @@ impl RotwkRules {
                     declaration: u8::MAX,
                     ..Stealth::default()
                 });
-            let activated = now < state.activated_until;
-            let eligible = declared
+            if now >= state.activated_until
+                && self.holds_status(tick.state(), entity, HIDDEN_STATUS)
+            {
+                untoggle.push(entity);
+            }
+            let on_pass = now.get().checked_rem(u64::from(NUGGET_PASS_FRAMES)) == Some(0);
+            let declared = own.len().saturating_add(live.len());
+            let fresh = usize::from(state.seen) != declared;
+            let every_frame = own
                 .iter()
-                .position(|declaration| {
-                    (declaration.hiding.starts_active || activated)
-                        && self.hiding_allowed(tick, ids, entity, declaration)
+                .chain(live.iter())
+                .any(|declaration| declaration.hiding.source == HiderSource::Stealth);
+            if !(on_pass || fresh || every_frame) {
+                continue;
+            }
+            let all: Vec<&StealthKind> = own.iter().chain(live.iter()).collect();
+            state.seen = u8::try_from(all.len()).unwrap_or(u8::MAX);
+            let activated = now < state.activated_until;
+            let eligible = (0..all.len())
+                .find(|at| {
+                    all.get(*at).is_some_and(|declaration| {
+                        (*at >= own.len() || declaration.hiding.starts_active || activated)
+                            && self.hiding_allowed(tick, ids, entity, declaration)
+                    })
                 })
                 .and_then(|at| u8::try_from(at).ok());
-            let stealth_kind = eligible
-                .and_then(|at| declared.get(usize::from(at)))
-                .or_else(|| declared.get(usize::from(state.declaration)));
+            let governing = eligible
+                .and_then(|at| all.get(usize::from(at)))
+                .or_else(|| all.get(usize::from(state.declaration)))
+                .copied();
             match eligible {
                 Some(at) => {
                     if state.declaration != at || state.allowed_since.is_none() {
-                        state.allowed_since = Some(now);
+                        state.allowed_since = Some(Frame::new(now.get().saturating_sub(1)));
                         state.declaration = at;
                     }
                 }
@@ -548,138 +730,59 @@ impl RotwkRules {
                             crate::voice::VoiceKind::StealthOff,
                             None,
                         );
+                        if governing.is_some_and(|governing| governing.hiding.untoggle) {
+                            untoggle.push(entity);
+                        }
                     }
                 }
             }
-            let Some(stealth_kind) = stealth_kind else {
+            let Some(governing) = governing else {
                 tick.state_mut().insert(ids.stealth, entity, state)?;
                 continue;
             };
-            if !state.hidden
-                && eligible.is_some()
-                && self.hide_is_due(entity, stealth_kind, state, now)
-            {
+            if !state.hidden && eligible.is_some() && Self::hide_is_due(governing, state, now) {
                 state.hidden = true;
+                state.hidden_since = now;
                 diag!(
                     "stealth: {} hidden ({})",
                     entity.index(),
-                    stealth_kind.hiding.token
+                    governing.hiding.token
                 );
                 effects.push((entity, conditions(true)));
                 self.emit_voice(tick, ids, entity, crate::voice::VoiceKind::StealthOn, None);
             }
             if state.hidden {
                 let was = state.revealed;
-                let (revealed, detector) =
-                    self.proximity_reveal(tick, ids, entity, stealth_kind, living, grid, was);
+                let (revealed, detector) = self.proximity_reveal(
+                    tick,
+                    ids,
+                    entity,
+                    governing,
+                    (living, grid),
+                    was,
+                    (&mut scratch, alliance_only),
+                );
                 state.revealed = revealed;
                 if let Some(detector) = detector {
                     Self::note_combat_fact(tick, ids, |facts, now| {
                         facts.push_detection(now, entity, detector);
                     });
                 }
-                if self.at_its_own_victim(tick, ids, entity, stealth_kind) {
+                if self.at_its_own_victim(tick, ids, entity, governing) {
                     state.revealed = u16::MAX;
+                }
+                if state.detected_at(now) && governing.hiding.untoggle {
+                    untoggle.push(entity);
                 }
             }
             tick.state_mut().insert(ids.stealth, entity, state)?;
         }
         self.apply_effects(tick, ids, effects)?;
-        self.advance_granted_hiding(tick, ids, living, grid)
-    }
-
-    fn advance_granted_hiding(
-        &self,
-        tick: &mut Tick<'_>,
-        ids: Ids,
-        living: &[(Foe, PlayerId)],
-        grid: &TargetGrid,
-    ) -> Result<()> {
-        let now = tick.frame();
-        let Some(store) = tick.state().store(ids.granted_hiding) else {
-            return Ok(());
-        };
-        let grants: Vec<(Entity, GrantedHiding)> = store
-            .iter()
-            .map(|(entity, grant)| (entity, grant.clone()))
-            .collect();
-        let mut effects: Vec<(Entity, Effect)> = Vec::new();
-        let mut expired: Vec<Entity> = Vec::new();
-        for (entity, grant) in grants {
-            let mut state = tick
-                .state()
-                .get(ids.stealth, entity)
-                .copied()
-                .unwrap_or_default();
-            if now >= grant.until {
-                expired.push(entity);
-                if state.hidden {
-                    state.hidden = false;
-                    state.revealed = 0;
-                    diag!(
-                        "stealth: {} granted-hide revealed (expired)",
-                        entity.index()
-                    );
-                    effects.push((entity, conditions(false)));
-                    self.emit_voice(tick, ids, entity, crate::voice::VoiceKind::StealthOff, None);
-                }
-                tick.state_mut().insert(ids.stealth, entity, state)?;
-                continue;
-            }
-            let unmodelled = grant
-                .hiding
-                .forbidden
-                .iter()
-                .copied()
-                .find(|condition| !modelled(*condition));
-            let kind = StealthKind {
-                hiding: grant.hiding,
-                unmodelled,
-            };
-            let allowed = unmodelled.is_none() && self.hiding_allowed(tick, ids, entity, &kind);
-            if allowed {
-                if state.allowed_since.is_none() {
-                    state.allowed_since = Some(now);
-                }
-            } else {
-                state.allowed_since = None;
-                if state.hidden {
-                    state.hidden = false;
-                    state.revealed = 0;
-                    diag!(
-                        "stealth: {} granted-hide revealed (not allowed)",
-                        entity.index()
-                    );
-                    effects.push((entity, conditions(false)));
-                    self.emit_voice(tick, ids, entity, crate::voice::VoiceKind::StealthOff, None);
-                }
-            }
-            if !state.hidden && allowed && self.hide_is_due(entity, &kind, state, now) {
-                state.hidden = true;
-                diag!("stealth: {} granted-hide hidden", entity.index());
-                effects.push((entity, conditions(true)));
-                self.emit_voice(tick, ids, entity, crate::voice::VoiceKind::StealthOn, None);
-            }
-            if state.hidden {
-                let was = state.revealed;
-                let (revealed, detector) =
-                    self.proximity_reveal(tick, ids, entity, &kind, living, grid, was);
-                state.revealed = revealed;
-                if let Some(detector) = detector {
-                    Self::note_combat_fact(tick, ids, |facts, now| {
-                        facts.push_detection(now, entity, detector);
-                    });
-                }
-                if self.at_its_own_victim(tick, ids, entity, &kind) {
-                    state.revealed = u16::MAX;
-                }
-            }
-            tick.state_mut().insert(ids.stealth, entity, state)?;
+        untoggle.dedup();
+        for entity in untoggle {
+            self.unhide_toggle(tick, ids, entity)?;
         }
-        for entity in expired {
-            tick.state_mut().remove(ids.granted_hiding, entity);
-        }
-        self.apply_effects(tick, ids, effects)
+        Ok(())
     }
 
     pub(super) fn grant_invisibility(
@@ -691,27 +794,36 @@ impl RotwkRules {
         nugget: &mint_sage_modules::InvisibilityNugget,
     ) -> Result<usize> {
         let now = tick.frame();
-        let until = now.checked_add(duration).unwrap_or(Frame::FOREVER);
         let hiding = Hiding::from_nugget(nugget, LogicFrames::ZERO);
         let mut granted = 0usize;
         for &entity in targets {
-            let has_own = tick.state().get(ids.kind, entity).is_some_and(|kind| {
-                self.stealth
-                    .kinds
-                    .get(usize::from(kind.0))
-                    .is_some_and(|declared| !declared.is_empty())
-            });
-            if has_own {
+            if tick.state().contains(ids.member, entity)
+                && !tick.state().contains(ids.horde, entity)
+            {
                 continue;
             }
-            tick.state_mut().insert(
-                ids.granted_hiding,
-                entity,
-                GrantedHiding {
-                    hiding: hiding.clone(),
-                    until,
-                },
-            )?;
+            let mut held = tick
+                .state()
+                .get(ids.granted_hiding, entity)
+                .cloned()
+                .unwrap_or_default();
+            match held
+                .0
+                .iter_mut()
+                .find(|grant| grant.hiding == hiding && now < grant.until)
+            {
+                Some(grant) => {
+                    grant.until = grant.until.checked_add(duration).unwrap_or(Frame::FOREVER);
+                }
+                None => {
+                    held.0.retain(|grant| grant.hiding != hiding);
+                    held.0.push(Grant {
+                        hiding: hiding.clone(),
+                        until: now.checked_add(duration).unwrap_or(Frame::FOREVER),
+                    });
+                }
+            }
+            tick.state_mut().insert(ids.granted_hiding, entity, held)?;
             granted = granted.saturating_add(1);
         }
         Ok(granted)
@@ -735,6 +847,22 @@ impl RotwkRules {
             return false;
         }
         let hiding = &kind.hiding;
+        if !hiding.forbidden_weapon_flags.is_empty()
+            && self
+                .modules
+                .as_ref()
+                .and_then(|wiring| tick.state().get(wiring.state, entity))
+                .is_some_and(|state| {
+                    state.weapon_set_flags.iter().any(|held| {
+                        hiding
+                            .forbidden_weapon_flags
+                            .iter()
+                            .any(|listed| held.eq_ignore_ascii_case(listed))
+                    })
+                })
+        {
+            return false;
+        }
         if !hiding.required_upgrades.is_empty() || !hiding.forbidden_upgrades.is_empty() {
             let held = self.effective_upgrades(tick, ids, entity);
             if !hiding.required_upgrades.is_empty() && !held.contains_all(&hiding.required_upgrades)
@@ -788,7 +916,7 @@ impl RotwkRules {
         ids: Ids,
         entity: Entity,
         condition: StealthCondition,
-        period: mint_sim::LogicFrames,
+        _period: mint_sim::LogicFrames,
     ) -> bool {
         match condition {
             StealthCondition::Moving => tick
@@ -796,35 +924,49 @@ impl RotwkRules {
                 .get(ids.body, entity)
                 .is_some_and(|body| body.0.speed > 0.0),
             StealthCondition::Attacking | StealthCondition::FiringAny => {
-                tick.state()
-                    .get(ids.armed, entity)
-                    .is_some_and(|armed| armed.target.is_some())
-                    || tick.state().contains(ids.attack_order, entity)
+                let world = tick.state();
+                let now = tick.frame();
+                attacking_recently(world, ids, entity)
+                    || world.get(ids.horde_last_shot, entity).is_some_and(|shot| {
+                        shot.0.get() > 2
+                            && shot
+                                .0
+                                .checked_add(super::death::frames_of_ms(2000.0))
+                                .is_some_and(|until| until > now)
+                    })
+                    || (condition == StealthCondition::FiringAny
+                        && world.get(ids.horde, entity).is_some_and(|horde| {
+                            horde
+                                .members
+                                .iter()
+                                .any(|member| attacking_recently(world, ids, *member))
+                        }))
             }
             StealthCondition::UsingAbility => tick.state().contains(ids.using_ability, entity),
-            StealthCondition::TakingDamage => tick
-                .state()
-                .get(ids.last_hurt, entity)
-                .is_some_and(|hurt| !hurt.quiet_for(period, tick.frame())),
+            StealthCondition::TakingDamage => {
+                let world = tick.state();
+                world.get(ids.stealth, entity).is_some_and(|state| {
+                    state.hidden
+                        && world
+                            .get(ids.last_hurt, entity)
+                            .and_then(|hurt| hurt.0)
+                            .is_some_and(|hurt| hurt > state.hidden_since)
+                })
+            }
             StealthCondition::AwayFromTrees => false,
             StealthCondition::HordebrainNotStealthed => true,
         }
     }
 
-    fn hide_is_due(&self, entity: Entity, kind: &StealthKind, state: Stealth, now: Frame) -> bool {
-        let period = kind.hiding.period;
-        let Some(since) = state.allowed_since else {
-            return false;
-        };
-        let due = since.checked_add(period).unwrap_or(now);
-        if now < due {
-            return false;
+    fn hide_is_due(kind: &StealthKind, state: Stealth, now: Frame) -> bool {
+        match kind.hiding.source {
+            HiderSource::Invisibility => true,
+            HiderSource::Stealth => state.allowed_since.is_some_and(|since| {
+                since
+                    .checked_add(kind.hiding.period)
+                    .is_none_or(|due| now >= due)
+            }),
         }
-        let span = u64::from(period.get().max(1));
-        now.get()
-            .wrapping_add(u64::from(entity.index()))
-            .checked_rem(span)
-            == Some(0)
     }
 
     fn proximity_reveal(
@@ -833,9 +975,9 @@ impl RotwkRules {
         ids: Ids,
         entity: Entity,
         kind: &StealthKind,
-        living: &[(Foe, PlayerId)],
-        grid: &TargetGrid,
+        (living, grid): (&[(Foe, PlayerId)], &TargetGrid),
         was: u16,
+        (candidates, alliance_only): (&mut Vec<u32>, bool),
     ) -> (u16, Option<Entity>) {
         let Some(range) = kind.hiding.proximity_range else {
             return (0, None);
@@ -846,16 +988,16 @@ impl RotwkRules {
         let owner = tick.state().get(ids.owner, entity).map(|owner| owner.0);
         let at = body.0.position;
         let widest = range * self.stealth.widest_multiplier;
-        let mut candidates: Vec<u32> = Vec::new();
+        candidates.clear();
         grid.query_into(
             grid_cell(at.x),
             grid_cell(at.y),
             grid_radius_cells(widest),
-            &mut candidates,
+            candidates,
         );
         let mut revealed = 0u16;
         let mut detector = None;
-        for index in candidates {
+        for &index in candidates.iter() {
             #[allow(clippy::cast_possible_truncation)]
             let index = index as usize;
             let Some((looker, player)) = living.get(index) else {
@@ -864,9 +1006,15 @@ impl RotwkRules {
             if looker.entity == entity {
                 continue;
             }
-            if owner.is_none()
-                || self.view_relation(tick.state(), *player, entity).victim() != Relation::Enemies
-            {
+            let Some(owner) = owner else {
+                continue;
+            };
+            let relation = if alliance_only {
+                self.alliance_view(*player, owner)
+            } else {
+                self.view_relation(tick.state(), *player, entity)
+            };
+            if relation.victim() != Relation::Enemies {
                 continue;
             }
             let Some(bit) = slot_bit(*player) else {
@@ -1165,6 +1313,7 @@ impl RotwkRules {
         tick: &mut Tick<'_>,
         ids: Ids,
         entity: Entity,
+        power: &str,
         lasts: Option<LogicFrames>,
         palantir_timer: bool,
     ) -> Result<()> {
@@ -1178,24 +1327,171 @@ impl RotwkRules {
                 ..Stealth::default()
             });
         if now < state.activated_until {
-            state.activated_until = Frame::ZERO;
-            state.timer = None;
             diag!("stealth: {} cloak off", entity.index());
-        } else {
-            state.activated_until = lasts
-                .and_then(|lasts| now.checked_add(lasts))
-                .unwrap_or(Frame::FOREVER);
-            state.timer = palantir_timer.then(|| {
-                let until = now.checked_add(lasts.unwrap_or(LogicFrames::ZERO));
-                (now, until.unwrap_or(Frame::FOREVER))
-            });
-            diag!(
-                "stealth: {} cloak on until frame {}",
-                entity.index(),
-                state.activated_until.get()
-            );
+            return self.unhide_toggle(tick, ids, entity);
+        }
+        state.activated_until = lasts
+            .and_then(|lasts| now.checked_add(lasts))
+            .unwrap_or(Frame::FOREVER);
+        state.timer = palantir_timer.then(|| {
+            let until = now.checked_add(lasts.unwrap_or(LogicFrames::ZERO));
+            (now, until.unwrap_or(Frame::FOREVER))
+        });
+        diag!(
+            "stealth: {} cloak on until frame {}",
+            entity.index(),
+            state.activated_until.get()
+        );
+        if let Some(power) = self.power_names.id(power) {
+            if state.power_paused.is_none() {
+                state.power_paused = Some((power, now));
+            }
         }
         tick.state_mut().insert(ids.stealth, entity, state)?;
+        if super::upgrades::is_moving(tick, ids, entity) {
+            self.stop_unit(tick, ids, entity);
+        }
+        if !self.holds_status(tick.state(), entity, HIDDEN_STATUS) {
+            self.apply_effects(
+                tick,
+                ids,
+                vec![
+                    (
+                        entity,
+                        Effect::StatusBits {
+                            set: mint_sage_modules::effects::names(vec![HIDDEN_STATUS.to_owned()]),
+                            clear: mint_sage_modules::effects::names(Vec::new()),
+                        },
+                    ),
+                    (entity, Effect::WeaponSetFlag(HIDDEN_STATUS.into())),
+                    (entity, Self::hidden_condition(true)),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn unhide_toggle(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+    ) -> Result<()> {
+        if !self.holds_status(tick.state(), entity, HIDDEN_STATUS) {
+            return Ok(());
+        }
+        let now = tick.frame();
+        let mut state = tick
+            .state()
+            .get(ids.stealth, entity)
+            .copied()
+            .unwrap_or_default();
+        if let Some((power, since)) = state.power_paused.take() {
+            self.shift_power_countdown(tick, ids, entity, power, since)?;
+        }
+        state.activated_until = Frame::ZERO;
+        state.timer = None;
+        tick.state_mut().insert(ids.stealth, entity, state)?;
+        diag!(
+            "stealth: {} unhidden at frame {}",
+            entity.index(),
+            now.get()
+        );
+        self.apply_effects(
+            tick,
+            ids,
+            vec![
+                (
+                    entity,
+                    Effect::StatusBits {
+                        set: mint_sage_modules::effects::names(Vec::new()),
+                        clear: mint_sage_modules::effects::names(vec![HIDDEN_STATUS.to_owned()]),
+                    },
+                ),
+                (entity, Effect::ClearWeaponSetFlag(HIDDEN_STATUS.into())),
+                (entity, Self::hidden_condition(false)),
+            ],
+        )
+    }
+
+    fn hidden_condition(on: bool) -> Effect {
+        let name = mint_sage_modules::effects::names(vec![HIDDEN_STATUS.to_owned()]);
+        let empty = mint_sage_modules::effects::names(Vec::new());
+        if on {
+            Effect::ModelConditions {
+                add: name,
+                remove: empty,
+            }
+        } else {
+            Effect::ModelConditions {
+                add: empty,
+                remove: name,
+            }
+        }
+    }
+
+    pub(super) fn holds_status(&self, world: &World, entity: Entity, name: &str) -> bool {
+        self.modules
+            .as_ref()
+            .and_then(|wiring| world.get(wiring.state, entity))
+            .is_some_and(|state| {
+                state
+                    .status_bits
+                    .iter()
+                    .any(|held| held.eq_ignore_ascii_case(name))
+            })
+    }
+
+    fn shift_power_countdown(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        power: PowerId,
+        since: Frame,
+    ) -> Result<()> {
+        let paused =
+            u32::try_from(tick.frame().get().saturating_sub(since.get())).unwrap_or(u32::MAX);
+        let shift = |available: Frame| {
+            if available == Frame::ZERO || available == Frame::FOREVER {
+                available
+            } else {
+                available
+                    .checked_add(LogicFrames::from_frames(paused))
+                    .unwrap_or(Frame::FOREVER)
+            }
+        };
+        let shared = self
+            .power_reload
+            .get(usize::from(power.get()))
+            .is_some_and(|(_, shared)| *shared);
+        if shared {
+            let Some(owner) = tick.state().get(ids.owner, entity).map(|owner| owner.0) else {
+                return Ok(());
+            };
+            let Some(player) =
+                crate::economy::player_entity(tick.state(), Self::economy_ids(ids), owner)
+            else {
+                return Ok(());
+            };
+            let Some(mut cooldowns) = tick
+                .state()
+                .get(ids.player_power_cooldowns, player)
+                .cloned()
+            else {
+                return Ok(());
+            };
+            if let Some((available, reload)) = cooldowns.cooldown(power) {
+                cooldowns.set_available_on(power, shift(available), reload);
+                tick.state_mut()
+                    .insert(ids.player_power_cooldowns, player, cooldowns)?;
+            }
+        } else if let Some(mut book) = tick.state().get(ids.power_book, entity).cloned() {
+            if let Some(instance) = book.instance(power).copied() {
+                book.set_available_on(power, shift(instance.available_on), instance.reload);
+                tick.state_mut().insert(ids.power_book, entity, book)?;
+            }
+        }
         Ok(())
     }
 
@@ -1318,7 +1614,7 @@ fn attacking_recently(world: &World, ids: Ids, entity: Entity) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{tree_gated_result, GrantedHiding, Hiding};
+    use super::{tree_gated_result, Grant, GrantedHiding, Hiding};
     use mint_sage_modules::{InvisibilityNugget, InvisibilityType};
     use mint_sim::{Component, Frame, LogicFrames, StateHasher};
 
@@ -1367,14 +1663,14 @@ mod tests {
             detection_range: Some(400.0),
             ..narrow.clone()
         };
-        let a = GrantedHiding {
+        let a = GrantedHiding(vec![Grant {
             hiding: Hiding::from_nugget(&narrow, LogicFrames::ZERO),
             until: Frame::new(100),
-        };
-        let b = GrantedHiding {
+        }]);
+        let b = GrantedHiding(vec![Grant {
             hiding: Hiding::from_nugget(&wide, LogicFrames::ZERO),
             until: Frame::new(100),
-        };
+        }]);
         assert_ne!(
             hash_of(&a),
             hash_of(&b),

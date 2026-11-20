@@ -25,7 +25,9 @@ impl RotwkRules {
             return Ok(());
         }
         let (_, movers) = self.move_order_targets_and_movers(tick, ids, player, true);
-        if self.group_move_tightens(tick, ids, &movers, anchor) {
+        let path = self.command_move_path(tick.state(), ids, player);
+        if path != busy::MovePath::PerMember && self.group_move_tightens(tick, ids, &movers, anchor)
+        {
             return if attack {
                 self.attack_move(tick, ids, player, anchor)
             } else {
@@ -68,11 +70,15 @@ impl RotwkRules {
         if points.is_empty() {
             return Ok(());
         }
-        let order = super::group_move::FormationOrder { points, facing };
+        let order = super::group_move::FormationOrder {
+            points,
+            facing,
+            slots: std::collections::BTreeMap::new(),
+        };
         if attack {
-            self.attack_move_with_drag_formation(tick, ids, player, anchor, order)
+            self.attack_move_with_drag_formation(tick, ids, player, anchor, order, path)
         } else {
-            self.move_to_with_drag_formation(tick, ids, player, anchor, order)
+            self.move_to_with_drag_formation(tick, ids, player, anchor, order, path)
         }
     }
 

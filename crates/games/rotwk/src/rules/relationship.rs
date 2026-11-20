@@ -106,6 +106,15 @@ impl RotwkRules {
         }
     }
 
+    pub(crate) fn views_are_alliance_stances(&self, world: &World, ids: Ids) -> bool {
+        self.script_state(world, ids)
+            .is_none_or(|state| state.rt.relations.is_empty())
+    }
+
+    pub(crate) fn alliance_view(&self, viewer: PlayerId, owner: PlayerId) -> Relation {
+        self.alliances.stance(viewer, owner).into()
+    }
+
     pub(crate) fn player_overrides(&self, world: &World, ids: Ids) -> Relations {
         self.script_state(world, ids)
             .map(|state| state.rt.relations.clone())

@@ -502,7 +502,11 @@ impl ActionVerb for ActionRemoveButton {
         _: u8,
         _: &mut Vec<(Entity, f32)>,
     ) -> Result<()> {
-        if let Some(set) = rules.command_set_of_type(&self.object_type) {
+        let sets = rules
+            .command_set_of_type(&self.object_type)
+            .into_iter()
+            .chain(rules.upgraded_command_sets_of_type(&self.object_type));
+        for set in sets {
             state.hud.remove_button(&set, &self.button);
         }
         Ok(())
@@ -582,6 +586,14 @@ impl RotwkRules {
     pub(super) fn command_set_of_type(&self, object_type: &str) -> Option<String> {
         let kind = self.kinds.kind(object_type)?;
         self.kinds.get(kind)?.record.command_set.clone()
+    }
+
+    pub(super) fn upgraded_command_sets_of_type(&self, object_type: &str) -> Vec<String> {
+        self.kinds
+            .kind(object_type)
+            .and_then(|kind| self.kinds.get(kind))
+            .map(|kind| kind.record.upgraded_command_sets.clone())
+            .unwrap_or_default()
     }
 }
 

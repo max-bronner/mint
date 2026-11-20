@@ -87,7 +87,7 @@ impl Lifetimes {
                     let frames = |ms: f32| {
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let whole = ms as u32;
-                        LogicFrames::from_milliseconds(whole)
+                        mint_sage_modules::retail_duration_ticks(whole)
                     };
                     let death = DeathNaming::of(
                         module
@@ -204,7 +204,7 @@ impl DeathPlans {
                     };
                     let delay_ms = int("DestructionDelay", 0).max(0);
                     let fade_delay = module.field("FadeDelay").map(|_| {
-                        LogicFrames::from_milliseconds(
+                        mint_sage_modules::retail_duration_ticks(
                             u32::try_from(int("FadeDelay", 0).max(0)).unwrap_or(0),
                         )
                     });
@@ -215,7 +215,7 @@ impl DeathPlans {
                                 "ModifierBonusPerOverkillPercent",
                                 0,
                             ),
-                            destruction_delay: LogicFrames::from_milliseconds(
+                            destruction_delay: mint_sage_modules::retail_duration_ticks(
                                 u32::try_from(delay_ms).unwrap_or(0),
                             ),
                             sink_rate,
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn a_lifetime_is_its_range_drawn_and_never_zero() {
-        let ms = LogicFrames::from_milliseconds;
+        let ms = LogicFrames::from_engine_milliseconds;
         let never = |_: u32| -> u32 { panic!("a single value draws nothing") };
         assert_eq!(
             lifetime_delay(ms(0), ms(0), never).get(),

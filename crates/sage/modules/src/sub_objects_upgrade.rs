@@ -3,8 +3,7 @@ use std::sync::Arc;
 use mint_sage_ini::value::parse_bool;
 use mint_sim::module::{Capability, CapabilityMask, UpgradeMask};
 use mint_sim::{
-    Component, CreateContext, Effects, Entity, FieldError, Frame, ModuleFieldSource, ModuleKind,
-    StateHasher,
+    Component, Effects, Entity, FieldError, Frame, ModuleFieldSource, ModuleKind, StateHasher,
 };
 
 use crate::effects::{names, Effect, EffectLog, Name, Names};
@@ -81,12 +80,14 @@ impl UpgradeEffect for SubObjectsUpgrade {
             out.push(Effect::SubObjects {
                 show: Names::from(Vec::new()),
                 hide: Names::clone(&data.hide_sub_objects),
+                permanent: true,
             });
         }
         if !data.show_sub_objects.is_empty() {
             out.push(Effect::SubObjects {
                 show: Names::clone(&data.show_sub_objects),
                 hide: Names::from(Vec::new()),
+                permanent: true,
             });
         }
         out.extend(self.texture_effect());
@@ -101,7 +102,6 @@ impl Component for SubObjectsUpgrade {
 
 impl ModuleKind for SubObjectsUpgrade {
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::Upgrade)
-        .union(CapabilityMask::single(Capability::Create))
         .union(CapabilityMask::single(Capability::Update));
 
     fn update(&mut self, ctx: &mut mint_sim::module::UpdateContext<'_>) -> mint_sim::module::Sleep {
@@ -139,6 +139,7 @@ impl ModuleKind for SubObjectsUpgrade {
                 Effect::SubObjects {
                     show: Names::from(Vec::new()),
                     hide: Names::clone(&data.show_sub_objects),
+                    permanent: true,
                 },
             );
         }
@@ -153,21 +154,7 @@ impl ModuleKind for SubObjectsUpgrade {
                 Effect::SubObjects {
                     show: Names::clone(&data.hide_sub_objects),
                     hide: Names::from(Vec::new()),
-                },
-            );
-        }
-    }
-
-    fn on_create(&mut self, ctx: &mut CreateContext<'_>) {
-        if self.data.show_sub_objects.is_empty() {
-            return;
-        }
-        if let Some(log) = ctx.effects.get::<EffectLog>() {
-            log.push(
-                ctx.entity,
-                Effect::SubObjects {
-                    show: Names::from(Vec::new()),
-                    hide: Names::clone(&self.data.show_sub_objects),
+                    permanent: true,
                 },
             );
         }
@@ -266,14 +253,6 @@ mod tests {
         TestFields(pairs.iter().cloned().collect(), Vec::new())
     }
 
-    fn fire_arrow_tip() -> SubObjectsUpgrade {
-        let fields = test_fields(&[
-            ("TriggeredBy", vec!["1"]),
-            ("ShowSubObjects", vec!["FireArowTip"]),
-        ]);
-        sub_objects_upgrade_from_fields(&fields, Frame::ZERO).unwrap()
-    }
-
     fn entity() -> mint_sim::Entity {
         mint_sim::World::new().spawn().unwrap()
     }
@@ -312,8 +291,11 @@ mod tests {
             state.apply(&effect);
         }
         assert_eq!(
-            state.sub_objects,
-            vec![("Sub_Shown".into(), false), ("Sub_Hidden".into(), true)]
+            [
+                state.sub_object("Sub_Shown"),
+                state.sub_object("Sub_Hidden")
+            ],
+            [Some(false), Some(true)]
         );
     }
 
@@ -432,33 +414,6 @@ mod tests {
             in_force(&state),
             [("Body_Own.tga".into(), "Body_A.tga".into())]
         );
-    }
-
-    #[test]
-    fn creation_hides_the_show_list_and_firing_shows_it() {
-        let mut module = fire_arrow_tip();
-        let mut log = EffectLog::new();
-        let mut create = CreateContext {
-            entity: entity(),
-            now: Frame::ZERO,
-            effects: Effects::into_sink(&mut log),
-        };
-        module.on_create(&mut create);
-        let mut active = UpgradeMask::EMPTY;
-        active.set(UpgradeBit::new(1));
-        let mut ctx = mint_sim::UpgradeContext {
-            entity: entity(),
-            now: Frame::ZERO,
-            effects: Effects::into_sink(&mut log),
-        };
-        module.attempt_upgrade(&active, &mut ctx);
-
-        let mut state = crate::effects::UpgradeState::default();
-        let entries = log.drain();
-        state.apply(&entries[0].1);
-        assert_eq!(state.sub_object("FireArowTip"), Some(false));
-        state.apply(&entries[1].1);
-        assert_eq!(state.sub_object("FireArowTip"), Some(true));
     }
 
     #[test]

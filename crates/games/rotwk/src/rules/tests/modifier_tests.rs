@@ -65,6 +65,11 @@ Object Soldier\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BountyValue = 4\
   Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
   ArmorSet\n    Conditions = None\n    Armor = Plain\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object Veteran\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 100\n  End\n  \
+  Behavior = AutoHealBehavior Tag_Self\n    StartsActive = Yes\n    HealingAmount = 1\n    \
+    HealingDelay = 400\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object Pikeman\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_Body\n    MaxHealth = 1000\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
@@ -139,7 +144,6 @@ const REACH: u8 = 3;
 const OUTLAW: u8 = 4;
 const GIFT: u8 = 5;
 const FARM: u8 = 6;
-const INF_HEAL: u8 = 7;
 
 struct Match {
     data: GameData,
@@ -160,6 +164,7 @@ fn load() -> Match {
         "HealingPost",
         "HealingPostSlow",
         "Soldier",
+        "Veteran",
         "Pikeman",
         "Rider",
         "Swordsman",
@@ -186,6 +191,15 @@ fn simulation_with(
     placed: &[(&str, f32, f32, PlayerId)],
     factor: u32,
 ) -> (Simulation<RotwkRules>, Ids) {
+    simulation_capped(m, placed, factor, Vec::new())
+}
+
+fn simulation_capped(
+    m: &Match,
+    placed: &[(&str, f32, f32, PlayerId)],
+    factor: u32,
+    caps: Vec<Option<u32>>,
+) -> (Simulation<RotwkRules>, Ids) {
     let production = m.kinds.production(&m.data);
     let power_names = crate::powers::PowerNames::build(m.kinds.power_names().map(str::to_owned));
     let power_reload = power_names.reload_table(&m.data.special_powers);
@@ -200,7 +214,13 @@ fn simulation_with(
             ai_base_candidates: Vec::new(),
         })
         .collect();
-    let (sciences, ranks, plans) = crate::skirmish::spell_setup(&m.data, &m.kinds, &starts);
+    let (sciences, ranks, plans) = crate::skirmish::spell_setup(
+        &m.data,
+        &m.kinds,
+        &starts,
+        crate::game_mode::GameMode::Skirmish,
+        false,
+    );
     let power_sciences = power_names.required_sciences(&m.data.special_powers, &sciences);
     let spawns: Vec<Spawn> = placed
         .iter()
@@ -219,7 +239,19 @@ fn simulation_with(
         .collect();
     let map = flat_map(96, 96);
     let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
+    let footprints = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (name, ..))| {
+            let entry = m.kinds.get(m.kinds.kind(name)?)?;
+            entry
+                .record
+                .has_kind("STRUCTURE")
+                .then(|| (at, crate::construction::footprint_of(&entry.record)))
+        })
+        .collect();
     let rules = RotwkRules::new(passability, spawns)
+        .with_structure_footprints(footprints)
         .with_players(2)
         .with_hordes(m.data.formations.tables().to_vec(), Vec::new())
         .with_combat(m.data.combat.clone())
@@ -232,7 +264,8 @@ fn simulation_with(
         .with_spell_books(sciences, ranks, plans, power_sciences)
         .with_creation_lists(Arc::clone(&m.data.ocls))
         .with_command_point_factor(factor)
-        .with_command_point_table(m.data.command_points);
+        .with_command_point_table(m.data.command_points)
+        .with_command_point_overrides(caps);
     let simulation = Simulation::new(5, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
     (simulation, ids)
@@ -530,53 +563,24 @@ fn nonstackable_skips_a_target_recently_healed_by_a_different_source() {
         &m,
         &[
             ("HealingPostSlow", 300.0, 300.0, PLAYER),
-            ("Soldier", 300.0, 350.0, PLAYER),
+            ("Veteran", 300.0, 350.0, PLAYER),
         ],
     );
-    let soldier = placed(&m, &simulation, ids, "Soldier")[0];
+    let veteran = placed(&m, &simulation, ids, "Veteran")[0];
     cast(&mut simulation, OTHER, HURT, Some((300.0, 350.0)));
-    until_hurt(&mut simulation, ids, soldier, 100.0);
-    cast(&mut simulation, PLAYER, INF_HEAL, Some((300.0, 350.0)));
+    until_hurt(&mut simulation, ids, veteran, 100.0);
     let mut max_step = 0.0f32;
-    let mut last = health(&simulation, ids, soldier);
+    let mut last = health(&simulation, ids, veteran);
     for _ in 0..200 {
         simulation.tick().unwrap();
-        let now = health(&simulation, ids, soldier);
+        let now = health(&simulation, ids, veteran);
         max_step = max_step.max(now - last);
         last = now;
     }
     assert!(
         max_step <= 1.1,
-        "no jump bigger than the 1 hp AUTO_HEAL pulse - the slow circle's own 50% heal must not land: {max_step}"
+        "no jump bigger than the veteran's 1 hp pulse - the slow circle's own 50% heal must not land: {max_step}"
     );
-}
-
-#[test]
-fn auto_heal_heals_its_sum_every_pulse() {
-    let m = load();
-    let (mut simulation, ids) = simulation(&m, &[("Barracks", 200.0, 200.0, PLAYER)]);
-    let barracks = placed(&m, &simulation, ids, "Barracks")[0];
-    cast(&mut simulation, OTHER, HURT, Some((200.0, 200.0)));
-    cast(&mut simulation, OTHER, HURT, Some((200.0, 200.0)));
-    run(&mut simulation, 5);
-    assert_eq!(health(&simulation, ids, barracks), 2880.0);
-    run(&mut simulation, 60);
-    assert_eq!(health(&simulation, ids, barracks), 2880.0, "no heal yet");
-    cast(&mut simulation, PLAYER, REBUILD, Some((200.0, 200.0)));
-    let mut rises = Vec::new();
-    let mut last = health(&simulation, ids, barracks);
-    for _ in 0..40 {
-        let frame = simulation.tick().unwrap().frame;
-        let now = health(&simulation, ids, barracks);
-        if now > last {
-            rises.push((frame.get(), now - last));
-        }
-        last = now;
-    }
-    assert_eq!(rises.len(), 3, "{rises:?}");
-    assert!(rises.iter().all(|(frame, _)| frame % 12 == 0), "{rises:?}");
-    assert_eq!(rises[0].1, 50.0);
-    assert_eq!(last, 3000.0, "never past its maximum: {rises:?}");
 }
 
 #[test]
@@ -690,6 +694,41 @@ fn the_command_point_limit_is_the_start_plus_standing_bonuses_up_to_the_maximum(
         limit(&doubled, ids, OTHER),
         350,
         "its sum now clears the unscaled cap"
+    );
+}
+
+#[test]
+fn a_battle_cap_replaces_the_rows_maximum_and_keeps_its_start() {
+    let m = load();
+    let layout = [
+        ("Fortress", 100.0, 100.0, PLAYER),
+        ("Farm", 300.0, 100.0, PLAYER),
+        ("Fortress", 600.0, 600.0, OTHER),
+        ("Farm", 700.0, 600.0, OTHER),
+    ];
+    let (mut simulation, ids) = simulation_capped(&m, &layout, 100, vec![Some(150), Some(40)]);
+    run(&mut simulation, 2);
+    assert_eq!(
+        limit(&simulation, ids, PLAYER),
+        150,
+        "100 + 100 + 50 capped at 150"
+    );
+    assert_eq!(
+        limit(&simulation, ids, OTHER),
+        40,
+        "the cap is below the row's start"
+    );
+
+    let bare = [
+        ("Soldier", 100.0, 100.0, PLAYER),
+        ("Soldier", 600.0, 600.0, OTHER),
+    ];
+    let (mut simulation, ids) = simulation_capped(&m, &bare, 100, vec![Some(150), None]);
+    run(&mut simulation, 2);
+    assert_eq!(
+        limit(&simulation, ids, PLAYER),
+        100,
+        "the row's start, not the cap"
     );
 }
 

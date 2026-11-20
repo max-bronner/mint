@@ -2,6 +2,7 @@ pub mod color_picker;
 pub mod gadget;
 pub mod host;
 pub mod scene;
+pub mod scene_surface;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -645,6 +646,20 @@ impl Letterbox {
     }
 
     #[must_use]
+    pub fn after(&self, inner: Letterbox) -> Letterbox {
+        Letterbox {
+            scale: [
+                self.scale[0] * inner.scale[0],
+                self.scale[1] * inner.scale[1],
+            ],
+            offset: [
+                inner.offset[0] * self.scale[0] + self.offset[0],
+                inner.offset[1] * self.scale[1] + self.offset[1],
+            ],
+        }
+    }
+
+    #[must_use]
     pub fn as_transform(&self) -> ([[f32; 2]; 2], [f32; 2]) {
         ([[self.scale[0], 0.0], [0.0, self.scale[1]]], self.offset)
     }
@@ -954,6 +969,15 @@ fn resolve_with_anchors(
     window_pos: [f32; 2],
 ) -> [f32; 2] {
     let stretch = Letterbox::stretch(stage_w, stage_h, window_w, window_h);
+    resolve_hosted(player, stretch, anchors, window_pos)
+}
+
+fn resolve_hosted(
+    player: &Player,
+    stretch: Letterbox,
+    anchors: &HashMap<InstanceId, Letterbox>,
+    window_pos: [f32; 2],
+) -> [f32; 2] {
     let root = player.root();
     let Some(root_inst) = player.instance(root) else {
         return stretch.to_stage(window_pos);

@@ -1,7 +1,7 @@
 use mint_movement::Vec2;
 use mint_sage_modules::{ObjectRecord, PieceShape};
 use mint_sage_passability::{Footprint, FootprintRecord};
-use mint_sim::{Component, Entity, LogicFrames, StateHasher};
+use mint_sim::{Component, Entity, Frame, LogicFrames, StateHasher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Construction {
@@ -10,6 +10,7 @@ pub(crate) struct Construction {
     pub(crate) rebuild: Option<u32>,
     pub(crate) worker: Option<Entity>,
     pub(crate) delay: u32,
+    pub(crate) created: Frame,
 }
 
 impl Component for Construction {
@@ -23,6 +24,7 @@ impl Component for Construction {
         }
         hasher.write_u32(self.elapsed);
         hasher.write_u32(self.delay);
+        self.created.hash_into(hasher);
         hasher.write_bool(self.rebuild.is_some());
         if let Some(frames) = self.rebuild {
             hasher.write_u32(frames);
@@ -121,6 +123,7 @@ impl Component for AutoRepair {
 pub(crate) enum Reason {
     OffMap,
     Blocked,
+    NotFlat,
     Planned,
     Ford,
     EnemyUnit,
@@ -137,6 +140,7 @@ impl Reason {
         match self {
             Self::OffMap => "off the map",
             Self::Blocked => "blocked by terrain or another structure",
+            Self::NotFlat => "the ground is not flat enough",
             Self::Planned => "a planned building is there",
             Self::Ford => "in a ford",
             Self::EnemyUnit => "an enemy unit is there",
@@ -156,13 +160,99 @@ impl Reason {
             Self::NoMoney => 7,
             Self::Blocked | Self::Planned | Self::EnemyUnit => 8,
             Self::WallHubTooFar => 9,
-            Self::Ford | Self::NoFootprint | Self::NotOffered | Self::Disallowed => 1,
+            Self::NotFlat
+            | Self::Ford
+            | Self::NoFootprint
+            | Self::NotOffered
+            | Self::Disallowed => 1,
         }
+    }
+}
+
+const FLATNESS_SAMPLE_STEP: f32 = 10.0;
+
+pub(crate) fn height_variation(
+    footprint: &[FootprintRecord],
+    centre: Vec2,
+    angle: f32,
+    height_at: impl Fn(f32, f32) -> Option<f32>,
+) -> f32 {
+    let (sin, cos) = mint_math::f32::sin_cos(angle);
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for record in footprint {
+        let (half_x, half_y, disc) = match record.footprint {
+            Footprint::Box { major, minor } => (major, minor, false),
+            Footprint::Disc { radius } => (radius, radius, true),
+        };
+        let mut local_y = -half_y;
+        while local_y < half_y + FLATNESS_SAMPLE_STEP {
+            let y = local_y.min(half_y);
+            let mut local_x = -half_x;
+            while local_x < half_x + FLATNESS_SAMPLE_STEP {
+                let x = local_x.min(half_x);
+                local_x += FLATNESS_SAMPLE_STEP;
+                if disc && x * x + y * y > half_x * half_x {
+                    continue;
+                }
+                let (px, py) = (x + record.offset.x, y + record.offset.y);
+                let at_x = centre.x + px * cos - py * sin;
+                let at_y = centre.y + px * sin + py * cos;
+                if let Some(z) = height_at(at_x, at_y) {
+                    low = low.min(z);
+                    high = high.max(z);
+                }
+            }
+            local_y += FLATNESS_SAMPLE_STEP;
+        }
+    }
+    if high < low {
+        0.0
+    } else {
+        high - low
     }
 }
 
 pub(crate) fn footprint_of(record: &ObjectRecord) -> Vec<FootprintRecord> {
     shown_footprint(record, &[])
+}
+
+pub(crate) fn bounding_radius(records: &[FootprintRecord]) -> f32 {
+    records
+        .iter()
+        .map(|record| {
+            let (ox, oy) = (record.offset.x.abs(), record.offset.y.abs());
+            match record.footprint {
+                Footprint::Box { major, minor } => {
+                    let (x, y) = (ox + major, oy + minor);
+                    (x * x + y * y).sqrt()
+                }
+                Footprint::Disc { radius } => (ox * ox + oy * oy).sqrt() + radius,
+            }
+        })
+        .fold(0.0, f32::max)
+}
+
+pub(crate) fn object_bounding_radius(
+    world: &mint_sim::World,
+    kinds: &crate::templates::KindTable,
+    ids: (
+        mint_sim::ComponentId<crate::unit::Kind>,
+        Option<mint_sim::ComponentId<mint_sage_modules::effects::UpgradeState>>,
+    ),
+    entity: Entity,
+) -> f32 {
+    let overrides = ids
+        .1
+        .and_then(|state| world.get(state, entity))
+        .map_or(&[][..], |state| state.geometry.as_slice());
+    world
+        .get(ids.0, entity)
+        .and_then(|kind| kinds.get(*kind))
+        .map_or(0.0, |entry| {
+            bounding_radius(&shown_footprint(&entry.record, overrides))
+        })
+        .max(0.01)
 }
 
 pub(crate) fn shown_footprint(
@@ -172,6 +262,7 @@ pub(crate) fn shown_footprint(
     record
         .geometry
         .shown(overrides)
+        .filter(|piece| piece.offset_z <= mint_sage_passability::MAX_STAMPED_OFFSET_Z)
         .filter_map(|piece| {
             let footprint = match piece.shape {
                 PieceShape::Box { major, minor } if major > 0.0 || minor > 0.0 => {
@@ -188,8 +279,6 @@ pub(crate) fn shown_footprint(
         .collect()
 }
 
-const BOOKEND_DECK_HEIGHT: f32 = 10.0;
-
 pub(crate) fn bookend_footprint(record: &ObjectRecord) -> Option<FootprintRecord> {
     let piece = record.geometry.pieces.iter().find(|piece| {
         piece
@@ -197,10 +286,7 @@ pub(crate) fn bookend_footprint(record: &ObjectRecord) -> Option<FootprintRecord
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case("Bookend"))
     })?;
-    if piece
-        .height
-        .is_some_and(|height| height > BOOKEND_DECK_HEIGHT)
-    {
+    if piece.offset_z > mint_sage_passability::MAX_STAMPED_OFFSET_Z {
         return None;
     }
     let footprint = match piece.shape {
@@ -303,11 +389,46 @@ mod tests {
         production_cost_change_percent: 0.0,
         kind_of_modifier: 1.0,
         handicap: 1.0,
+        brutal_reduction: 0.0,
     };
     const TIME: mint_sage_economy::TimeModifiers = mint_sage_economy::TimeModifiers {
         handicap: 1.0,
         production_time_change_percent: 0.0,
+        builder_modifier: 1.0,
+        speed_multiplier: 1.0,
+        brutal_reduction: 0.0,
     };
+
+    #[test]
+    fn height_variation_spans_the_rotated_footprint_and_skips_off_map_samples() {
+        let slope = |x: f32, _y: f32| Some(x * 0.5);
+        let boxed = [FootprintRecord {
+            offset: Vec2::ZERO,
+            footprint: Footprint::Box {
+                major: 40.0,
+                minor: 10.0,
+            },
+        }];
+        assert!(
+            (height_variation(&boxed, Vec2::new(100.0, 100.0), 0.0, slope) - 40.0).abs() < 1e-3
+        );
+        let across = height_variation(
+            &boxed,
+            Vec2::new(100.0, 100.0),
+            core::f32::consts::FRAC_PI_2,
+            slope,
+        );
+        assert!(
+            across < 11.0,
+            "turned a quarter, only the minor radius lies along the slope: {across}"
+        );
+        let disc = [FootprintRecord {
+            offset: Vec2::ZERO,
+            footprint: Footprint::Disc { radius: 20.0 },
+        }];
+        assert!((height_variation(&disc, Vec2::new(100.0, 100.0), 0.0, slope) - 20.0).abs() < 1e-3);
+        assert_eq!(height_variation(&boxed, Vec2::ZERO, 0.0, |_, _| None), 0.0);
+    }
 
     fn record_with(pieces: Vec<(f32, f32, PieceShape)>) -> ObjectRecord {
         ObjectRecord {
@@ -365,64 +486,67 @@ mod tests {
 
     fn piece_named(
         name: &str,
-        height: Option<f32>,
+        offset_z: f32,
         shape: PieceShape,
     ) -> mint_sage_modules::GeometryPiece {
         mint_sage_modules::GeometryPiece {
             offset: (3.0, 4.0),
-            offset_z: 0.0,
+            offset_z,
             shape,
             name: Some(name.to_owned()),
             active: false,
-            height,
+            height: Some(53.0),
             for_health_box: true,
         }
     }
 
-    #[test]
-    fn bookend_footprint_reads_the_named_piece_at_or_under_the_deck_height() {
-        let record = ObjectRecord {
+    fn record_of(piece: mint_sage_modules::GeometryPiece) -> ObjectRecord {
+        ObjectRecord {
             geometry: mint_sage_modules::Geometry {
-                pieces: vec![piece_named(
-                    "Bookend",
-                    Some(BOOKEND_DECK_HEIGHT),
-                    PieceShape::Disc { radius: 20.0 },
-                )],
+                pieces: vec![piece],
                 ..mint_sage_modules::Geometry::default()
             },
             ..ObjectRecord::default()
-        };
-        let footprint = bookend_footprint(&record).expect("a Bookend piece at the limit qualifies");
-        assert_eq!(footprint.offset, Vec2::new(3.0, 4.0));
-        assert_eq!(footprint.footprint, Footprint::Disc { radius: 20.0 });
+        }
     }
 
     #[test]
-    fn a_tall_bookend_or_a_missing_one_is_refused() {
-        let tall = ObjectRecord {
+    fn a_bookend_is_re_added_by_its_offset_z_not_its_height() {
+        let disc = PieceShape::Disc { radius: 20.0 };
+        let footprint = bookend_footprint(&record_of(piece_named("Bookend", 0.0, disc)))
+            .expect("a tall Bookend at ground level qualifies");
+        assert_eq!(footprint.offset, Vec2::new(3.0, 4.0));
+        assert_eq!(footprint.footprint, Footprint::Disc { radius: 20.0 });
+        assert!(bookend_footprint(&record_of(piece_named("Bookend", 11.0, disc))).is_none());
+        assert!(bookend_footprint(&record_of(piece_named("Other", 0.0, disc))).is_none());
+    }
+
+    #[test]
+    fn a_raised_geometry_piece_is_not_stamped() {
+        let mut low = piece_named("Low", 0.0, PieceShape::Disc { radius: 5.0 });
+        low.active = true;
+        let mut edge = piece_named("Edge", 10.0, PieceShape::Disc { radius: 6.0 });
+        edge.active = true;
+        let mut raised = piece_named("Raised", 11.0, PieceShape::Disc { radius: 7.0 });
+        raised.active = true;
+        let record = ObjectRecord {
             geometry: mint_sage_modules::Geometry {
-                pieces: vec![piece_named(
-                    "Bookend",
-                    Some(BOOKEND_DECK_HEIGHT + 1.0),
-                    PieceShape::Disc { radius: 20.0 },
-                )],
+                pieces: vec![low, edge, raised],
                 ..mint_sage_modules::Geometry::default()
             },
             ..ObjectRecord::default()
         };
-        assert!(bookend_footprint(&tall).is_none(), "too tall, still a deck");
-        let none = ObjectRecord {
-            geometry: mint_sage_modules::Geometry {
-                pieces: vec![piece_named(
-                    "Other",
-                    Some(0.0),
-                    PieceShape::Disc { radius: 20.0 },
-                )],
-                ..mint_sage_modules::Geometry::default()
-            },
-            ..ObjectRecord::default()
-        };
-        assert!(bookend_footprint(&none).is_none(), "no piece named Bookend");
+        let radii: Vec<Footprint> = footprint_of(&record)
+            .into_iter()
+            .map(|record| record.footprint)
+            .collect();
+        assert_eq!(
+            radii,
+            [
+                Footprint::Disc { radius: 5.0 },
+                Footprint::Disc { radius: 6.0 }
+            ]
+        );
     }
 
     #[test]

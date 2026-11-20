@@ -5,8 +5,8 @@ use mint_sage_ini::AnimationFxEvent;
 
 use super::fx::{queue_fx_events, MAX_FX_EVENTS_QUEUED};
 use super::pose::{
-    pose_drawable, record_sub_object_writes, run_chunked, sub_object_overrides,
-    write_permanent_parts, Posed,
+    pose_drawable, record_sub_object_writes, route_script_writes, sub_object_overrides,
+    take_look_writes, write_parts, Posed,
 };
 use super::*;
 use crate::animation_state::{rate_scale, WeaponPhase};
@@ -278,27 +278,6 @@ fn the_stretch_bound_is_never_below_the_real_stretch() {
     assert!((stretch_bound(matrices[2]) - 2.0).abs() < 1e-3);
 }
 
-#[test]
-fn every_chunked_item_travels_with_its_own_pair() {
-    for threads in [1usize, 2, 3, 8, 64] {
-        let mut items: Vec<u32> = (0..1000).collect();
-        let pairs: Vec<u32> = (0..1000).map(|i| i * 3).collect();
-        let sums = run_chunked(&mut items, &pairs, threads, 1, |chunk, pairs| {
-            assert_eq!(chunk.len(), pairs.len());
-            for (item, pair) in chunk.iter_mut().zip(pairs) {
-                assert_eq!(*pair, *item * 3, "an item met another's pair");
-                *item += 1;
-            }
-            chunk.len()
-        });
-        assert_eq!(sums.iter().sum::<usize>(), 1000, "{threads} thread(s)");
-        assert!(items
-            .iter()
-            .zip(1u32..)
-            .all(|(value, expected)| *value == expected));
-    }
-}
-
 fn empty_body() -> Arc<BodyArt> {
     Arc::new(BodyArt {
         model: Arc::new(CachedModel {
@@ -315,8 +294,13 @@ fn empty_body() -> Arc<BodyArt> {
 
 fn scene_with_one_template() -> UnitScene {
     let mut scene = UnitScene::new();
-    scene.templates.push(UnitTemplate {
-        name: "Synthetic".to_owned(),
+    scene.templates.push(synthetic_template("Synthetic"));
+    scene
+}
+
+fn synthetic_template(name: &str) -> UnitTemplate {
+    UnitTemplate {
+        name: name.to_owned(),
         light_set: mint_sage_model::OBJECT_LIGHT_SET,
         swirl_host: false,
         model: Some("synthetic".to_owned()),
@@ -337,6 +321,8 @@ fn scene_with_one_template() -> UnitScene {
         companions: Vec::new(),
         floors: Vec::new(),
         modules: Vec::new(),
+        module_tags: Vec::new(),
+        body_rank: 0,
         module_of: None,
         attach: None,
         look_conditions: Vec::new(),
@@ -350,8 +336,7 @@ fn scene_with_one_template() -> UnitScene {
         max_update_range_cap: None,
         sound_cues: BTreeMap::new(),
         frame_event_parts: BTreeMap::new(),
-    });
-    scene
+    }
 }
 
 fn scene_with_two_templates() -> UnitScene {
@@ -378,6 +363,8 @@ fn scene_with_two_templates() -> UnitScene {
         companions: Vec::new(),
         floors: Vec::new(),
         modules: Vec::new(),
+        module_tags: Vec::new(),
+        body_rank: 0,
         module_of: None,
         attach: None,
         look_conditions: Vec::new(),
@@ -708,12 +695,16 @@ fn a_force_to_back_floor_sorts_after_the_others() {
             FloorModule {
                 model: model.clone(),
                 hide_if: Conditions::NONE,
+                tag: None,
+                start_hidden: false,
                 weather: Vec::new(),
                 force_to_back: true,
             },
             FloorModule {
                 model,
                 hide_if: Conditions::NONE,
+                tag: None,
+                start_hidden: false,
                 weather: Vec::new(),
                 force_to_back: false,
             },
@@ -1091,6 +1082,15 @@ fn the_selected_model_states_decal_is_drawn_under_the_drawable() {
         texture: "ring".to_owned(),
         size_x: 440.0,
         size_y: 440.0,
+        opacity: mint_sage_ini::DecalOpacity {
+            dynamic: false,
+            start: 0,
+            fade_in_ms: 0.0,
+            peak: 255,
+            fade_out_ms: 0.0,
+            end: 0,
+        },
+        override_lod_visibility: false,
     };
     let state = |conditions: &[&str], decal: Option<mint_sage_ini::StateDecal>| ModelStateDef {
         conditions: conditions.iter().map(|c| (*c).to_owned()).collect(),
@@ -1435,6 +1435,12 @@ fn an_override_carries_to_the_parts_on_bones_below_the_named_part() {
             "{why}"
         );
     }
+    let siblings = [("M.MOUNT", Some(1)), ("M.SADDLE", Some(1))];
+    assert_eq!(
+        bone_part_overrides(&[("Mount", false)], &siblings, &pivots),
+        [Some(false), None],
+        "a part on the same bone is not reached"
+    );
 }
 
 #[test]
@@ -1442,7 +1448,12 @@ fn a_look_is_interned_once_and_rebuilt_only_when_its_stamp_moves() {
     let mut scene = UnitScene::new();
     assert_eq!(scene.intern_look(UnitLook::default()), LookKey::PLAIN);
     let tip = UnitLook {
-        sub_objects: vec![("FireArowTip".into(), true)],
+        sub_objects: vec![LookSubObject {
+            name: "FireArowTip".into(),
+            shown: true,
+            permanent: true,
+            rewrites: 0,
+        }],
         ..UnitLook::default()
     };
     let key = scene.intern_look(tip.clone());
@@ -1478,18 +1489,105 @@ fn a_look_is_interned_once_and_rebuilt_only_when_its_stamp_moves() {
 }
 
 #[test]
-fn an_upgrades_override_wins_over_the_states_and_either_alone_decides() {
-    assert!(!overridden_hidden(None, None));
-    assert!(overridden_hidden(None, Some(false)));
-    assert!(!overridden_hidden(None, Some(true)));
-    assert!(overridden_hidden(Some(false), None));
-    assert!(
-        !overridden_hidden(Some(true), Some(false)),
-        "the upgrade shows it"
+fn a_simulation_write_and_a_state_script_share_one_last_write_per_name() {
+    let write = |shown: bool, rewrites: u32| -> Arc<[LookSubObject]> {
+        Arc::from([LookSubObject {
+            name: "Club".into(),
+            shown,
+            permanent: true,
+            rewrites,
+        }])
+    };
+    let mut scene = scene_with_one_template();
+    scene.sync(&[pose(9, 0)], 0.0);
+    let art = scene.templates.first().unwrap();
+    let drawable = scene.drawables.first_mut().unwrap();
+    let club = |drawable: &UnitDrawable| drawable.permanent_parts.clone();
+
+    assert!(take_look_writes(drawable, art, write(false, 0)));
+    assert_eq!(club(drawable), [("Club".to_owned(), false)]);
+
+    write_parts(drawable, vec![("Club".to_owned(), true, true)]);
+    assert!(!take_look_writes(drawable, art, write(false, 0)));
+    assert_eq!(
+        club(drawable),
+        [("Club".to_owned(), true)],
+        "the state's show stands"
     );
-    assert!(
-        overridden_hidden(Some(false), Some(true)),
-        "the upgrade hides it"
+
+    assert!(take_look_writes(drawable, art, write(false, 1)));
+    assert_eq!(
+        club(drawable),
+        [("Club".to_owned(), false)],
+        "a rewrite is a new write"
+    );
+}
+
+#[test]
+fn a_transition_reached_from_a_script_writes_its_parts() {
+    let table = mint_sage_ini::BlockTable::object_model_path();
+    let text = "Object A
+  Draw = W3DScriptedModelDraw T
+    DefaultModelConditionState
+      Model = Body
+    End
+    IdleAnimationState
+      Animation
+        AnimationName = idle
+      End
+    End
+    AnimationState = MOVING
+      Animation
+        AnimationName = run
+      End
+      BeginScript
+        CurDrawableSetTransitionAnimState(\"TRANS_Go\")
+      EndScript
+    End
+    TransitionState = TRANS_Go
+      Animation
+        AnimationName = go
+      End
+      BeginScript
+        CurDrawableHideSubObject(\"TIP\")
+      EndScript
+    End
+  End
+End
+";
+    let document = mint_sage_ini::Document::parse("t.ini", text, &table).unwrap();
+    let draw = document.roots()[0].blocks().next().unwrap().clone();
+    let states = mint_sage_ini::draw_animation_states(&draw);
+    let (scripts, report) = crate::anim_script::compile_states(&states);
+    assert_eq!(report.failed, 0);
+    let mut scene = scene_with_one_template();
+    {
+        let template = scene.templates.get_mut(0).unwrap();
+        template.machine = StateMachine::compile(&states);
+        template.scripts = scripts;
+        template.transition_names = BTreeMap::from([("TRANS_GO".to_owned(), 2)]);
+        template.states = states;
+    }
+    let unit = pose(9, 0);
+    scene.sync(&[unit], 0.0);
+    let mut scratch = Scratch::default();
+    for conditions in [Conditions::NONE, Conditions::MOVING] {
+        let template = scene.templates.first().unwrap();
+        let drawable = scene.drawables.first_mut().unwrap();
+        pose_drawable(
+            drawable,
+            template,
+            &UnitPose { conditions, ..unit },
+            1.0,
+            &[],
+            Blending::Retail,
+            true,
+            &mut scratch,
+        );
+    }
+    assert_eq!(
+        scene.drawables.first().unwrap().plain_parts,
+        [("TIP".to_owned(), false)]
     );
 }
 
@@ -1498,18 +1596,18 @@ fn a_look_selects_its_states_and_follows_the_body_worn() {
     let mut scene = scene_with_one_template();
     let upgraded = UnitLook {
         conditions: vec!["WEAPONSET_PLAYER_UPGRADE".into()],
-        sub_objects: vec![("Forged_Blade".into(), true)],
+        sub_objects: Vec::new(),
         ..UnitLook::default()
     };
     let key = scene.intern_look(upgraded);
-    let art = |hidden: bool| {
+    let art = || {
         Arc::new(LookArt {
-            parts: vec![Some(!hidden)],
+            writes: Arc::from([]),
             skin: None,
             conditions: Conditions::NONE,
         })
     };
-    let (pool_art, scaffold_art) = (art(false), art(true));
+    let (pool_art, scaffold_art) = (art(), art());
     {
         let template = scene.templates.get_mut(0).unwrap();
         template.model_states = vec![
@@ -1574,7 +1672,7 @@ fn a_look_selects_its_states_and_follows_the_body_worn() {
 fn a_look_resolved_after_first_sight_is_still_worn() {
     let mut scene = scene_with_one_template();
     let key = scene.intern_look(UnitLook {
-        sub_objects: vec![("Tip".into(), true)],
+        conditions: vec!["TIP".into()],
         ..UnitLook::default()
     });
     let worn = UnitPose {
@@ -2216,7 +2314,12 @@ fn a_rider_is_drawn_on_its_containers_bone_as_posed_now() {
     }
     scene.drawables.get_mut(1).unwrap().placement =
         Mat4::from_translation(Vec3::new(110.0, 0.0, 5.0));
-    super::ride::carry_riders(&mut scene.drawables, &[Some(0), Some(1)], &poses);
+    super::ride::carry_riders(
+        &mut scene.drawables,
+        &scene.keys,
+        &[Some(0), Some(1)],
+        &poses,
+    );
     let drawn = scene.drawables[1].placement().transform_point(Vec3::ZERO);
     assert!(
         (drawn.x - 110.0).abs() < 1e-4 && drawn.y.abs() < 1e-4 && (drawn.z - 15.0).abs() < 1e-4,
@@ -2257,16 +2360,16 @@ fn frame_lua_events_list_their_data_and_write_permanent_sub_objects() {
         state(vec![event(35, "show_rock"), event(40, "hide_rock")]),
     ];
     assert_eq!(scene.frame_event_data(0), ["hide_rock", "show_rock"]);
-    scene.set_frame_event_parts(0, "hide_rock", vec![("ROCK".to_owned(), false)]);
+    scene.set_frame_event_parts(0, "hide_rock", vec![("ROCK".to_owned(), false, true)]);
     assert_eq!(
         scene.templates[0].frame_event_parts.get("hide_rock"),
-        Some(&vec![("ROCK".to_owned(), false)])
+        Some(&vec![("ROCK".to_owned(), false, true)])
     );
 
     scene.sync(&[pose(6, 0)], 0.0);
     let drawable = scene.drawables.first_mut().unwrap();
-    write_permanent_parts(drawable, vec![("ROCK".to_owned(), false)]);
-    write_permanent_parts(drawable, vec![("rock".to_owned(), true)]);
+    write_parts(drawable, vec![("ROCK".to_owned(), false, true)]);
+    write_parts(drawable, vec![("rock".to_owned(), true, true)]);
     assert_eq!(drawable.permanent_parts, [("ROCK".to_owned(), true)]);
 }
 
@@ -2717,5 +2820,250 @@ fn a_house_colour_list_is_one_colour_or_three_and_black_alone_is_nothing() {
         house_colour_layer(&[black, black, black]),
         Some((black, [black; 2])),
         "a three-colour list is always drawn, even all black"
+    );
+}
+
+fn scene_with_tagged_floor(start_hidden: bool) -> UnitScene {
+    let mut scene = scene_with_one_template();
+    let model = Arc::new(CachedModel {
+        name: "floor".to_owned(),
+        hierarchy: None,
+        parts: Vec::new(),
+        bounds: Aabb::EMPTY,
+        vertices: 0,
+        triangles: 0,
+    });
+    scene.templates.get_mut(0).unwrap().floors = vec![FloorModule {
+        model,
+        hide_if: Conditions::NONE,
+        tag: Some("Floor".to_owned()),
+        start_hidden,
+        weather: Vec::new(),
+        force_to_back: false,
+    }];
+    scene.sync(&[pose(9, 0)], 0.0);
+    scene.drawables.first_mut().unwrap().present = true;
+    scene
+}
+
+fn floors_drawn(scene: &UnitScene) -> usize {
+    floors_wanted(&scene.drawables, &scene.templates).len()
+}
+
+#[test]
+fn a_script_write_hides_a_floor_by_tag_only_where_retail_looks_the_tag_up() {
+    let rows: [(&str, bool, bool, bool, bool); 4] = [
+        ("Floor", false, false, false, false),
+        ("floor", false, false, true, true),
+        ("Floor", true, false, true, true),
+        ("Floor", false, true, false, false),
+    ];
+    for (name, permanent, module, drawn, part) in rows {
+        let mut scene = scene_with_tagged_floor(false);
+        let art = scene.templates.first().unwrap();
+        let drawable = scene.drawables.first_mut().unwrap();
+        let (calls, modules) = if module {
+            (Vec::new(), vec![(name.to_owned(), false)])
+        } else {
+            (vec![(name.to_owned(), false, permanent)], Vec::new())
+        };
+        let rest = route_script_writes(drawable, art, calls, &modules);
+        assert_eq!(rest.len() == 1, part, "{name} {permanent} {module}");
+        assert_eq!(
+            floors_drawn(&scene) == 1,
+            drawn,
+            "{name} {permanent} {module}"
+        );
+    }
+}
+
+#[test]
+fn a_script_show_by_tag_returns_the_floor() {
+    let mut scene = scene_with_tagged_floor(false);
+    let art = scene.templates.first().unwrap();
+    let drawable = scene.drawables.first_mut().unwrap();
+    route_script_writes(drawable, art, vec![("Floor".to_owned(), false, false)], &[]);
+    assert_eq!(floors_drawn(&scene), 0);
+    let drawable = scene.drawables.first_mut().unwrap();
+    route_script_writes(drawable, art, vec![("Floor".to_owned(), true, false)], &[]);
+    assert_eq!(floors_drawn(&scene), 1);
+}
+
+#[test]
+fn simulation_writes_follow_each_writers_lookup_rule() {
+    let write = |shown: bool, permanent: bool, rewrites: u32| -> Arc<[LookSubObject]> {
+        Arc::from([LookSubObject {
+            name: "Floor".into(),
+            shown,
+            permanent,
+            rewrites,
+        }])
+    };
+    let mut scene = scene_with_tagged_floor(false);
+    let art = scene.templates.first().unwrap();
+    let drawable = scene.drawables.first_mut().unwrap();
+    take_look_writes(drawable, art, write(false, false, 0));
+    assert_eq!(floors_drawn(&scene), 1);
+    let drawable = scene.drawables.first_mut().unwrap();
+    take_look_writes(drawable, art, write(false, true, 0));
+    assert_eq!(floors_drawn(&scene), 0);
+    assert!(scene.drawables.first().unwrap().permanent_parts.is_empty());
+    let drawable = scene.drawables.first_mut().unwrap();
+    take_look_writes(drawable, art, write(true, true, 1));
+    assert_eq!(floors_drawn(&scene), 1);
+    assert_eq!(
+        scene.drawables.first().unwrap().permanent_parts,
+        [("Floor".to_owned(), true)]
+    );
+}
+
+#[test]
+fn a_script_write_naming_a_model_modules_tag_hides_that_module_drawable() {
+    let mut scene = scene_with_one_template();
+    let module = synthetic_template("Synthetic/Tower");
+    scene.templates.push(module);
+    let body = scene.templates.first_mut().unwrap();
+    body.modules = vec![1];
+    body.module_tags = vec![Some("Tower".to_owned())];
+    scene.sync(&[pose(9, 0)], 0.0);
+    assert_eq!(scene.drawables.len(), 2);
+    let drawn_after = |scene: &mut UnitScene, shown: bool| {
+        let art = scene.templates.first().unwrap();
+        let drawable = scene.drawables.first_mut().unwrap();
+        let rest =
+            route_script_writes(drawable, art, vec![("Tower".to_owned(), shown, false)], &[]);
+        assert!(rest.is_empty(), "a module tag writes no part");
+        for drawable in &mut scene.drawables {
+            drawable.drawn = true;
+        }
+        hide_modules_by_name(&mut scene.drawables, &scene.templates, &scene.keys);
+        scene.drawables.iter().map(|d| d.drawn).collect::<Vec<_>>()
+    };
+    assert_eq!(drawn_after(&mut scene, false), [true, false]);
+    assert_eq!(drawn_after(&mut scene, true), [true, true]);
+}
+
+#[test]
+fn a_start_hidden_floor_waits_for_its_first_flag_change() {
+    let mut scene = scene_with_tagged_floor(true);
+    assert_eq!(floors_drawn(&scene), 0);
+    let art = scene.templates.first().unwrap();
+    let drawable = scene.drawables.first_mut().unwrap();
+    route_script_writes(drawable, art, vec![("Floor".to_owned(), true, false)], &[]);
+    assert_eq!(
+        floors_drawn(&scene),
+        0,
+        "a show that changes nothing adds nothing"
+    );
+    let drawable = scene.drawables.first_mut().unwrap();
+    route_script_writes(drawable, art, vec![("Floor".to_owned(), false, false)], &[]);
+    let drawable = scene.drawables.first_mut().unwrap();
+    route_script_writes(drawable, art, vec![("Floor".to_owned(), true, false)], &[]);
+    assert_eq!(floors_drawn(&scene), 1);
+}
+
+#[test]
+fn a_drawable_that_draws_nothing_still_runs_its_state_script() {
+    let table = mint_sage_ini::BlockTable::object_model_path();
+    let text = "Object A
+  Draw = W3DScriptedModelDraw T
+    DefaultModelConditionState
+      Model = Body
+    End
+    IdleAnimationState
+      Animation
+        AnimationName = idle
+      End
+    End
+    AnimationState = MOVING
+      BeginScript
+        CurDrawableHideSubObject(\"Floor\")
+      EndScript
+    End
+  End
+End
+";
+    let document = mint_sage_ini::Document::parse("t.ini", text, &table).unwrap();
+    let draw = document.roots()[0].blocks().next().unwrap().clone();
+    let states = mint_sage_ini::draw_animation_states(&draw);
+    let (scripts, report) = crate::anim_script::compile_states(&states);
+    assert_eq!(report.failed, 0);
+    let mut scene = scene_with_tagged_floor(false);
+    {
+        let template = scene.templates.get_mut(0).unwrap();
+        template.machine = StateMachine::compile(&states);
+        template.scripts = scripts;
+        template.states = states;
+        template.hide_if = Conditions::MOVING;
+    }
+    let unit = pose(9, 0);
+    let mut scratch = Scratch::default();
+    for conditions in [Conditions::NONE, Conditions::MOVING] {
+        let template = scene.templates.first().unwrap();
+        let drawable = scene.drawables.first_mut().unwrap();
+        pose_drawable(
+            drawable,
+            template,
+            &UnitPose { conditions, ..unit },
+            1.0,
+            &[],
+            Blending::Retail,
+            true,
+            &mut scratch,
+        );
+        drawable.last_conditions = conditions;
+    }
+    assert!(!scene.drawables.first().unwrap().drawn);
+    assert_eq!(floors_drawn(&scene), 0);
+}
+
+fn art_with_bones(names: &[&str]) -> Option<Arc<BodyArt>> {
+    let pivots = names
+        .iter()
+        .map(|name| mint_sage_w3d::Pivot {
+            name: (*name).to_owned(),
+            ..Default::default()
+        })
+        .collect();
+    Some(Arc::new(BodyArt {
+        model: Arc::new(CachedModel {
+            name: "rigid".to_owned(),
+            hierarchy: Some(mint_sage_w3d::Hierarchy {
+                header: mint_sage_w3d::HierarchyHeader::default(),
+                pivots,
+            }),
+            parts: Vec::new(),
+            bounds: Aabb::EMPTY,
+            vertices: 0,
+            triangles: 0,
+        }),
+        gpu: GpuSkin::default(),
+    }))
+}
+
+#[test]
+fn a_bone_resolves_in_the_first_declared_module_that_carries_it() {
+    let mut scene = scene_with_two_templates();
+    scene.templates[0].modules = vec![1];
+    scene.templates[1].module_of = Some(0);
+    scene.templates[0].art = vec![art_with_bones(&["ROOT", "SHARED", "BODYONLY"])];
+    scene.templates[1].art = vec![art_with_bones(&["ROOT", "SHARED", "MODULEONLY"])];
+    scene.sync(&[pose(5, 0)], 0.0);
+    let source = |scene: &UnitScene, from: usize, bone: &str| {
+        let drawable = scene.drawables.iter().find(|d| d.template == from).unwrap();
+        crate::particles_present::bone_source(scene, drawable, Some(bone), true).template
+    };
+    assert_eq!(source(&scene, 1, "SHARED"), 0, "body declared first");
+    assert_eq!(source(&scene, 1, "MODULEONLY"), 1, "only the module has it");
+    assert_eq!(
+        source(&scene, 0, "MODULEONLY"),
+        1,
+        "searched from the body too"
+    );
+    scene.templates[0].body_rank = 1;
+    assert_eq!(
+        source(&scene, 0, "SHARED"),
+        1,
+        "module declared before the body"
     );
 }

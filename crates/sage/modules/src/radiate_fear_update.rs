@@ -84,6 +84,7 @@ impl Component for RadiateFearUpdate {
 }
 
 impl ModuleKind for RadiateFearUpdate {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::NEVER;
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::Update)
         .union(CapabilityMask::single(Capability::Upgrade));
 
@@ -112,22 +113,12 @@ impl RadiateFearUpdate {
         if !self.active || self.data.kinds.is_empty() || self.data.radius <= 0.0 {
             return Sleep::Forever;
         }
-        let due = match self.next_pulse {
-            Some(due) => due,
-            None => {
-                let offset = stagger(ctx.entity, self.data.interval);
-                let due = ctx.now.checked_add(offset).unwrap_or(ctx.now);
-                self.next_pulse = Some(due);
-                if due > ctx.now {
-                    return Sleep::Frames(offset);
-                }
-                due
-            }
-        };
+        let due = self.next_pulse.unwrap_or(ctx.now);
+        let every = self.data.interval.saturating_add(stagger(ctx.entity));
         if ctx.now < due {
-            return Sleep::Frames(self.data.interval);
+            return Sleep::Frames(every);
         }
-        self.next_pulse = ctx.now.checked_add(self.data.interval);
+        self.next_pulse = ctx.now.checked_add(every);
         if let Some(log) = ctx.effects.get::<EffectLog>() {
             for kind in &self.data.kinds {
                 log.push(
@@ -142,13 +133,15 @@ impl RadiateFearUpdate {
                 );
             }
         }
-        Sleep::Frames(self.data.interval)
+        Sleep::Frames(every)
     }
 }
 
-fn stagger(entity: Entity, interval: LogicFrames) -> LogicFrames {
-    let span = interval.get().max(1);
-    LogicFrames::from_frames(entity.index().checked_rem(span).unwrap_or(0))
+fn stagger(entity: Entity) -> LogicFrames {
+    let frames = entity.index().checked_rem(5).unwrap_or(0);
+    LogicFrames::from_frames(
+        frames.saturating_mul(crate::special_ability_update::TICKS_PER_RETAIL_FRAME),
+    )
 }
 
 pub fn radiate_fear_update_from_fields(
@@ -201,7 +194,8 @@ pub fn radiate_fear_update_from_fields(
         data: Arc::new(RadiatorData {
             initially_active,
             radius: number("EmotionPulseRadius")?.unwrap_or(0.0),
-            interval: LogicFrames::from_milliseconds(interval_ms).max(LogicFrames::ONE),
+            interval: crate::special_ability_update::retail_duration_ticks(interval_ms)
+                .max(LogicFrames::ONE),
             kinds,
             victim_filter: Arc::new(ObjectFilter::parse(&victim_tokens)),
             which_special_power: number("WhichSpecialPower")?.map(|value| {
@@ -266,9 +260,21 @@ mod tests {
         frames: u64,
         upgrade_at: Option<u64>,
     ) -> Vec<(u64, Effect)> {
+        pulses_for(module, frames, upgrade_at, 0)
+    }
+
+    fn pulses_for(
+        module: RadiateFearUpdate,
+        frames: u64,
+        upgrade_at: Option<u64>,
+        before: u32,
+    ) -> Vec<(u64, Effect)> {
         let mut world = World::new();
         let mut registry = ModuleRegistry::new(&mut world);
         registry.register::<RadiateFearUpdate>(&mut world, "RadiateFearUpdate");
+        for _ in 0..before {
+            world.spawn().unwrap();
+        }
         let entity = world.spawn().unwrap();
         registry
             .attach(&mut world, entity, Frame::ZERO, module)
@@ -327,15 +333,22 @@ mod tests {
     }
 
     #[test]
-    fn radiators_stagger_their_first_pulse_by_entity() {
-        let interval = LogicFrames::from_frames(30);
-        let mut seen = std::collections::BTreeSet::new();
-        let mut world = World::new();
-        for _ in 0..30u32 {
-            let entity = world.spawn().unwrap();
-            seen.insert(stagger(entity, interval).get());
-        }
-        assert_eq!(seen.len(), 30, "30 radiators, 30 distinct first pulses");
+    fn a_radiator_pulses_every_interval_plus_its_id_mod_five_frames() {
+        let module = radiate_fear_update_from_fields(
+            &fields(&[
+                ("InitiallyActive", "Yes"),
+                ("EmotionPulseRadius", "100"),
+                ("EmotionPulseInterval", "1000"),
+                ("GenerateFear", "Yes"),
+            ]),
+            Frame::ZERO,
+        )
+        .unwrap();
+        let frames: Vec<u64> = pulses_for(module, 100, None, 3)
+            .iter()
+            .map(|(frame, _)| *frame)
+            .collect();
+        assert_eq!(frames, vec![0, 48, 96]);
     }
 
     #[test]

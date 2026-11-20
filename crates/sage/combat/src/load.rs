@@ -9,18 +9,22 @@ use crate::attributes::{ModifierStore, MODIFIER_LIST_KEYWORD};
 use crate::collide::CollideMask;
 use crate::damage::{DamageTypeId, DamageTypes, DeathTypeId, DeathTypes};
 use crate::nugget::{
-    carries_upgrade_gate, DamageFxTypes, DamageNugget, DotNugget, EffectNugget, EffectNuggets,
-    EmotionWeaponNugget, FireLogicNugget, GrabNugget, HordeAttackNugget, MetaImpactNugget,
-    ModifierNugget, Nugget, OpenGateNugget, ParalyzeNugget, ProjectileNugget, SpawnAndFadeNugget,
-    SpecialModelConditionNugget, StealMoneyNugget, WeaponOclNugget,
+    carries_upgrade_gate, DamageContainedNugget, DamageFxTypes, DamageNugget, DamageShape,
+    DotNugget, EffectNugget, EffectNuggets, EmotionWeaponNugget, FireLogicNugget, GrabNugget,
+    HordeAttackNugget, MetaImpactNugget, ModifierNugget, Nugget, OpenGateNugget, ParalyzeNugget,
+    ProjectileNugget, SpawnAndFadeNugget, SpecialModelConditionNugget, StealMoneyNugget,
+    WeaponOclNugget,
 };
 use crate::upgrade_filter::{UpgradeFilter, UpgradeFilters};
 use crate::victim::{RadiusAffects, VictimRuleTable, VictimRules};
 use crate::weapon::{
-    AntiMask, FrameRange, FxTrigger, PreAttackType, RangeBonus, WeaponId, WeaponStore,
+    AntiMask, FrameRange, FxTrigger, LinearPoint, PreAttackType, RangeBonus, WeaponId, WeaponStore,
     WeaponTemplate,
 };
 use crate::weapon_bonus::WeaponBonusSet;
+use crate::weapon_slots::WeaponSlot;
+
+const DAMAGE_SPEED_PER_FRAME: f32 = 0.2;
 
 pub const WEAPON_KEYWORD: &str = "Weapon";
 pub const ARMOR_KEYWORD: &str = "Armor";
@@ -205,7 +209,10 @@ impl CombatData {
                 if !gated {
                     rules.special.clear();
                 }
-                if !rules.special.is_empty() || !rules.scalars.is_empty() {
+                if !rules.special.is_empty()
+                    || !rules.scalars.is_empty()
+                    || !rules.force_kill.is_empty()
+                {
                     victims.push((nuggets.len(), rules));
                 }
             }
@@ -314,6 +321,9 @@ impl CombatData {
                 per_foot: self
                     .non_negative(block, "RangeBonusPerFoot", macros)
                     .unwrap_or(0.0),
+                restricted_height: self
+                    .non_negative(block, "RestrictedHeightRange", macros)
+                    .unwrap_or(0.0),
             },
             pre_attack_random: self
                 .non_negative(block, "PreAttackRandomAmount", macros)
@@ -323,6 +333,16 @@ impl CombatData {
             hit_stored_target: self.yes_no(block, "HitStoredTarget"),
             can_be_dodged: self.yes_no(block, "CanBeDodged"),
             hit_passenger_chance: self.fraction(block, "HitPassengerPercentage", macros, 0.0),
+            use_innate_attributes: self.yes_no(block, "UseInnateAttributes"),
+            passenger_proportional_attack: self.yes_no(block, "PassengerProportionalAttack"),
+            max_attack_passengers: self.number(block, "MaxAttackPassengers", macros).map_or(
+                0,
+                |value| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let count = value.clamp(0.0, 255.0) as u8;
+                    count
+                },
+            ),
             no_victim_needed: self.yes_no(block, "NoVictimNeeded"),
             can_fire_while_moving: self.yes_no(block, "CanFireWhileMoving"),
             can_fire_while_charging: self.yes_no(block, "CanFireWhileCharging"),
@@ -334,7 +354,17 @@ impl CombatData {
                 .unwrap_or(0.0),
             projectile_filter_in_container: self
                 .object_filter(block, "ProjectileFilterInContainer"),
+            projectile_self: flag("ProjectileSelf"),
             fx_trigger: self.fx_trigger(block),
+            instant_load_clip_on_activate: flag("InstantLoadClipOnActivate"),
+            share_timers: flag("ShareTimers"),
+            finish_attack_once_started: flag("FinishAttackOnceStarted"),
+            chase_weapon: flag("ChaseWeapon"),
+            lock_when_using: flag("LockWhenUsing"),
+            bombard_type: flag("BombardType"),
+            disable_scatter_for_targets_on_wall: flag("DisableScatterForTargetsOnWall"),
+            linear_targets: self.linear_targets(block, macros),
+            ignore_linear_first_target: flag("IgnoreLinearFirstTarget"),
             bonus: self.weapon_bonus(block, macros),
         };
         if !template.has_effect() {
@@ -425,6 +455,24 @@ impl CombatData {
                     .unwrap_or(0.0),
                 requires_upgrade: requires_upgrade(block),
                 accepts_add: self.boolean_or(block, "AcceptDamageAdd", true),
+                shape: DamageShape {
+                    cylinder_aoe: self.boolean(block, "CylinderAOE"),
+                    min_radius: self.number(block, "MinRadius", macros).unwrap_or(0.0),
+                    taper_off: self.number(block, "DamageTaperOff", macros),
+                    max_height: self.number(block, "DamageMaxHeight", macros),
+                    speed: self.number(block, "DamageSpeed", macros).unwrap_or(0.0)
+                        * DAMAGE_SPEED_PER_FRAME,
+                    max_height_above_terrain: self.number(
+                        block,
+                        "DamageMaxHeightAboveTerrain",
+                        macros,
+                    ),
+                    drain_life: self.boolean(block, "DrainLife"),
+                    drain_multiplier: self
+                        .number(block, "DrainLifeMultiplier", macros)
+                        .unwrap_or(1.0),
+                    flanked_scalar: self.number(block, "FlankedScalar", macros),
+                },
             });
         }
         if block.keyword.eq_ignore_ascii_case("DOTNugget") {
@@ -457,6 +505,16 @@ impl CombatData {
             return Nugget::Modifier(ModifierNugget {
                 list: list.to_owned(),
                 radius: self.number(block, "Radius", macros).unwrap_or(0.0),
+                affect_horde_members: self.boolean(block, "AffectHordeMembers"),
+                damage_arc: self.number(block, "DamageArc", macros),
+                anti_categories: block
+                    .field("AntiCategories")
+                    .map(|field| field.args.clone())
+                    .unwrap_or_default(),
+                anti_fx: block
+                    .field("AntiFX")
+                    .and_then(Field::value)
+                    .map(str::to_owned),
             });
         }
         if block.keyword.eq_ignore_ascii_case("ProjectileNugget") {
@@ -470,6 +528,22 @@ impl CombatData {
                     .map(str::to_owned),
                 warhead: warhead.to_owned(),
                 requires_upgrade: requires_upgrade(block),
+                launch_slot: block
+                    .field("WeaponLaunchBoneSlotOverride")
+                    .and_then(Field::value)
+                    .and_then(WeaponSlot::parse),
+                always_attack_offset: self.boolean(block, "UseAlwaysAttackOffset").then(|| {
+                    let args = block
+                        .field("AlwaysAttackHereOffset")
+                        .map(|field| field.args.clone())
+                        .unwrap_or_default();
+                    let axis = |tag: &str| {
+                        tagged_value(&args, tag)
+                            .and_then(|v| parse_float_or_macro(v, macros))
+                            .unwrap_or(0.0)
+                    };
+                    [axis("X"), axis("Y"), axis("Z")]
+                }),
             });
         }
         if block.keyword.eq_ignore_ascii_case("MetaImpactNugget") {
@@ -553,6 +627,9 @@ impl CombatData {
                     .field("ParalyzeFX")
                     .and_then(Field::value)
                     .map(str::to_owned),
+                damage_arc: self.number(block, "DamageArc", macros),
+                freeze_animation: self.boolean(block, "FreezeAnimation"),
+                affect_horde_members: self.boolean(block, "AffectHordeMembers"),
             }));
         }
         if block.keyword.eq_ignore_ascii_case("GrabNugget") {
@@ -605,13 +682,11 @@ impl CombatData {
         if block.keyword.eq_ignore_ascii_case("EmotionWeaponNugget") {
             let emotion = block.field("EmotionType").and_then(Field::value)?;
             let seconds = self.number(block, "Duration", macros).unwrap_or(0.0);
-            let milliseconds = (seconds * 1000.0).clamp(0.0, f32::from(u16::MAX) * 1000.0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let milliseconds = milliseconds as u32;
+            let milliseconds = seconds.trunc().clamp(0.0, f32::from(u16::MAX)) * 1000.0;
             return Some(EffectNugget::EmotionWeapon(EmotionWeaponNugget {
                 emotion: emotion.to_owned(),
                 radius: self.number(block, "Radius", macros).unwrap_or(0.0),
-                duration: LogicFrames::from_milliseconds(milliseconds),
+                duration: milliseconds_to_frames(milliseconds, self.authored_logic_hz),
             }));
         }
         if block.keyword.eq_ignore_ascii_case("OpenGateNugget") {
@@ -624,6 +699,18 @@ impl CombatData {
             #[allow(clippy::cast_possible_truncation)]
             let amount = amount.clamp(0.0, f32::from(i16::MAX)) as i32;
             return Some(EffectNugget::StealMoney(StealMoneyNugget { amount }));
+        }
+        if block.keyword.eq_ignore_ascii_case("DamageContainedNugget") {
+            let tokens = |keyword: &str| {
+                block
+                    .field(keyword)
+                    .map(|field| field.args.clone())
+                    .unwrap_or_default()
+            };
+            return Some(EffectNugget::DamageContained(DamageContainedNugget {
+                kill_kind_of: tokens("KillKindof"),
+                kill_kind_of_not: tokens("KillKindofNot"),
+            }));
         }
         if block.keyword.eq_ignore_ascii_case("SpawnAndFadeNugget") {
             let spawned_object = block.field("SpawnedObjectName").and_then(Field::value)?;
@@ -767,6 +854,28 @@ impl CombatData {
         set
     }
 
+    fn linear_targets(&self, block: &Block, macros: &MacroTable) -> Vec<LinearPoint> {
+        block
+            .fields_named("LinearTarget")
+            .filter_map(|field| {
+                let component = |tag| {
+                    tagged_value(&field.args, tag).and_then(|v| parse_float_or_macro(v, macros))
+                };
+                let (Some(x), Some(y), Some(t)) = (component("X"), component("Y"), component("T"))
+                else {
+                    self.value_errors
+                        .field(WEAPON_KEYWORD, field, "X:<n> Y:<n> T:<n>");
+                    return None;
+                };
+                Some(LinearPoint {
+                    x,
+                    y,
+                    ends_volley: t.trunc() != 0.0,
+                })
+            })
+            .collect()
+    }
+
     fn fx_trigger(&self, block: &Block) -> FxTrigger {
         let Some(field) = block.field("FXTrigger") else {
             return FxTrigger::None;
@@ -824,27 +933,10 @@ fn milliseconds_to_frames(
     milliseconds: f32,
     authored: Option<core::num::NonZeroU32>,
 ) -> LogicFrames {
-    if !milliseconds.is_finite() || milliseconds <= 0.0 {
-        return LogicFrames::ZERO;
-    }
-    let bounded = if milliseconds > 86_400_000.0 {
-        86_400_000.0
-    } else {
-        milliseconds
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let ours = mint_sim::SIMULATION_HZ as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let frames = match authored {
-        Some(hz) => {
-            let theirs = hz.get() as f32;
-            (bounded * theirs / 1000.0).ceil() * ours / theirs
-        }
-        None => bounded * ours / 1000.0,
-    };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let whole = frames.ceil() as u32;
-    LogicFrames::from_frames(whole)
+    let hz = authored
+        .or(core::num::NonZeroU32::new(mint_sim::SIMULATION_HZ))
+        .unwrap_or(core::num::NonZeroU32::MIN);
+    LogicFrames::from_authored_milliseconds_f32(milliseconds, hz)
 }
 
 fn retail_frames(count: u32, authored: Option<core::num::NonZeroU32>) -> LogicFrames {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use mint_sage_combat::BodyKind;
 use mint_sage_map::{TeamDef, TeamTemplate};
 use mint_sim::{Entity, PlayerId, Result, StateHasher, Tick, World};
 
@@ -79,6 +80,9 @@ impl TeamProtos {
 pub(crate) trait TeamProbe {
     fn is_live(&self, entity: Entity) -> bool;
     fn effectively_dead(&self, entity: Entity) -> bool;
+    fn inactive_body(&self, _entity: Entity) -> bool {
+        false
+    }
     fn forming(&self, entity: Entity) -> bool;
     fn unit_count(&self, _entity: Entity) -> i32 {
         1
@@ -194,6 +198,7 @@ impl TeamInstance {
         self.members.iter().any(|&m| {
             probe.is_live(m)
                 && !probe.effectively_dead(m)
+                && !probe.inactive_body(m)
                 && !excluded.iter().any(|kind| probe.has_kind(m, kind))
         })
     }
@@ -254,7 +259,7 @@ impl TeamInstance {
             self.cur_units = self
                 .members
                 .iter()
-                .filter(|&&m| !probe.effectively_dead(m))
+                .filter(|&&m| !probe.effectively_dead(m) && !probe.inactive_body(m))
                 .fold(0i32, |sum, &m| sum.saturating_add(probe.unit_count(m)));
             if self.cur_units != before && self.cur_units <= self.destroy_threshold {
                 hooks.push(TeamHook::OnDestroyed);
@@ -706,6 +711,7 @@ struct WorldProbe<'a> {
     world: &'a World,
     ids: Ids,
     kinds: &'a KindTable,
+    body_kinds: &'a [BodyKind],
 }
 
 impl TeamProbe for WorldProbe<'_> {
@@ -715,6 +721,13 @@ impl TeamProbe for WorldProbe<'_> {
 
     fn effectively_dead(&self, entity: Entity) -> bool {
         self.world.contains(self.ids.doomed, entity)
+    }
+
+    fn inactive_body(&self, entity: Entity) -> bool {
+        self.world
+            .get(self.ids.kind, entity)
+            .and_then(|kind| self.body_kinds.get(usize::from(kind.0)))
+            .is_some_and(|body| *body == BodyKind::Inactive)
     }
 
     fn forming(&self, entity: Entity) -> bool {
@@ -828,6 +841,7 @@ impl RotwkRules {
             world: tick.state(),
             ids,
             kinds: &self.kinds,
+            body_kinds: &self.body_kinds,
         };
         state
             .rt
@@ -847,6 +861,7 @@ impl RotwkRules {
             world: tick.state(),
             ids,
             kinds: &self.kinds,
+            body_kinds: &self.body_kinds,
         };
         state.rt.teams.is_destroyed(team, &probe)
     }
@@ -1024,6 +1039,7 @@ impl RotwkRules {
                 world: tick.state(),
                 ids,
                 kinds: &self.kinds,
+                body_kinds: &self.body_kinds,
             };
             state
                 .rt
@@ -1080,6 +1096,7 @@ mod tests {
         dead: BTreeSet<Entity>,
         gone: BTreeSet<Entity>,
         forming: BTreeSet<Entity>,
+        inactive: BTreeSet<Entity>,
         kinds: BTreeMap<Entity, &'static str>,
     }
 
@@ -1089,6 +1106,9 @@ mod tests {
         }
         fn effectively_dead(&self, e: Entity) -> bool {
             self.dead.contains(&e)
+        }
+        fn inactive_body(&self, e: Entity) -> bool {
+            self.inactive.contains(&e)
         }
         fn forming(&self, e: Entity) -> bool {
             self.forming.contains(&e)
@@ -1267,6 +1287,24 @@ mod tests {
             assert_eq!(instance.has_any_units(&probe), unit, "{kind}");
             assert_eq!(teams.is_destroyed(id, &probe), destroyed, "{kind}");
         }
+    }
+
+    #[test]
+    fn an_inactive_body_member_is_no_unit_no_survivor_and_never_reported_dead() {
+        let protos = TeamProtos(vec![proto("Side", "teamSide", true)]);
+        let mut teams = Teams::seeded(&protos);
+        let id = teams.instances_of(0)[0];
+        let members = entities(1);
+        teams.add_member(id, members[0]);
+        let mut probe = Probe::default();
+        probe.inactive.insert(members[0]);
+        let due = teams.update_states(&probe, &protos, &BTreeMap::new());
+        let instance = teams.get(id).unwrap();
+        assert!(!instance.has_any_units(&probe));
+        assert!(teams.is_destroyed(id, &probe));
+        assert!(!due
+            .iter()
+            .any(|(_, hook)| matches!(hook, TeamHook::OnUnitDestroyed)));
     }
 
     #[test]

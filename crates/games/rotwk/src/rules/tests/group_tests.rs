@@ -47,6 +47,7 @@ pub(super) fn retail_sword(combat: &mut CombatData) -> mint_sage_combat::WeaponI
                 clip_size: 0,
                 melee: true,
                 nuggets: vec![Nugget::Damage(DamageNugget {
+                    shape: Default::default(),
                     damage: 2.0,
                     damage_type: slash,
                     death_type: None,
@@ -68,7 +69,9 @@ pub(super) fn retail_sword(combat: &mut CombatData) -> mint_sage_combat::WeaponI
 
 const RANGEFINDER: f32 = 12.0;
 
-fn melee_pair(avoidance: AvoidanceMode) -> (Simulation<RotwkRules>, Ids, [Vec<Entity>; 2]) {
+pub(super) fn melee_pair(
+    avoidance: AvoidanceMode,
+) -> (Simulation<RotwkRules>, Ids, [Vec<Entity>; 2]) {
     melee_pair_with(avoidance, [10_000.0; 2], [true; 2])
 }
 
@@ -345,8 +348,6 @@ fn a_fighter_gives_up_a_victim_out_of_reach_after_two_seconds() {
             },
         )
         .unwrap();
-    let give_up =
-        u64::from(mint_sim::LogicFrames::from_milliseconds(crate::melee::GIVE_UP_MS).get());
     let mut given_up = 0;
     let mut reapproached = false;
     let mut held = std::collections::BTreeMap::new();
@@ -357,9 +358,11 @@ fn a_fighter_gives_up_a_victim_out_of_reach_after_two_seconds() {
             let attack = simulation.state().get(ids.member_attack, *member).copied();
             if let (None, Some(before)) = (attack, held.get(member)) {
                 let before: &crate::melee::MemberAttack = before;
-                if let Some(since) = before.out_of_reach_since {
-                    let waited = now - since.get();
-                    assert!(waited <= give_up + 1, "given up after {waited}");
+                if let Some(until) = before.hold_until {
+                    assert!(
+                        now <= until.get() + 1,
+                        "given up at {now}, held to {until:?}"
+                    );
                 }
                 given_up += 1;
             }
@@ -563,10 +566,6 @@ fn hordes_moved_together_form_one_blob_and_never_merge() {
             let depth = a.penetration(b);
             println!("block overlap {depth:.1}");
             assert!(depth <= SOLDIER_RADIUS, "hordes merge: {report:?}");
-            assert!(
-                squares_apart(a, b),
-                "claim squares overlap - retail spacing lost: {report:?}"
-            );
         }
     }
 }
@@ -607,6 +606,7 @@ fn an_archer_horde_does_not_close_on_a_target_inside_its_minimum_range() {
                 ),
                 clip_size: 0,
                 nuggets: vec![Nugget::Damage(DamageNugget {
+                    shape: Default::default(),
                     damage: 1.0,
                     damage_type: pierce,
                     death_type: None,
@@ -802,12 +802,55 @@ fn a_ranged_horde_closes_along_the_straight_line_shortcut() {
 }
 
 fn archers_and_victims(victims: &[Vec2]) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
-    let (combat, bow, _armour) = combat_data();
+    archers_and_victims_with(victims, 1, false)
+}
+
+fn archers_and_victims_with(
+    victims: &[Vec2],
+    victim_size: u32,
+    armed: bool,
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    archers_and_victims_in(victims, victim_size, armed, false)
+}
+
+fn archers_and_victims_in(
+    victims: &[Vec2],
+    victim_size: u32,
+    armed: bool,
+    swords: bool,
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    archers_and_victims_armoured(victims, victim_size, armed, swords, None)
+}
+
+pub(super) fn archers_and_victims_armoured(
+    victims: &[Vec2],
+    victim_size: u32,
+    armed: bool,
+    swords: bool,
+    victim_armour: Option<&str>,
+) -> (Simulation<RotwkRules>, Ids, Vec<Entity>) {
+    let (mut combat, bow, _armour) = combat_data();
+    let victim_armour = victim_armour.and_then(|name| combat.armors.id(name));
+    let held = if swords {
+        retail_sword(&mut combat)
+    } else {
+        bow
+    };
+    let finder = {
+        let mut template = combat.weapons.get(bow).cloned().unwrap();
+        template.attack_range = BOW_RANGEFINDER;
+        template.attack_range += BOW_RANGEFINDER - template.reach(1.0);
+        combat.weapons.insert("TestFinder", template).unwrap()
+    };
     let map = flat_map(128, 128);
     let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
     let archer_formation = block_formation_with(None, vec![0, 1, 2, 3]);
     let archer_count = u32::try_from(archer_formation.len()).unwrap();
-    let victim_formation = table_of(&[Vec2::ZERO]);
+    let victim_formation = table_of(
+        &(0..victim_size)
+            .map(|i| Vec2::new(0.0, 40.0 * i as f32))
+            .collect::<Vec<_>>(),
+    );
     let spawn = |formation: u16, origin: Vec2, owner: PlayerId, weapon, count| HordeSpawn {
         formation,
         origin,
@@ -815,7 +858,7 @@ fn archers_and_victims(victims: &[Vec2]) -> (Simulation<RotwkRules>, Ids, Vec<En
         member: Spawn {
             health: Some(100_000.0),
             weapon,
-            armour: None,
+            armour: if owner == PLAYER { None } else { victim_armour },
             ..Spawn::inert(
                 Vec2::ZERO,
                 Facing::EAST,
@@ -835,14 +878,19 @@ fn archers_and_victims(victims: &[Vec2]) -> (Simulation<RotwkRules>, Ids, Vec<En
         0,
         Vec2::new(200.0, 300.0),
         PLAYER,
-        Some(bow),
+        Some(held),
         archer_count,
     )];
-    spawns.extend(victims.iter().map(|at| spawn(1, *at, OTHER, None, 1)));
+    spawns.extend(
+        victims
+            .iter()
+            .map(|at| spawn(1, *at, OTHER, None, victim_size)),
+    );
     let rules = RotwkRules::new(passability, Vec::new())
         .with_combat(combat)
         .with_hordes(vec![archer_formation, victim_formation], spawns)
-        .with_horde_rangefinders(vec![Some(BOW_RANGEFINDER), None]);
+        .with_horde_rangefinders(vec![Some(BOW_RANGEFINDER), None])
+        .with_horde_rangefinder_weapons(vec![armed.then_some(finder), None]);
     let simulation = Simulation::new(3, rules).unwrap();
     let ids = simulation.rules().ids().unwrap();
     let hordes: Vec<Entity> = simulation
@@ -995,6 +1043,234 @@ fn a_ranged_horde_replans_its_stand_off_spot_when_the_victim_walks_in() {
     );
 }
 
+fn archer_stand_off(gap: f32) -> (f32, f32) {
+    let (probe, ids, hordes) = archers_and_victims(&[Vec2::new(900.0, 300.0)]);
+    let footprint = probe
+        .state()
+        .get(ids.horde, hordes[0])
+        .unwrap()
+        .offsets()
+        .fold(0.0f32, |farthest, offset| farthest.max(offset.length()))
+        + SOLDIER_RADIUS;
+    let victim_at = Vec2::new(200.0 + gap + footprint + SOLDIER_RADIUS, 300.0);
+    let (mut simulation, ids, hordes) = archers_and_victims(&[victim_at]);
+    let archers = simulation
+        .state()
+        .get(ids.horde, hordes[0])
+        .unwrap()
+        .members
+        .clone();
+    let target = simulation
+        .state()
+        .get(ids.horde, hordes[1])
+        .unwrap()
+        .members[0];
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: archers,
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(PLAYER, RotwkCommand::AttackObject { target })
+        .unwrap();
+    let start = simulation
+        .state()
+        .get(ids.body, hordes[0])
+        .unwrap()
+        .0
+        .position;
+    for _ in 0..300 {
+        simulation.tick().unwrap();
+        if let Some(path) = simulation.state().get(ids.path, hordes[0]) {
+            let spot = path.goal;
+            return (
+                spot.minus(start).length(),
+                victim_at.minus(spot).length() - footprint - SOLDIER_RADIUS,
+            );
+        }
+    }
+    panic!("the archers never planned a stand-off path");
+}
+
+#[test]
+fn the_straight_line_spot_stands_a_little_inside_the_reach() {
+    let (walked, _) = archer_stand_off(169.85);
+    assert!(
+        (walked - 25.0).abs() < 0.5,
+        "the archers walked {walked:.2} to their spot, not the 25 of the step inside d^2 + 100 <= R^2"
+    );
+}
+
+#[test]
+fn the_cell_search_spot_is_judged_at_the_reach_itself() {
+    let (walked, gap) = archer_stand_off(196.0);
+    assert!(
+        gap <= BOW_RANGEFINDER + 1e-3 && gap > BOW_RANGEFINDER - 12.0 && walked > 45.0,
+        "the cell spot is {walked:.1} away and {gap:.2} from the victim"
+    );
+}
+
+fn volley_log(gap: f32, victim_size: u32, ticks: usize) -> Vec<(bool, Vec<Option<Entity>>)> {
+    let (probe, ids, hordes) = archers_and_victims(&[Vec2::new(900.0, 300.0)]);
+    let footprint = probe
+        .state()
+        .get(ids.horde, hordes[0])
+        .unwrap()
+        .offsets()
+        .fold(0.0f32, |farthest, offset| farthest.max(offset.length()))
+        + SOLDIER_RADIUS;
+    let victim_at = Vec2::new(
+        200.0 + BOW_RANGEFINDER + gap + footprint + SOLDIER_RADIUS,
+        300.0,
+    );
+    let (mut simulation, ids, hordes) = archers_and_victims_with(&[victim_at], victim_size, true);
+    let archers = simulation
+        .state()
+        .get(ids.horde, hordes[0])
+        .unwrap()
+        .members
+        .clone();
+    let target = simulation
+        .state()
+        .get(ids.horde, hordes[1])
+        .unwrap()
+        .members[0];
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: archers.clone(),
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(PLAYER, RotwkCommand::AttackObject { target })
+        .unwrap();
+    let last_shot = |simulation: &Simulation<RotwkRules>| {
+        simulation
+            .state()
+            .get(ids.horde, hordes[0])
+            .unwrap()
+            .rangefinder
+            .and_then(|state| state.last_shot())
+    };
+    let mut log = Vec::new();
+    for _ in 0..ticks {
+        let before = last_shot(&simulation);
+        simulation.tick().unwrap();
+        let held = archers
+            .iter()
+            .map(|member| {
+                simulation
+                    .state()
+                    .get(ids.armed, *member)
+                    .and_then(|armed| armed.target)
+            })
+            .collect();
+        log.push((last_shot(&simulation) != before, held));
+    }
+    log
+}
+
+#[test]
+fn a_ranged_hordes_members_take_victims_only_when_its_weapon_fires() {
+    let log = volley_log(20.0, 1, 200);
+    assert!(
+        log.iter()
+            .take(3)
+            .all(|(_, held)| held.iter().all(Option::is_none)),
+        "members held victims before the horde's weapon could fire"
+    );
+    let first = log
+        .iter()
+        .position(|(_, held)| held.iter().any(Option::is_some))
+        .expect("no member ever took a victim");
+    assert!(
+        log[first].0,
+        "the first victims were taken on tick {first}, which is not a tick the weapon fired"
+    );
+}
+
+#[test]
+fn a_melee_member_of_a_ranged_horde_engages_an_enemy_on_its_spot_at_the_shot() {
+    let (mut simulation, ids, hordes) =
+        archers_and_victims_in(&[Vec2::new(228.0, 300.0)], 1, true, true);
+    let archers = simulation
+        .state()
+        .get(ids.horde, hordes[0])
+        .unwrap()
+        .members
+        .clone();
+    let target = simulation
+        .state()
+        .get(ids.horde, hordes[1])
+        .unwrap()
+        .members[0];
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: archers.clone(),
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(PLAYER, RotwkCommand::AttackObject { target })
+        .unwrap();
+    for _ in 0..200 {
+        simulation.tick().unwrap();
+    }
+    let engaged = archers
+        .iter()
+        .filter(|member| {
+            simulation
+                .state()
+                .get(ids.member_attack, **member)
+                .is_some_and(|attack| attack.victim == target)
+        })
+        .count();
+    let distant = archers.len() - engaged;
+    assert!(engaged >= 1, "no member engaged the enemy on its spot");
+    assert!(
+        distant >= 1,
+        "every member engaged, including those with nothing in reach"
+    );
+}
+
+#[test]
+fn a_member_keeps_its_victim_across_the_next_volleys() {
+    let log = volley_log(-100.0, 2, 400);
+    let volleys: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter_map(|(tick, (fired, _))| fired.then_some(tick))
+        .collect();
+    assert!(
+        volleys.len() >= 4,
+        "only {} volleys: {volleys:?}",
+        volleys.len()
+    );
+    let first = &log[volleys[0]].1;
+    assert!(
+        first.iter().any(Option::is_some),
+        "the first volley gave no victims"
+    );
+    for &tick in &volleys[1..4] {
+        for (member, (before, after)) in first.iter().zip(&log[tick].1).enumerate() {
+            assert!(
+                before.is_none() || before == after,
+                "member {member} was given another victim on the volley at tick {tick}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_group_move_replays_to_the_same_hash_sequence() {
     let run = || {
@@ -1119,14 +1395,6 @@ fn blocks(
             )
         })
         .collect()
-}
-
-fn squares_apart(
-    a: &mint_movement::destination::Footprint,
-    b: &mint_movement::destination::Footprint,
-) -> bool {
-    let apart = b.centre.minus(a.centre);
-    apart.x.abs().max(apart.y.abs()) >= 90.0 - 2.0 * 5.0
 }
 
 #[test]

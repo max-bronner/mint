@@ -1,13 +1,13 @@
-use mint_sage_modules::effects::{Name, Names};
+use mint_sage_modules::effects::{HealerRules, Name, Names};
 use mint_sim::{Entity, Frame, LogicFrames, PlayerId, Result, Tick};
 
 use super::{Ids, RotwkRules};
 use crate::combat::{grid_cell, grid_radius_cells, Foe, TargetGrid};
 use crate::spell_state::{HealedAt, LastHurt, PointBonus, SoleHealer};
 
-pub(crate) const AUTO_HEAL_PULSE: LogicFrames = LogicFrames::from_milliseconds(400);
+const UNDER_ATTACK_WINDOW: LogicFrames = LogicFrames::from_engine_milliseconds(1_000);
 
-const RECENT_DAMAGE_WINDOW: LogicFrames = LogicFrames::from_milliseconds(4_000);
+const RECENT_DAMAGE_WINDOW: LogicFrames = LogicFrames::from_engine_milliseconds(4_000);
 
 pub(super) struct HealPulse<'a> {
     pub(super) amount: f32,
@@ -22,10 +22,11 @@ pub(super) struct HealPulse<'a> {
     pub(super) nonstackable: bool,
     pub(super) skip_recently_damaged: bool,
     pub(super) fx_always: bool,
+    pub(super) rules: &'a HealerRules,
 }
 
 impl RotwkRules {
-    fn heal(
+    pub(super) fn heal(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
@@ -154,6 +155,20 @@ impl RotwkRules {
         {
             return Ok(());
         }
+        let amount = if pulse.rules.add_bonus {
+            let bonus = world
+                .get(ids.bonuses, source)
+                .map_or(0.0, |bonuses| bonuses.0.auto_heal);
+            (pulse.amount + bonus).trunc()
+        } else {
+            pulse.amount
+        };
+        if !pulse.as_percent && amount <= 0.0 {
+            return Ok(());
+        }
+        if pulse.rules.contained {
+            return self.heal_contained(tick, ids, source, amount, pulse);
+        }
         if pulse.radius <= 0.0 {
             let quiet = world
                 .get(ids.last_hurt, source)
@@ -162,7 +177,7 @@ impl RotwkRules {
                 .quiet_for(pulse.quiet, now);
             if quiet
                 && self.hurt(tick, ids, source)
-                && self.heal(tick, ids, source, pulse.amount, pulse.as_percent, now)?
+                && self.heal(tick, ids, source, amount, pulse.as_percent, now)?
             {
                 self.heal_fx(tick, ids, source, pulse.fx);
             }
@@ -174,6 +189,7 @@ impl RotwkRules {
         ) else {
             return Ok(());
         };
+        let held_off = pulse.rules.not_under_attack && self.under_attack(world, ids, source, now);
         let mut near: Vec<u32> = Vec::new();
         grid.query_into(
             grid_cell(centre.x),
@@ -193,6 +209,9 @@ impl RotwkRules {
             .map(|(foe, _)| foe.entity)
             .filter(|entity| !pulse.skip_self || *entity != source)
             .collect();
+        if held_off {
+            targets.clear();
+        }
         targets.sort_unstable_by_key(|entity| entity.index());
         targets.dedup();
         let until = now.checked_add(pulse.sole_for).unwrap_or(Frame::FOREVER);
@@ -215,14 +234,7 @@ impl RotwkRules {
             if !self.hurt(tick, ids, entity) || !self.kinds_admit(tick, ids, entity, pulse) {
                 continue;
             }
-            if pulse.nonstackable
-                && !tick
-                    .state()
-                    .get(ids.healed_at, entity)
-                    .copied()
-                    .unwrap_or_default()
-                    .quiet_for(pulse.sole_for, now)
-            {
+            if self.stacking_refused(tick, ids, entity, pulse) {
                 continue;
             }
             if !bypasses_sole {
@@ -236,8 +248,94 @@ impl RotwkRules {
                     SoleHealer { by: source, until },
                 )?;
             }
-            let landed = self.heal(tick, ids, entity, pulse.amount, pulse.as_percent, now)?;
+            let landed = self.heal(tick, ids, entity, amount, pulse.as_percent, now)?;
             if landed || pulse.fx_always {
+                self.heal_fx(tick, ids, entity, pulse.fx);
+            }
+        }
+        if let Some(regrow) = &pulse.rules.regrow {
+            self.regrow_hordes_near(tick, ids, source, pulse.radius, regrow.fx.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn stacking_refused(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        pulse: &HealPulse<'_>,
+    ) -> bool {
+        pulse.nonstackable
+            && !tick
+                .state()
+                .get(ids.healed_at, entity)
+                .copied()
+                .unwrap_or_default()
+                .quiet_for(pulse.sole_for, tick.frame())
+    }
+
+    fn under_attack(&self, world: &mint_sim::World, ids: Ids, healer: Entity, now: Frame) -> bool {
+        let horde = world
+            .get(ids.member, healer)
+            .map_or(healer, |member| member.horde);
+        let group: Vec<Entity> = match world.get(ids.horde, horde) {
+            Some(horde) => horde.members.clone(),
+            None => vec![healer],
+        };
+        group.iter().any(|entity| {
+            world
+                .get(ids.last_hurt, *entity)
+                .and_then(|last| last.0)
+                .is_some_and(|hit| {
+                    hit < now
+                        && hit
+                            .checked_add(UNDER_ATTACK_WINDOW)
+                            .is_some_and(|end| now < end)
+                })
+        })
+    }
+
+    fn heal_contained(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        amount: f32,
+        pulse: &HealPulse<'_>,
+    ) -> Result<()> {
+        let now = tick.frame();
+        let world = tick.state();
+        let held: Vec<Entity> = if let Some(own) = world.get(ids.passengers, source) {
+            own.0.clone()
+        } else if let Some(member) = world.get(ids.member, source) {
+            world
+                .get(ids.horde, member.horde)
+                .map(|horde| horde.members.clone())
+                .unwrap_or_default()
+        } else if let Some(container) = world.get(ids.contained, source) {
+            world
+                .get(ids.passengers, container.container)
+                .map(|list| list.0.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut targets: Vec<(Entity, bool)> = Vec::new();
+        for entry in held {
+            let enclosed = world
+                .get(ids.contained, entry)
+                .is_some_and(|held| held.status.has(super::contain::ContainStatus::ENCLOSED));
+            match world.get(ids.horde, entry) {
+                Some(horde) => targets.extend(horde.members.iter().map(|m| (*m, enclosed))),
+                None => targets.push((entry, enclosed)),
+            }
+        }
+        for (entity, enclosed) in targets {
+            if !self.hurt(tick, ids, entity) || self.stacking_refused(tick, ids, entity, pulse) {
+                continue;
+            }
+            if self.heal(tick, ids, entity, amount, pulse.as_percent, now)? && !enclosed {
                 self.heal_fx(tick, ids, entity, pulse.fx);
             }
         }
@@ -252,30 +350,6 @@ impl RotwkRules {
             let power = crate::fx::FxSource::Power;
             self.emit_fx_object_named(tick, ids, list, at, power, entity, None);
         }
-    }
-
-    pub(super) fn pulse_modifier_heals(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
-        if tick.frame().get() % u64::from(AUTO_HEAL_PULSE.get()) != 0 {
-            return Ok(());
-        }
-        let now = tick.frame();
-        let healing: Vec<(Entity, f32)> = tick
-            .state()
-            .store(ids.bonuses)
-            .map(|store| {
-                store
-                    .iter()
-                    .filter(|(_, bonuses)| bonuses.0.auto_heal > 0.0)
-                    .map(|(entity, bonuses)| (entity, bonuses.0.auto_heal))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (entity, hp) in healing {
-            if self.hurt(tick, ids, entity) {
-                self.heal(tick, ids, entity, hp, false, now)?;
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn note_hurt(&self, tick: &mut Tick<'_>, ids: Ids, victim: Entity) {

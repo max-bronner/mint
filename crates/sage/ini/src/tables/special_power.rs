@@ -68,6 +68,13 @@ const FIELDS: &[FieldSpec] = &[
         consumer: "special_power.rs::read_special_power",
     },
     FieldSpec {
+        token: "PreventActivationConditions",
+        primitive: Primitive::IdentifierList,
+        rotwk_only: false,
+        source: "unit-d-abilities.md AB42, [V] 2.01 (0x942733)",
+        consumer: "special_power.rs::read_special_power",
+    },
+    FieldSpec {
         token: "Flags",
         primitive: Primitive::BitFlags(SPECIAL_POWER_FLAGS),
         rotwk_only: false,

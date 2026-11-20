@@ -227,13 +227,26 @@ pub struct WeaponTemplate {
     pub hit_stored_target: bool,
     pub can_be_dodged: bool,
     pub hit_passenger_chance: f32,
+    pub use_innate_attributes: bool,
+    pub passenger_proportional_attack: bool,
+    pub max_attack_passengers: u8,
     pub no_victim_needed: bool,
     pub can_fire_while_moving: bool,
     pub can_fire_while_charging: bool,
     pub aim_direction: f32,
     pub continue_attack_range: f32,
     pub projectile_filter_in_container: Vec<String>,
+    pub projectile_self: bool,
     pub fx_trigger: FxTrigger,
+    pub instant_load_clip_on_activate: bool,
+    pub share_timers: bool,
+    pub finish_attack_once_started: bool,
+    pub chase_weapon: bool,
+    pub lock_when_using: bool,
+    pub bombard_type: bool,
+    pub disable_scatter_for_targets_on_wall: bool,
+    pub linear_targets: Vec<LinearPoint>,
+    pub ignore_linear_first_target: bool,
     pub bonus: crate::weapon_bonus::WeaponBonusSet,
 }
 
@@ -279,16 +292,36 @@ impl Default for WeaponTemplate {
             hit_stored_target: false,
             can_be_dodged: false,
             hit_passenger_chance: 0.0,
+            use_innate_attributes: false,
+            passenger_proportional_attack: false,
+            max_attack_passengers: 0,
             no_victim_needed: false,
             can_fire_while_moving: false,
             can_fire_while_charging: false,
             aim_direction: 0.0,
             continue_attack_range: 0.0,
             projectile_filter_in_container: Vec::new(),
+            projectile_self: false,
             fx_trigger: FxTrigger::None,
+            instant_load_clip_on_activate: false,
+            share_timers: false,
+            finish_attack_once_started: false,
+            chase_weapon: false,
+            lock_when_using: false,
+            bombard_type: false,
+            disable_scatter_for_targets_on_wall: false,
+            linear_targets: Vec::new(),
+            ignore_linear_first_target: false,
             bonus: crate::weapon_bonus::WeaponBonusSet::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinearPoint {
+    pub x: f32,
+    pub y: f32,
+    pub ends_volley: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -296,6 +329,7 @@ pub struct RangeBonus {
     pub min_height: f32,
     pub bonus: f32,
     pub per_foot: f32,
+    pub restricted_height: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -317,6 +351,8 @@ pub fn scatter_landing(rng: &mut Pcg32, radius: f32) -> ShotOutcome {
 
 const PATHFIND_CELL_SIZE: f32 = 10.0;
 
+pub const RANGE_TRIM: f32 = PATHFIND_CELL_SIZE * 0.25;
+
 const MIN_AIM_TOLERANCE: f32 = 0.035;
 
 impl WeaponTemplate {
@@ -329,6 +365,39 @@ impl WeaponTemplate {
     #[must_use]
     pub fn is_contact(&self) -> bool {
         self.attack_range - PATHFIND_CELL_SIZE * 0.25 < PATHFIND_CELL_SIZE
+    }
+
+    #[must_use]
+    pub fn reach(&self, bonus: f32) -> f32 {
+        self.reach_at(bonus, 0.0)
+    }
+
+    #[must_use]
+    pub fn reach_at(&self, bonus: f32, height_above: f32) -> f32 {
+        let trim = if self.melee { 0.0 } else { RANGE_TRIM };
+        let mut reach = self.attack_range * bonus - trim;
+        let height = self.range_bonus;
+        if height_above >= height.min_height {
+            reach += height.bonus + (height_above - height.min_height) * height.per_foot;
+        }
+        if height.restricted_height > 0.0 && height_above.abs() > height.restricted_height {
+            reach = 0.0;
+        }
+        reach.max(0.0)
+    }
+
+    #[must_use]
+    pub fn ranged_reach(&self, bonus: f32) -> f32 {
+        (self.attack_range * bonus - RANGE_TRIM).max(0.0)
+    }
+
+    #[must_use]
+    pub fn minimum_reach(&self) -> f32 {
+        if self.melee {
+            self.minimum_attack_range
+        } else {
+            (self.minimum_attack_range - RANGE_TRIM).max(0.0)
+        }
     }
 
     #[must_use]
@@ -446,8 +515,14 @@ impl WeaponTemplate {
             .any(|nugget| matches!(nugget, Nugget::Projectile(_)))
     }
 
-    pub fn resolve_shot(&self, rng: &mut Pcg32, infantry_victim: bool) -> ShotOutcome {
-        let inaccurate = infantry_victim && self.scatter_vs_infantry > 0.0;
+    pub fn resolve_shot(
+        &self,
+        rng: &mut Pcg32,
+        infantry_victim: bool,
+        victim_on_wall: bool,
+    ) -> ShotOutcome {
+        let scatters_here = !(self.disable_scatter_for_targets_on_wall && victim_on_wall);
+        let inaccurate = infantry_victim && self.scatter_vs_infantry > 0.0 && scatters_here;
         let radius = if inaccurate {
             self.scatter_radius + self.scatter_vs_infantry
         } else {
@@ -507,10 +582,14 @@ impl WeaponTemplate {
         hasher.write_f32(self.range_bonus.min_height);
         hasher.write_f32(self.range_bonus.bonus);
         hasher.write_f32(self.range_bonus.per_foot);
+        hasher.write_f32(self.range_bonus.restricted_height);
         self.pre_attack_random.hash_into(hasher);
         hasher.write_bool(self.hit_stored_target);
         hasher.write_bool(self.can_be_dodged);
         hasher.write_f32(self.hit_passenger_chance);
+        hasher.write_bool(self.use_innate_attributes);
+        hasher.write_bool(self.passenger_proportional_attack);
+        hasher.write_u8(self.max_attack_passengers);
         hasher.write_bool(self.no_victim_needed);
         hasher.write_bool(self.can_fire_while_moving);
         hasher.write_bool(self.can_fire_while_charging);
@@ -520,7 +599,22 @@ impl WeaponTemplate {
         for token in &self.projectile_filter_in_container {
             hasher.write_bytes(token.as_bytes());
         }
+        hasher.write_bool(self.projectile_self);
         hasher.write_u8(self.fx_trigger.code());
+        hasher.write_bool(self.instant_load_clip_on_activate);
+        hasher.write_bool(self.share_timers);
+        hasher.write_bool(self.finish_attack_once_started);
+        hasher.write_bool(self.chase_weapon);
+        hasher.write_bool(self.lock_when_using);
+        hasher.write_bool(self.bombard_type);
+        hasher.write_bool(self.disable_scatter_for_targets_on_wall);
+        hasher.write_usize(self.linear_targets.len());
+        for point in &self.linear_targets {
+            hasher.write_f32(point.x);
+            hasher.write_f32(point.y);
+            hasher.write_bool(point.ends_volley);
+        }
+        hasher.write_bool(self.ignore_linear_first_target);
         self.bonus.hash_into(hasher);
     }
 }
@@ -648,6 +742,7 @@ pub struct WeaponState {
     cycle_started_at: Frame,
     attack_cycle: u32,
     pre_attack_draw: LogicFrames,
+    linear_cursor: u32,
 }
 
 impl WeaponState {
@@ -665,7 +760,41 @@ impl WeaponState {
             cycle_started_at: Frame::ZERO,
             attack_cycle: 0,
             pre_attack_draw: LogicFrames::ZERO,
+            linear_cursor: 0,
         }
+    }
+
+    pub fn take_linear_index(&mut self, len: usize) -> Option<usize> {
+        let len = u32::try_from(len).ok().filter(|len| *len > 0)?;
+        let at = self.linear_cursor.checked_rem(len)?;
+        self.linear_cursor = at.saturating_add(1).checked_rem(len)?;
+        usize::try_from(at).ok()
+    }
+
+    #[must_use]
+    pub fn activated(template: &WeaponTemplate, now: Frame, rate: f32, rng: &mut Pcg32) -> Self {
+        let mut state = Self::new(template);
+        if !template.instant_load_clip_on_activate {
+            state.status = WeaponStatus::ReloadingClip;
+            state.when_last_reload_started = now;
+            state.when_we_can_fire_again = now
+                .checked_add(at_rate(template.reload_draw(rng), rate))
+                .unwrap_or(Frame::FOREVER);
+        }
+        state
+    }
+
+    pub fn take_next_fire_from(&mut self, from: &Self) {
+        self.when_we_can_fire_again = from.when_we_can_fire_again;
+        self.status = WeaponStatus::BetweenFiringShots;
+    }
+
+    pub fn abort_wind_up(&mut self) {
+        self.when_pre_attack_finished = Frame::ZERO;
+        if self.status == WeaponStatus::PreAttack {
+            self.status = WeaponStatus::ReadyToFire;
+        }
+        self.leech_until = Frame::ZERO;
     }
 
     pub fn start_cycle(&mut self, now: Frame) {
@@ -803,6 +932,11 @@ impl WeaponState {
         rng: &mut Pcg32,
     ) -> bool {
         self.last_shot = Some(now);
+        if template.leech_range {
+            self.leech_until = now
+                .checked_add(template.firing_duration.max(LogicFrames::from_frames(1)))
+                .unwrap_or(Frame::FOREVER);
+        }
         self.forced_reload_at = (template.auto_reload_when_idle > LogicFrames::ZERO)
             .then(|| now.checked_add(template.auto_reload_when_idle))
             .flatten();
@@ -862,6 +996,7 @@ impl WeaponState {
         self.cycle_started_at.hash_into(hasher);
         hasher.write_u32(self.attack_cycle);
         self.pre_attack_draw.hash_into(hasher);
+        hasher.write_u32(self.linear_cursor);
     }
 }
 
@@ -886,6 +1021,34 @@ mod tests {
 
     fn rng() -> Pcg32 {
         Pcg32::new(1)
+    }
+
+    #[test]
+    fn a_shooter_high_over_its_victim_reaches_further() {
+        let weapon = WeaponTemplate {
+            attack_range: 200.0,
+            range_bonus: RangeBonus {
+                min_height: 30.0,
+                bonus: 1.0,
+                per_foot: 0.6,
+                restricted_height: 0.0,
+            },
+            ..WeaponTemplate::default()
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        assert!(near(weapon.reach_at(1.0, 80.0), 228.5));
+        assert!(near(weapon.reach_at(1.0, 29.0), 197.5));
+        assert!(near(weapon.reach_at(1.0, -80.0), 197.5));
+        let restricted = WeaponTemplate {
+            range_bonus: RangeBonus {
+                restricted_height: 60.0,
+                ..weapon.range_bonus
+            },
+            ..weapon
+        };
+        assert_eq!(restricted.reach_at(1.0, -80.0), 0.0);
+        assert_eq!(restricted.reach_at(1.0, 61.0), 0.0);
+        assert!(near(restricted.reach_at(1.0, 50.0), 197.5 + 1.0 + 12.0));
     }
 
     #[test]
@@ -1016,6 +1179,27 @@ mod tests {
                 "{rate}"
             );
         }
+    }
+
+    #[test]
+    fn a_leech_weapon_with_no_wind_up_is_armed_at_the_shot() {
+        let t = WeaponTemplate {
+            leech_range: true,
+            firing_duration: LogicFrames::from_frames(6),
+            ..WeaponTemplate::default()
+        };
+        let mut state = WeaponState::new(&t);
+        state.fire(&t, Frame::new(100), &mut rng());
+        assert!(state.leeching(Frame::new(105)));
+        assert!(!state.leeching(Frame::new(106)));
+        let bare = WeaponTemplate {
+            leech_range: true,
+            ..WeaponTemplate::default()
+        };
+        let mut state = WeaponState::new(&bare);
+        state.fire(&bare, Frame::new(100), &mut rng());
+        assert!(state.leeching(Frame::new(100)));
+        assert!(!state.leeching(Frame::new(101)));
     }
 
     #[test]
@@ -1298,9 +1482,12 @@ mod tests {
         };
         let mut stream = rng();
         for _ in 0..50 {
-            assert_eq!(always.resolve_shot(&mut stream, false), ShotOutcome::Struck);
             assert_eq!(
-                never.resolve_shot(&mut stream, false),
+                always.resolve_shot(&mut stream, false, false),
+                ShotOutcome::Struck
+            );
+            assert_eq!(
+                never.resolve_shot(&mut stream, false, false),
                 ShotOutcome::Missed([0.0, 0.0])
             );
         }
@@ -1317,7 +1504,7 @@ mod tests {
         let run = |seed| {
             let mut stream = Pcg32::new(seed);
             (0..200)
-                .map(|_| t.resolve_shot(&mut stream, false))
+                .map(|_| t.resolve_shot(&mut stream, false, false))
                 .collect::<Vec<_>>()
         };
         let shots = run(7);
@@ -1344,7 +1531,7 @@ mod tests {
         let mut stream = Pcg32::new(3);
         let mut farthest = 0.0f32;
         for _ in 0..200 {
-            let outcome = t.resolve_shot(&mut stream, true);
+            let outcome = t.resolve_shot(&mut stream, true, false);
             assert!(
                 matches!(outcome, ShotOutcome::Missed(_)),
                 "a shot at infantry struck"
@@ -1357,7 +1544,48 @@ mod tests {
             farthest > 50.0 * 50.0 && farthest <= 90.0 * 90.0 + 1e-3,
             "{farthest}"
         );
-        assert_eq!(t.resolve_shot(&mut stream, false), ShotOutcome::Struck);
+        assert_eq!(
+            t.resolve_shot(&mut stream, false, false),
+            ShotOutcome::Struck
+        );
+    }
+
+    #[test]
+    fn an_aborted_wind_up_leaves_the_weapon_ready() {
+        let t = WeaponTemplate {
+            pre_attack_delay: LogicFrames::from_frames(30),
+            ..WeaponTemplate::default()
+        };
+        let mut state = WeaponState::new(&t);
+        let mut stream = Pcg32::new(1);
+        state.begin_attack(&t, Frame::new(10), true, true, 1.0, &mut stream);
+        assert_eq!(state.status(Frame::new(15)), WeaponStatus::PreAttack);
+        state.abort_wind_up();
+        assert_eq!(state.status(Frame::new(15)), WeaponStatus::ReadyToFire);
+    }
+
+    #[test]
+    fn disable_scatter_for_targets_on_wall_spares_a_victim_on_a_wall() {
+        let t = WeaponTemplate {
+            hit_chance: 1.0,
+            scatter_vs_infantry: 40.0,
+            disable_scatter_for_targets_on_wall: true,
+            ..WeaponTemplate::default()
+        };
+        let mut stream = Pcg32::new(3);
+        assert_eq!(t.resolve_shot(&mut stream, true, true), ShotOutcome::Struck);
+        assert!(matches!(
+            t.resolve_shot(&mut stream, true, false),
+            ShotOutcome::Missed(_)
+        ));
+        let plain = WeaponTemplate {
+            disable_scatter_for_targets_on_wall: false,
+            ..t
+        };
+        assert!(matches!(
+            plain.resolve_shot(&mut stream, true, true),
+            ShotOutcome::Missed(_)
+        ));
     }
 
     #[test]

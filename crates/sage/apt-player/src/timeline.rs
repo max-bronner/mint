@@ -127,6 +127,8 @@ pub(crate) struct Stage {
     pub(crate) native_extern_writes: Vec<(Arc<str>, crate::avm::Value)>,
     pub(crate) pending_loads: Vec<crate::load::LoadRequest>,
     pub(crate) loaded: Vec<(InstanceId, MovieId)>,
+    pub(crate) shared_global: Option<crate::avm::SharedGlobal>,
+    pub(crate) shared_seen: u64,
 }
 
 impl Stage {
@@ -175,6 +177,8 @@ impl Stage {
             native_extern_writes: Vec::new(),
             pending_loads: Vec::new(),
             loaded: Vec::new(),
+            shared_global: None,
+            shared_seen: 0,
         };
         if scripts_enabled {
             natives::install(&mut stage);

@@ -1,6 +1,6 @@
 use mint_movement::Vec2;
 use mint_sage_modules::effects::{Name, Names};
-use mint_sage_modules::{CastEdge, PowerSides};
+use mint_sage_modules::{CastEdge, Effect, PowerSides};
 use mint_sim::module::OwnerChange;
 use mint_sim::{Entity, Frame, LogicFrames, PlayerId, Result, Tick, World};
 
@@ -9,7 +9,9 @@ use crate::combat::{grid_cell, grid_radius_cells, Foe, TargetGrid};
 use crate::defeat::ObjectFilter;
 use crate::diag::diag;
 use crate::powers::PowerEnumEffect;
-use crate::spell_state::{ArrowStormHits, CashBounty, PendingShot, ProductionBonuses, Suppressed};
+use crate::spell_state::{
+    ArrowStormHits, CashBounty, CashBountyPower, PendingShot, ProductionBonuses, Suppressed,
+};
 
 pub(super) fn standing(
     rules: &RotwkRules,
@@ -56,20 +58,113 @@ impl RotwkRules {
         entity: Entity,
         id: mint_sage_combat::ModifierId,
         until: Frame,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let Some(list) = self.combat.modifiers.get(id) else {
+            return Ok(false);
+        };
+        let now = tick.frame();
+        if !self.is_level_list(id) {
+            let members = tick
+                .state()
+                .get(ids.horde, entity)
+                .map(|horde| horde.members.clone())
+                .unwrap_or_default();
+            for member in members {
+                if tick.state().contains(ids.body, member) {
+                    self.give_timed_list(tick, ids, member, id, until)?;
+                }
+            }
+        }
+        if list.ignore_if_anti_category_active
+            && tick
+                .state()
+                .get(ids.suppressed, entity)
+                .is_some_and(|held| held.active(list.category.as_deref(), now))
+        {
+            return Ok(false);
+        }
         let mut timed = tick
             .state()
             .get(ids.timed_modifiers, entity)
             .cloned()
             .unwrap_or_default();
+        let mut dropped = false;
+        if let (true, Some(category)) = (
+            list.replace_in_category_if_longest,
+            list.category.as_deref(),
+        ) {
+            let same = |held: mint_sage_combat::ModifierId| {
+                held != id
+                    && self
+                        .combat
+                        .modifiers
+                        .get(held)
+                        .and_then(|other| other.category.as_deref())
+                        .is_some_and(|other| other.eq_ignore_ascii_case(category))
+            };
+            if timed
+                .0
+                .iter()
+                .any(|(held, end)| same(*held) && *end >= until)
+            {
+                return Ok(false);
+            }
+            let before = timed.0.len();
+            timed.0.retain(|(held, _)| !same(*held));
+            dropped = timed.0.len() != before;
+        }
         let new = timed.give(id, until);
         tick.state_mut()
             .insert(ids.timed_modifiers, entity, timed)?;
         if new {
             self.gain_power_list(tick, ids, entity, id)?;
+        }
+        if new || dropped {
             self.recompute_bonuses(tick, ids, entity)?;
         }
-        Ok(())
+        self.list_given(tick, ids, entity, id, until, new)?;
+        Ok(true)
+    }
+
+    pub(super) fn remove_timed_list(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        id: mint_sage_combat::ModifierId,
+    ) -> Result<bool> {
+        if !self.is_level_list(id) {
+            let members = tick
+                .state()
+                .get(ids.horde, entity)
+                .map(|horde| horde.members.clone())
+                .unwrap_or_default();
+            for member in members {
+                self.remove_timed_list(tick, ids, member, id)?;
+            }
+        }
+        let Some(mut timed) = tick.state().get(ids.timed_modifiers, entity).cloned() else {
+            return Ok(false);
+        };
+        if !timed.remove(id) {
+            return Ok(false);
+        }
+        if timed.0.is_empty() {
+            tick.state_mut().remove(ids.timed_modifiers, entity);
+        } else {
+            tick.state_mut()
+                .insert(ids.timed_modifiers, entity, timed)?;
+        }
+        self.recompute_bonuses(tick, ids, entity)?;
+        Ok(true)
+    }
+
+    fn is_level_list(&self, id: mint_sage_combat::ModifierId) -> bool {
+        self.combat
+            .modifiers
+            .get(id)
+            .and_then(|list| list.category.as_deref())
+            .is_some_and(|category| category.eq_ignore_ascii_case("LEVEL"))
     }
 
     pub(super) fn admits(
@@ -126,22 +221,34 @@ impl RotwkRules {
             .unwrap_or_default()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn pulse_aura(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         source: Entity,
-        list: &Name,
-        radius: f32,
-        affects: &Names,
-        sides: PowerSides,
-        allow_self: bool,
-        lasts: LogicFrames,
-        while_dead: bool,
+        aura: &Effect,
         living: &[(Foe, PlayerId)],
         grid: &TargetGrid,
     ) -> Result<()> {
+        let Effect::Aura {
+            list,
+            radius,
+            affects,
+            target_enemy,
+            affect_good,
+            affect_evil,
+            allow_self,
+            while_dead,
+            anti,
+            anti_fx,
+            max_active_rank,
+            contained_only,
+            required_mounted,
+            allow_while_attacking,
+        } = aura
+        else {
+            return Ok(());
+        };
         let world = tick.state();
         let dying = world.contains(ids.doomed, source)
             || world.get(ids.health, source).is_some_and(|h| h.0.is_dead());
@@ -154,36 +261,154 @@ impl RotwkRules {
         ) else {
             return Ok(());
         };
+        if self.holds_condition_in(world, source, "STONED")
+            || (*required_mounted && !self.holds_condition_in(world, source, "MOUNTED"))
+            || (!allow_while_attacking && Self::is_attacking(world, ids, source))
+        {
+            return Ok(());
+        }
         let Some(id) = self.combat.modifiers.id(list) else {
             return Ok(());
         };
+        let wall = self.has_kind_bit(world, ids, source, "WALK_ON_TOP_OF_WALL");
+        let sides = if *affect_good || *affect_evil || (wall && !target_enemy) {
+            PowerSides::All
+        } else if *target_enemy {
+            PowerSides::Enemies
+        } else {
+            PowerSides::Friends
+        };
         let filter = filter_of(affects);
-        let mut near: Vec<u32> = Vec::new();
-        grid.query_into(
-            grid_cell(centre.x),
-            grid_cell(centre.y),
-            grid_radius_cells(radius),
-            &mut near,
-        );
-        let reach = radius * radius;
-        let mut targets: Vec<Entity> = near
-            .iter()
-            .filter_map(|index| living.get(usize::try_from(*index).ok()?))
-            .filter(|(foe, _)| {
-                let (dx, dy) = (foe.position.x - centre.x, foe.position.y - centre.y);
-                dx * dx + dy * dy <= reach
-            })
-            .map(|(foe, _)| foe.entity)
-            .filter(|entity| allow_self || *entity != source)
-            .filter(|entity| self.admits(world, ids, *entity, owner, &filter, sides))
-            .collect();
+        let mut targets: Vec<Entity> = if *contained_only {
+            world
+                .get(ids.passengers, source)
+                .map(|held| {
+                    held.0
+                        .iter()
+                        .flat_map(|object| Self::object_and_members(world, ids, *object))
+                        .filter(|entity| self.admits(world, ids, *entity, owner, &filter, sides))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            let radius = radius.unwrap_or_else(|| {
+                if wall {
+                    crate::construction::object_bounding_radius(
+                        world,
+                        &self.kinds,
+                        (ids.kind, self.modules.as_ref().map(|wiring| wiring.state)),
+                        source,
+                    )
+                } else {
+                    0.0
+                }
+            });
+            let mut near: Vec<u32> = Vec::new();
+            grid.query_into(
+                grid_cell(centre.x),
+                grid_cell(centre.y),
+                grid_radius_cells(radius),
+                &mut near,
+            );
+            let reach = radius * radius;
+            let mut found: Vec<Entity> = near
+                .iter()
+                .filter_map(|index| living.get(usize::try_from(*index).ok()?))
+                .filter(|(foe, _)| {
+                    let (dx, dy) = (foe.position.x - centre.x, foe.position.y - centre.y);
+                    dx * dx + dy * dy <= reach
+                })
+                .map(|(foe, _)| foe.entity)
+                .filter(|entity| self.admits(world, ids, *entity, owner, &filter, sides))
+                .collect();
+            let hordes: Vec<Entity> = world
+                .store(ids.horde)
+                .map(|store| store.entities().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|horde| {
+                    world.get(ids.body, *horde).is_some_and(|body| {
+                        let (dx, dy) = (body.0.position.x - centre.x, body.0.position.y - centre.y);
+                        dx * dx + dy * dy <= reach
+                    })
+                })
+                .filter(|horde| self.admits(world, ids, *horde, owner, &filter, sides))
+                .collect();
+            if !self.is_level_list(id) {
+                found.retain(|entity| {
+                    !world
+                        .get(ids.member, *entity)
+                        .is_some_and(|member| hordes.contains(&member.horde))
+                });
+            }
+            found.extend(hordes);
+            found
+        };
         targets.sort_unstable_by_key(|entity| entity.index());
         targets.dedup();
-        let until = tick.frame().checked_add(lasts).unwrap_or(Frame::FOREVER);
+        let now = tick.frame();
+        let until = self.list_end(now, id);
         for entity in targets {
+            if (entity == source && !allow_self)
+                || !self.aura_reaches(tick.state(), ids, entity, *affect_good, *affect_evil)
+                || (wall
+                    && !tick
+                        .state()
+                        .get(ids.layer, entity)
+                        .is_some_and(|layer| layer.is_wall_top()))
+                || max_active_rank.is_some_and(|rank| {
+                    rank > 0.0
+                        && self
+                            .experience_of(tick.state(), ids, entity)
+                            .is_some_and(|(index, _)| (index as f32) + 1.0 > rank)
+                })
+            {
+                continue;
+            }
+            if !anti.is_empty() {
+                let mut suppressed = tick
+                    .state()
+                    .get(ids.suppressed, entity)
+                    .cloned()
+                    .unwrap_or_default();
+                for category in anti.iter() {
+                    suppressed.add(category, until);
+                }
+                tick.state_mut()
+                    .insert(ids.suppressed, entity, suppressed)?;
+                self.recompute_bonuses(tick, ids, entity)?;
+                if let (Some(fx), Some(at)) = (
+                    anti_fx,
+                    tick.state().get(ids.body, entity).map(|b| b.0.position),
+                ) {
+                    let power = crate::fx::FxSource::Power;
+                    self.emit_fx_object_named(tick, ids, fx, at, power, entity, None);
+                }
+            }
             self.give_timed_list(tick, ids, entity, id, until)?;
         }
         Ok(())
+    }
+
+    fn aura_reaches(
+        &self,
+        world: &World,
+        ids: Ids,
+        entity: Entity,
+        affect_good: bool,
+        affect_evil: bool,
+    ) -> bool {
+        if ["IGNORED_IN_GUI", "ARMY_OF_DEAD"]
+            .iter()
+            .any(|bit| self.has_kind_bit(world, ids, entity, bit))
+            || self.holds_condition_in(world, entity, "STONED")
+        {
+            return false;
+        }
+        let evil = world
+            .get(ids.owner, entity)
+            .is_some_and(|owner| self.is_evil_owner(owner.0));
+        (!affect_good || !evil) && (!affect_evil || evil)
     }
 
     pub(super) fn expire_spell_state(&self, tick: &mut Tick<'_>, ids: Ids) -> Result<()> {
@@ -266,10 +491,11 @@ impl RotwkRules {
         Ok(made)
     }
 
-    pub(super) fn raise_cash_bounty(
+    pub(super) fn set_cash_bounty(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
+        source: Entity,
         owner: PlayerId,
         fraction: f32,
     ) -> Result<()> {
@@ -278,13 +504,11 @@ impl RotwkRules {
         else {
             return Ok(());
         };
-        let held = tick
-            .state()
-            .get(ids.cash_bounty, player)
-            .map_or(0.0, |bounty| bounty.0);
-        if fraction.is_finite() && fraction > held {
+        if fraction.is_finite() {
             tick.state_mut()
                 .insert(ids.cash_bounty, player, CashBounty(fraction))?;
+            tick.state_mut()
+                .insert(ids.cash_bounty_power, source, CashBountyPower(fraction))?;
             diag!(
                 "power: player {} earns {:.0}% of a victim's bounty value per kill",
                 owner.get(),
@@ -292,6 +516,30 @@ impl RotwkRules {
             );
         }
         Ok(())
+    }
+
+    pub(super) fn pause_special_powers(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        disabled: bool,
+    ) -> Result<()> {
+        let Some(owner) = tick.state().get(ids.owner, entity).map(|owner| owner.0) else {
+            return Ok(());
+        };
+        let Some(player) =
+            crate::economy::player_entity(tick.state(), Self::economy_ids(ids), owner)
+        else {
+            return Ok(());
+        };
+        crate::spell_state::pause_bounty(
+            tick.state_mut(),
+            (ids.cash_bounty, ids.cash_bounty_power),
+            entity,
+            player,
+            disabled,
+        )
     }
 
     pub(super) fn capture(
@@ -369,6 +617,7 @@ impl RotwkRules {
                 .get(ids.owner, entity)
                 .is_none_or(|other| other.0 != owner)
             && !world.contains(ids.construction, entity)
+            && self.airborne_category(world, ids, entity).is_none()
     }
 
     fn dominate_targets_within(
@@ -384,7 +633,7 @@ impl RotwkRules {
         let filter = filter_of(affects);
         let reach = radius * radius;
         let mut targets: Vec<Entity> = self
-            .select_everywhere(world, ids, owner, &filter, PowerSides::All)
+            .select_everywhere(world, ids, owner, &filter, PowerSides::Enemies)
             .into_iter()
             .filter(|entity| self.dominate_may_target(world, ids, source, owner, *entity))
             .filter(|entity| !world.contains(ids.member, *entity))
@@ -486,6 +735,22 @@ impl RotwkRules {
         }
     }
 
+    pub(super) fn curse_may_reach(
+        &self,
+        world: &World,
+        ids: Ids,
+        source: Entity,
+        owner: PlayerId,
+        target: Entity,
+    ) -> bool {
+        let is_hero = world
+            .get(ids.kind, target)
+            .and_then(|kind| self.kinds.get(*kind))
+            .is_some_and(|entry| entry.record.has_kind("HERO"));
+        let (_, _, hostile) = standing(self, owner, world.get(ids.owner, target).map(|o| o.0));
+        target != source && is_hero && hostile && !self.fails_power_scan_status(world, target)
+    }
+
     pub(super) fn curse_powers(
         &self,
         tick: &mut Tick<'_>,
@@ -507,6 +772,7 @@ impl RotwkRules {
                 .get(usize::from(instance.power.get()))
                 .and_then(|(reload, _)| *reload)
                 .unwrap_or(LogicFrames::ZERO);
+            let reload = self.measured_reload(tick.state(), ids, target, instance.power, reload);
             if reload.get() == 0 {
                 continue;
             }
@@ -565,7 +831,7 @@ impl RotwkRules {
         source: Entity,
         power: &str,
     ) -> Result<()> {
-        let Some(range) = tick
+        let range = tick
             .state()
             .get(ids.kind, source)
             .and_then(|kind| self.kinds.get(*kind))
@@ -580,26 +846,17 @@ impl RotwkRules {
                 })
             })
             .and_then(|field| field.numeric)
-            .filter(|range| range.is_finite() && *range > 0.0)
-        else {
-            diag!(
-                "power: {power} at entity {} reaches nobody - its module writes no EffectRange",
-                source.index()
-            );
-            return Ok(());
-        };
-        let filter = ObjectFilter::parse(&["ANY".to_owned(), "ENEMIES".to_owned()]);
-        self.emotion_pulse(
+            .filter(|range| range.is_finite())
+            .unwrap_or(0.0);
+        self.fire_object_event_at(
             tick,
             ids,
             source,
-            super::emotions::Pulse {
-                at: mint_sage_modules::PowerPlace::Source,
-                radius: range,
-                kind: mint_sage_ini::EmotionType::Fear,
-                filter: &filter,
-                lasts: LogicFrames::ZERO,
-            },
+            "BeScary",
+            None,
+            Some(source),
+            Some(mint_sage_modules::object_scripts::EventArg::Number(range)),
+            0,
         )
     }
 
@@ -634,7 +891,20 @@ impl RotwkRules {
                 .and_then(|field| field.numeric)
                 .filter(|value| value.is_finite())
         };
-        let amount = numeric("HealingAmount").unwrap_or(0.0);
+        let flag = |keyword: &str| {
+            declaration
+                .field(keyword)
+                .and_then(|field| field.args.first())
+                .is_some_and(|value| value.eq_ignore_ascii_case("Yes"))
+        };
+        if flag("HealOnlyIfNotInCombat") && Self::in_combat(tick.state(), ids, source) {
+            return Ok(());
+        }
+        let bonus = tick
+            .state()
+            .get(ids.bonuses, source)
+            .map_or(0.0, |bonuses| bonuses.0.auto_heal);
+        let amount = (numeric("HealingAmount").unwrap_or(0.0) + bonus).trunc();
         let radius = numeric("Radius").unwrap_or(0.0);
         let kinds: Vec<String> = declaration
             .field("KindOf")
@@ -666,10 +936,12 @@ impl RotwkRules {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn level_grant(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
+        source: Entity,
         owner: PlayerId,
         centre: Vec2,
         radius: f32,
@@ -679,26 +951,39 @@ impl RotwkRules {
         let filter = filter_of(affects);
         let world = tick.state();
         let reach = radius * radius;
-        let mut targets: Vec<Entity> = self
-            .select_everywhere(world, ids, owner, &filter, PowerSides::All)
+        let mut receivers: Vec<Entity> = self
+            .select_everywhere(world, ids, owner, &filter, PowerSides::Friends)
             .into_iter()
+            .filter(|entity| *entity != source)
             .filter(|entity| {
                 world.get(ids.body, *entity).is_some_and(|body| {
                     let (dx, dy) = (body.0.position.x - centre.x, body.0.position.y - centre.y);
                     dx * dx + dy * dy <= reach
                 })
             })
+            .map(|entity| self.sink_of(world, ids, entity))
             .collect();
-        targets.sort_unstable_by_key(|entity| entity.index());
-        targets.dedup();
-        for &entity in &targets {
+        receivers.sort_unstable_by_key(|entity| entity.index());
+        receivers.dedup();
+        let mut granted = Vec::with_capacity(receivers.len());
+        for entity in receivers {
+            if self.experience_of(tick.state(), ids, entity).is_none() {
+                continue;
+            }
+            if tick.state().contains(ids.horde, entity) {
+                if experience > 0 && self.grant_horde_pools(tick, ids, entity, experience)? {
+                    granted.push(entity);
+                }
+                continue;
+            }
             let scalar = self.level_scalar(tick.state(), ids, entity);
             let gain = crate::experience::scaled(experience, scalar);
             if gain > 0 {
                 self.add_experience(tick, ids, entity, gain)?;
+                granted.push(entity);
             }
         }
-        Ok(targets)
+        Ok(granted)
     }
 
     pub(super) fn production_bonus(
@@ -752,7 +1037,6 @@ impl RotwkRules {
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
-        owner: PlayerId,
         source: Entity,
         weapon: &Name,
         centre: Vec2,
@@ -775,92 +1059,207 @@ impl RotwkRules {
         if remaining_total == 0 {
             return Ok(0);
         }
-        let this_burst = shots_per_burst.min(remaining_total);
-
-        let filter = ObjectFilter::default();
-        let world = tick.state();
-        let reach = radius * radius;
-        let mut candidates: Vec<Entity> = self
-            .select_everywhere(world, ids, owner, &filter, PowerSides::All)
-            .into_iter()
-            .filter(|&entity| entity != source)
-            .filter(|&entity| {
-                world.get(ids.body, entity).is_some_and(|body| {
-                    let (dx, dy) = (body.0.position.x - centre.x, body.0.position.y - centre.y);
-                    dx * dx + dy * dy <= reach
+        let mut shots: Vec<(Vec2, Option<Entity>)> = Vec::new();
+        for _ in 0..shots_per_burst.min(remaining_total) {
+            let target = {
+                let world = tick.state();
+                hits.next_target(shots_per_target, |entity| {
+                    Self::arrow_storm_target_alive(world, ids, entity)
                 })
-            })
-            .collect();
-        candidates.sort_unstable_by_key(|entity| entity.index());
-        candidates.dedup();
-
-        let this_burst = usize::try_from(this_burst).unwrap_or(usize::MAX);
-        let mut points: Vec<Vec2> = Vec::new();
-        for &entity in &candidates {
-            if points.len() >= this_burst {
-                break;
-            }
-            if hits.count(entity.index()) < shots_per_target {
-                if let Some(body) = world.get(ids.body, entity) {
-                    points.push(body.0.position);
-                    hits.record(entity.index());
+            };
+            match target {
+                Some(entity) => {
+                    let Some(at) = tick
+                        .state()
+                        .get(ids.body, entity)
+                        .map(|body| body.0.position)
+                    else {
+                        continue;
+                    };
+                    shots.push((at, Some(entity)));
                 }
+                None if can_shoot_empty_ground => {
+                    let dx = (tick.rng().next_f32() * 2.0 - 1.0) * radius;
+                    let dy = (tick.rng().next_f32() * 2.0 - 1.0) * radius;
+                    shots.push((Vec2::new(centre.x + dx, centre.y + dy), None));
+                }
+                None => break,
             }
+            hits.fired = hits.fired.saturating_add(1);
         }
-        if points.len() < this_burst {
-            if can_shoot_empty_ground {
-                while points.len() < this_burst {
-                    points.push(centre);
-                    hits.record_ground();
-                }
-            } else if !candidates.is_empty() {
-                let needed = this_burst.saturating_sub(points.len());
-                for entity in Self::spread_doubled_up_shots(&candidates, &mut hits, needed) {
-                    if let Some(body) = world.get(ids.body, entity) {
-                        points.push(body.0.position);
-                    }
-                }
-            }
-        }
-
-        for point in &points {
+        for (at, victim) in &shots {
             self.queue_shot(
                 tick,
                 ids,
                 PendingShot {
                     source,
                     weapon: weapon_id,
-                    at: *point,
+                    at: *at,
                     repeat: None,
                     alive_only: false,
                     reload_slot: None,
                     owner_if_gone: None,
+                    victim: *victim,
                 },
             )?;
         }
-        let fired = points.len();
+        let fired = shots.len();
         tick.state_mut()
             .insert(ids.arrow_storm_hits, source, hits)?;
         Ok(fired)
     }
 
-    fn spread_doubled_up_shots(
-        candidates: &[Entity],
-        hits: &mut ArrowStormHits,
-        needed: usize,
-    ) -> Vec<Entity> {
-        let mut picked = Vec::with_capacity(needed.min(candidates.len()));
-        while picked.len() < needed {
-            let Some(&entity) = candidates
-                .iter()
-                .min_by_key(|entity| (hits.count(entity.index()), entity.index()))
-            else {
-                break;
-            };
-            hits.record(entity.index());
-            picked.push(entity);
-        }
-        picked
+    pub(super) fn sense_enemies(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        range: f32,
+        filter: &ObjectFilter,
+    ) -> Result<()> {
+        const NEAR: &str = "SPECIAL_ENEMY_NEAR";
+        let world = tick.state();
+        let (Some(owner), Some(centre)) = (
+            world.get(ids.owner, source).map(|owner| owner.0),
+            world.get(ids.body, source).map(|body| body.0.position),
+        ) else {
+            return Ok(());
+        };
+        let reach = range * range;
+        let near = world.store(ids.kind).is_some_and(|store| {
+            store.entities().iter().any(|&entity| {
+                entity != source
+                    && self.admits(world, ids, entity, owner, filter, PowerSides::Enemies)
+                    && world.get(ids.body, entity).is_some_and(|body| {
+                        let (dx, dy) = (body.0.position.x - centre.x, body.0.position.y - centre.y);
+                        dx * dx + dy * dy <= reach
+                    })
+            })
+        });
+        let carriers = world
+            .get(ids.passengers, source)
+            .map_or_else(|| vec![source], |held| held.0.clone());
+        let set = mint_sage_modules::effects::names(if near {
+            vec![NEAR.to_owned()]
+        } else {
+            Vec::new()
+        });
+        let clear = mint_sage_modules::effects::names(if near {
+            Vec::new()
+        } else {
+            vec![NEAR.to_owned()]
+        });
+        let effects = carriers
+            .into_iter()
+            .map(|carrier| {
+                (
+                    carrier,
+                    Effect::ModelConditions {
+                        add: Names::clone(&set),
+                        remove: Names::clone(&clear),
+                    },
+                )
+            })
+            .collect();
+        self.apply_effects(tick, ids, effects)
+    }
+
+    fn arrow_storm_target_alive(world: &World, ids: Ids, entity: Entity) -> bool {
+        world.is_live(entity)
+            && !world.contains(ids.doomed, entity)
+            && !world
+                .get(ids.health, entity)
+                .is_some_and(|health| health.0.is_dead())
+    }
+
+    pub(super) fn arrow_storm_shots(&self, world: &World, ids: Ids) -> Vec<(Entity, u32)> {
+        world
+            .store(ids.arrow_storm_hits)
+            .map(|store| {
+                store
+                    .iter()
+                    .map(|(caster, hits)| {
+                        (
+                            caster,
+                            hits.shots_left(|entity| {
+                                Self::arrow_storm_target_alive(world, ids, entity)
+                            }),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn arrow_storm_prepare(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        owner: PlayerId,
+        source: Entity,
+        (centre, radius): (Vec2, f32),
+        (shots_per_target, max_shots): (u32, u32),
+    ) -> Result<()> {
+        let found = self.arrow_storm_scan(tick.state(), ids, owner, centre, radius);
+        let list = crate::spell_state::arrow_storm_list(
+            &found,
+            usize::try_from(max_shots).unwrap_or(usize::MAX),
+        );
+        tick.state_mut().insert(
+            ids.arrow_storm_hits,
+            source,
+            ArrowStormHits {
+                list: Some(list),
+                per_target: shots_per_target,
+                max_shots,
+                ..ArrowStormHits::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    fn arrow_storm_scan(
+        &self,
+        world: &World,
+        ids: Ids,
+        owner: PlayerId,
+        centre: Vec2,
+        radius: f32,
+    ) -> Vec<(Entity, bool)> {
+        const SKIPPED: [&str; 6] = [
+            "UNATTACKABLE",
+            "IGNORED_IN_GUI",
+            "INERT",
+            "BASE_FOUNDATION",
+            "MOVE_ONLY",
+            "WALL_UPGRADE",
+        ];
+        let reach = radius * radius;
+        let mut found: Vec<(Entity, bool)> = self
+            .select_everywhere(
+                world,
+                ids,
+                owner,
+                &ObjectFilter::default(),
+                PowerSides::Enemies,
+            )
+            .into_iter()
+            .filter_map(|entity| {
+                let body = world.get(ids.body, entity)?;
+                let (dx, dy) = (body.0.position.x - centre.x, body.0.position.y - centre.y);
+                if dx * dx + dy * dy > reach {
+                    return None;
+                }
+                let entry = world
+                    .get(ids.kind, entity)
+                    .and_then(|kind| self.kinds.get(*kind))?;
+                let has = |name: &str| entry.record.kind_of.iter().any(|flag| flag == name);
+                (!SKIPPED.iter().any(|name| has(name))).then(|| (entity, has("MONSTER")))
+            })
+            .collect();
+        found.sort_unstable_by_key(|(entity, _)| entity.index());
+        found.dedup();
+        found
     }
 
     pub(super) fn refresh_other_powers(
@@ -868,35 +1267,20 @@ impl RotwkRules {
         tick: &mut Tick<'_>,
         ids: Ids,
         source: Entity,
-        except: &Name,
-        recipients: Option<(f32, &Names)>,
+        rule: &mint_sage_modules::ModifierRule,
     ) -> Result<usize> {
         let now = tick.frame();
-        let mut total = self.reset_declared_powers(tick, ids, source, except, now)?;
-        let Some((range, affects)) = recipients else {
-            return Ok(total);
-        };
         let world = tick.state();
         let (Some(owner), Some(centre)) = (
             world.get(ids.owner, source).map(|o| o.0),
             world.get(ids.body, source).map(|body| body.0.position),
         ) else {
-            return Ok(total);
+            return Ok(0);
         };
-        let mut targets =
-            self.admitted_within(world, ids, owner, centre, range, &filter_of(affects));
-        targets.retain(|entity| *entity != source);
-        for entity in targets {
-            let count = self.reset_declared_powers(tick, ids, entity, except, now)?;
-            let name = tick
-                .state()
-                .get(ids.kind, entity)
-                .and_then(|kind| self.kinds.get(*kind))
-                .map_or("-", |entry| entry.record.name.as_str());
-            diag!(
-                "power: {except} refreshed {count} power(s) on entity {} ({name})",
-                entity.index()
-            );
+        let recipients = self.modifier_recipients(tick, ids, source, owner, centre, rule);
+        let mut total = 0usize;
+        for entity in recipients {
+            let count = self.reset_declared_powers(tick, ids, entity, now)?;
             total = total.saturating_add(count);
         }
         Ok(total)
@@ -937,14 +1321,62 @@ impl RotwkRules {
         targets
     }
 
+    pub(super) fn hero_die(&self, tick: &mut Tick<'_>, ids: Ids, dying: Entity) -> Result<()> {
+        let world = tick.state();
+        let Some(entry) = world
+            .get(ids.kind, dying)
+            .and_then(|kind| self.kinds.get(*kind))
+            .filter(|entry| entry.record.has_kind("HERO"))
+        else {
+            return Ok(());
+        };
+        let Some(owner) = world.get(ids.owner, dying).map(|owner| owner.0) else {
+            return Ok(());
+        };
+        let Some(power) = entry
+            .record
+            .declared_modules
+            .iter()
+            .find(|module| module.name.eq_ignore_ascii_case("HeroDie"))
+            .and_then(|module| module.field("SpecialPowerTemplate"))
+            .and_then(|field| field.args.first().cloned())
+        else {
+            return Ok(());
+        };
+        let mut holders: Vec<Entity> = world
+            .store(ids.owner)
+            .map(|store| {
+                store
+                    .iter()
+                    .filter(|(_, held)| held.0 == owner)
+                    .map(|(entity, _)| entity)
+                    .filter(|entity| {
+                        world
+                            .get(ids.kind, *entity)
+                            .and_then(|kind| self.kinds.get(*kind))
+                            .is_some_and(|entry| entry.record.power(&power).is_some())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        holders.sort_unstable_by_key(|entity| entity.index());
+        let now = tick.frame();
+        for holder in holders {
+            self.reset_power_ready(tick, ids, holder, &power, now)?;
+        }
+        Ok(())
+    }
+
     fn reset_declared_powers(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         entity: Entity,
-        except: &Name,
         now: Frame,
     ) -> Result<usize> {
+        if tick.state().contains(ids.using_ability, entity) {
+            return Ok(0);
+        }
         let Some(kind) = tick.state().get(ids.kind, entity).copied() else {
             return Ok(0);
         };
@@ -957,10 +1389,17 @@ impl RotwkRules {
             .iter()
             .filter_map(|module| module.field("SpecialPowerTemplate"))
             .filter_map(|field| field.args.first().cloned())
-            .filter(|name| !name.eq_ignore_ascii_case(except))
             .collect();
         names.sort();
         names.dedup();
+        names.retain(|name| {
+            let shared = self.power_names.id(name).is_some_and(|id| {
+                self.power_reload
+                    .get(usize::from(id.get()))
+                    .is_some_and(|(_, shared)| *shared)
+            });
+            !shared && !self.power_is_paused(tick.state(), ids, entity, name)
+        });
         for name in &names {
             self.reset_power_ready(tick, ids, entity, name, now)?;
         }
@@ -1194,13 +1633,6 @@ impl RotwkRules {
 mod tests {
     use super::*;
 
-    fn candidates(n: u32) -> Vec<Entity> {
-        let mut world = World::new();
-        (0..n)
-            .map(|_| world.spawn().expect("a fresh world always has room"))
-            .collect()
-    }
-
     #[test]
     fn the_sunbeam_grid_starts_a_spacing_in_and_clears_a_spacing_at_the_far_edge() {
         let points = sunbeam_grid(Vec2::new(1000.0, 700.0), 300.0);
@@ -1210,20 +1642,6 @@ mod tests {
         );
         assert!(sunbeam_grid(Vec2::new(1000.0, 700.0), 0.0).is_empty());
         assert!(sunbeam_grid(Vec2::new(1000.0, 700.0), f32::NAN).is_empty());
-    }
-
-    #[test]
-    fn doubled_up_shots_spread_to_whichever_target_has_fewer_hits() {
-        let entities = candidates(2);
-        let mut hits = ArrowStormHits::default();
-        hits.record(entities[0].index());
-        hits.record(entities[1].index());
-
-        let picked = RotwkRules::spread_doubled_up_shots(&entities, &mut hits, 9);
-
-        assert_eq!(picked.len(), 9);
-        assert_eq!(hits.count(entities[0].index()), 6);
-        assert_eq!(hits.count(entities[1].index()), 5);
     }
 
     #[test]

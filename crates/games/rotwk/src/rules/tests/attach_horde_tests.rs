@@ -11,7 +11,8 @@ Object TestHorde\n  Side = Men\n  KindOf = SELECTABLE HORDE\n  CommandSet = Hord
   Behavior = HordeContain Tag_01\n    Slots = 3\n    \
     RankInfo = RankNumber:1 UnitType:Pikeman Position:X:10 Y:-10 Position:X:10 Y:10 Position:X:-10 Y:0\n  \
   End\n  \
-  Geometry = CYLINDER\n  GeometryMajorRadius = 15\n  GeometryHeight = 20\nEnd\n\
+  Geometry = BOX\n  GeometryMajorRadius = 30
+  GeometryMinorRadius = 45\n  GeometryHeight = 20\nEnd\n\
 Object Crown\n  Side = Men\n  KindOf = SELECTABLE IMMOBILE\n  \
   Behavior = AttachUpdate Tag_Attach\n    ObjectFilter = ANY\n    ScanRange = 50\n    \
     AnchorToTopOfGeometry = Yes\n  End\n  \
@@ -25,8 +26,7 @@ Object Camp\n  Side = Men\n  KindOf = STRUCTURE SELECTABLE IMMOBILE\n  CommandSe
 CommandSet HordeSet\n  1 = Build_TestHorde\nEnd\n\
 CommandButton Build_TestHorde\n  Command = UNIT_BUILD\n  Object = TestHorde\nEnd\n";
 
-#[test]
-fn a_crown_on_a_horde_follows_the_members_mean_and_the_hordes_geometry_top() {
+fn horde_scene(crown_x: f32) -> (Simulation<RotwkRules>, Ids) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
@@ -41,7 +41,7 @@ fn a_crown_on_a_horde_follows_the_members_mean_and_the_hordes_geometry_top() {
         .spawn(
             &data.combat,
             kinds.kind("Crown").unwrap(),
-            Vec2::new(305.0, 300.0),
+            Vec2::new(crown_x, 300.0),
             Facing::EAST,
             PLAYER,
         )
@@ -76,6 +76,12 @@ fn a_crown_on_a_horde_follows_the_members_mean_and_the_hordes_geometry_top() {
     for _ in 0..4 {
         simulation.tick().unwrap();
     }
+    (simulation, ids)
+}
+
+#[test]
+fn a_crown_on_a_horde_follows_the_members_mean_and_the_hordes_geometry_top() {
+    let (mut simulation, ids) = horde_scene(305.0);
     let crown = simulation
         .state()
         .store(ids.attach_link)
@@ -109,4 +115,16 @@ fn a_crown_on_a_horde_follows_the_members_mean_and_the_hordes_geometry_top() {
         (z - (mean_z + 20.0)).abs() < 1.0,
         "z {z} mean feet {mean_z}"
     );
+}
+
+#[test]
+fn a_horde_is_found_by_the_scan_through_its_own_bounding_circle() {
+    let (mut simulation, ids) = horde_scene(366.0);
+    for _ in 0..2 {
+        simulation.tick().unwrap();
+    }
+    let crown = simulation.state().store(ids.body).unwrap().entities()[0];
+    let horde = simulation.state().store(ids.horde).unwrap().entities()[0];
+    let link = simulation.state().get(ids.attach_link, crown).copied();
+    assert_eq!(link.map(|l| l.parent), Some(horde));
 }

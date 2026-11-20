@@ -1008,6 +1008,82 @@ fn extern_members_are_what_the_host_set() {
     assert_eq!(p.take_traces(), vec!["true".to_owned()]);
 }
 
+fn global_writer(shared: &crate::SharedGlobal) -> Player {
+    let mut s = Synth::new();
+    let mut a = Asm::new();
+    a.push_str("_global.InGame")
+        .get_var("extern")
+        .push_str("InGame")
+        .op(op::GET_MEMBER)
+        .op(op::SET_VARIABLE);
+    a.push_str("_global.Holder")
+        .push_byte(0)
+        .push_str("Object")
+        .op(op::NEW)
+        .op(op::SET_VARIABLE)
+        .end();
+    let block = s.code(&mut a);
+    let mut p = scripted(&s, &vec![vec![Item::Action(block)]]);
+    p.share_global(shared);
+    p.set_extern_value("InGame", Value::str("1"));
+    p
+}
+
+fn global_reader(shared: &crate::SharedGlobal) -> Player {
+    let mut s = Synth::new();
+    let mut a = Asm::new();
+    trace_var(&mut a, "_global.InGame");
+    a.get_var("_global")
+        .push_str("InGame")
+        .op(op::GET_MEMBER)
+        .op(op::TRACE);
+    trace_var(&mut a, "_global.Holder");
+    a.end();
+    let block = s.code(&mut a);
+    let mut p = scripted(&s, &vec![vec![Item::Action(block)]]);
+    p.share_global(shared);
+    p
+}
+
+#[test]
+fn a_global_member_one_player_writes_is_read_by_the_others_and_outlives_the_writer() {
+    let shared = crate::SharedGlobal::new();
+    let mut writer = global_writer(&shared);
+    writer.tick().unwrap();
+    assert_eq!(shared.get("InGame"), Some(Value::str("1")));
+    assert_eq!(shared.get("Holder"), None);
+    drop(writer);
+    let mut reader = global_reader(&shared);
+    reader.tick().unwrap();
+    assert_eq!(
+        reader.take_traces(),
+        vec!["1".to_owned(), "1".to_owned(), "undefined".to_owned()]
+    );
+}
+
+#[test]
+fn players_that_do_not_share_a_global_do_not_see_each_others_writes() {
+    let mut writer = global_writer(&crate::SharedGlobal::new());
+    writer.tick().unwrap();
+    let mut reader = global_reader(&crate::SharedGlobal::new());
+    reader.tick().unwrap();
+    assert_eq!(reader.take_traces(), vec!["undefined".to_owned(); 3]);
+}
+
+#[test]
+fn a_later_write_reaches_a_player_that_already_read() {
+    let shared = crate::SharedGlobal::new();
+    let mut reader = global_reader(&shared);
+    reader.tick().unwrap();
+    assert_eq!(reader.take_traces()[0], "undefined");
+    let mut writer = global_writer(&shared);
+    writer.tick().unwrap();
+    assert_eq!(
+        reader.variable(reader.root(), "_global.InGame"),
+        Value::str("1")
+    );
+}
+
 struct CountingHost(std::rc::Rc<std::cell::Cell<i32>>);
 
 impl crate::SyncHost for CountingHost {
@@ -1185,4 +1261,87 @@ fn xmouse_and_ymouse_read_the_pointer_the_host_moved() {
     p.pointer_move(30.0, 40.0).unwrap();
     p.tick().unwrap();
     assert_eq!(p.take_traces(), vec!["30".to_owned(), "40".to_owned()]);
+}
+
+fn attach_and_trace(a: &mut Asm, export: &str, name: &str, depth: u8) {
+    a.push_byte(depth)
+        .push_str(name)
+        .push_str(export)
+        .push_byte(3)
+        .op(op::PUSH_THIS)
+        .push_str("attachMovie")
+        .op(op::CALL_METHOD)
+        .op(op::TRACE);
+}
+
+#[test]
+fn attach_movie_searches_own_exports_and_imports_then_ancestor_exports() {
+    let mut far = Synth::new();
+    let far_art = far.sprite(vec![vec![]]);
+    far.export("Far", far_art);
+    let (fc, fapt) = far.build(&vec![vec![]]);
+
+    let mut child = Synth::new();
+    let child_art = child.sprite(vec![vec![]]);
+    child.export("ChildItem", child_art);
+    let mut c = Asm::new();
+    attach_and_trace(&mut c, "ChildItem", "own", 1);
+    attach_and_trace(&mut c, "mIDitem", "mid", 2);
+    attach_and_trace(&mut c, "HostItem", "host", 3);
+    attach_and_trace(&mut c, "Far", "far", 4);
+    attach_and_trace(&mut c, "Nobody", "none", 5);
+    c.end();
+    let code = child.code(&mut c);
+    let (cc, capt) = child.build(&vec![vec![Item::Action(code)]]);
+
+    let mut mid = Synth::new();
+    let mid_art = mid.sprite(vec![vec![]]);
+    mid.export("MidItem", mid_art);
+    let slot2 = mid.sprite(vec![vec![]]);
+    let mut m = Asm::new();
+    m.get_url("child.swf", "_level0.slot.slot2").end();
+    let code = mid.code(&mut m);
+    let (mc, mapt) = mid.build(&vec![vec![
+        Item::Place(place(1, slot2).name("slot2")),
+        Item::Action(code),
+    ]]);
+
+    let mut host = Synth::new();
+    let host_art = host.sprite(vec![vec![]]);
+    host.export("HostItem", host_art);
+    host.import("far.apt", "Far");
+    let slot = host.sprite(vec![vec![]]);
+    let mut h = Asm::new();
+    attach_and_trace(&mut h, "far", "imported", 7);
+    attach_and_trace(&mut h, "hostitem", "exported", 8);
+    h.get_url("mid.swf", "_level0.slot").end();
+    let code = host.code(&mut h);
+    let (hc, hapt) = host.build(&vec![vec![
+        Item::Place(place(1, slot).name("slot")),
+        Item::Action(code),
+    ]]);
+
+    let mut lib = Library::new();
+    let host_id = lib.add("host", &hc, hapt).unwrap();
+    lib.add("mid", &mc, mapt).unwrap();
+    lib.add("child", &cc, capt).unwrap();
+    lib.add("far", &fc, fapt).unwrap();
+    lib.link();
+    let mut p = Player::new(Arc::new(lib), host_id, Limits::default()).unwrap();
+    p.set_trace_log(true);
+    for _ in 0..4 {
+        p.tick().unwrap();
+    }
+    assert_eq!(
+        p.take_traces(),
+        vec![
+            "_level0.imported",
+            "_level0.exported",
+            "_level0.slot.slot2.own",
+            "_level0.slot.slot2.mid",
+            "_level0.slot.slot2.host",
+            "undefined",
+            "undefined",
+        ]
+    );
 }

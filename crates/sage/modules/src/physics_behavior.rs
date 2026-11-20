@@ -12,6 +12,8 @@ pub struct PhysicsBehavior {
     allow_bouncing: bool,
     arc: ArcFields,
     ground_hit_fx: Option<String>,
+    orient_to_flight_path: bool,
+    tumble_randomly: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -76,6 +78,11 @@ impl PhysicsBehavior {
     pub const fn allow_bouncing(&self) -> bool {
         self.allow_bouncing
     }
+
+    #[must_use]
+    pub const fn orients_to_flight_path(&self) -> bool {
+        self.orient_to_flight_path && !self.tumble_randomly
+    }
 }
 
 impl Component for PhysicsBehavior {
@@ -100,6 +107,10 @@ impl Component for PhysicsBehavior {
         }
         hasher.write_bool(arc.ignore_terrain_height);
         hasher.write_bytes(self.ground_hit_fx.as_deref().unwrap_or("").as_bytes());
+        if self.orient_to_flight_path || self.tumble_randomly {
+            hasher.write_bool(self.orient_to_flight_path);
+            hasher.write_bool(self.tumble_randomly);
+        }
     }
 }
 
@@ -142,6 +153,8 @@ pub fn physics_behavior_from_fields(
         allow_bouncing: allow_bouncing.unwrap_or(false),
         arc,
         ground_hit_fx,
+        orient_to_flight_path: optional_bool(fields, "OrientToFlightPath")?.unwrap_or(false),
+        tumble_randomly: optional_bool(fields, "TumbleRandomly")?.unwrap_or(false),
     })
 }
 

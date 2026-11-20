@@ -6,7 +6,7 @@ use crate::value::{parse_bool, parse_float, parse_percent, Duration};
 
 pub const LOCOMOTOR_KEYWORD: &str = "Locomotor";
 
-pub const LOCOMOTOR_FIELDS: [&str; 48] = [
+pub const LOCOMOTOR_FIELDS: [&str; 56] = [
     "Surfaces",
     "ZAxisBehavior",
     "Appearance",
@@ -55,6 +55,14 @@ pub const LOCOMOTOR_FIELDS: [&str; 48] = [
     "ScalesWalls",
     "PreferredHeightDamping",
     "WanderAboutPointRadius",
+    "WanderWidthFactor",
+    "BackingUpDistanceMin",
+    "BackingUpDistanceMax",
+    "BackingUpAngle",
+    "BackingUpStopWhenTurning",
+    "BackingUpSpeed",
+    "CirclingRadius",
+    "LocomotorWorksWhenDead",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -79,6 +87,14 @@ pub struct LocomotorDef {
     pub crew_powered: Option<bool>,
     pub scales_walls: Option<bool>,
     pub wander_about_point_radius: Option<f32>,
+    pub wander_width_factor: Option<f32>,
+    pub backing_up_distance_min: Option<f32>,
+    pub backing_up_distance_max: Option<f32>,
+    pub backing_up_angle: Option<f32>,
+    pub backing_up_stop_when_turning: Option<bool>,
+    pub backing_up_speed: Option<f32>,
+    pub circling_radius: Option<f32>,
+    pub works_when_dead: Option<bool>,
     pub has_suspension: Option<bool>,
     pub roll_stiffness: Option<f32>,
     pub roll_damping: Option<f32>,
@@ -224,7 +240,7 @@ pub fn read_locomotor(block: &Block, errors: &ValueErrors) -> LocomotorDef {
         braking: scalar(block, "Braking", errors, "a number", parse_float),
         acceleration: scalar(block, "Acceleration", errors, "a number", parse_float),
         min_turn_speed: scalar(block, "MinTurnSpeed", errors, "a percentage", parse_percent),
-        min_speed: scalar(block, "MinSpeed", errors, "a number", parse_float),
+        min_speed: scalar(block, "MinSpeed", errors, "a percentage", parse_percent),
         stick_to_ground: scalar(block, "StickToGround", errors, "Yes or No", parse_bool),
         slow_turn_radius: scalar(block, "SlowTurnRadius", errors, "a number", parse_float),
         fast_turn_radius: scalar(block, "FastTurnRadius", errors, "a number", parse_float),
@@ -241,6 +257,44 @@ pub fn read_locomotor(block: &Block, errors: &ValueErrors) -> LocomotorDef {
             errors,
             "a number",
             parse_float,
+        ),
+        wander_width_factor: scalar(block, "WanderWidthFactor", errors, "a number", parse_float),
+        backing_up_distance_min: scalar(
+            block,
+            "BackingUpDistanceMin",
+            errors,
+            "a number",
+            parse_float,
+        ),
+        backing_up_distance_max: scalar(
+            block,
+            "BackingUpDistanceMax",
+            errors,
+            "a number",
+            parse_float,
+        ),
+        backing_up_angle: scalar(block, "BackingUpAngle", errors, "a number", parse_float),
+        backing_up_stop_when_turning: scalar(
+            block,
+            "BackingUpStopWhenTurning",
+            errors,
+            "Yes or No",
+            parse_bool,
+        ),
+        backing_up_speed: scalar(
+            block,
+            "BackingUpSpeed",
+            errors,
+            "a percentage",
+            parse_percent,
+        ),
+        circling_radius: scalar(block, "CirclingRadius", errors, "a number", parse_float),
+        works_when_dead: scalar(
+            block,
+            "LocomotorWorksWhenDead",
+            errors,
+            "Yes or No",
+            parse_bool,
         ),
         has_suspension: scalar(block, "HasSuspension", errors, "Yes or No", parse_bool),
         roll_stiffness: scalar(block, "RollStiffness", errors, "a number", parse_float),

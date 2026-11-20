@@ -144,13 +144,33 @@ impl RotwkRules {
                 continue;
             }
             if tick.state().is_live(passenger) {
+                let here = tick.state().get(ids.body, passenger).map(|b| b.0.position);
+                let route = match here {
+                    Some(here) if self.exits_by_landing(tick.state(), ids, ship) => {
+                        let points = self.ship_exit_route(
+                            tick,
+                            ids,
+                            (ship, passenger),
+                            here,
+                            unload.destination,
+                        );
+                        Route {
+                            portals: vec![None; points.len()],
+                            points,
+                            extra_distance: 0.0,
+                            unsearched: false,
+                        }
+                    }
+                    _ => Route::to_point(unload.destination),
+                };
+                let goal = route.points.last().copied().unwrap_or(unload.destination);
                 crate::unit::give_path(
                     tick.state_mut(),
                     (ids.body, ids.path),
                     passenger,
                     Path {
-                        route: Route::to_point(unload.destination),
-                        goal: unload.destination,
+                        route,
+                        goal,
                         kind: PathKind::Ordered,
                         facing: None,
                     },

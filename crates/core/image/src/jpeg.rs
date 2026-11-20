@@ -1,11 +1,26 @@
+use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
+
 use crate::{rgba_len, Error, Result};
 
 pub const MAX_DIMENSION: u16 = 8192;
 
 pub fn decode(bytes: &[u8]) -> Result<crate::RgbaImage> {
-    let mut decoder = jpeg_decoder::Decoder::new(bytes);
-    decoder.read_info().map_err(box_jpeg_error)?;
+    std::panic::catch_unwind(|| decode_unguarded(bytes)).unwrap_or(Err(Error::JpegDecoderPanicked))
+}
+
+fn decode_unguarded(bytes: &[u8]) -> Result<crate::RgbaImage> {
+    let options = DecoderOptions::default()
+        .set_max_width(usize::from(u16::MAX))
+        .set_max_height(usize::from(u16::MAX))
+        .set_strict_mode(true)
+        .jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    decoder.decode_headers().map_err(box_jpeg_error)?;
     let info = decoder.info().ok_or(Error::JpegNoFrame)?;
+    let input = decoder.input_colorspace().ok_or(Error::JpegNoFrame)?;
 
     if info.width == 0 || info.height == 0 {
         return Err(Error::ZeroDimension {
@@ -30,33 +45,25 @@ pub fn decode(bytes: &[u8]) -> Result<crate::RgbaImage> {
         height,
     })?;
 
-    let samples = info
-        .pixel_format
-        .pixel_bytes()
-        .checked_mul(width as usize)
-        .and_then(|row| row.checked_mul(height as usize))
-        .ok_or(Error::DimensionsOverflow {
-            format: "jpeg",
-            width,
-            height,
-        })?;
-    decoder.set_max_decoding_buffer_size(samples);
-
-    let samples = decoder.decode().map_err(box_jpeg_error)?;
-
-    let pixels = match info.pixel_format {
-        jpeg_decoder::PixelFormat::L8 => expand(&samples, 1, rgba_bytes, width, height)?,
-        jpeg_decoder::PixelFormat::RGB24 => expand(&samples, 3, rgba_bytes, width, height)?,
-        other => {
+    match input {
+        ColorSpace::Luma | ColorSpace::YCbCr | ColorSpace::RGB => {}
+        ColorSpace::CMYK | ColorSpace::YCCK => {
+            return Err(Error::JpegUnsupportedPixelFormat { format: "CMYK" })
+        }
+        _ => {
             return Err(Error::JpegUnsupportedPixelFormat {
-                format: match other {
-                    jpeg_decoder::PixelFormat::L16 => "16-bit greyscale",
-                    jpeg_decoder::PixelFormat::CMYK32 => "CMYK",
-                    _ => "an unrecognised sample layout",
-                },
+                format: "an unrecognised sample layout",
             })
         }
-    };
+    }
+
+    decoder.set_options(
+        options
+            .set_max_width(usize::from(MAX_DIMENSION))
+            .set_max_height(usize::from(MAX_DIMENSION)),
+    );
+    let samples = decoder.decode().map_err(box_jpeg_error)?;
+    let pixels = expand(&samples, 3, rgba_bytes, width, height)?;
 
     Ok(crate::RgbaImage::new(width, height, pixels))
 }
@@ -111,7 +118,7 @@ fn expand(
     Ok(pixels)
 }
 
-fn box_jpeg_error(source: jpeg_decoder::Error) -> Error {
+fn box_jpeg_error(source: zune_jpeg::errors::DecodeErrors) -> Error {
     Error::Jpeg {
         source: Box::new(source),
     }

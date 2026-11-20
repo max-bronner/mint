@@ -307,6 +307,9 @@ impl RotwkRules {
             || self
                 .level_upgrades(world, ids, entity)
                 .is_some_and(|granted| granted.contains(bit))
+            || self
+                .forwarded_level_upgrades(world, ids, entity)
+                .is_some_and(|granted| granted.contains(bit))
     }
 }
 

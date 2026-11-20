@@ -84,6 +84,7 @@ impl RadiusAffects {
 pub struct VictimRules {
     pub special: Vec<String>,
     pub scalars: Vec<(f32, Vec<String>)>,
+    pub force_kill: Vec<String>,
 }
 
 impl VictimRules {
@@ -91,6 +92,10 @@ impl VictimRules {
     pub fn read(block: &Block, unreadable: &mut usize) -> Option<Self> {
         let special: Vec<String> = block
             .field("SpecialObjectFilter")
+            .map(|field| field.args.clone())
+            .unwrap_or_default();
+        let force_kill: Vec<String> = block
+            .field("ForceKillObjectFilter")
             .map(|field| field.args.clone())
             .unwrap_or_default();
         let mut scalars = Vec::new();
@@ -106,7 +111,11 @@ impl VictimRules {
                 None => *unreadable = unreadable.saturating_add(1),
             }
         }
-        (!special.is_empty() || !scalars.is_empty()).then_some(Self { special, scalars })
+        (!special.is_empty() || !scalars.is_empty() || !force_kill.is_empty()).then_some(Self {
+            special,
+            scalars,
+            force_kill,
+        })
     }
 }
 

@@ -521,6 +521,10 @@ impl<A: App + Subject> App for Dumping<A> {
     fn exit_requested(&self) -> bool {
         self.app.exit_requested()
     }
+
+    fn abandon_on_exit(&self) -> bool {
+        self.app.abandon_on_exit()
+    }
 }
 
 #[cfg(test)]

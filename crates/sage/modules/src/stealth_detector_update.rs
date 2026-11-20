@@ -76,7 +76,7 @@ pub fn stealth_detector_update_from_fields(
 ) -> Result<StealthDetectorUpdate, FieldError> {
     let rate_ms = number(fields, "DetectionRate")?;
     let detection_rate = rate_ms.map_or(LogicFrames::ONE, |ms| {
-        LogicFrames::from_milliseconds(milliseconds(ms)).max(LogicFrames::ONE)
+        crate::special_ability_update::retail_duration_ticks(milliseconds(ms)).max(LogicFrames::ONE)
     });
     Ok(StealthDetectorUpdate {
         data: Arc::new(StealthDetectorData {
@@ -129,7 +129,10 @@ mod tests {
             stealth_detector_update_from_fields(&fields(&[("DetectionRate", "500")]), Frame::ZERO)
                 .unwrap();
         assert_eq!(read.detection_range(), None);
-        assert_eq!(read.detection_rate(), LogicFrames::from_milliseconds(500));
+        assert_eq!(
+            read.detection_rate(),
+            crate::special_ability_update::retail_duration_ticks(500)
+        );
         assert_eq!(
             read.mark_frames().get(),
             read.detection_rate().get().saturating_add(1)

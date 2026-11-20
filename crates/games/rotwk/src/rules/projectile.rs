@@ -7,6 +7,11 @@ use mint_sage_modules::effects::{names, Effect};
 
 const THROWN: &str = "THROWN_PROJECTILE";
 
+const ABOUT_TO_HIT: &str = "ABOUT_TO_HIT";
+const DETONATED: &str = "DETONATED";
+const NORMAL: &str = "NORMAL";
+const UNRESISTABLE: &str = "UNRESISTABLE";
+
 pub(super) const FREEFALL: &str = "FREEFALL";
 
 const SPLATTED: &str = "SPLATTED";
@@ -58,17 +63,20 @@ impl RotwkRules {
                 let weapon = |name: Option<&String>| {
                     name.and_then(|name| self.combat.weapons.id(name.as_str()))
                 };
-                let landing = |kind: Option<&String>, radius: Option<f32>, time: Option<f32>| {
-                    let kind = mint_sage_ini::EmotionType::parse(kind?)?;
-                    let radius = radius.filter(|radius| radius.is_finite() && *radius > 0.0)?;
+                let frames = |time: Option<f32>| {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let ms = time
                         .filter(|ms| ms.is_finite() && *ms > 0.0)
                         .map_or(0, |ms| ms.min(3_600_000.0) as u32);
+                    mint_sage_modules::retail_duration_ticks(ms)
+                };
+                let landing = |kind: Option<&String>, radius: Option<f32>, time: Option<f32>| {
+                    let kind = mint_sage_ini::EmotionType::parse(kind?)?;
+                    let radius = radius.filter(|radius| radius.is_finite() && *radius > 0.0)?;
                     Some(crate::combat::LandingEmotion {
                         kind,
                         radius,
-                        time: LogicFrames::from_milliseconds(ms),
+                        time: frames(time),
                     })
                 };
                 Some(ProjectileKind {
@@ -93,7 +101,7 @@ impl RotwkRules {
                     ground_bounce_weapon: weapon(read.ground_bounce_weapon.as_ref()),
                     die_on_impact: read.die_on_impact,
                     detonate_calls_kill: read.detonate_calls_kill,
-                    death_fx: entry
+                    fx_dies: entry
                         .record
                         .declared_modules
                         .iter()
@@ -105,9 +113,12 @@ impl RotwkRules {
                             )
                             .ok()
                         })
-                        .find_map(|die| die.death_fx().map(str::to_owned)),
+                        .collect(),
                     flight_path_adjust: read.flight_path_adjust_dist_per_second
                         / Self::ticks_per_second(),
+                    crush_style: read.crush_style,
+                    pre_landing_time: frames(read.pre_landing_state_time),
+                    final_stuck: frames(read.final_stuck_time),
                 })
             })
             .collect();
@@ -187,6 +198,34 @@ impl RotwkRules {
         self.projectile_kinds.get(usize::from(kind.0))?.as_ref()
     }
 
+    pub(super) fn aim_at_always_offset(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        shooter: Entity,
+        pending: PendingProjectile,
+    ) -> PendingProjectile {
+        let (Some(offset), Some(body), Some(foe)) = (
+            pending.always_attack_offset,
+            tick.state().get(ids.body, shooter),
+            self.foe_of(tick, ids, shooter),
+        ) else {
+            return pending;
+        };
+        let to = offset_aim(body.0.position, foe.z, body.0.facing.to_vector(), offset);
+        let range = Vec2::new(to.x - pending.from.x, to.y - pending.from.y).length();
+        let speed = self
+            .combat
+            .weapons
+            .get(pending.source)
+            .map_or(pending.speed, |template| template.launch_speed(range));
+        PendingProjectile {
+            to,
+            speed,
+            ..pending
+        }
+    }
+
     pub(super) fn launch_flight(
         &self,
         pending: &PendingProjectile,
@@ -244,7 +283,50 @@ impl RotwkRules {
             carried_velocity: Point3::default(),
             carried_ballistic: false,
             falls_to_death: false,
+            object: false,
         }
+    }
+
+    pub(super) fn launch_object(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        flight: Flight,
+    ) -> Result<Flight> {
+        let Some(kind) = flight
+            .kind
+            .filter(|kind| self.projectile_kind(*kind).is_some())
+        else {
+            return Ok(flight);
+        };
+        let Some(owner) = tick
+            .state()
+            .get(ids.owner, flight.launcher)
+            .map(|owner| owner.0)
+        else {
+            return Ok(flight);
+        };
+        let (from, to) = (flight.flight.start(), flight.flight.end());
+        let facing =
+            Facing::from_vector(Vec2::new(to.x - from.x, to.y - from.y)).unwrap_or(Facing::EAST);
+        let Some(object) = self.spawn_kind_placed(
+            tick,
+            ids,
+            kind,
+            super::spawning::Placement::Exact(Vec2::new(from.x, from.y)),
+            facing,
+            owner,
+        )?
+        else {
+            return Ok(flight);
+        };
+        let flight = Flight {
+            carried: Some(object),
+            object: true,
+            ..flight
+        };
+        self.launch_carried(tick, ids, flight.launcher, object, &flight)?;
+        Ok(flight)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -321,6 +403,7 @@ impl RotwkRules {
             carried_velocity: velocity,
             carried_ballistic: true,
             falls_to_death: false,
+            object: false,
         }
     }
 
@@ -350,7 +433,20 @@ impl RotwkRules {
         flight: &Flight,
     ) -> Result<()> {
         self.take_out(tick, ids, container, passenger)?;
+        self.launch_carried(tick, ids, container, passenger, flight)
+    }
+
+    pub(super) fn launch_carried(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        launcher: Entity,
+        passenger: Entity,
+        flight: &Flight,
+    ) -> Result<()> {
         self.carry(tick, ids, passenger, flight.flight.position())?;
+        tick.state_mut()
+            .insert(ids.no_attack, passenger, super::debug::NoAttack)?;
         self.apply_effects(
             tick,
             ids,
@@ -366,7 +462,7 @@ impl RotwkRules {
         diag!(
             "projectile: frame {} entity {} launches its passenger entity {} from ({:.1},{:.1},{:.1}) to ({:.1},{:.1},{:.1}), {} frames",
             tick.frame().get(),
-            container.index(),
+            launcher.index(),
             passenger.index(),
             from.x,
             from.y,
@@ -394,6 +490,9 @@ impl RotwkRules {
         for (carrier, flight) in riding {
             tick.state_mut().despawn(carrier);
             tick.state_mut().remove(ids.ground_offset, entity);
+            if flight.warhead.is_some() {
+                tick.state_mut().remove(ids.no_attack, entity);
+            }
             self.apply_effects(
                 tick,
                 ids,
@@ -441,6 +540,9 @@ impl RotwkRules {
             return Ok(());
         };
         tick.state_mut().remove(ids.ground_offset, carried);
+        if flight.warhead.is_some() && !flight.object {
+            tick.state_mut().remove(ids.no_attack, carried);
+        }
         self.apply_effects(
             tick,
             ids,
@@ -448,10 +550,14 @@ impl RotwkRules {
                 carried,
                 Effect::ModelConditions {
                     add: names(Vec::new()),
-                    remove: names(vec![airborne(flight).to_owned()]),
+                    remove: names(vec![airborne(flight).to_owned(), ABOUT_TO_HIT.to_owned()]),
                 },
             )],
         )?;
+        if flight.object && !tick.state().contains(ids.health, carried) {
+            tick.state_mut().despawn(carried);
+            return Ok(());
+        }
         let alive = tick
             .state()
             .get(ids.health, carried)
@@ -492,12 +598,54 @@ impl RotwkRules {
             );
         }
         if alive && (splatted || dies || rests_dead) {
-            self.land_dead(tick, ids, carried, splatted || rests_dead)?;
+            self.land_dead(tick, ids, carried, splatted || rests_dead || flight.object)?;
         }
         Ok(())
     }
 
     fn land_dead(&self, tick: &mut Tick<'_>, ids: Ids, body: Entity, splatted: bool) -> Result<()> {
+        let blow = splatted.then_some(crate::combat::DeathNaming::Normal);
+        self.kill_projectile(tick, ids, body, blow, splatted)
+    }
+
+    fn detonate_object(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        flight_entity: Entity,
+        flight: &Flight,
+        kills: bool,
+    ) -> Result<()> {
+        tick.state_mut().despawn(flight_entity);
+        let Some(object) = flight.carried else {
+            return Ok(());
+        };
+        let alive = tick
+            .state()
+            .get(ids.health, object)
+            .is_some_and(|health| !health.0.is_dead());
+        if kills && alive {
+            self.kill_projectile(
+                tick,
+                ids,
+                object,
+                Some(crate::combat::DeathNaming::Detonated),
+                false,
+            )
+        } else {
+            tick.state_mut().despawn(object);
+            Ok(())
+        }
+    }
+
+    fn kill_projectile(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        body: Entity,
+        blow: Option<crate::combat::DeathNaming>,
+        splatted: bool,
+    ) -> Result<()> {
         let Some(mut health) = tick.state().get(ids.health, body).copied() else {
             return Ok(());
         };
@@ -506,7 +654,7 @@ impl RotwkRules {
             return Ok(());
         }
         tick.state_mut().insert(ids.health, body, health)?;
-        if splatted {
+        if let Some(death) = blow {
             tick.state_mut().insert(
                 ids.killing_blow,
                 body,
@@ -514,10 +662,12 @@ impl RotwkRules {
                     killer: None,
                     damage_type: self.combat.damage_types.lookup(LANDING_KILL_DAMAGE),
                     dealt,
-                    death: crate::combat::DeathNaming::Normal,
+                    death,
                     sub_type: None,
                 },
             )?;
+        }
+        if splatted {
             self.apply_effects(
                 tick,
                 ids,
@@ -677,6 +827,7 @@ impl RotwkRules {
             return Ok(());
         }
         let living = self.living(tick, ids);
+        let collidable = Collidable::new(&living);
         for (entity, mut flight) in flights {
             if let Some(carried) = flight.carried {
                 let alive = tick
@@ -693,13 +844,17 @@ impl RotwkRules {
             }
             let before = flight.flight.ticks_to_arrival();
             let arrived = flight.flight.advance();
-            self.pre_landing_emotion(tick, ids, entity, &flight, before)?;
+            self.pre_landing(tick, ids, entity, &flight, before)?;
             let here = flight.flight.position();
             if let Some(carried) = flight.carried {
                 self.carry(tick, ids, carried, here)?;
             }
             let collided = if flight.bounces_done == 0 && !flight.falls_to_death {
-                self.collided(tick, ids, &flight, here, &living)
+                let crushed = tick
+                    .state()
+                    .get(ids.crush_hits, entity)
+                    .map_or(&[][..], |hits| hits.0.as_slice());
+                self.collided(tick, ids, &flight, here, &collidable, crushed)
             } else {
                 None
             };
@@ -708,7 +863,10 @@ impl RotwkRules {
                 .filter(|_| !flight.falls_to_death)
                 .and_then(|kind| self.projectile_kind(kind))
                 .cloned();
-            if let Some(foe) = collided {
+            let crush = kind.as_ref().is_some_and(|kind| kind.crush_style);
+            if let Some(foe) = collided.filter(|_| crush) {
+                self.crush_hit(tick, ids, entity, &flight, here, foe, &living, events)?;
+            } else if let Some(foe) = collided {
                 diag!(
                     "projectile: collided at ({:.1},{:.1}) {:.1} above ground with {} {:?}{}",
                     here.x,
@@ -726,8 +884,16 @@ impl RotwkRules {
                     }
                 );
                 self.detonate(tick, ids, &flight, here, &living, events)?;
+                if flight.object {
+                    let kills = kind.as_ref().is_some_and(|kind| kind.detonate_calls_kill)
+                        || flight.warhead.is_none();
+                    self.detonate_object(tick, ids, entity, &flight, kills)?;
+                    continue;
+                }
                 if let Some(kind) = &kind {
-                    self.projectile_death_fx(tick, ids, &flight, here, kind);
+                    if kind.detonate_calls_kill || flight.warhead.is_none() {
+                        self.projectile_death_fx(tick, ids, &flight, here, kind, DETONATED);
+                    }
                 }
                 let dies = kind.as_ref().is_some_and(|kind| kind.die_on_impact);
                 self.end_flight(tick, ids, entity, &flight, dies)?;
@@ -737,7 +903,7 @@ impl RotwkRules {
                 tick.state_mut().insert(ids.flight, entity, flight)?;
                 continue;
             }
-            if flight.bounces_done == 0 {
+            if flight.bounces_done == 0 && !crush {
                 self.detonate(tick, ids, &flight, here, &living, events)?;
             }
             let Some(kind) = kind else {
@@ -769,10 +935,10 @@ impl RotwkRules {
                 continue;
             };
             let remaining = kind.bounce_count.saturating_sub(flight.bounces_done);
-            let (fx, weapon) = if remaining > 0 {
-                (kind.ground_bounce_fx.as_deref(), kind.ground_bounce_weapon)
-            } else {
+            let (fx, weapon) = if flight.bounces_done == 0 {
                 (kind.ground_hit_fx.as_deref(), kind.ground_hit_weapon)
+            } else {
+                (kind.ground_bounce_fx.as_deref(), kind.ground_bounce_weapon)
             };
             diag!(
                 "projectile: ground hit at ({:.1},{:.1}) fx={} bounces={}",
@@ -816,8 +982,20 @@ impl RotwkRules {
                 self.apply_fire_result(tick, ids, weapon, &shot, result, events)?;
             }
             if remaining == 0 {
-                self.projectile_death_fx(tick, ids, &flight, here, &kind);
+                if kind.die_on_impact && !flight.object {
+                    self.projectile_death_fx(tick, ids, &flight, here, &kind, NORMAL);
+                }
                 self.end_flight(tick, ids, entity, &flight, kind.die_on_impact)?;
+                if let Some(carried) = flight
+                    .carried
+                    .filter(|_| (crush || flight.object) && !kind.die_on_impact)
+                {
+                    if !kind.final_stuck.is_zero() {
+                        Self::start_ai_busy(tick, ids, carried, kind.final_stuck)?;
+                    } else if !flight.object {
+                        self.disengage_for_ability(tick, ids, carried, false)?;
+                    }
+                }
                 continue;
             }
             let Some(next) = bounce_from(here, flight.flight.start(), kind.bounce_distance) else {
@@ -838,7 +1016,7 @@ impl RotwkRules {
         Ok(())
     }
 
-    fn pre_landing_emotion(
+    fn pre_landing(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
@@ -846,17 +1024,29 @@ impl RotwkRules {
         flight: &Flight,
         before: u32,
     ) -> Result<()> {
-        let Some(landing) = flight
-            .kind
-            .and_then(|kind| self.projectile_kind(kind))
-            .and_then(|kind| kind.pre_landing)
-        else {
+        let Some(kind) = flight.kind.and_then(|kind| self.projectile_kind(kind)) else {
             return Ok(());
         };
-        let lead = landing.time.get();
-        if !(before > lead && flight.flight.ticks_to_arrival() <= lead) {
+        let lead = kind.pre_landing_time.get();
+        if lead == 0 || !(before > lead && flight.flight.ticks_to_arrival() <= lead) {
             return Ok(());
         }
+        if let Some(carried) = flight.carried.filter(|_| !flight.falls_to_death) {
+            self.apply_effects(
+                tick,
+                ids,
+                vec![(
+                    carried,
+                    Effect::ModelConditions {
+                        add: names(vec![ABOUT_TO_HIT.to_owned()]),
+                        remove: names(Vec::new()),
+                    },
+                )],
+            )?;
+        }
+        let Some(landing) = kind.pre_landing else {
+            return Ok(());
+        };
         let end = flight.flight.end();
         let filter = crate::defeat::ObjectFilter::parse(&["ANY".to_owned()]);
         self.emotion_pulse(
@@ -869,6 +1059,7 @@ impl RotwkRules {
                 kind: landing.kind,
                 filter: &filter,
                 lasts: super::emotions::ONE_FRAME,
+                enemies_only: false,
             },
         )
     }
@@ -898,6 +1089,7 @@ impl RotwkRules {
                 kind: landing.kind,
                 filter: &filter,
                 lasts: landing.time,
+                enemies_only: false,
             },
         )
     }
@@ -908,8 +1100,10 @@ impl RotwkRules {
         ids: Ids,
         flight: &Flight,
         here: Point3,
-        living: &[(Foe, PlayerId)],
+        collidable: &Collidable<'_>,
+        crushed: &[Entity],
     ) -> Option<Foe> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("projectile_collide"));
         let mask = self
             .combat
             .weapons
@@ -956,13 +1150,15 @@ impl RotwkRules {
                 },
             )
         };
-        living
-            .iter()
+        collidable
+            .near(at)
+            .into_iter()
             .filter(|(foe, _)| {
                 foe.entity != flight.launcher
                     && Some(foe.entity) != holder
                     && Some(foe.entity) != flight.carried
                     && !foe.unattackable
+                    && !crushed.contains(&foe.entity)
             })
             .filter(|(foe, _)| {
                 here.z >= foe.z.min(ground)
@@ -1006,26 +1202,83 @@ impl RotwkRules {
         flight: &Flight,
         here: Point3,
         kind: &ProjectileKind,
+        death: &str,
     ) {
-        if !kind.detonate_calls_kill {
-            return;
+        let blow = mint_sim::module::Death {
+            kind: death,
+            cause: UNRESISTABLE,
+            ..mint_sim::module::Death::NONE
+        };
+        for die in &kind.fx_dies {
+            let Some(list) = die.plays_on(flight.launcher, &blow) else {
+                continue;
+            };
+            diag!(
+                "projectile: death FX {list} at ({:.1},{:.1}) on {death}",
+                here.x,
+                here.y
+            );
+            self.emit_fx_named(
+                tick,
+                ids,
+                list,
+                here,
+                crate::fx::FxSource::Weapon,
+                flight.launcher,
+            );
         }
-        let Some(list) = kind.death_fx.as_deref() else {
-            return;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crush_hit(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        flight: &Flight,
+        here: Point3,
+        foe: Foe,
+        living: &[(Foe, PlayerId)],
+        events: &mut Vec<DamageEvent>,
+    ) -> Result<()> {
+        let mut hits = tick
+            .state()
+            .get(ids.crush_hits, entity)
+            .cloned()
+            .unwrap_or_default();
+        hits.0.push(foe.entity);
+        tick.state_mut().insert(ids.crush_hits, entity, hits)?;
+        let Some(warhead) = flight.warhead else {
+            return Ok(());
         };
         diag!(
-            "projectile: death FX {list} at ({:.1},{:.1})",
-            here.x,
-            here.y
+            "projectile: crushes entity {} at ({:.1},{:.1}) and flies on",
+            foe.entity.index(),
+            foe.position.x,
+            foe.position.y
         );
-        self.emit_fx_named(
+        let shot = Shot {
+            weapon: warhead,
+            attacker: flight.launcher,
+            origin: here,
+            victim: None,
+            missed: None,
+            centre: foe.position,
+            centre_height: foe.z,
+            owner_if_gone: None,
+        };
+        let result = self.fire_shot(tick, ids, &shot, living)?;
+        self.emit_weapon_fx(
             tick,
             ids,
-            list,
-            here,
-            crate::fx::FxSource::Weapon,
+            warhead,
+            Point3::new(foe.position.x, foe.position.y, foe.z),
             flight.launcher,
-        );
+            flight.launcher,
+            None,
+            None,
+        )?;
+        self.apply_fire_result(tick, ids, warhead, &shot, result, events)
     }
 
     fn detonate(
@@ -1046,7 +1299,7 @@ impl RotwkRules {
             .weapons
             .get(warhead)
             .is_some_and(|warhead| warhead.hit_stored_target);
-        let victim = if let Some(carried) = flight.carried {
+        let victim = if let Some(carried) = flight.carried.filter(|_| !flight.object) {
             self.foe_of(tick, ids, carried)
         } else if hit_stored_target {
             living
@@ -1094,12 +1347,14 @@ impl RotwkRules {
                     .into_iter()
                     .partition(|hit| hit.victim == container);
             result.damage = rest;
-            if struck {
-                for hit in &on_container {
-                    events.extend(self.passenger_hit(tick.state(), ids, hit));
-                }
+            for hit in on_container {
+                let aimed = if struck {
+                    self.passenger_hit(tick.state(), ids, &hit)
+                } else {
+                    None
+                };
+                events.push(aimed.unwrap_or(hit));
             }
-            events.extend(on_container);
         }
         self.emit_weapon_fx(
             tick,
@@ -1139,10 +1394,77 @@ fn airborne(flight: &Flight) -> &'static str {
     }
 }
 
+struct Collidable<'a> {
+    living: &'a [(Foe, PlayerId)],
+    grid: crate::combat::TargetGrid,
+    cells: Option<i32>,
+}
+
+impl<'a> Collidable<'a> {
+    fn new(living: &'a [(Foe, PlayerId)]) -> Self {
+        let widest = living
+            .iter()
+            .map(|(foe, _)| foe.radius.abs())
+            .fold(0.0f32, f32::max);
+        Self {
+            living,
+            grid: crate::combat::TargetGrid::build(living),
+            cells: widest
+                .is_finite()
+                .then(|| crate::combat::grid_radius_cells(widest)),
+        }
+    }
+
+    fn near(&self, at: Vec2) -> Vec<&'a (Foe, PlayerId)> {
+        let Some(cells) = self.cells else {
+            return self.living.iter().collect();
+        };
+        let mut found = Vec::new();
+        self.grid.query_into(
+            crate::combat::grid_cell(at.x),
+            crate::combat::grid_cell(at.y),
+            cells,
+            &mut found,
+        );
+        found.sort_unstable();
+        found
+            .into_iter()
+            .filter_map(|index| self.living.get(usize::try_from(index).ok()?))
+            .collect()
+    }
+}
+
+fn offset_aim(position: Vec2, z: f32, ahead: Vec2, offset: [f32; 3]) -> Point3 {
+    let [forward, left, up] = offset;
+    Point3::new(
+        position.x + ahead.x * forward - ahead.y * left,
+        position.y + ahead.y * forward + ahead.x * left,
+        z + up,
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_always_attack_offset_is_taken_in_the_shooters_frame() {
+        let at = offset_aim(
+            Vec2::new(10.0, 20.0),
+            5.0,
+            Vec2::new(0.0, 1.0),
+            [150.0, 0.0, 0.0],
+        );
+        assert_eq!((at.x, at.y, at.z), (10.0, 170.0, 5.0));
+        let left = offset_aim(
+            Vec2::new(0.0, 0.0),
+            0.0,
+            Vec2::new(0.0, 1.0),
+            [0.0, 100.0, 3.0],
+        );
+        assert_eq!((left.x, left.y, left.z), (-100.0, 0.0, 3.0));
+    }
 
     #[test]
     fn a_bounce_carries_on_along_the_heading_it_arrived_on() {

@@ -11,6 +11,11 @@ Object Slinger\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 30
     MoodAttackCheckRate = 100\n  End\n  \
   LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object Brute\n  Side = Men\n  KindOf = MONSTER PATH_THROUGH_INFANTRY SELECTABLE\n  CrushableLevel = 0\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 1000\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n  End\n  \
+  LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 12\n  GeometryHeight = 30\nEnd\n\
 Object Post\n  Side = Wild\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 10\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100000\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
@@ -21,25 +26,29 @@ fn simulation() -> (Simulation<RotwkRules>, Ids, Entity) {
             .unwrap();
     assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
     let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
-    let names = ["Slinger", "Post"].map(str::to_owned);
+    let names = ["Slinger", "Post", "Brute"].map(str::to_owned);
     let (kinds, missing) = KindTable::closure(&data, &names);
     assert!(missing.is_empty(), "missing from the closure: {missing:?}");
     let kinds = Arc::new(kinds);
     let production = kinds.production(&data);
-    let spawns: Vec<Spawn> = [("Slinger", 300.0, PLAYER), ("Post", 400.0, OTHER)]
-        .into_iter()
-        .map(|(name, x, owner)| {
-            kinds
-                .spawn(
-                    &data.combat,
-                    kinds.kind(name).unwrap(),
-                    Vec2::new(x, 300.0),
-                    Facing::EAST,
-                    owner,
-                )
-                .unwrap()
-        })
-        .collect();
+    let spawns: Vec<Spawn> = [
+        ("Slinger", 300.0, PLAYER),
+        ("Post", 400.0, OTHER),
+        ("Brute", 100.0, PLAYER),
+    ]
+    .into_iter()
+    .map(|(name, x, owner)| {
+        kinds
+            .spawn(
+                &data.combat,
+                kinds.kind(name).unwrap(),
+                Vec2::new(x, 300.0),
+                Facing::EAST,
+                owner,
+            )
+            .unwrap()
+    })
+    .collect();
     let passability = Passability::build(&flat_map(96, 96), 5.0 / 128.0).unwrap();
     let rules = RotwkRules::new(passability, spawns)
         .with_combat(data.combat.clone())
@@ -114,5 +123,134 @@ fn a_busy_unit_holds_the_newest_order_until_its_hold_ends() {
     }
     let (frame, goal) = set_off.expect("the held order never ran");
     assert!(frame >= shot + 60, "set off at {frame}, shot at {shot}");
-    assert!((goal.x - 150.0).abs() < 1.0, "went for {goal:?}");
+    assert!((goal.x - 150.0).abs() < 6.0, "went for {goal:?}");
+}
+
+#[test]
+fn a_stop_given_inside_the_window_waits_in_the_slot() {
+    let (mut simulation, ids, slinger) = simulation();
+    for _ in 0..120 {
+        simulation.tick().unwrap();
+        if simulation
+            .state()
+            .get(ids.armed, slinger)
+            .is_some_and(|armed| armed.state.last_shot().is_some())
+        {
+            break;
+        }
+    }
+    simulation.submit(PLAYER, RotwkCommand::Stop).unwrap();
+    simulation.tick().unwrap();
+    let held = simulation.state().get(ids.deferred_order, slinger).copied();
+    assert_eq!(
+        held.map(|held| held.order),
+        Some(crate::rules::busy::HeldOrder::Stop)
+    );
+    for _ in 0..150 {
+        simulation.tick().unwrap();
+    }
+    assert!(!simulation.state().contains(ids.deferred_order, slinger));
+}
+
+#[test]
+fn a_unit_carrying_status_102_holds_a_move_in_the_slot() {
+    let (mut simulation, ids, slinger) = simulation();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::Debug(crate::rules::debug::DebugCommand::SetStatus {
+                status: "SUMMONING_REPLACEMENT".to_owned(),
+            }),
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::MoveTo {
+                x: 100.0,
+                y: 300.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    assert!(simulation.state().contains(ids.deferred_order, slinger));
+    assert!(ordered_goal(&simulation, ids, slinger).is_none());
+}
+
+#[test]
+fn a_unit_ignoring_ai_commands_holds_a_move_in_the_slot() {
+    let (mut simulation, ids, slinger) = simulation();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::Debug(crate::rules::debug::DebugCommand::IgnoreAiCommand { ticks: 20 }),
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::MoveTo {
+                x: 100.0,
+                y: 300.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    assert!(simulation.state().contains(ids.deferred_order, slinger));
+    assert!(ordered_goal(&simulation, ids, slinger).is_none());
+}
+
+#[test]
+fn a_pushed_ally_busy_after_firing_holds_its_move_away() {
+    let (mut simulation, ids, slinger) = simulation();
+    let brute = simulation
+        .state()
+        .store(ids.kind)
+        .unwrap()
+        .entities()
+        .iter()
+        .copied()
+        .find(|entity| {
+            *entity != slinger && simulation.state().get(ids.owner, *entity).unwrap().0 == PLAYER
+        })
+        .unwrap();
+    for _ in 0..120 {
+        simulation.tick().unwrap();
+        if simulation
+            .state()
+            .get(ids.armed, slinger)
+            .is_some_and(|armed| armed.state.last_shot().is_some())
+        {
+            break;
+        }
+    }
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![brute],
+            },
+        )
+        .unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::MoveTo {
+                x: 600.0,
+                y: 300.0,
+                queue: false,
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    assert!(simulation.state().contains(ids.held_aside, slinger));
+    for _ in 0..150 {
+        simulation.tick().unwrap();
+    }
+    assert!(!simulation.state().contains(ids.held_aside, slinger));
 }

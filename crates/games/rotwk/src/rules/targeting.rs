@@ -4,7 +4,7 @@ use mint_sim::{Entity, PlayerId, Tick, World};
 use super::map_scripts::{ATTITUDE_NORMAL, ATTITUDE_SLEEP};
 use super::{Ids, RotwkRules};
 use crate::combat::priority::{acquire_ranked, PriorityRanking, TargetPriority};
-use crate::combat::{acquire_target, in_range, Foe};
+use crate::combat::{acquire_target, Foe};
 
 const APPROACH_REACH: f32 = 150.0;
 
@@ -94,6 +94,7 @@ impl RotwkRules {
         min_range: f32,
         max_range: f32,
     ) -> Option<Entity> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("acquire_for"));
         match self.priority_ranking(world, ids, scanner) {
             Some(ranking) => {
                 let mover = self.mover_class_in(world, ids, scanner);
@@ -172,6 +173,7 @@ impl RotwkRules {
         foe: &Foe,
         radius: f32,
     ) -> bool {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("friendly_fire"));
         let max_share = self.attack_priorities.max_friendly_fire;
         let own = world
             .get(ids.health, foe.entity)
@@ -238,12 +240,7 @@ impl RotwkRules {
         let vision = base * (1.0 + bonus).max(0.0);
         if let Some(horde) = world.get(ids.horde, scanner) {
             let reach = self
-                .horde_rangefinder(horde)
-                .map(|range| {
-                    world
-                        .get(ids.bonuses, scanner)
-                        .map_or(range, |bonuses| bonuses.0.range(range))
-                })
+                .horde_reach(world, ids, scanner, horde)
                 .or_else(|| self.horde_max_range(tick, ids, horde));
             return HereReach {
                 vision,
@@ -259,14 +256,15 @@ impl RotwkRules {
                 .into_iter()
                 .collect(),
         };
+        let charges = self.owns_charge_attack(world, ids, scanner);
         let arms = weapons
             .into_iter()
             .filter_map(|weapon| self.combat.weapons.get(weapon))
             .map(|template| {
                 (
-                    template.minimum_attack_range,
+                    self.min_range_of(world, scanner, template),
                     self.attack_range_of(world, ids, scanner, template),
-                    template.melee,
+                    template.melee || template.chase_weapon || charges,
                 )
             })
             .collect();
@@ -277,7 +275,7 @@ impl RotwkRules {
         }
     }
 
-    fn has_status_bit(&self, world: &World, entity: Entity, bit: &str) -> bool {
+    pub(super) fn has_status_bit(&self, world: &World, entity: Entity, bit: &str) -> bool {
         self.modules
             .as_ref()
             .and_then(|wiring| world.get(wiring.state, entity))
@@ -373,6 +371,46 @@ impl RotwkRules {
         self.mood_attitude(world, ids, entity) == ATTITUDE_SLEEP
     }
 
+    pub(super) fn stopped_last_damager(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        me: &Foe,
+        living: &[(Foe, PlayerId)],
+    ) -> mint_sim::Result<Option<Foe>> {
+        if !tick.state().contains(ids.player_stopped, entity) {
+            return Ok(None);
+        }
+        let Some(damager) = self.last_damager(tick.state(), ids, entity, living) else {
+            return Ok(None);
+        };
+        let Some(template) = tick
+            .state()
+            .get(ids.armed, entity)
+            .and_then(|armed| self.combat.weapons.get(armed.weapon))
+        else {
+            return Ok(None);
+        };
+        let (dx, dy) = (
+            damager.position.x - me.position.x,
+            damager.position.y - me.position.y,
+        );
+        if (dx * dx + dy * dy).sqrt() - me.radius - damager.radius < 1.0 {
+            tick.state_mut().remove(ids.player_stopped, entity);
+            return Ok(Some(damager));
+        }
+        let range = self.attack_range_of(tick.state(), ids, entity, template);
+        Ok(crate::combat::in_range_volumes(
+            me.reach_volume(),
+            damager.reach_volume(),
+            0.0,
+            0.0,
+            range,
+        )
+        .then_some(damager))
+    }
+
     pub(super) fn last_damager(
         &self,
         world: &World,
@@ -403,18 +441,38 @@ pub(super) struct HereReach {
 
 impl HereReach {
     pub(super) fn attackable(&self, at: Vec2, radius: f32, foe: &Foe, no_walk: bool) -> bool {
-        let sighted = || in_range(at, radius, foe.position, foe.radius, 0.0, self.vision);
+        let sighted = || {
+            crate::combat::in_range_volumes(
+                (at, radius, None),
+                foe.reach_volume(),
+                0.0,
+                0.0,
+                self.vision,
+            )
+        };
         if let Some((reach, melee)) = self.horde {
             let Some(reach) = reach else {
                 return false;
             };
-            if in_range(at, radius, foe.position, foe.radius, 0.0, reach) {
+            if crate::combat::in_range_volumes(
+                (at, radius, None),
+                foe.reach_volume(),
+                0.0,
+                0.0,
+                reach,
+            ) {
                 return true;
             }
             return melee && !no_walk && sighted();
         }
         for &(minimum, reach, melee) in &self.arms {
-            if in_range(at, radius, foe.position, foe.radius, minimum, reach) {
+            if crate::combat::in_range_volumes(
+                (at, radius, None),
+                foe.reach_volume(),
+                0.0,
+                minimum,
+                reach,
+            ) {
                 return true;
             }
             if melee {

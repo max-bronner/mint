@@ -84,6 +84,11 @@ thread_local! {
     static CURRENT: RefCell<[f64; STAGES.len()]> = const { RefCell::new([0.0; STAGES.len()]) };
     static LAST: RefCell<[f64; STAGES.len()]> = const { RefCell::new([0.0; STAGES.len()]) };
     static LAST_COUNTS: RefCell<FrameCounts> = RefCell::new(FrameCounts::default());
+    static AUDIO: RefCell<(u64, u64)> = const { RefCell::new((0, 0)) };
+}
+
+pub(crate) fn set_audio(counters: (u64, u64)) {
+    AUDIO.with(|audio| *audio.borrow_mut() = counters);
 }
 
 pub(crate) struct Clock {
@@ -213,6 +218,14 @@ pub(crate) fn last_frame_stages(stage: &mut dyn FnMut(&'static str, f64)) {
         );
         stage("submit_count", f64::from(counts.submits.0));
         stage("pass_count", f64::from(counts.passes));
+    });
+    AUDIO.with(|audio| {
+        let (underruns, load_us) = *audio.borrow();
+        #[allow(clippy::cast_precision_loss)]
+        {
+            stage("audio_underrun_count", underruns as f64);
+            stage("sound_load_us_count", load_us as f64);
+        }
     });
 }
 

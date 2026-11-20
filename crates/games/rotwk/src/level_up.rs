@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-
 use mint_render::{Renderer, Vec3};
-use mint_sim::Entity;
+use mint_sim::{Entity, Frame};
 
 use crate::audio::GameAudio;
 use crate::game::{fire_at_drawables, report_second, MatchState};
@@ -10,8 +8,7 @@ use crate::report::SecondReport;
 
 #[derive(Debug, Default)]
 pub(crate) struct LevelWatch {
-    seen: HashMap<Entity, usize>,
-    next: HashMap<Entity, usize>,
+    played: u64,
     pending: Vec<(u32, String)>,
     tints: Vec<(u32, mint_sage_modules::LevelUpTint)>,
     pub(crate) rises: u64,
@@ -24,17 +21,17 @@ pub(crate) struct LevelWatch {
 impl LevelWatch {
     pub(crate) fn observe(
         &mut self,
-        current: impl IntoIterator<Item = (Entity, usize)>,
+        events: impl IntoIterator<Item = (Entity, Frame, usize)>,
     ) -> Vec<(Entity, usize)> {
         let mut rose = Vec::new();
-        self.next.clear();
-        for (entity, level) in current {
-            if self.seen.get(&entity).is_some_and(|old| level > *old) {
+        let mut newest = self.played;
+        for (entity, at, level) in events {
+            if at.get() > self.played {
                 rose.push((entity, level));
+                newest = newest.max(at.get());
             }
-            self.next.insert(entity, level);
         }
-        std::mem::swap(&mut self.seen, &mut self.next);
+        self.played = newest;
         self.rises = self
             .rises
             .saturating_add(u64::try_from(rose.len()).unwrap_or(u64::MAX));
@@ -66,10 +63,11 @@ pub(crate) fn observe(state: &mut MatchState, audio: &mut GameAudio, units: &[Un
         return;
     };
     let world = simulation.state();
-    let rose = state.level_ups.observe(units.iter().filter_map(|unit| {
+    let rose = state.level_ups.observe(units.iter().flat_map(|unit| {
         rules
-            .experience_of(world, ids, unit.entity)
-            .map(|(level, _)| (unit.entity, level))
+            .level_feedback_of(world, ids, unit.entity)
+            .into_iter()
+            .map(|(at, level)| (unit.entity, at, usize::from(level)))
     }));
     for (entity, level) in &rose {
         if let Some(tint) = rules
@@ -190,21 +188,20 @@ mod tests {
     }
 
     #[test]
-    fn only_a_rise_of_an_object_already_watched_is_reported() {
+    fn each_level_reached_is_reported_once() {
         let (a, b) = (entity(0), entity(1));
         let mut watch = LevelWatch::default();
-        assert!(
-            watch.observe([(a, 1)]).is_empty(),
-            "first sight is a baseline"
+        let at = |frame: u64| Frame::new(frame);
+        assert_eq!(
+            watch.observe([(a, at(70), 2), (a, at(70), 3)]),
+            vec![(a, 2), (a, 3)],
+            "a two-level rise reports both levels"
         );
-        assert_eq!(watch.observe([(a, 2), (b, 3)]), vec![(a, 2)]);
-        assert!(watch.observe([(a, 2), (b, 3)]).is_empty(), "no change");
         assert!(
-            watch.observe([(a, 1), (b, 3)]).is_empty(),
-            "a fall is silent"
+            watch.observe([(a, at(70), 2), (a, at(70), 3)]).is_empty(),
+            "seen already"
         );
-        assert!(watch.observe([(b, 3)]).is_empty());
-        assert!(watch.observe([(a, 4), (b, 3)]).is_empty(), "back in view");
-        assert_eq!(watch.rises, 1);
+        assert_eq!(watch.observe([(b, at(71), 2)]), vec![(b, 2)]);
+        assert_eq!(watch.rises, 3);
     }
 }

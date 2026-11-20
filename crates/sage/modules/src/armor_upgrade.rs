@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use mint_sim::module::{Capability, CapabilityMask, UpgradeMask};
-use mint_sim::{Component, FieldError, Frame, ModuleFieldSource, ModuleKind, StateHasher};
+use mint_sim::{
+    Component, Effects, Entity, FieldError, Frame, ModuleFieldSource, ModuleKind, StateHasher,
+};
 
-use crate::effects::{Effect, Name};
+use crate::effects::{Effect, EffectLog, Name};
 use crate::upgrade_mux::{attempt_upgrade_via_mux, UpgradeEffect, UpgradeMuxData};
 
 pub const DEFAULT_UPGRADE_FLAG: &str = "PLAYER_UPGRADE";
@@ -13,6 +15,38 @@ pub struct ArmorUpgrade {
     mux: UpgradeMuxData,
     declared: Option<Arc<str>>,
     flag: Name,
+    ignore: bool,
+    kill: bool,
+}
+
+#[must_use]
+pub(crate) fn armor_set_condition(flag: &str) -> Name {
+    if flag.eq_ignore_ascii_case("AS_TOWER") {
+        Name::from("ARMORSET_PLAYER_UPGRADE")
+    } else {
+        Name::from(format!("ARMORSET_{flag}"))
+    }
+}
+
+fn set_effects(flag: &Name, raise: bool) -> [Effect; 2] {
+    let condition = vec![armor_set_condition(flag)];
+    if raise {
+        [
+            Effect::ArmorSetFlag(Name::clone(flag)),
+            Effect::ModelConditions {
+                add: condition.into(),
+                remove: Vec::new().into(),
+            },
+        ]
+    } else {
+        [
+            Effect::ClearArmorSetFlag(Name::clone(flag)),
+            Effect::ModelConditions {
+                add: Vec::new().into(),
+                remove: condition.into(),
+            },
+        ]
+    }
 }
 
 impl ArmorUpgrade {
@@ -38,7 +72,9 @@ impl UpgradeEffect for ArmorUpgrade {
     }
 
     fn on_fire(&mut self, _active: &UpgradeMask, out: &mut Vec<Effect>) {
-        out.push(Effect::ArmorSetFlag(Name::clone(&self.flag)));
+        if !self.ignore {
+            out.extend(set_effects(&self.flag, !self.kill));
+        }
     }
 }
 
@@ -67,6 +103,22 @@ impl ModuleKind for ArmorUpgrade {
     fn on_upgrade_removed(&mut self, removed: &UpgradeMask) {
         self.mux.reset_if_triggered_by(removed);
     }
+
+    fn upgrade_removed_effects(
+        &self,
+        removed: &UpgradeMask,
+        entity: Entity,
+        mut effects: Effects<'_>,
+    ) {
+        if self.ignore || !self.mux.undone_by(removed) {
+            return;
+        }
+        if let Some(log) = effects.get::<EffectLog>() {
+            for effect in set_effects(&self.flag, false) {
+                log.push(entity, effect);
+            }
+        }
+    }
 }
 
 pub fn armor_upgrade_from_fields(
@@ -81,6 +133,8 @@ pub fn armor_upgrade_from_fields(
         mux: UpgradeMuxData::from_fields(fields)?,
         declared,
         flag,
+        ignore: crate::fire_weapon_update::flag(fields, "IgnoreArmorUpgrade") == Some(true),
+        kill: crate::fire_weapon_update::flag(fields, "KillArmorUpgrade") == Some(true),
     })
 }
 
@@ -155,8 +209,81 @@ mod tests {
                 .iter()
                 .map(|(_, e)| e.clone())
                 .collect::<Vec<_>>(),
-            vec![Effect::ArmorSetFlag(Name::from(DEFAULT_UPGRADE_FLAG))]
+            set_effects(&Name::from(DEFAULT_UPGRADE_FLAG), true).to_vec()
         );
         assert!(offer(&mut module, &active).is_empty(), "the latch holds");
+    }
+
+    fn fired(pairs: &[(&'static str, &'static str)]) -> (ArmorUpgrade, UpgradeMask) {
+        let mut all = vec![("TriggeredBy", "1")];
+        all.extend_from_slice(pairs);
+        let mut module =
+            armor_upgrade_from_fields(&TestFields(all.into_iter().collect()), Frame::ZERO).unwrap();
+        let mut active = UpgradeMask::EMPTY;
+        active.set(UpgradeBit::new(1));
+        offer(&mut module, &active);
+        (module, active)
+    }
+
+    fn taken_back(module: &ArmorUpgrade, removed: &UpgradeMask) -> Vec<Effect> {
+        let mut log = EffectLog::new();
+        module.upgrade_removed_effects(
+            removed,
+            mint_sim::World::new().spawn().unwrap(),
+            mint_sim::Effects::into_sink(&mut log),
+        );
+        log.entries()
+            .iter()
+            .map(|(_, effect)| effect.clone())
+            .collect()
+    }
+
+    #[test]
+    fn an_armour_flag_raises_its_model_condition_unless_ignored() {
+        let mut active = UpgradeMask::EMPTY;
+        active.set(UpgradeBit::new(1));
+        let mut ignored = armor_upgrade_from_fields(
+            &TestFields(BTreeMap::from([
+                ("TriggeredBy", "1"),
+                ("IgnoreArmorUpgrade", "Yes"),
+            ])),
+            Frame::ZERO,
+        )
+        .unwrap();
+        assert!(offer(&mut ignored, &active).is_empty());
+        for (flag, condition) in [
+            ("PLAYER_UPGRADE_2", "ARMORSET_PLAYER_UPGRADE_2"),
+            ("AS_TOWER", "ARMORSET_PLAYER_UPGRADE"),
+        ] {
+            let mut module = armor_upgrade_from_fields(
+                &TestFields(BTreeMap::from([
+                    ("TriggeredBy", "1"),
+                    ("ArmorSetFlag", flag),
+                ])),
+                Frame::ZERO,
+            )
+            .unwrap();
+            let effects: Vec<Effect> = offer(&mut module, &active)
+                .entries()
+                .iter()
+                .map(|(_, effect)| effect.clone())
+                .collect();
+            assert!(
+                effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::ModelConditions { add, .. } if add.iter().any(|name| &**name == condition)
+                )),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn losing_the_trigger_undoes_a_non_permanent_armour_upgrade() {
+        let (module, removed) = fired(&[]);
+        let effects = taken_back(&module, &removed);
+        assert!(effects.contains(&Effect::ClearArmorSetFlag(Name::from(DEFAULT_UPGRADE_FLAG))));
+        let (permanent, removed) = fired(&[("Permanent", "Yes")]);
+        assert!(taken_back(&permanent, &removed).is_empty());
     }
 }

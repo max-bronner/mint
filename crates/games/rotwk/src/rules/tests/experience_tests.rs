@@ -1,7 +1,7 @@
 use super::*;
 
 const DATA: &str = "\
-#define TROOPS Soldier SoldierHorde Veteran\n\
+#define TROOPS Soldier SoldierHorde Veteran VeteranMp\n\
 #define TROOP_HP_ADD 20\n\
 Upgrade Upgrade_ObjectLevel1\n  Type = OBJECT\nEnd\n\
 Upgrade Upgrade_ObjectLevel2\n  Type = OBJECT\nEnd\n\
@@ -165,6 +165,10 @@ Object Veteran\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Behavior = ExperienceLevelCreate Tag_Create\n    LevelToGrant = 2\n    MPOnly = No\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object VeteranMp\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n  BuildTime = 1\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = ExperienceLevelCreate Tag_Create\n    LevelToGrant = 2\n    MPOnly = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object Walker\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  BuildCost = 10\n  BuildTime = 1\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
@@ -232,6 +236,7 @@ pub(super) fn load() -> Match {
         "Runner",
         "Walker",
         "Veteran",
+        "VeteranMp",
         "Farm",
         "Mill",
         "Frenzied",
@@ -461,7 +466,11 @@ fn enough_kills_level_the_horde_and_its_members_gain_the_levels_lists() {
     assert!(dead(&simulation, ids, &targets) >= 2, "two kills");
     assert_eq!(rank(&simulation, horde), Some(2), "the horde levelled");
     for member in &members {
-        assert_eq!(rank(&simulation, *member), Some(2), "and every member");
+        assert_eq!(
+            rank(&simulation, *member),
+            Some(1),
+            "a member keeps its own level"
+        );
         let health = simulation.state().get(ids.health, *member).unwrap().0;
         assert_eq!(health.max(), 120.0, "TroopRank2's +20 on the maximum");
         let bonuses = simulation.state().get(ids.bonuses, *member).unwrap().0;
@@ -1012,11 +1021,12 @@ fn a_banner_carrier_from_level_zero_comes_with_the_horde() {
 }
 
 #[test]
-fn a_level_up_upgrade_stops_at_its_cap_and_the_members_follow() {
+fn a_level_up_upgrade_levels_every_member_once_per_level_and_stops_at_its_cap() {
     let m = load();
     let mut simulation = Simulation::new(18, rules(&m, &[])).unwrap();
     let ids = simulation.rules().ids().unwrap();
     let (horde, members) = spawn_horde(&mut simulation, ids, 200.0, 200.0, PLAYER);
+    run(&mut simulation, 70);
     research(&mut simulation, PLAYER, members[0], 1);
     assert_eq!(rank(&simulation, horde), Some(2), "capped at rank 2, not 3");
     assert_eq!(
@@ -1025,8 +1035,72 @@ fn a_level_up_upgrade_stops_at_its_cap_and_the_members_follow() {
         "the level's own requirement plus the upgrade's completion XP"
     );
     for member in &members {
-        assert_eq!(rank(&simulation, *member), Some(2));
+        assert_eq!(rank(&simulation, *member), Some(2), "one level each");
+        assert!(
+            simulation
+                .rules()
+                .level_feedback_of(simulation.state(), ids, *member)
+                .is_empty(),
+            "a member's level carries no feedback"
+        );
     }
+}
+
+#[test]
+fn every_level_reached_queues_its_own_feedback_and_none_in_the_first_ten_frames() {
+    let gain = |warm_up: u32| {
+        let m = load();
+        let mut simulation = Simulation::new(21, rules(&m, &[])).unwrap();
+        let ids = simulation.rules().ids().unwrap();
+        let (horde, members) = spawn_horde(&mut simulation, ids, 200.0, 200.0, PLAYER);
+        run(&mut simulation, warm_up);
+        simulation
+            .submit(
+                PLAYER,
+                RotwkCommand::SetSelection {
+                    replace: true,
+                    units: members,
+                },
+            )
+            .unwrap();
+        simulation
+            .submit(PLAYER, RotwkCommand::DebugExperience { points: 1000 })
+            .unwrap();
+        run(&mut simulation, 1);
+        let events = simulation
+            .rules()
+            .level_feedback_of(simulation.state(), ids, horde);
+        let leveled = simulation
+            .rules()
+            .modules
+            .as_ref()
+            .and_then(|wiring| simulation.state().get(wiring.state, horde))
+            .is_some_and(|state| state.has_model_condition("LEVELED"));
+        (
+            events.iter().map(|(_, level)| *level).collect::<Vec<_>>(),
+            leveled,
+        )
+    };
+    assert_eq!(gain(70), (vec![1, 2], true));
+    assert_eq!(gain(5), (Vec::new(), false));
+}
+
+#[test]
+fn an_mp_only_level_at_creation_is_not_granted_in_a_campaign() {
+    let m = load();
+    let place = [("VeteranMp", 100.0, 100.0, PLAYER)];
+    let skirmish = Simulation::new(19, rules(&m, &place)).unwrap();
+    let ids = skirmish.rules().ids().unwrap();
+    let granted = placed(&skirmish, ids, &m, "VeteranMp")[0];
+    assert_eq!(rank(&skirmish, granted), Some(2));
+    let campaign = Simulation::new(
+        19,
+        rules(&m, &place).with_script_named_sides(vec![("Gondor".to_owned(), PLAYER)]),
+    )
+    .unwrap();
+    let ids = campaign.rules().ids().unwrap();
+    let plain = placed(&campaign, ids, &m, "VeteranMp")[0];
+    assert_eq!(rank(&campaign, plain), Some(1), "still at its first level");
 }
 
 #[test]

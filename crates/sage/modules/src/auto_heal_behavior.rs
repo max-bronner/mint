@@ -5,9 +5,11 @@ use mint_sim::{
     Component, FieldError, Frame, LogicFrames, ModuleFieldSource, StateHasher, UpgradeContext,
 };
 
-use crate::effects::{names, Effect, EffectLog, Name, Names};
+use crate::effects::{names, Effect, EffectLog, HealerRules, Name, Names, Regrow};
 use crate::fire_weapon_update::{flag, milliseconds};
+use crate::special_ability_update::RETAIL_LOGIC_NONZERO;
 use crate::upgrade_mux::{sooner, UpgradeMuxData};
+use crate::world_reads::{InCombat, Movers};
 
 #[derive(Debug, PartialEq)]
 struct HealData {
@@ -23,6 +25,16 @@ struct HealData {
     fx: Option<Name>,
     button_triggered: bool,
     affects_contained: bool,
+    not_in_combat: bool,
+    not_under_attack: bool,
+    non_stackable: bool,
+    regrow: Option<RegrowData>,
+}
+
+#[derive(Debug, PartialEq)]
+struct RegrowData {
+    fx: Option<Name>,
+    min_delay: LogicFrames,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +43,7 @@ pub struct AutoHealBehavior {
     mux: UpgradeMuxData,
     active: bool,
     phased: bool,
+    last_regrow: Frame,
 }
 
 impl AutoHealBehavior {
@@ -64,17 +77,20 @@ impl Component for AutoHealBehavior {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_bool(self.active);
         hasher.write_bool(self.phased);
+        self.last_regrow.hash_into(hasher);
         self.mux.hash_into(hasher);
     }
 }
 
 impl ModuleKind for AutoHealBehavior {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::HELD;
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::Update)
         .union(CapabilityMask::single(Capability::Upgrade));
 
     fn on_attach(&mut self, _now: Frame) {
         self.active = self.data.starts_active;
         self.phased = false;
+        self.last_regrow = Frame::ZERO;
     }
 
     fn attempt_upgrade(&mut self, active: &UpgradeMask, ctx: &mut UpgradeContext<'_>) {
@@ -96,13 +112,13 @@ impl ModuleKind for AutoHealBehavior {
 impl AutoHealBehavior {
     fn own_update(&mut self, ctx: &mut UpdateContext<'_>) -> Sleep {
         let data = &self.data;
-        if data.button_triggered || data.affects_contained || data.amount <= 0.0 {
+        if data.button_triggered {
             return Sleep::Forever;
         }
         let pulse = data.delay.map_or(Sleep::Forever, Sleep::Frames);
         if !self.active {
             return data.delay.map_or(
-                Sleep::Frames(LogicFrames::from_milliseconds(1000)),
+                Sleep::Frames(LogicFrames::from_engine_milliseconds(1000)),
                 Sleep::Frames,
             );
         }
@@ -115,6 +131,30 @@ impl AutoHealBehavior {
             }
         }
         let entity = ctx.entity;
+        if data.not_in_combat && in_combat(ctx) {
+            let wait = if data.start_delay.is_zero() {
+                LogicFrames::from_engine_milliseconds(1000)
+            } else {
+                data.start_delay
+            };
+            return Sleep::Frames(wait);
+        }
+        let area = data.radius > 0.0 && !data.affects_contained;
+        let regrow = match &data.regrow {
+            Some(regrow)
+                if area
+                    && self
+                        .last_regrow
+                        .checked_add(regrow.min_delay)
+                        .is_some_and(|due| ctx.now >= due) =>
+            {
+                self.last_regrow = ctx.now;
+                Some(Regrow {
+                    fx: regrow.fx.clone(),
+                })
+            }
+            _ => None,
+        };
         if let Some(log) = ctx.effects.get::<EffectLog>() {
             log.push(
                 entity,
@@ -128,17 +168,41 @@ impl AutoHealBehavior {
                     fx: data.fx.clone(),
                     sole_for: data.delay.unwrap_or(LogicFrames::ONE),
                     as_percent: false,
-                    nonstackable: false,
+                    nonstackable: data.non_stackable,
                     skip_recently_damaged: false,
                     fx_always: false,
+                    rules: HealerRules {
+                        not_under_attack: data.not_under_attack,
+                        contained: data.affects_contained,
+                        add_bonus: true,
+                        regrow,
+                    },
                 },
             );
         }
-        if data.single_burst && data.radius > 0.0 {
+        if data.single_burst && (data.radius > 0.0 || data.affects_contained) {
             return Sleep::Forever;
         }
         pulse
     }
+}
+
+fn in_combat(ctx: &UpdateContext<'_>) -> bool {
+    let Some(combat) = ctx.reads.get::<InCombat>() else {
+        return false;
+    };
+    let home = ctx
+        .reads
+        .get::<Movers>()
+        .map_or(ctx.entity, |movers| movers.resolve(ctx.entity));
+    combat.contains(ctx.entity) || combat.contains(home)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn raw_frames(value: Option<f32>) -> u32 {
+    value
+        .filter(|frames| frames.is_finite() && *frames > 0.0)
+        .map_or(0, |frames| frames.min(1.0e9) as u32)
 }
 
 pub fn auto_heal_behavior_from_fields(
@@ -187,10 +251,26 @@ pub fn auto_heal_behavior_from_fields(
                 .map(Name::from),
             button_triggered: flag(fields, "ButtonTriggered").unwrap_or(false),
             affects_contained: flag(fields, "AffectsContained").unwrap_or(false),
+            not_in_combat: flag(fields, "HealOnlyIfNotInCombat").unwrap_or(false),
+            not_under_attack: flag(fields, "HealOnlyIfNotUnderAttack").unwrap_or(false),
+            non_stackable: flag(fields, "NonStackable").unwrap_or(false),
+            regrow: flag(fields, "RespawnNearbyHordeMembers")
+                .unwrap_or(false)
+                .then(|| RegrowData {
+                    fx: fields
+                        .field("RespawnFXList")
+                        .filter(|name| !name.eq_ignore_ascii_case("NONE"))
+                        .map(Name::from),
+                    min_delay: LogicFrames::from_authored_frames(
+                        raw_frames(fields.field_numeric("RespawnMinimumDelay")),
+                        RETAIL_LOGIC_NONZERO,
+                    ),
+                }),
         }),
         mux: UpgradeMuxData::from_fields(fields)?,
         active: starts_active,
         phased: false,
+        last_regrow: Frame::ZERO,
     })
 }
 
@@ -348,20 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn a_button_or_container_heal_never_runs() {
-        for extra in [("ButtonTriggered", "Yes"), ("AffectsContained", "Yes")] {
-            let module = auto_heal_behavior_from_fields(
-                &fields(&[
-                    ("StartsActive", "Yes"),
-                    ("HealingAmount", "10"),
-                    ("HealingDelay", "100"),
-                    extra,
-                ]),
-                Frame::ZERO,
-            )
-            .unwrap();
-            assert!(heals(module, 100, None).is_empty(), "{extra:?}");
-        }
+    fn a_button_triggered_heal_never_runs() {
+        let module = auto_heal_behavior_from_fields(
+            &fields(&[
+                ("StartsActive", "Yes"),
+                ("HealingAmount", "10"),
+                ("HealingDelay", "100"),
+                ("ButtonTriggered", "Yes"),
+            ]),
+            Frame::ZERO,
+        )
+        .unwrap();
+        assert!(heals(module, 100, None).is_empty());
     }
 
     #[test]

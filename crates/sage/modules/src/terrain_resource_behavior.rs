@@ -105,7 +105,7 @@ pub fn terrain_resource_behavior_from_fields(
         .map(|ms| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let whole_ms = ms as u32;
-            LogicFrames::from_milliseconds(whole_ms)
+            crate::special_ability_update::retail_duration_ticks(whole_ms)
         });
     Ok(TerrainResourceBehavior {
         radius: fields.field_numeric("Radius"),
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(module.radius(), Some(160.0));
         assert_eq!(
             module.income_interval(),
-            Some(LogicFrames::from_milliseconds(999_999))
+            Some(LogicFrames::from_engine_milliseconds(999_999))
         );
         assert!(module.high_priority());
     }

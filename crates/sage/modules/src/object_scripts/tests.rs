@@ -27,6 +27,7 @@ fn hide(name: &str) -> Effect {
     Effect::SubObjects {
         show: [].into(),
         hide: [Name::from(name)].into(),
+        permanent: true,
     }
 }
 
@@ -34,6 +35,7 @@ fn show(name: &str) -> Effect {
     Effect::SubObjects {
         show: [Name::from(name)].into(),
         hide: [].into(),
+        permanent: true,
     }
 }
 
@@ -189,6 +191,34 @@ fn play_sound_queues_the_named_event() {
     assert_eq!(
         run.effects,
         vec![Effect::PlayObjectSound(Name::from("RecoverFromTerror"))]
+    );
+}
+
+#[test]
+fn the_plain_hide_is_a_plain_write() {
+    let scripts = ObjectScripts::load(
+        EVENTS,
+        "function Poked(self)\n ObjectHideSubObject(self, \"PART\", true)\nend\n",
+    )
+    .unwrap();
+    let run = scripts
+        .run(
+            "Flagpole",
+            "OnPoked",
+            None,
+            &ObjectFacts::default(),
+            EventSource::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(run.error, None);
+    assert_eq!(
+        run.effects,
+        [Effect::SubObjects {
+            show: [].into(),
+            hide: [Name::from("PART")].into(),
+            permanent: false,
+        }]
     );
 }
 

@@ -136,7 +136,9 @@ pub fn temporarily_defect_update_from_fields(
                 )));
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            Some(LogicFrames::from_milliseconds(ms as u32))
+            Some(crate::special_ability_update::retail_duration_ticks(
+                ms as u32,
+            ))
         }
     };
     Ok(TemporarilyDefectUpdate { defect_duration })
@@ -206,7 +208,7 @@ pub fn notify_targets_of_imminent_probable_crushing_update_from_fields(
     let duration = |keyword: &str| -> Result<LogicFrames, FieldError> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ms = number(keyword)?.map_or(NOTIFY_DEFAULT_MS, |ms| ms.min(86_400_000.0) as u32);
-        Ok(LogicFrames::from_milliseconds(ms))
+        Ok(crate::special_ability_update::retail_duration_ticks(ms))
     };
     Ok(NotifyTargetsOfImminentProbableCrushingUpdate {
         time_between_updates: duration("TimeBetweenUpdatesMS")?,
@@ -309,7 +311,7 @@ mod tests {
         let module = temporarily_defect_update_from_fields(&fields, Frame::ZERO).unwrap();
         assert_eq!(
             module.defect_duration(),
-            Some(LogicFrames::from_milliseconds(30_000))
+            Some(crate::special_ability_update::retail_duration_ticks(30_000))
         );
     }
 

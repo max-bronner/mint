@@ -282,12 +282,13 @@ fn a_dense_channel_samples_exactly_at_frame_boundaries() {
 }
 
 #[test]
-fn a_dense_channel_interpolates_between_frames() {
-    let values = vec![Value::Scalar(0.0), Value::Scalar(10.0)];
-    match sample_dense(ChannelKind::TranslationX, 0, &values, 0.25) {
-        Some(Value::Scalar(v)) => assert!(approx(v, 2.5), "got {v}"),
-        other => panic!("expected a scalar, got {other:?}"),
-    }
+fn a_dense_channel_takes_the_nearest_whole_frame_with_ties_to_even() {
+    let values = vec![Value::Scalar(0.0), Value::Scalar(10.0), Value::Scalar(20.0)];
+    let at = |frame| sample_dense(ChannelKind::TranslationX, 0, &values, frame);
+    assert_eq!(at(0.25), Some(Value::Scalar(0.0)));
+    assert_eq!(at(0.75), Some(Value::Scalar(10.0)));
+    assert_eq!(at(0.5), Some(Value::Scalar(0.0)));
+    assert_eq!(at(1.5), Some(Value::Scalar(20.0)));
 }
 
 #[test]

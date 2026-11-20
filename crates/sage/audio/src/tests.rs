@@ -633,3 +633,20 @@ fn a_disabled_event_is_refused_until_enabled() {
         "the direct play and the multisound's nested one"
     );
 }
+
+#[test]
+fn a_decoded_duration_is_the_longest_variant_of_an_event_or_of_a_multisounds_subsounds() {
+    let fixture = Fixture::new(&[
+        ("short.wav", wav(44_100, 44_100, 1000)),
+        ("long.wav", wav(88_200, 44_100, 1000)),
+        ("other.wav", wav(132_300, 44_100, 1000)),
+    ]);
+    let mut audio = audio(
+        "AudioEvent Pair\n  Sounds = short long\nEnd\n\
+         AudioEvent Other\n  Sounds = other\nEnd\n\
+         Multisound Both\n  Subsounds = Pair Other\nEnd\n",
+    );
+    assert_eq!(audio.decoded_duration_ms(&fixture.vfs, "Pair"), Some(2_000));
+    assert_eq!(audio.decoded_duration_ms(&fixture.vfs, "Both"), Some(3_000));
+    assert_eq!(audio.decoded_duration_ms(&fixture.vfs, "Nothing"), None);
+}

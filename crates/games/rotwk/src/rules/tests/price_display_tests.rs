@@ -190,8 +190,10 @@ fn the_command_bar_shows_exactly_what_a_press_would_charge() {
             cancel_refusal: None,
             under_construction: false,
             power_clock: &|_| None,
+            power_restricted: &|_| false,
             auto_cast_on: &|_| false,
             weapon_set_raised: &|_| false,
+            model_condition_gate: &|_, _| true,
             foreign_owner: false,
         };
         let bar = crate::command_bar::resolve_command_bar(

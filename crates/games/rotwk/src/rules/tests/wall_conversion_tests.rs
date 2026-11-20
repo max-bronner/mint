@@ -125,6 +125,17 @@ fn a_long_conversion_takes_over_its_two_neighbours_only() {
 }
 
 #[test]
+fn a_conversion_leaves_no_entity_where_the_neighbours_stood() {
+    let (mut simulation, _, pieces) = wall();
+    buy(&mut simulation, pieces[2], 0);
+    for _ in 0..60 {
+        simulation.tick().unwrap();
+    }
+    assert!(!simulation.state().is_live(pieces[1]));
+    assert!(!simulation.state().is_live(pieces[3]));
+}
+
+#[test]
 fn a_conversion_is_refused_beside_a_standing_or_queued_wall_upgrade() {
     let (mut simulation, ids, pieces) = wall();
     buy(&mut simulation, pieces[0], 1);

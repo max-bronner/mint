@@ -12,6 +12,10 @@ fn wall(major: f32, minor: f32) -> Vec<FootprintRecord> {
 }
 
 fn sealed_pocket(from: Vec2) -> (Simulation<RotwkRules>, Ids, Entity) {
+    sealed_pocket_with(from, None)
+}
+
+fn sealed_pocket_with(from: Vec2, standing: Option<Vec2>) -> (Simulation<RotwkRules>, Ids, Entity) {
     let passability = Passability::build(&flat_map(64, 64), 5.0 / 128.0).unwrap();
     let sides = [
         (Vec2::new(400.0, 350.0), 60.0, 10.0),
@@ -24,6 +28,9 @@ fn sealed_pocket(from: Vec2) -> (Simulation<RotwkRules>, Ids, Entity) {
     for (at, major, minor) in sides {
         footprints.push((spawns.len(), wall(major, minor)));
         spawns.push(spawn_at(at.x, at.y, KindOf::STRUCTURE, PLAYER));
+    }
+    if let Some(at) = standing {
+        spawns.push(spawn_at(at.x, at.y, KindOf::SELECTABLE, PLAYER));
     }
     let rules = RotwkRules::new(passability, spawns).with_structure_footprints(footprints);
     let simulation = Simulation::new(7, rules).unwrap();
@@ -157,7 +164,17 @@ fn an_attack_move_into_a_sealed_pocket_walks_to_the_nearest_reachable_point() {
         )
         .unwrap();
     let horde = horde_entity(&simulation, ids).unwrap();
-    for _ in 0..600 {
+    for _ in 0..300 {
+        simulation.tick().unwrap();
+    }
+    assert!(
+        simulation
+            .state()
+            .get(ids.attack_move_order, horde)
+            .is_some_and(|order| order.retries_left > 0),
+        "the order is held at the route's end for its retries, not ended on arriving"
+    );
+    for _ in 0..300 {
         simulation.tick().unwrap();
     }
     let at = position(&simulation, ids, horde);
@@ -167,7 +184,7 @@ fn an_attack_move_into_a_sealed_pocket_walks_to_the_nearest_reachable_point() {
     );
     assert!(
         !simulation.state().contains(ids.attack_move_order, horde),
-        "the order ends at the closest reachable point"
+        "the order ends after its fifth retry"
     );
 }
 
@@ -212,4 +229,77 @@ fn a_move_onto_a_wide_cliff_walks_to_its_edge() {
         at.minus(Vec2::new(450.0, 320.0)).length() < 160.0,
         "walked up to the cliffs' edge nearest the click, stopped at {at:?}"
     );
+}
+
+#[test]
+fn the_closest_cell_is_not_one_another_unit_has_claimed() {
+    let far = Vec2::new(500.0, 330.0);
+    let route_end = |claim: Option<Vec2>| {
+        let (mut simulation, ids, unit) = sealed_pocket_with(Vec2::new(200.0, 300.0), Some(far));
+        let other = simulation
+            .state()
+            .store(ids.body)
+            .unwrap()
+            .iter()
+            .find(|(_, body)| body.0.position == far)
+            .map(|(entity, _)| entity)
+            .unwrap();
+        if let Some(at) = claim {
+            order(&mut simulation, other, at);
+            simulation.tick().unwrap();
+        }
+        order(&mut simulation, unit, POCKET);
+        simulation.tick().unwrap();
+        simulation.state().get(ids.path, unit).unwrap().goal
+    };
+    let alone = route_end(None);
+    let crowded = route_end(Some(alone));
+    assert!(
+        crowded.minus(alone).length() >= 8.0,
+        "the route still ends on the claimed point: {crowded:?} vs {alone:?}"
+    );
+}
+
+#[test]
+fn a_goal_inside_an_obstacle_is_stepped_back_toward_the_mover() {
+    let map = flat_map(64, 16);
+    let block = mint_sage_passability::Obstacle {
+        id: 0,
+        centre: Vec2::new(100.0, 50.0),
+        angle: 0.0,
+        records: wall(40.0, 100.0),
+    };
+    let passability = Passability::builder(&map, 5.0 / 128.0)
+        .obstacles(std::slice::from_ref(&block))
+        .build()
+        .unwrap();
+    let start = passability.cell_at(Vec2::new(400.0, 50.0)).unwrap();
+    let goal = passability.cell_at(Vec2::new(100.0, 50.0)).unwrap();
+    let rules = RotwkRules::new(passability, Vec::new());
+    let request = PathRequest {
+        start,
+        goal,
+        mover: GROUND,
+        goal_id: GoalId(0),
+        origin: None,
+        corner_radius: 0.0,
+        departure: None,
+        approach: None,
+        prune: false,
+        final_goal: true,
+    };
+    let aimed = rules.stepped_back(&request).goal;
+    assert_ne!(aimed, goal, "the goal is inside the block");
+    let at = rules.passability.geometry.centre_of(aimed);
+    assert!(
+        (140.0..170.0).contains(&at.x),
+        "stepped back out of the block, not past the mover: {at:?}"
+    );
+}
+
+#[test]
+fn an_attack_move_goal_object_that_rose_past_the_limit_regoals() {
+    let at = Vec2::new(10.0, 10.0);
+    assert!(crate::rules::attack::regoal_due((at, 10.0), (at, 0.0)));
+    assert!(!crate::rules::attack::regoal_due((at, 4.0), (at, 0.0)));
 }

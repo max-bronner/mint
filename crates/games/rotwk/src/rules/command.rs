@@ -15,6 +15,16 @@ pub(crate) enum RotwkCommand {
         button: String,
         lead: Option<Entity>,
     },
+    ToggleWeapon {
+        toggles: [u8; 3],
+        lead: Option<Entity>,
+    },
+    ToggleHoldFire {
+        lead: Option<Entity>,
+    },
+    Sacrifice {
+        target: Entity,
+    },
     MoveTo {
         x: f32,
         y: f32,
@@ -185,6 +195,12 @@ impl UiPanel {
             Self::Objectives => 1,
             Self::StanceSubMenu => 2,
         }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        [Self::SpellStore, Self::Objectives, Self::StanceSubMenu]
+            .into_iter()
+            .find(|panel| format!("{panel:?}").eq_ignore_ascii_case(name))
     }
 }
 
@@ -376,6 +392,27 @@ impl Command for RotwkCommand {
                 for byte in button.bytes() {
                     hasher.write_u8(byte);
                 }
+                hasher.write_bool(lead.is_some());
+                if let Some(lead) = lead {
+                    lead.hash_into(hasher);
+                }
+            }
+            Self::Sacrifice { target } => {
+                hasher.write_u8(51);
+                target.hash_into(hasher);
+            }
+            Self::ToggleWeapon { toggles, lead } => {
+                hasher.write_u8(52);
+                for slot in toggles {
+                    hasher.write_u8(*slot);
+                }
+                hasher.write_bool(lead.is_some());
+                if let Some(lead) = lead {
+                    lead.hash_into(hasher);
+                }
+            }
+            Self::ToggleHoldFire { lead } => {
+                hasher.write_u8(50);
                 hasher.write_bool(lead.is_some());
                 if let Some(lead) = lead {
                     lead.hash_into(hasher);

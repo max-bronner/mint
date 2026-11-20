@@ -70,11 +70,10 @@ impl RotwkRules {
             .zip(Facing::from_vector(victim.position.minus(me.position)))
             .is_some_and(|(facing, bearing)| facing.delta_to(bearing).abs() < aim_tolerance);
         let (min_range, max_range) = ranges;
-        let in_reach = in_range(
-            me.position,
-            me.radius,
-            victim.position,
-            victim.radius,
+        let in_reach = crate::combat::in_range_volumes(
+            me.reach_volume(),
+            victim.reach_volume(),
+            0.0,
             min_range,
             max_range,
         );

@@ -16,6 +16,7 @@ pub(crate) struct Level {
     pub(crate) modifiers: Vec<ModifierId>,
     pub(crate) granted: UpgradeMask,
     pub(crate) level_up_fx: Option<String>,
+    pub(crate) level_up_ocl: Option<String>,
     pub(crate) emotion: Option<mint_sage_ini::EmotionType>,
     pub(crate) level_up_tint: Option<mint_sage_modules::LevelUpTint>,
 }
@@ -25,6 +26,7 @@ pub(crate) struct LevelTable {
     pub(crate) levels: Vec<Level>,
     pub(crate) trainable: bool,
     pub(crate) created_at: usize,
+    pub(crate) created_mp_only: bool,
     pub(crate) scalars: Vec<f32>,
 }
 
@@ -200,6 +202,7 @@ impl LevelTables {
                         modifiers: ids,
                         granted: granted.clone(),
                         level_up_fx: record.level_up_fx.clone(),
+                        level_up_ocl: record.level_up_ocl.clone(),
                         emotion: record
                             .emotion_type
                             .as_deref()
@@ -219,6 +222,7 @@ impl LevelTables {
                     levels,
                     trainable: entry.record.is_trainable.unwrap_or(true),
                     created_at,
+                    created_mp_only: entry.record.level_on_create_mp_only,
                     scalars: entry
                         .record
                         .experience_scalar_table
@@ -293,7 +297,10 @@ impl Component for WeaponBonusConditions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct TimedModifiers(pub(crate) Vec<(ModifierId, mint_sim::Frame)>);
+pub(crate) struct TimedModifiers(
+    pub(crate) Vec<(ModifierId, mint_sim::Frame)>,
+    pub(crate) Vec<(ModifierId, mint_sim::Frame)>,
+);
 
 impl Component for TimedModifiers {
     fn hash_into(&self, hasher: &mut StateHasher) {
@@ -302,6 +309,11 @@ impl Component for TimedModifiers {
             hasher.write_u16(list.index());
             until.hash_into(hasher);
         }
+        hasher.write_usize(self.1.len());
+        for (list, at) in &self.1 {
+            hasher.write_u16(list.index());
+            at.hash_into(hasher);
+        }
     }
 }
 
@@ -309,25 +321,34 @@ impl TimedModifiers {
     pub(crate) fn give(&mut self, list: ModifierId, until: mint_sim::Frame) -> bool {
         match self.0.iter_mut().find(|(held, _)| *held == list) {
             Some((_, end)) => {
-                *end = (*end).max(until);
+                *end = until;
                 false
             }
             None => {
+                self.1.retain(|(held, _)| *held != list);
                 self.0.push((list, until));
                 true
             }
         }
     }
 
-    pub(crate) fn expire(&mut self, now: mint_sim::Frame) -> bool {
-        let before = self.0.len();
+    pub(crate) fn take_ended(&mut self, now: mint_sim::Frame) -> Vec<ModifierId> {
+        let ended: Vec<ModifierId> = self
+            .0
+            .iter()
+            .filter(|(_, until)| *until <= now)
+            .map(|(list, _)| *list)
+            .collect();
         self.0.retain(|(_, until)| *until > now);
-        self.0.len() != before
+        self.1
+            .retain(|(list, _)| self.0.iter().any(|(held, _)| held == list));
+        ended
     }
 
     pub(crate) fn remove(&mut self, list: ModifierId) -> bool {
         let before = self.0.len();
         self.0.retain(|(held, _)| *held != list);
+        self.1.retain(|(held, _)| *held != list);
         self.0.len() != before
     }
 }
@@ -519,12 +540,14 @@ mod tests {
                     modifiers: Vec::new(),
                     granted: UpgradeMask::EMPTY,
                     level_up_fx: None,
+                    level_up_ocl: None,
                     emotion: None,
                     level_up_tint: None,
                 })
                 .collect(),
             trainable: true,
             created_at: 0,
+            created_mp_only: false,
             scalars: Vec::new(),
         }
     }
@@ -607,17 +630,19 @@ mod tests {
     }
 
     #[test]
-    fn a_timed_list_given_twice_is_held_once_until_the_later_end() {
+    fn a_timed_list_given_twice_is_held_once_until_the_newer_end() {
         let mut timed = TimedModifiers::default();
         let list = ModifierId::from_index(3);
         assert!(timed.give(list, mint_sim::Frame::new(100)));
         assert!(!timed.give(list, mint_sim::Frame::new(50)));
-        assert_eq!(timed.0, vec![(list, mint_sim::Frame::new(100))]);
+        assert_eq!(timed.0, vec![(list, mint_sim::Frame::new(50))]);
+        assert!(!timed.give(list, mint_sim::Frame::new(100)));
         assert!(!timed.give(list, mint_sim::Frame::new(150)));
         assert_eq!(timed.0[0].1, mint_sim::Frame::new(150));
-        assert!(!timed.expire(mint_sim::Frame::new(149)));
-        assert!(
-            timed.expire(mint_sim::Frame::new(150)),
+        assert!(timed.take_ended(mint_sim::Frame::new(149)).is_empty());
+        assert_eq!(
+            timed.take_ended(mint_sim::Frame::new(150)),
+            vec![list],
             "gone on its end frame"
         );
         assert!(timed.0.is_empty());

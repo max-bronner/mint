@@ -8,7 +8,11 @@ use crate::value::{is_none, parse_bool, parse_int};
 
 pub const COMMAND_BUTTON_KEYWORD: &str = "CommandButton";
 
-pub const COMMAND_BUTTON_FIELDS: [&str; 37] = [
+pub const COMMAND_BUTTON_FIELDS: [&str; 41] = [
+    "TriggerWhenReady",
+    "WeaponSlotToggle1",
+    "WeaponSlotToggle2",
+    "WeaponSlotToggle3",
     "Command",
     "ShowButton",
     "Options",
@@ -90,6 +94,8 @@ pub struct CommandButtonDef {
     pub weapon_slot: Option<u8>,
     pub enable_on_model_condition: Vec<String>,
     pub disable_on_model_condition: Vec<String>,
+    pub trigger_when_ready: bool,
+    pub weapon_slot_toggles: [Option<u8>; 3],
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -332,6 +338,22 @@ pub fn read_command_button(
         ),
         enable_on_model_condition: names(block, "EnableOnModelCondition"),
         disable_on_model_condition: names(block, "DisableOnModelCondition"),
+        trigger_when_ready: scalar(block, "TriggerWhenReady", errors, "Yes or No", parse_bool)
+            .unwrap_or(false),
+        weapon_slot_toggles: [
+            "WeaponSlotToggle1",
+            "WeaponSlotToggle2",
+            "WeaponSlotToggle3",
+        ]
+        .map(|keyword| {
+            scalar(
+                block,
+                keyword,
+                errors,
+                "a weapon slot, PRIMARY to QUINARY",
+                weapon_slot,
+            )
+        }),
     }
 }
 

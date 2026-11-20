@@ -152,7 +152,11 @@ fn read_clip(block: &Block) -> Option<AnimationClip> {
     })
 }
 
-fn read_state(block: &Block, kind: AnimationStateKind, module_flag: bool) -> AnimationStateDef {
+fn read_state(
+    block: &Block,
+    kind: AnimationStateKind,
+    (module_flag, check_drawable): (bool, bool),
+) -> AnimationStateDef {
     let mut clips = Vec::new();
     for child in block.blocks() {
         if clips.len() >= MAX_CLIPS_PER_STATE {
@@ -204,6 +208,7 @@ fn read_state(block: &Block, kind: AnimationStateKind, module_flag: bool) -> Ani
             .filter_map(|field| parse_particle_sys_bone(&field.args))
             .map(|mut attachment| {
                 attachment.module_flag = module_flag;
+                attachment.check_drawable = check_drawable;
                 attachment
             })
             .collect(),
@@ -344,6 +349,8 @@ pub fn draw_animation_states(draw: &Block) -> Vec<AnimationStateDef> {
         .and_then(Field::value)
         .and_then(crate::value::parse_bool)
         == Some(true);
+    let check_drawable =
+        crate::object::draw_flag(draw, crate::object::PARTICLE_BONES_CHECK_DRAWABLE_KEYWORD);
     let mut states = Vec::new();
     for child in draw.blocks() {
         if states.len() >= MAX_STATES_PER_DRAW {
@@ -352,7 +359,7 @@ pub fn draw_animation_states(draw: &Block) -> Vec<AnimationStateDef> {
         let Some(kind) = kind_of(&child.keyword) else {
             continue;
         };
-        states.push(read_state(child, kind, module_flag));
+        states.push(read_state(child, kind, (module_flag, check_drawable)));
     }
     states
 }

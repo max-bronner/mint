@@ -44,12 +44,13 @@ impl LargeGroupBonusUpdate {
     }
 
     #[must_use]
-    pub fn reach(&self, held: bool) -> f32 {
-        if held {
-            self.data.rub_off_radius
-        } else {
-            self.data.radius
-        }
+    pub fn radius(&self) -> f32 {
+        self.data.radius
+    }
+
+    #[must_use]
+    pub fn rub_off_radius(&self) -> f32 {
+        self.data.rub_off_radius
     }
 
     #[must_use]
@@ -77,8 +78,11 @@ impl LargeGroupBonusUpdate {
         now >= self.next_scan
     }
 
-    pub fn scanned(&mut self, now: Frame) {
-        self.next_scan = now.checked_add(self.data.cadence).unwrap_or(Frame::FOREVER);
+    pub fn scanned(&mut self, now: Frame, extra: LogicFrames) {
+        self.next_scan = now
+            .checked_add(self.data.cadence)
+            .and_then(|due| due.checked_add(extra))
+            .unwrap_or(Frame::FOREVER);
     }
 
     pub fn stagger(&mut self, entity: Entity, now: Frame) {
@@ -150,7 +154,8 @@ pub fn large_group_bonus_update_from_fields(
     }
     Ok(LargeGroupBonusUpdate {
         data: Arc::new(GroupBonusData {
-            cadence: LogicFrames::from_milliseconds(rate_ms).max(LogicFrames::ONE),
+            cadence: crate::special_ability_update::retail_duration_ticks(rate_ms)
+                .max(LogicFrames::ONE),
             member_filter: ObjectFilter::parse(&member_tokens),
             count,
             radius,
@@ -219,7 +224,7 @@ mod tests {
         let module =
             large_group_bonus_update_from_fields(&fields(&[("Radius", "160.0")]), Frame::ZERO)
                 .unwrap();
-        assert_eq!(module.reach(true), 160.0);
+        assert_eq!(module.rub_off_radius(), 160.0);
     }
 
     #[test]

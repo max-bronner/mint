@@ -8,7 +8,7 @@ mod table;
 mod text;
 
 pub use csf::parse_csf;
-pub use placeholder::{format_placeholder, Placeholder};
+pub use placeholder::{format_placeholder, format_placeholders, Placeholder};
 pub use str_file::parse_str;
 pub use table::StringTable;
 pub use text::decode_cp1252;

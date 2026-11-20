@@ -15,6 +15,7 @@ const PANIC_SET: &str = "PANIC";
 enum Order {
     StopAndDisband,
     WanderInPlace,
+    Wander { path: String },
     Panic { path: String },
     MoveToNearest { types: String },
 }
@@ -88,6 +89,33 @@ impl RotwkRules {
         Ok(())
     }
 
+    fn wander_along(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        engine: &MapScriptEngine,
+        state: &mut MapScriptState,
+        members: &[Entity],
+        path: &str,
+    ) -> Result<()> {
+        for &member in members {
+            if !self.has_ai(tick.state(), ids, member) {
+                continue;
+            }
+            let Some(from) = self.position_of_entity(tick, ids, member) else {
+                continue;
+            };
+            let Some(start) = Self::nearest_on_path(engine, path, from) else {
+                break;
+            };
+            Self::release_script_orders(state, &[member]);
+            self.apply_locomotor_override(tick, ids, member, Some(WANDER_SET))?;
+            state.rt.walks.begin_own(member, path);
+            state.rt.wanderers.begin_path(member, path, start, false);
+        }
+        Ok(())
+    }
+
     fn panic_along(
         &self,
         tick: &mut Tick<'_>,
@@ -104,16 +132,14 @@ impl RotwkRules {
             let Some(from) = self.position_of_entity(tick, ids, member) else {
                 continue;
             };
-            let walk = self.path_from(tick, engine, path, from);
-            if walk.is_empty() {
+            let Some(start) = Self::nearest_on_path(engine, path, from) else {
                 break;
-            }
+            };
             Self::release_script_orders(state, &[member]);
             self.apply_locomotor_override(tick, ids, member, Some(PANIC_SET))?;
-            for (step, &to) in walk.iter().enumerate() {
-                self.issue_script_order(tick, ids, &[member], ScriptOrder::Move(to, step > 0))?;
-            }
-            state.rt.walks.begin(member, path);
+            self.set_model_condition(tick, ids, member, "PANICKING", true)?;
+            state.rt.walks.begin_own(member, path);
+            state.rt.wanderers.begin_path(member, path, start, true);
         }
         Ok(())
     }
@@ -140,6 +166,7 @@ impl ActionVerb for ActionTeamOrder {
                 rules.stop_and_disband(tick, ids, engine, state, team, &members)
             }
             Order::WanderInPlace => rules.wander_in_place(tick, ids, state, &members),
+            Order::Wander { path } => rules.wander_along(tick, ids, engine, state, &members, path),
             Order::Panic { path } => rules.panic_along(tick, ids, engine, state, &members, path),
             Order::MoveToNearest { types } => {
                 if members.is_empty() {
@@ -187,6 +214,14 @@ pub(super) fn parse_wander_in_place(
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
     order(params, ctx, Order::WanderInPlace)
+}
+
+pub(super) fn parse_wander(
+    params: &[Parameter],
+    ctx: &ParseCtx<'_>,
+) -> Option<Arc<dyn ActionVerb>> {
+    let path = parameter_string(params, 1)?;
+    order(params, ctx, Order::Wander { path })
 }
 
 pub(super) fn parse_panic(params: &[Parameter], ctx: &ParseCtx<'_>) -> Option<Arc<dyn ActionVerb>> {

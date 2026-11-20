@@ -139,13 +139,5 @@ impl RotwkRules {
 }
 
 fn frames_of(milliseconds: f32) -> LogicFrames {
-    if !milliseconds.is_finite() || milliseconds <= 0.0 {
-        return LogicFrames::ZERO;
-    }
-    let bounded = milliseconds.min(86_400_000.0);
-    #[allow(clippy::cast_precision_loss)]
-    let frames = bounded * (mint_sim::SIMULATION_HZ as f32) / 1000.0;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let whole = frames.ceil() as u32;
-    LogicFrames::from_frames(whole)
+    mint_sage_modules::retail_duration_ticks_f32(milliseconds)
 }

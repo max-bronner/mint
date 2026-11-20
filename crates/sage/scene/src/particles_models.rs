@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use mint_render::{Instance, Mat4};
+use mint_render::{Instance, Mat4, Renderer};
 use mint_sage_ini::{AnimationFlags, AnimationSource, DefaultAnimation};
 use mint_sage_model::{
-    faded, load_animation, CachedModel, Completion, ModelAnimation, PartPose, PoseBuffers, Resolver,
+    faded, load_animation, CachedModel, Completion, GpuSkin, ModelAnimation, PartPose, PoseBuffers,
+    Resolver,
 };
 use mint_sage_particle::ModelDraw;
 use mint_vfs::Vfs;
@@ -11,10 +12,12 @@ use mint_vfs::Vfs;
 pub(crate) struct ParticleModel {
     model: Arc<CachedModel>,
     animation: Option<ModelAnimation>,
+    gpu: GpuSkin,
 }
 
 impl ParticleModel {
     pub(crate) fn bind(
+        renderer: &mut Renderer,
         vfs: &Vfs,
         resolver: &Resolver,
         name: &str,
@@ -42,7 +45,16 @@ impl ParticleModel {
             }
         }
         .filter(ModelAnimation::moves);
-        let bound = Self { model, animation };
+        let gpu = if animation.is_some() {
+            GpuSkin::upload(renderer, &model)
+        } else {
+            GpuSkin::default()
+        };
+        let bound = Self {
+            model,
+            animation,
+            gpu,
+        };
         if bound.needs_frame() {
             crate::once::report_once(&format!(
                 "  particle model {name}: clip {} frame(s), UV mapper {}",
@@ -63,6 +75,8 @@ impl ParticleModel {
         out: &mut [Instance],
         seconds: f32,
         scratch: &mut PoseScratch,
+        palette: &mut Vec<Mat4>,
+        palette_base: usize,
     ) {
         let particles = draw.placements.len();
         let parts = self.model.parts.len();
@@ -89,6 +103,13 @@ impl ParticleModel {
                 &mut scratch.poses,
                 &mut scratch.buffers,
             );
+            let bone_base = if self.gpu.any() {
+                let at = palette_base.saturating_add(palette.len());
+                palette.extend_from_slice(&scratch.bones);
+                u32::try_from(at).ok()
+            } else {
+                None
+            };
             for (part_index, part) in self.model.parts.iter().enumerate() {
                 let Some(pose) = scratch.poses.get(part_index).copied() else {
                     continue;
@@ -100,6 +121,12 @@ impl ParticleModel {
                     continue;
                 };
                 apply_pose(instance, *placement, part.instance.transform, pose);
+                let skinned = self.gpu.parts.get(part_index).and_then(Option::as_ref);
+                if let (Some(skinned), Some(base)) = (skinned, bone_base) {
+                    instance.mesh = skinned.mesh;
+                    instance.bone_base = Some(base);
+                    instance.bounds = self.gpu.posed_bounds(part_index, &scratch.bones);
+                }
             }
         }
     }

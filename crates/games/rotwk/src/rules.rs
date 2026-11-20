@@ -44,8 +44,10 @@ use crate::powers::PowerBook;
 use crate::shroud::{Seen, Shroud, ShroudIds, Vision};
 use crate::templates::{KindTable, Production, TargetKind};
 
+mod adjust_destination;
 mod ai_attack;
 mod ai_build;
+mod ai_forfeit;
 mod ai_powers;
 mod amphibious;
 mod animal_ai;
@@ -53,12 +55,19 @@ mod aod_crush;
 mod attach;
 mod attack;
 mod attack_ground;
+mod attribute_nugget;
 mod auto_cast;
 mod avoidance;
 pub(crate) mod border;
 mod busy;
 mod cah;
 mod cah_preview;
+mod cell_raster;
+mod command_monitor;
+mod critter_emitter;
+mod disabled;
+mod ship_exit;
+mod weapon_toggle;
 pub(crate) use cah_preview::{CahPreview, ExamineRaise};
 mod capture;
 pub(crate) mod carryover;
@@ -84,21 +93,36 @@ mod emotion_states;
 mod emotions;
 mod enemy_contact;
 mod engaged;
+mod hold_fire;
+mod list_looks;
 mod match_stats;
 mod misc_sounds;
+mod pillage;
+mod sacrifice;
+mod troll;
 pub(crate) use misc_sounds::MiscSound;
 mod experience;
 mod fire;
+mod fire_gate;
 mod flank;
 mod forest_powers;
 mod formation_arrow;
 pub(crate) use formation_arrow::ArrowPiece;
 mod formation_preview;
 pub(crate) use formation_preview::{FormationPreviewItem, PreviewDecals};
+mod fade_away;
 mod gates;
 mod geometry;
 mod giant_bird;
+mod horde_portal;
+mod leaving_factory;
+mod portal_fade;
+mod portal_links;
+mod queue_lines;
 pub(crate) use engaged::EngagedDefaults;
+mod creation;
+mod flood;
+mod formation_bonus;
 mod group_bonus;
 mod group_move;
 mod guard;
@@ -106,14 +130,20 @@ mod harvest;
 mod heroes;
 mod hit_reaction;
 mod horde_melee;
+mod horde_pick;
+mod horde_squish;
 mod horde_swarm;
 mod knockback;
+mod last_shot_horde;
+mod line_of_fire;
 mod loose_melee;
 mod map_keys;
 pub(crate) mod map_scripts;
+mod melee_contact;
 mod melee_engage;
 mod move_allies;
-mod movement;
+pub(crate) mod movement;
+mod mover_rows;
 mod order_queue;
 mod orders;
 mod path_footprint;
@@ -127,11 +157,14 @@ mod regeneration;
 mod relationship;
 mod repair;
 mod replenish;
+mod repulsor;
+mod safe_path;
 mod script_events;
 mod selection;
 mod sell;
 mod shooting;
 pub(crate) mod siege;
+mod slave_attack;
 mod spawning;
 mod spell_effects;
 mod spells;
@@ -143,11 +176,14 @@ mod unit_cells;
 mod unit_costs;
 mod unit_index;
 mod upgrades;
+mod victim_facts;
+mod wading;
 mod wall;
 mod wall_link;
 mod wall_upgrade;
 mod weapon_fire;
 mod weather;
+pub(crate) mod wotr_battle;
 use crate::diag::diag;
 pub(crate) use aod_crush::{AodCrusher, LargeUnitTouch};
 use avoidance::{AvoidanceGrid, IgnoringTarget};
@@ -158,6 +194,7 @@ pub(crate) use debug::{DebugCommand, DebugTarget, LevelStep, SpawnRole, UnitEntr
 pub(crate) use economy::IncomeView;
 pub(crate) use gates::{GateAction, GateButtons};
 pub(crate) use group_move::GroupFormation;
+pub(crate) use horde_melee::RunningDown;
 pub(crate) use melee_engage::MeleePlacement;
 #[cfg(test)]
 use movement::{last_straggler_rescue_spent, STRAGGLER_RESCUE_BUDGET_PER_TICK};
@@ -172,7 +209,7 @@ pub(crate) use upgrades::{ModuleWiring, UsingAbility};
 
 pub(crate) const MAX_SELECTION_UNITS: usize = 512;
 
-pub(crate) const DEFAULT_MAX_QUEUE_ENTRIES: u32 = 9;
+pub(crate) const DEFAULT_MAX_QUEUE_ENTRIES: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MatchClock(pub(crate) u64);
@@ -257,6 +294,8 @@ pub(crate) struct Ids {
     pub(crate) obstacles: ComponentId<ObstacleLayer>,
     pub(crate) portals: ComponentId<crate::portals::PortalLayer>,
     pub(crate) gate_cycle: ComponentId<gates::GateCycle>,
+    pub(crate) gate_box: ComponentId<gates::GateBox>,
+    pub(crate) box_seen: ComponentId<gates::BoxSeen>,
     pub(crate) replanned_at: ComponentId<ReplannedAt>,
     pub(crate) construction: ComponentId<Construction>,
     pub(crate) build_task: ComponentId<BuildTask>,
@@ -285,6 +324,7 @@ pub(crate) struct Ids {
     pub(crate) dots: ComponentId<crate::spell_state::DamageOverTime>,
     pub(crate) suppressed: ComponentId<crate::spell_state::Suppressed>,
     pub(crate) cash_bounty: ComponentId<crate::spell_state::CashBounty>,
+    pub(crate) cash_bounty_power: ComponentId<crate::spell_state::CashBountyPower>,
     pub(crate) production_bonuses: ComponentId<crate::spell_state::ProductionBonuses>,
     pub(crate) last_hurt: ComponentId<crate::spell_state::LastHurt>,
     pub(crate) sole_healer: ComponentId<crate::spell_state::SoleHealer>,
@@ -293,6 +333,7 @@ pub(crate) struct Ids {
     pub(crate) point_rule: ComponentId<crate::spell_state::PointRule>,
     pub(crate) castle_member: ComponentId<crate::castle::CastleMember>,
     pub(crate) pad_occupant: ComponentId<crate::castle::PadOccupant>,
+    pub(crate) pending_unpack: ComponentId<crate::castle::PendingUnpack>,
     pub(crate) voice: ComponentId<crate::voice::VoiceEvents>,
     pub(crate) locomotion: ComponentId<crate::unit::Locomotion>,
     pub(crate) player_order: ComponentId<PlayerOrder>,
@@ -306,7 +347,6 @@ pub(crate) struct Ids {
     pub(crate) ground_offset: ComponentId<crate::unit::GroundOffset>,
     pub(crate) corpse_sink: ComponentId<death::CorpseSink>,
     pub(crate) player_point_bonus: ComponentId<crate::spell_state::PointBonus>,
-    pub(crate) auto_cast: ComponentId<auto_cast::AutoCastSlot>,
     pub(crate) using_ability: ComponentId<upgrades::UsingAbility>,
     pub(crate) no_auto_acquire: ComponentId<upgrades::NoAutoAcquire>,
     pub(crate) motive: ComponentId<crate::unit::Motive>,
@@ -338,7 +378,7 @@ pub(crate) struct Ids {
     pub(crate) ignored_obstacle: ComponentId<movement::IgnoredObstacle>,
     pub(crate) claimant: ComponentId<crate::claims::Claimant>,
     pub(crate) claims: ComponentId<crate::claims::ClaimLayer>,
-    pub(crate) flight_level: ComponentId<movement::FlightLevel>,
+    pub(crate) attack_phase: ComponentId<movement::AttackHeight>,
     pub(crate) held: ComponentId<movement::Held>,
     pub(crate) burning: ComponentId<death::Burning>,
     pub(crate) ground_order: ComponentId<crate::combat::GroundOrder>,
@@ -357,6 +397,7 @@ pub(crate) struct Ids {
     pub(crate) dummy: ComponentId<debug::Dummy>,
     pub(crate) contact: ComponentId<enemy_contact::Contact>,
     pub(crate) cell_mark: ComponentId<cell_change::CellMark>,
+    pub(crate) level_feedback: ComponentId<experience::LevelFeedback>,
     pub(crate) crush_speed_cap: ComponentId<crate::combat::CrushSpeedCap>,
     pub(crate) desired_speed: ComponentId<crate::unit::DesiredSpeed>,
     pub(crate) formation_speed: ComponentId<crate::unit::FormationSpeed>,
@@ -367,6 +408,7 @@ pub(crate) struct Ids {
     pub(crate) forest: ComponentId<crate::forest::Forest>,
     pub(crate) last_attacker: ComponentId<guard::LastAttacker>,
     pub(crate) deferred_order: ComponentId<busy::DeferredOrder>,
+    pub(crate) held_aside: ComponentId<busy::HeldAside>,
     pub(crate) harvesting: ComponentId<harvest::Harvesting>,
     pub(crate) approach_wait: ComponentId<shooting::ApproachWait>,
     pub(crate) ranged_approach: ComponentId<attack::RangedApproach>,
@@ -381,16 +423,20 @@ pub(crate) struct Ids {
     pub(crate) aflame: ComponentId<fire::Aflame>,
     pub(crate) pending_eject: ComponentId<rampage::PendingEject>,
     pub(crate) animal_origin: ComponentId<animal_ai::AnimalOrigin>,
+    pub(crate) critter_emitter_spent: ComponentId<critter_emitter::CritterEmitterSpent>,
     pub(crate) aod_crusher: ComponentId<aod_crush::AodCrusher>,
     pub(crate) amphibious_unload: ComponentId<amphibious::AmphibiousUnload>,
+    pub(crate) last_path_goal: ComponentId<ship_exit::LastPathGoal>,
     pub(crate) ability_weapon_clocks: ComponentId<crate::spell_state::AbilityWeaponClocks>,
     pub(crate) suspended_order: ComponentId<SuspendedOrder>,
     pub(crate) auto_repair: ComponentId<crate::construction::AutoRepair>,
     pub(crate) horde_trail: ComponentId<crate::horde_trail::HordeTrail>,
     pub(crate) glided: ComponentId<crate::horde_trail::Glided>,
+    pub(crate) idle_ask: ComponentId<crate::horde::IdleAsk>,
     pub(crate) ai_power_refire: ComponentId<ai_powers::AiPowerRefire>,
     pub(crate) rally_events: ComponentId<rally::RallyEvents>,
     pub(crate) join_fade: ComponentId<crate::horde::JoinFade>,
+    pub(crate) portal_walk: ComponentId<crate::horde::PortalWalk>,
     pub(crate) death_phase: ComponentId<crate::death_phase::DeathPhaseEvents>,
     pub(crate) death_phase_clock: ComponentId<death::DeathPhaseClock>,
     pub(crate) spell_recharge: ComponentId<crate::spell_state::SpellRecharge>,
@@ -430,6 +476,38 @@ pub(crate) struct Ids {
     pub(crate) border: ComponentId<crate::rules::border::ActiveBorder>,
     pub(crate) human_barred: ComponentId<crate::rules::border::HumanBarred>,
     pub(crate) events_list: ComponentId<map_keys::EventsList>,
+    pub(crate) kill_credits: ComponentId<crate::kill_credit::KillCredits>,
+    pub(crate) ai_busy: ComponentId<busy::AiBusy>,
+    pub(crate) crush_hits: ComponentId<crate::combat::CrushHits>,
+    pub(crate) flood_path: ComponentId<flood::FloodPath>,
+    pub(crate) order_origin: ComponentId<crate::unit::OrderOrigin>,
+    pub(crate) formation_slot: ComponentId<crate::unit::FormationSlot>,
+    pub(crate) maintain_point: ComponentId<crate::unit::MaintainPoint>,
+    pub(crate) order_goal: ComponentId<crate::unit::OrderGoal>,
+    pub(crate) factory_exit: ComponentId<leaving_factory::FactoryExit>,
+    pub(crate) created: ComponentId<creation::Created>,
+    pub(crate) creation_count: ComponentId<creation::CreationCount>,
+    pub(crate) repulsor_clear: ComponentId<repulsor::RepulsorClear>,
+    pub(crate) repulsed: ComponentId<repulsor::Repulsed>,
+    pub(crate) repulsor_pair: ComponentId<repulsor::RepulsorPair>,
+    pub(crate) portal_fade: ComponentId<portal_fade::PortalFade>,
+    pub(crate) own_cell_entry: ComponentId<crate::unit::OwnCellEntry>,
+    pub(crate) running_down: ComponentId<horde_melee::RunningDown>,
+    pub(crate) pending_impacts: ComponentId<crate::spell_state::PendingImpacts>,
+    pub(crate) disabled: ComponentId<disabled::Disabled>,
+    pub(crate) player_stopped: ComponentId<orders::PlayerStopped>,
+    pub(crate) one_shot_order: ComponentId<slave_attack::OneShotOrder>,
+    pub(crate) formation_lists: ComponentId<formation_bonus::FormationLists>,
+    pub(crate) hold_fire: ComponentId<hold_fire::HoldFire>,
+    pub(crate) sacrificing: ComponentId<sacrifice::Sacrificing>,
+    pub(crate) sacrificed: ComponentId<sacrifice::Sacrificed>,
+    pub(crate) command_monitor: ComponentId<command_monitor::CommandMonitor>,
+    pub(crate) position_raised: ComponentId<command_monitor::AttackingPositionRaised>,
+    pub(crate) pillage_count: ComponentId<pillage::PillageCount>,
+    pub(crate) locomotor_upgraded: ComponentId<upgrades::LocomotorUpgraded>,
+    pub(crate) click_reaction: ComponentId<troll::ClickReaction>,
+    pub(crate) bored_clock: ComponentId<troll::BoredClock>,
+    pub(crate) fade_opacity: ComponentId<fade_away::FadeOpacity>,
 }
 
 pub(crate) struct RotwkRules {
@@ -442,6 +520,8 @@ pub(crate) struct RotwkRules {
     command_sets: Arc<mint_sage_ini::CommandSetIndex>,
     ai_power_activation_tuning: [(i64, i64); 4],
     ai_power_difficulty: Vec<(PlayerId, crate::lobby::Difficulty)>,
+    forfeit: Option<mint_sage_ini::game_data::RetreatTuning>,
+    brutal_cheats: mint_sage_ini::game_data::BrutalCheats,
     difficulty: difficulty::DifficultySetup,
     combat_chains: crate::combat::CombatChainTable,
     combat: CombatData,
@@ -449,6 +529,8 @@ pub(crate) struct RotwkRules {
     formations: Vec<FormationTable>,
     melee_hordes: Vec<Option<f32>>,
     horde_rangefinders: Vec<Option<f32>>,
+    horde_rangefinder_weapons: Vec<Option<mint_sage_combat::WeaponId>>,
+    horde_overloaded: Vec<bool>,
     hordes: Vec<HordeSpawn>,
     buildables: Vec<Buildable>,
     menus: Vec<Vec<u16>>,
@@ -456,6 +538,7 @@ pub(crate) struct RotwkRules {
     players: u8,
     starting_cash: i64,
     starting_cash_overrides: Vec<Option<i64>>,
+    command_point_overrides: Vec<Option<u32>>,
     initial_upgrades: Vec<UpgradeMask>,
     production_cost_change: Vec<f32>,
     use_shroud: bool,
@@ -464,6 +547,7 @@ pub(crate) struct RotwkRules {
     map_placements: Vec<(usize, u32)>,
     script_object_names: Vec<(usize, String)>,
     script_teams: Vec<(usize, String)>,
+    map_snowy: bool,
     indestructible: Vec<usize>,
     placed_keys: Vec<(usize, crate::map_keys::ObjectKeys)>,
     placed_hordes: Vec<PlacedHorde>,
@@ -487,12 +571,15 @@ pub(crate) struct RotwkRules {
     drag_formation: Arc<mint_sage_formation::FormationAssistant>,
     castle_siege_stand_back_distance: f32,
     victory_structure_filter: ObjectFilter,
+    victory_unit_filter: ObjectFilter,
+    defeat_mode: crate::defeat::DefeatMode,
     empty_counts: Vec<u8>,
     reachability: std::cell::RefCell<Reachability>,
-    reachability_extra: std::cell::RefCell<Vec<(MoverClass, Reachability)>>,
+    portal_links: std::cell::RefCell<Vec<mint_movement::PortalLink>>,
     path_search: std::cell::RefCell<Pipeline>,
     attack_spot_search: std::cell::RefCell<mint_movement::AStar<mint_movement::Octile>>,
     unit_index: std::cell::RefCell<unit_index::UnitIndex>,
+    mover_rows: std::cell::RefCell<mover_rows::MoverRows>,
     victory_enabled: bool,
     ai_seeds: Vec<crate::skirmish_ai::AiSeed>,
     ai_timing: crate::combat::AiTiming,
@@ -522,8 +609,9 @@ pub(crate) struct RotwkRules {
     bird_kinds: Vec<giant_bird::BirdKind>,
     spawn_points: Arc<Vec<Vec<crate::perches::Perch>>>,
     siege_docks: Arc<Vec<Vec<siege::DockBone>>>,
-    siege_above_wall: Arc<Vec<Option<Vec2>>>,
+    siege_above_wall: Arc<Vec<Option<siege::AboveWall>>>,
     siege_ladder_exit: Arc<Vec<Option<crate::perches::Perch>>>,
+    portal_bones: Arc<Vec<Vec<crate::perches::Perch>>>,
     launch_bones: Arc<Vec<Vec<crate::perches::SlotLaunch>>>,
     wall_bounds: Arc<Vec<Option<crate::wall_meshes::WallBounds>>>,
     ramp_meshes: Arc<Vec<Vec<crate::wall_meshes::RampMesh>>>,
@@ -582,6 +670,7 @@ pub(crate) struct RotwkRules {
     projectile_kinds: Vec<Option<crate::combat::ProjectileKind>>,
     stealth: stealth::StealthTables,
     value_per_supply_box: f32,
+    building_height_variation: f32,
 }
 
 impl core::fmt::Debug for RotwkRules {
@@ -607,6 +696,10 @@ fn ai_kinds_of(kinds: &KindTable) -> Vec<bool> {
 }
 
 impl RotwkRules {
+    pub(crate) fn configured(self: Box<Self>, step: impl FnOnce(Self) -> Self) -> Box<Self> {
+        Box::new(step(*self))
+    }
+
     pub(crate) fn new(passability: Passability, spawns: Vec<Spawn>) -> Self {
         let empty_counts =
             vec![0u8; usize::try_from(passability.grid.extent().cell_count()).unwrap_or(0)];
@@ -630,10 +723,11 @@ impl RotwkRules {
         Self {
             passability,
             reachability: std::cell::RefCell::new(reachability),
-            reachability_extra: std::cell::RefCell::new(Vec::new()),
+            portal_links: std::cell::RefCell::new(Vec::new()),
             path_search: std::cell::RefCell::new(Pipeline::new(PipelineConfig::default())),
             attack_spot_search: std::cell::RefCell::new(mint_movement::AStar::octile()),
             unit_index: std::cell::RefCell::default(),
+            mover_rows: std::cell::RefCell::default(),
             spawns,
             ids: None,
             combat: CombatData::new(),
@@ -644,11 +738,15 @@ impl RotwkRules {
             ai_power_activation_tuning: [(1, 1); 4],
             combat_chains: crate::combat::CombatChainTable::default(),
             ai_power_difficulty: Vec::new(),
+            forfeit: None,
+            brutal_cheats: mint_sage_ini::game_data::BrutalCheats::NONE,
             difficulty: difficulty::DifficultySetup::default(),
             unarmoured: ArmorTemplate::default(),
             formations: Vec::new(),
             melee_hordes: Vec::new(),
             horde_rangefinders: Vec::new(),
+            horde_rangefinder_weapons: Vec::new(),
+            horde_overloaded: Vec::new(),
             hordes: Vec::new(),
             buildables: Vec::new(),
             menus: Vec::new(),
@@ -656,6 +754,7 @@ impl RotwkRules {
             players: 4,
             starting_cash: mint_sage_economy::DEFAULT_STARTING_CASH,
             starting_cash_overrides: Vec::new(),
+            command_point_overrides: Vec::new(),
             initial_upgrades: Vec::new(),
             production_cost_change: Vec::new(),
             use_shroud: false,
@@ -663,6 +762,7 @@ impl RotwkRules {
             wall_geometry: Vec::new(),
             map_placements: Vec::new(),
             script_object_names: Vec::new(),
+            map_snowy: false,
             indestructible: Vec::new(),
             placed_keys: Vec::new(),
             script_teams: Vec::new(),
@@ -688,6 +788,8 @@ impl RotwkRules {
             castle_siege_stand_back_distance: 500.0,
             empty_counts,
             victory_structure_filter: ObjectFilter::default(),
+            victory_unit_filter: ObjectFilter::default(),
+            defeat_mode: crate::defeat::DefeatMode::default(),
             victory_enabled: false,
             ai_seeds: Vec::new(),
             ai_timing: crate::combat::AiTiming::default(),
@@ -719,6 +821,7 @@ impl RotwkRules {
             siege_docks: Arc::new(Vec::new()),
             siege_above_wall: Arc::new(Vec::new()),
             siege_ladder_exit: Arc::new(Vec::new()),
+            portal_bones: Arc::new(Vec::new()),
             launch_bones: Arc::new(Vec::new()),
             wall_bounds: Arc::new(Vec::new()),
             ramp_meshes: Arc::new(Vec::new()),
@@ -777,6 +880,7 @@ impl RotwkRules {
             projectile_kinds: Vec::new(),
             stealth: stealth::StealthTables::default(),
             value_per_supply_box: crate::game_data::DEFAULT_VALUE_PER_SUPPLY_BOX,
+            building_height_variation: crate::game_data::DEFAULT_BUILDING_HEIGHT_VARIATION,
         }
     }
 
@@ -823,6 +927,11 @@ impl RotwkRules {
 
     pub(crate) fn with_alignments(mut self, alignments: Vec<mint_sage_economy::Alignment>) -> Self {
         self.alignments = alignments;
+        self
+    }
+
+    pub(crate) fn with_command_point_overrides(mut self, limits: Vec<Option<u32>>) -> Self {
+        self.command_point_overrides = limits;
         self
     }
 
@@ -922,6 +1031,19 @@ impl RotwkRules {
         self
     }
 
+    pub(crate) fn with_horde_rangefinder_weapons(
+        mut self,
+        weapons: Vec<Option<mint_sage_combat::WeaponId>>,
+    ) -> Self {
+        self.horde_rangefinder_weapons = weapons;
+        self
+    }
+
+    pub(crate) fn with_horde_overloaded(mut self, overloaded: Vec<bool>) -> Self {
+        self.horde_overloaded = overloaded;
+        self
+    }
+
     pub(crate) fn with_combat(mut self, combat: CombatData) -> Self {
         self.combat = combat;
         self
@@ -962,6 +1084,22 @@ impl RotwkRules {
     ) -> Self {
         self.ai_power_activation_tuning = activation_tuning;
         self.ai_power_difficulty = difficulty;
+        self
+    }
+
+    pub(crate) fn with_forfeit(
+        mut self,
+        tuning: Option<mint_sage_ini::game_data::RetreatTuning>,
+    ) -> Self {
+        self.forfeit = tuning;
+        self
+    }
+
+    pub(crate) fn with_brutal_cheats(
+        mut self,
+        cheats: mint_sage_ini::game_data::BrutalCheats,
+    ) -> Self {
+        self.brutal_cheats = cheats;
         self
     }
 
@@ -1038,6 +1176,11 @@ impl RotwkRules {
 
     pub(crate) fn with_script_object_names(mut self, names: Vec<(usize, String)>) -> Self {
         self.script_object_names = names;
+        self
+    }
+
+    pub(crate) fn with_map_snowy(mut self, snowy: bool) -> Self {
+        self.map_snowy = snowy;
         self
     }
 
@@ -1193,6 +1336,24 @@ impl RotwkRules {
         self
     }
 
+    pub(crate) fn with_victory_units(mut self, filter: ObjectFilter) -> Self {
+        self.victory_unit_filter = filter;
+        self
+    }
+
+    pub(crate) fn with_defeat_mode(mut self, mode: crate::defeat::DefeatMode) -> Self {
+        self.defeat_mode = mode;
+        self
+    }
+
+    fn victory_filters(&self) -> crate::defeat::VictoryFilters<'_> {
+        crate::defeat::VictoryFilters {
+            structure: &self.victory_structure_filter,
+            unit: &self.victory_unit_filter,
+            mode: self.defeat_mode,
+        }
+    }
+
     pub(crate) fn player_defeated(&self, world: &World, ids: Ids, player: PlayerId) -> bool {
         self.victory_enabled
             && self.players >= 2
@@ -1201,7 +1362,7 @@ impl RotwkRules {
                 world,
                 Self::defeat_ids(ids),
                 &self.kinds,
-                &self.victory_structure_filter,
+                self.victory_filters(),
                 player,
             )
     }
@@ -1222,12 +1383,17 @@ impl RotwkRules {
     pub(crate) fn with_siege_bones(
         mut self,
         docks: Vec<Vec<siege::DockBone>>,
-        above_wall: Vec<Option<Vec2>>,
+        above_wall: Vec<Option<siege::AboveWall>>,
         ladder_exit: Vec<Option<crate::perches::Perch>>,
     ) -> Self {
         self.siege_docks = Arc::new(docks);
         self.siege_above_wall = Arc::new(above_wall);
         self.siege_ladder_exit = Arc::new(ladder_exit);
+        self
+    }
+
+    pub(crate) fn with_portal_bones(mut self, bones: Vec<Vec<crate::perches::Perch>>) -> Self {
+        self.portal_bones = Arc::new(bones);
         self
     }
 
@@ -1479,6 +1645,10 @@ impl RotwkRules {
         &self.player_sides
     }
 
+    pub(crate) fn castle_layouts(&self) -> &crate::castle::CastleLayouts {
+        &self.castle_layouts
+    }
+
     pub(crate) fn hostile(&self, a: PlayerId, b: PlayerId) -> bool {
         self.alliances.hostile(a, b)
     }
@@ -1666,6 +1836,17 @@ impl RotwkRules {
             .and_then(|store| store.iter().next())
             .map(|(_, state)| state.view())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn ui_panel_open(
+        &self,
+        world: &mint_sim::World,
+        player: mint_sim::PlayerId,
+        panel: UiPanel,
+    ) -> bool {
+        self.ids()
+            .and_then(|ids| self.script_state(world, ids))
+            .is_some_and(|state| state.ui.panel_open(player, panel))
     }
 
     pub(crate) fn collapse_view(
@@ -1999,6 +2180,11 @@ impl RotwkRules {
         self.passable_cell_for(tick, ids, origin, mover)
     }
 
+    pub(crate) fn inside_active(&self, world: &World, ids: Ids, point: Vec2) -> bool {
+        let high = self.active_high(world, ids);
+        point.x > 0.0 && point.y > 0.0 && point.x < high.x && point.y < high.y
+    }
+
     fn both_off_extent(&self, from: Vec2, to: Vec2) -> bool {
         let high = self.passability.playable_high;
         let inside = |p: Vec2| p.x > 0.0 && p.y > 0.0 && p.x < high.x && p.y < high.y;
@@ -2083,8 +2269,7 @@ impl RotwkRules {
                 scaleable: crate::obstacles::scaleable_of(tick.state(), ids.obstacles),
                 barred: border::barred_of(tick.state(), ids.human_barred),
             },
-            portals: crate::portals::masks_of(tick.state(), ids.portals),
-            tags: crate::portals::tags_of(tick.state(), ids.portals),
+            links: crate::portals::links_of(tick.state(), ids.portals),
         }
     }
 
@@ -2109,14 +2294,7 @@ impl RotwkRules {
         };
         let mover = self.reachability.borrow().mover();
         let ground = Reachability::build(&view, mover);
-        let extra: Vec<(MoverClass, Reachability)> = self
-            .reachability_extra
-            .borrow()
-            .iter()
-            .map(|(terrain, _)| (*terrain, Reachability::build(&view, *terrain)))
-            .collect();
         *self.reachability.borrow_mut() = ground;
-        *self.reachability_extra.borrow_mut() = extra;
     }
 
     fn static_view(&self) -> DynamicView<'_> {
@@ -2185,19 +2363,31 @@ impl RotwkRules {
     }
 
     fn insert_spawn(
+        &self,
         tick: &mut Tick<'_>,
         ids: Ids,
         entity: Entity,
         spawn: &Spawn,
         combat: &CombatData,
     ) -> Result<()> {
-        map_scripts::note_object_count_changed(tick, ids);
+        if !spawn.shape.kind_of.contains(KindOf::PROJECTILE) {
+            map_scripts::note_object_count_changed(tick, ids);
+        }
         tick.state_mut().insert(
             ids.body,
             entity,
             Body(MoverState::new(spawn.position, spawn.facing)),
         )?;
         tick.state_mut().insert(ids.shape, entity, spawn.shape)?;
+        if spawn.shape.kind_of.contains(KindOf::PROJECTILE)
+            || spawn.shape.kind_of.contains(KindOf::INERT)
+        {
+            tick.state_mut().insert(
+                ids.own_cell_entry,
+                entity,
+                crate::unit::OwnCellEntry(spawn.position),
+            )?;
+        }
         if let Some(offset) = spawn.ground_offset {
             tick.state_mut().insert(
                 ids.ground_offset,
@@ -2208,7 +2398,10 @@ impl RotwkRules {
         tick.state_mut()
             .insert(ids.owner, entity, Owner(spawn.owner))?;
         if let Some(max) = spawn.health {
-            if let Some(pool) = HealthPool::new(max, BodyKind::Active) {
+            if let Some(mut pool) = HealthPool::new(max, BodyKind::Active) {
+                if let Some(initial) = spawn.initial_health {
+                    pool = pool.with_initial(initial);
+                }
                 tick.state_mut().insert(ids.health, entity, Health(pool))?;
             }
         }
@@ -2222,12 +2415,14 @@ impl RotwkRules {
         if let Some(weapon) = spawn.weapon {
             if let Some(template) = combat.weapons.get(weapon) {
                 let next_acquire = staggered_first_acquire(entity, tick.frame());
+                let now = tick.frame();
+                let state = WeaponState::activated(template, now, 1.0, tick.rng());
                 tick.state_mut().insert(
                     ids.armed,
                     entity,
                     Armed {
                         weapon,
-                        state: WeaponState::new(template),
+                        state,
                         target: None,
                         winding: false,
                         shots_at_target: 0,
@@ -2235,6 +2430,8 @@ impl RotwkRules {
                         next_acquire,
                         reacquire_ready: None,
                         squish_reacquire: false,
+                        position_shot: None,
+                        last_shot_horde: None,
                     },
                 )?;
             }
@@ -2305,6 +2502,10 @@ impl RotwkRules {
             }
         }
         self.attach_regeneration(tick, ids, entity, kind)?;
+        self.attach_command_monitor(tick, ids, entity, kind)?;
+        if self.wotr_player_list(tick.state(), ids, entity).is_some() {
+            self.recompute_bonuses(tick, ids, entity)?;
+        }
         if self
             .kinds
             .get(kind)
@@ -2315,8 +2516,15 @@ impl RotwkRules {
                 .get(ids.body, entity)
                 .map(|body| body.0.position)
             {
-                tick.state_mut()
-                    .insert(ids.animal_origin, entity, animal_ai::AnimalOrigin(at))?;
+                let z = tick
+                    .state()
+                    .get(ids.elevation, entity)
+                    .map_or(0.0, |elevation| elevation.0);
+                tick.state_mut().insert(
+                    ids.animal_origin,
+                    entity,
+                    animal_ai::AnimalOrigin(at, z),
+                )?;
             }
         }
         let object_menu = self.object_upgrade_menu_of.get(index).copied().flatten();
@@ -2396,7 +2604,8 @@ impl RotwkRules {
         self.create_modules(tick, ids, entity, Some(kind))?;
         self.grant_difficulty_upgrade(tick, ids, entity)?;
         self.apply_weather_to_new_object(tick, ids, entity)?;
-        self.fire_object_event(tick, ids, entity, "OnCreated", None)
+        self.fire_object_event(tick, ids, entity, "OnCreated", None)?;
+        self.stamp_creation(tick, ids, entity)
     }
 
     fn effective_upgrades(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> UpgradeMask {
@@ -2412,11 +2621,19 @@ impl RotwkRules {
             .and_then(|owner| crate::economy::player_entity(world, Self::economy_ids(ids), owner.0))
             .and_then(|player| world.get(ids.player_upgrades, player))
             .map_or_else(UpgradeMask::default, |mask| mask.0.clone());
-        let held = object.union(&player);
-        match self.level_upgrades(world, ids, entity) {
-            Some(granted) if !granted.is_empty() => held.union(granted),
-            _ => held,
+        let mut held = object.union(&player);
+        for granted in [
+            self.level_upgrades(world, ids, entity),
+            self.forwarded_level_upgrades(world, ids, entity),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !granted.is_empty() {
+                held = held.union(granted);
+            }
         }
+        held
     }
 
     fn needs_gate(
@@ -2562,7 +2779,10 @@ impl RotwkRules {
             &self.upgrade_bits,
             player,
             buildable,
+            Some(entity),
             self.production_cost_change_percent(player),
+            self.brutal_cheats_for(player).build_cost_reduction,
+            &|world, builder, bit| self.sub_upgrade_counted(world, ids, builder, bit),
         );
         crate::economy::purse_of(world, economy, player).can_afford(cost)
     }
@@ -2672,6 +2892,7 @@ impl RotwkRules {
             member_mark: ids.horde_member_mark,
             body: ids.body,
             path: ids.path,
+            path_queue: ids.path_queue,
             doomed: ids.doomed,
             health: ids.health,
             shape: ids.shape,
@@ -2680,7 +2901,6 @@ impl RotwkRules {
             locomotion: ids.locomotion,
             motive: ids.motive,
             owner: ids.owner,
-            portals: ids.portals,
             wall_layer: ids.wall_layer,
             horde_melee: ids.horde_melee,
             member_melee: ids.member_melee,
@@ -2688,10 +2908,13 @@ impl RotwkRules {
             goal_cells: ids.goal_cells,
             horde_trail: ids.horde_trail,
             glided: ids.glided,
+            idle_ask: ids.idle_ask,
             layer: ids.layer,
             aod_crusher: ids.aod_crusher,
             using_ability: ids.using_ability,
+            running_down: ids.running_down,
             join_fade: ids.join_fade,
+            portal_walk: ids.portal_walk,
             elevation: ids.elevation,
             scaleable_walls: ids.scaleable_walls,
             combat_facts: ids.combat_facts,
@@ -2813,6 +3036,17 @@ impl RotwkRules {
                 );
                 continue;
             }
+            let readiness = self.button_readiness_power(tick.state(), ids, structure, &power_name);
+            if !readiness.eq_ignore_ascii_case(&power_name)
+                && !self.power_is_ready(tick.state(), ids, tick.frame(), structure, readiness)
+            {
+                diag!(
+                    "power: {power_name} at entity {} refused - its button waits on {readiness}, \
+                     not ready",
+                    structure.index()
+                );
+                continue;
+            }
             self.fire_power_from(
                 tick,
                 ids,
@@ -2910,7 +3144,7 @@ impl RotwkRules {
                     ..*member
                 });
                 let entity = tick.state_mut().spawn()?;
-                Self::insert_spawn(tick, ids, entity, &built, &self.combat)?;
+                self.insert_spawn(tick, ids, entity, &built, &self.combat)?;
                 self.attach_upgrade_state(tick, ids, entity, built.kind)?;
                 Ok(entity)
             },
@@ -3029,6 +3263,9 @@ impl Rules for RotwkRules {
             cash_bounty: tick
                 .state_mut()
                 .register::<crate::spell_state::CashBounty>(),
+            cash_bounty_power: tick
+                .state_mut()
+                .register::<crate::spell_state::CashBountyPower>(),
             production_bonuses: tick
                 .state_mut()
                 .register::<crate::spell_state::ProductionBonuses>(),
@@ -3043,6 +3280,7 @@ impl Rules for RotwkRules {
             point_rule: tick.state_mut().register::<crate::spell_state::PointRule>(),
             castle_member: tick.state_mut().register::<crate::castle::CastleMember>(),
             pad_occupant: tick.state_mut().register::<crate::castle::PadOccupant>(),
+            pending_unpack: tick.state_mut().register::<crate::castle::PendingUnpack>(),
             voice: tick.state_mut().register::<crate::voice::VoiceEvents>(),
             locomotion: tick.state_mut().register::<crate::unit::Locomotion>(),
             player_order: tick.state_mut().register::<PlayerOrder>(),
@@ -3057,7 +3295,6 @@ impl Rules for RotwkRules {
             player_point_bonus: tick
                 .state_mut()
                 .register::<crate::spell_state::PointBonus>(),
-            auto_cast: tick.state_mut().register::<auto_cast::AutoCastSlot>(),
             using_ability: tick.state_mut().register::<upgrades::UsingAbility>(),
             capturer: tick.state_mut().register::<capture::Capturer>(),
             motive: tick.state_mut().register::<crate::unit::Motive>(),
@@ -3073,6 +3310,8 @@ impl Rules for RotwkRules {
             path_retry: tick.state_mut().register::<PathRetry>(),
             portals: tick.state_mut().register::<crate::portals::PortalLayer>(),
             gate_cycle: tick.state_mut().register::<gates::GateCycle>(),
+            gate_box: tick.state_mut().register::<gates::GateBox>(),
+            box_seen: tick.state_mut().register::<gates::BoxSeen>(),
             emotion: tick.state_mut().register::<emotions::Emotion>(),
             emotion_table: tick.state_mut().register::<emotions::EmotionTable>(),
             horde_combat: tick.state_mut().register::<replenish::HordeCombat>(),
@@ -3098,7 +3337,7 @@ impl Rules for RotwkRules {
             ignored_obstacle: tick.state_mut().register::<movement::IgnoredObstacle>(),
             claimant: tick.state_mut().register::<crate::claims::Claimant>(),
             claims: tick.state_mut().register::<crate::claims::ClaimLayer>(),
-            flight_level: tick.state_mut().register::<movement::FlightLevel>(),
+            attack_phase: tick.state_mut().register::<movement::AttackHeight>(),
             held: tick.state_mut().register::<movement::Held>(),
             burning: tick.state_mut().register::<death::Burning>(),
             ground_order: tick.state_mut().register::<crate::combat::GroundOrder>(),
@@ -3117,6 +3356,7 @@ impl Rules for RotwkRules {
             dummy: tick.state_mut().register::<debug::Dummy>(),
             contact: tick.state_mut().register::<enemy_contact::Contact>(),
             cell_mark: tick.state_mut().register::<cell_change::CellMark>(),
+            level_feedback: tick.state_mut().register::<experience::LevelFeedback>(),
             crush_speed_cap: tick.state_mut().register::<crate::combat::CrushSpeedCap>(),
             desired_speed: tick.state_mut().register::<crate::unit::DesiredSpeed>(),
             formation_speed: tick.state_mut().register::<crate::unit::FormationSpeed>(),
@@ -3127,6 +3367,7 @@ impl Rules for RotwkRules {
             forest: tick.state_mut().register::<crate::forest::Forest>(),
             last_attacker: tick.state_mut().register::<guard::LastAttacker>(),
             deferred_order: tick.state_mut().register::<busy::DeferredOrder>(),
+            held_aside: tick.state_mut().register::<busy::HeldAside>(),
             harvesting: tick.state_mut().register::<harvest::Harvesting>(),
             approach_wait: tick.state_mut().register::<shooting::ApproachWait>(),
             ranged_approach: tick.state_mut().register::<attack::RangedApproach>(),
@@ -3146,8 +3387,12 @@ impl Rules for RotwkRules {
             aflame: tick.state_mut().register::<fire::Aflame>(),
             pending_eject: tick.state_mut().register::<rampage::PendingEject>(),
             animal_origin: tick.state_mut().register::<animal_ai::AnimalOrigin>(),
+            critter_emitter_spent: tick
+                .state_mut()
+                .register::<critter_emitter::CritterEmitterSpent>(),
             aod_crusher: tick.state_mut().register::<aod_crush::AodCrusher>(),
             amphibious_unload: tick.state_mut().register::<amphibious::AmphibiousUnload>(),
+            last_path_goal: tick.state_mut().register::<ship_exit::LastPathGoal>(),
             ability_weapon_clocks: tick
                 .state_mut()
                 .register::<crate::spell_state::AbilityWeaponClocks>(),
@@ -3159,9 +3404,11 @@ impl Rules for RotwkRules {
                 .state_mut()
                 .register::<crate::horde_trail::HordeTrail>(),
             glided: tick.state_mut().register::<crate::horde_trail::Glided>(),
+            idle_ask: tick.state_mut().register::<crate::horde::IdleAsk>(),
             ai_power_refire: tick.state_mut().register::<ai_powers::AiPowerRefire>(),
             rally_events: tick.state_mut().register::<rally::RallyEvents>(),
             join_fade: tick.state_mut().register::<crate::horde::JoinFade>(),
+            portal_walk: tick.state_mut().register::<crate::horde::PortalWalk>(),
             death_phase: tick
                 .state_mut()
                 .register::<crate::death_phase::DeathPhaseEvents>(),
@@ -3227,6 +3474,48 @@ impl Rules for RotwkRules {
                 .state_mut()
                 .register::<crate::rules::border::HumanBarred>(),
             events_list: tick.state_mut().register::<map_keys::EventsList>(),
+            kill_credits: tick
+                .state_mut()
+                .register::<crate::kill_credit::KillCredits>(),
+            ai_busy: tick.state_mut().register::<busy::AiBusy>(),
+            crush_hits: tick.state_mut().register::<crate::combat::CrushHits>(),
+            flood_path: tick.state_mut().register::<flood::FloodPath>(),
+            order_origin: tick.state_mut().register::<crate::unit::OrderOrigin>(),
+            formation_slot: tick.state_mut().register::<crate::unit::FormationSlot>(),
+            maintain_point: tick.state_mut().register::<crate::unit::MaintainPoint>(),
+            order_goal: tick.state_mut().register::<crate::unit::OrderGoal>(),
+            factory_exit: tick.state_mut().register::<leaving_factory::FactoryExit>(),
+            created: tick.state_mut().register::<creation::Created>(),
+            creation_count: tick.state_mut().register::<creation::CreationCount>(),
+            repulsor_clear: tick.state_mut().register::<repulsor::RepulsorClear>(),
+            repulsed: tick.state_mut().register::<repulsor::Repulsed>(),
+            repulsor_pair: tick.state_mut().register::<repulsor::RepulsorPair>(),
+            portal_fade: tick.state_mut().register::<portal_fade::PortalFade>(),
+            own_cell_entry: tick.state_mut().register::<crate::unit::OwnCellEntry>(),
+            running_down: tick.state_mut().register::<horde_melee::RunningDown>(),
+            pending_impacts: tick
+                .state_mut()
+                .register::<crate::spell_state::PendingImpacts>(),
+            disabled: tick.state_mut().register::<disabled::Disabled>(),
+            player_stopped: tick.state_mut().register::<orders::PlayerStopped>(),
+            one_shot_order: tick.state_mut().register::<slave_attack::OneShotOrder>(),
+            formation_lists: tick
+                .state_mut()
+                .register::<formation_bonus::FormationLists>(),
+            hold_fire: tick.state_mut().register::<hold_fire::HoldFire>(),
+            sacrificing: tick.state_mut().register::<sacrifice::Sacrificing>(),
+            sacrificed: tick.state_mut().register::<sacrifice::Sacrificed>(),
+            command_monitor: tick
+                .state_mut()
+                .register::<command_monitor::CommandMonitor>(),
+            position_raised: tick
+                .state_mut()
+                .register::<command_monitor::AttackingPositionRaised>(),
+            pillage_count: tick.state_mut().register::<pillage::PillageCount>(),
+            click_reaction: tick.state_mut().register::<troll::ClickReaction>(),
+            bored_clock: tick.state_mut().register::<troll::BoredClock>(),
+            locomotor_upgraded: tick.state_mut().register::<upgrades::LocomotorUpgraded>(),
+            fade_opacity: tick.state_mut().register::<fade_away::FadeOpacity>(),
         };
         let bits = Arc::clone(&self.upgrade_bits);
         self.combat.resolve_upgrade_filters(|name| bits.bit(name));
@@ -3308,38 +3597,6 @@ impl Rules for RotwkRules {
             crate::summons::Lifetimes::build(&self.kinds, &mut self.combat.death_types);
         self.death_plans = crate::summons::DeathPlans::build(&self.kinds);
         println!("{}", self.death_plans.describe());
-        let mut reachability_extra = Vec::new();
-        for entry in self.kinds.iter() {
-            let Some(terrain) = entry.mover.map(MoverClass::terrain) else {
-                continue;
-            };
-            if terrain == self.reachability.borrow().mover()
-                || reachability_extra
-                    .iter()
-                    .any(|(class, _): &(MoverClass, Reachability)| *class == terrain)
-            {
-                continue;
-            }
-            let oracle = Reachability::build(
-                &DynamicView {
-                    grid: &self.passability.grid,
-                    counts: &self.empty_counts,
-                    rubble: &[],
-                    wall_rim: &[],
-                    tags: &[],
-                    connect: &[],
-                    released: &[],
-                    closed: &[],
-                    obstacle_pinched: &[],
-                    ramp_side: &[],
-                    scaleable: &[],
-                    barred: &[],
-                },
-                terrain,
-            );
-            reachability_extra.push((terrain, oracle));
-        }
-        *self.reachability_extra.borrow_mut() = reachability_extra;
         self.burning_deaths = death::BurningDeaths::build(&self.kinds);
         println!("{}", self.burning_deaths.describe());
         self.contain_damage =
@@ -3376,7 +3633,6 @@ impl Rules for RotwkRules {
             self.seed_team_builders(&mut script_state);
             tick.state_mut()
                 .insert(ids.map_script_state, clock_entity, script_state)?;
-            self.restore_carryover(tick, ids)?;
         }
         tick.state_mut()
             .insert(ids.crate_texts, clock_entity, crates::CrateTexts::default())?;
@@ -3384,6 +3640,11 @@ impl Rules for RotwkRules {
             ids.death_phase,
             clock_entity,
             crate::death_phase::DeathPhaseEvents::default(),
+        )?;
+        tick.state_mut().insert(
+            ids.kill_credits,
+            clock_entity,
+            crate::kill_credit::KillCredits::default(),
         )?;
         tick.state_mut().insert(
             ids.combat_facts,
@@ -3516,7 +3777,23 @@ impl Rules for RotwkRules {
                 .get(usize::from(slot))
                 .copied()
                 .unwrap_or_else(|| crate::economy::alignment_of(player));
-            let rule = self.point_rule_for(alignment, true);
+            let rule = match self.command_point_overrides.get(usize::from(slot)) {
+                Some(Some(max)) => {
+                    let max = i32::try_from(*max).unwrap_or(i32::MAX);
+                    let evil = alignment == mint_sage_economy::Alignment::Evil;
+                    let start = self
+                        .command_point_table
+                        .and_then(|table| table.of(evil, 2))
+                        .map_or(max, |(start, _)| start);
+                    crate::spell_state::PointRule {
+                        start,
+                        cap: Some(max),
+                        factor: 100,
+                        overridden: false,
+                    }
+                }
+                _ => self.point_rule_for(alignment, true),
+            };
             tick.state_mut().insert(ids.point_rule, entity, rule)?;
             tick.state_mut().insert(
                 ids.points,
@@ -3540,6 +3817,8 @@ impl Rules for RotwkRules {
             }
         }
         self.setup_spell_books(tick, ids, &player_entities)?;
+        self.restore_carryover(tick, ids)?;
+        self.start_wotr_battle(tick, ids)?;
 
         for side in &self.computer_sides {
             let entity = tick.state_mut().spawn()?;
@@ -3653,15 +3932,17 @@ impl Rules for RotwkRules {
         }
         for (member, lead, enemies) in records {
             if let Some(&entity) = player_entities.get(usize::from(member.get())) {
-                tick.state_mut().insert(
-                    ids.ai_attack_progress,
-                    entity,
-                    crate::skirmish_ai::AiAttackProgress::new(
-                        &self.attack_urgency_values,
-                        lead,
-                        enemies,
-                    ),
-                )?;
+                let mut progress = crate::skirmish_ai::AiAttackProgress::new(
+                    &self.attack_urgency_values,
+                    lead,
+                    enemies,
+                );
+                progress.forfeit = self
+                    .forfeit
+                    .as_ref()
+                    .map(crate::skirmish_ai::forfeit::ForfeitProgress::new);
+                tick.state_mut()
+                    .insert(ids.ai_attack_progress, entity, progress)?;
             }
         }
 
@@ -3676,7 +3957,7 @@ impl Rules for RotwkRules {
         for (index, spawn) in self.spawns.iter().enumerate() {
             let entity = tick.state_mut().spawn()?;
             spawned.push(entity);
-            Self::insert_spawn(tick, ids, entity, spawn, &self.combat)?;
+            self.insert_spawn(tick, ids, entity, spawn, &self.combat)?;
             if let Some((_, keys)) = self.placed_keys.iter().find(|(at, _)| *at == index) {
                 Self::place_events_list(tick, ids, entity, keys)?;
             }
@@ -3827,7 +4108,7 @@ impl Rules for RotwkRules {
         tick.state_mut().insert(
             ids.portals,
             clock_entity,
-            crate::portals::PortalLayer::empty(cell_count),
+            crate::portals::PortalLayer::default(),
         )?;
         if let Some(grid) = self.claim_grid() {
             tick.state_mut().insert(
@@ -3929,6 +4210,7 @@ impl Rules for RotwkRules {
     fn step(&self, tick: &mut Tick<'_>) -> Result<()> {
         let Some(ids) = self.ids else { return Ok(()) };
         self.unit_index.borrow_mut().begin();
+        self.mover_rows.borrow_mut().begin();
         let result = if crate::perf::enabled() {
             let mut profile = crate::perf::TickProfile::new(tick.frame().get());
             let started = std::time::Instant::now();
@@ -3939,6 +4221,7 @@ impl Rules for RotwkRules {
             self.step_rules(tick, ids, None)
         };
         self.unit_index.borrow_mut().end();
+        self.mover_rows.borrow_mut().end();
         result
     }
 }
@@ -3951,6 +4234,16 @@ impl RotwkRules {
         command: &RotwkCommand,
     ) -> Result<()> {
         let Some(ids) = self.ids else { return Ok(()) };
+        if matches!(
+            command,
+            RotwkCommand::FireSpecialPower { .. }
+                | RotwkCommand::CastSpell { .. }
+                | RotwkCommand::CaptureObject { .. }
+                | RotwkCommand::Exit { .. }
+                | RotwkCommand::MoveToFormation { .. }
+        ) {
+            self.release_player_stop(tick, ids, key.player);
+        }
         match command {
             RotwkCommand::SetSelection { replace, units } => {
                 self.set_selection(tick, ids, key.player, *replace, units)
@@ -3963,6 +4256,7 @@ impl RotwkRules {
                 busy::HeldOrder::MoveTo(
                     self.clamp_move_goal(tick.state(), ids, key.player, Vec2::new(*x, *y)),
                     *queue,
+                    self.command_move_path(tick.state(), ids, key.player),
                 ),
             ),
             RotwkCommand::AttackObject { target } => self.issue_order(
@@ -3978,6 +4272,7 @@ impl RotwkRules {
                 busy::HeldOrder::AttackMove(
                     self.clamp_move_goal(tick.state(), ids, key.player, Vec2::new(*x, *y)),
                     *queue,
+                    self.command_move_path(tick.state(), ids, key.player),
                 ),
             ),
             RotwkCommand::ForceAttackObject { target } => self.issue_order(
@@ -3986,7 +4281,7 @@ impl RotwkRules {
                 key.player,
                 busy::HeldOrder::ForceAttackObject(*target),
             ),
-            RotwkCommand::Stop => self.stop(tick, ids, key.player),
+            RotwkCommand::Stop => self.issue_order(tick, ids, key.player, busy::HeldOrder::Stop),
             RotwkCommand::GateCommand { action } => {
                 self.command_gate(tick, ids, key.player, *action)
             }
@@ -4072,8 +4367,11 @@ impl RotwkRules {
                         gate: &gate,
                         kinds: &self.kinds,
                         upgrade_bits: &self.upgrade_bits,
+                        brutal_cost_reduction: self
+                            .brutal_cheats_for(key.player)
+                            .build_cost_reduction,
                     },
-                    self.multiplay.unit_speed(self.players),
+                    &self.unit_time_modifiers(key.player),
                     self.production_cost_change_percent(key.player),
                 )? {
                     diag!("{line}");
@@ -4096,7 +4394,10 @@ impl RotwkRules {
                         .get(usize::from(*button))?;
                     producer
                         .queue
-                        .last_of(mint_sage_economy::ItemId::new(u32::from(item)))
+                        .last_of(
+                            mint_sage_economy::ItemTable::Objects,
+                            mint_sage_economy::ItemId::new(u32::from(item)),
+                        )
                         .map(|entry| entry.id)
                 };
                 self.cancel_production(tick, ids, key.player, &selected, &last)
@@ -4120,6 +4421,8 @@ impl RotwkRules {
                     &self.upgrade_buildables,
                     &gate,
                     self.production_cost_change_percent(key.player),
+                    self.brutal_cheats_for(key.player).build_cost_reduction,
+                    &|world, builder, bit| self.sub_upgrade_counted(world, ids, builder, bit),
                 )? {
                     diag!("{line}");
                 }
@@ -4143,6 +4446,8 @@ impl RotwkRules {
                     &self.upgrade_buildables,
                     &gate,
                     self.production_cost_change_percent(key.player),
+                    self.brutal_cheats_for(key.player).build_cost_reduction,
+                    &|world, builder, bit| self.sub_upgrade_counted(world, ids, builder, bit),
                 )? {
                     diag!("{line}");
                 }
@@ -4179,7 +4484,9 @@ impl RotwkRules {
                 self.cast_spell(tick, ids, key.player, *button, *target, *at)
             }
             RotwkCommand::Sell => self.sell(tick, ids, key.player),
-            RotwkCommand::Enter { target } => self.enter_container(tick, ids, key.player, *target),
+            RotwkCommand::Enter { target } => {
+                self.issue_order(tick, ids, key.player, busy::HeldOrder::Enter(*target))
+            }
             RotwkCommand::Exit { passenger } => {
                 self.exit_container(tick, ids, key.player, *passenger)
             }
@@ -4191,6 +4498,15 @@ impl RotwkRules {
             }
             RotwkCommand::ToggleWeaponSet { button, lead } => {
                 self.toggle_weapon_set(tick, ids, key.player, button, *lead)
+            }
+            RotwkCommand::Sacrifice { target } => {
+                self.start_sacrifice(tick, ids, key.player, *target)
+            }
+            RotwkCommand::ToggleWeapon { toggles, lead } => {
+                self.toggle_weapon(tick, ids, key.player, *toggles, *lead)
+            }
+            RotwkCommand::ToggleHoldFire { lead } => {
+                self.toggle_hold_fire(tick, ids, key.player, *lead)
             }
             RotwkCommand::StartSelfRepair => self.start_self_repair(tick, ids, key.player),
             RotwkCommand::CaptureObject { target } => {
@@ -4324,7 +4640,7 @@ impl RotwkRules {
                     return Ok(());
                 };
                 let entity = tick.state_mut().spawn()?;
-                Self::insert_spawn(
+                self.insert_spawn(
                     tick,
                     ids,
                     entity,
@@ -4390,6 +4706,7 @@ impl RotwkRules {
             }
             clock_entity
         });
+        self.sync_portal_links(tick, ids);
         let mut map_script_kills = pass!(
             "step_map_scripts",
             rule!(self.step_map_scripts(tick, ids, clock_entity))
@@ -4398,6 +4715,12 @@ impl RotwkRules {
             "step_team_builders",
             rule!(self.step_team_builders(tick, ids, clock_entity))
         )?);
+        pass!(
+            "step_castle_unpack",
+            rule!(self.step_castle_unpack(tick, ids))
+        )?;
+        self.step_wotr_battle(tick, ids)?;
+        pass!("end_ai_busy", rule!(self.end_ai_busy(tick, ids)))?;
         pass!(
             "replay_deferred_orders",
             rule!(self.replay_deferred_orders(tick, ids))
@@ -4436,21 +4759,15 @@ impl RotwkRules {
         )?;
 
         let now = tick.frame();
-        let (living, grid, global_max_radius) = pass!("grid", {
-            let living = self.living(tick, ids);
-            let grid = TargetGrid::build(&living);
-            let global_max_radius = living
-                .iter()
-                .map(|(foe, _)| foe.radius)
-                .fold(0.0f32, f32::max);
-            (living, grid, global_max_radius)
-        });
+        let (living, grid, global_max_radius) = pass!("grid", self.tick_snapshot(tick, ids));
+        pass!("step_disabled", rule!(self.step_disabled(tick, ids)))?;
         pass!("members", rule!(self.advance_members(tick, ids)))?;
 
         pass!(
             "advance_knockback",
             rule!(self.advance_knockback(tick, ids))
         )?;
+        let flood_kills = pass!("advance_floods", rule!(self.advance_floods(tick, ids)))?;
 
         let overrides = pass!("player_overrides", self.player_overrides(tick.state(), ids));
         let neutral_to = |a: PlayerId, b: PlayerId| {
@@ -4474,10 +4791,15 @@ impl RotwkRules {
             "advance_detectors",
             rule!(self.advance_detectors(tick, ids, &living, &grid))
         )?;
-        pass!(
+        let (spawned, eaten) = pass!(
             "advance_pick_ups",
             rule!(self.advance_pick_ups(tick, ids, &living))
         )?;
+        let (living, grid, global_max_radius) = if spawned {
+            pass!("grid", self.tick_snapshot(tick, ids))
+        } else {
+            (living, grid, global_max_radius)
+        };
         pass!(
             "advance_attach",
             rule!(self.advance_attach(tick, ids, &living))
@@ -4533,6 +4855,7 @@ impl RotwkRules {
             "modules",
             rule!(self.step_modules(tick, ids, &mut events, &living, &grid, &mut budgets))
         )?;
+        destroyed.extend(eaten);
         pass!(
             "run_crate_pickups",
             rule!(self.run_crate_pickups(
@@ -4557,20 +4880,43 @@ impl RotwkRules {
             rule!(self.step_emotions(tick, ids, &living, &grid))
         )?;
         pass!(
+            "step_repulsors",
+            rule!(self.step_repulsor_helpers(tick, ids))
+        )?;
+        pass!("step_repulsed", rule!(self.step_repulsed(tick, ids)))?;
+        pass!(
+            "step_portal_fades",
+            rule!(self.step_portal_fades(tick, ids))
+        )?;
+        pass!(
             "step_animals",
             rule!(self.step_animals(tick, ids, &living, &grid))
         )?;
+        pass!(
+            "step_critter_emitters",
+            rule!(self.step_critter_emitters(tick, ids, &living))
+        )?;
+        rule!(self.note_path_goals(tick, ids))?;
         pass!("step_amphibious", rule!(self.step_amphibious(tick, ids)))?;
         pass!("step_siege", rule!(self.step_siege(tick, ids)))?;
+        rule!(self.step_troll_reactions(tick, ids))?;
         pass!(
             "step_group_bonuses",
-            rule!(self.step_group_bonuses(tick, ids, &living, &grid, global_max_radius))
+            rule!(self.step_group_bonuses(tick, ids))
+        )?;
+        pass!(
+            "step_formation_lists",
+            rule!(self.step_formation_lists(tick, ids))
         )?;
         pass!(
             "settle_path_requests",
             rule!(self.settle_path_requests(tick, ids, &budgets))
         )?;
         let killed = pass!("damage", rule!(self.apply_damage(tick, ids, &mut events)))?;
+        pass!(
+            "pending_impacts",
+            rule!(self.resolve_pending_impacts(tick, ids, &killed))
+        )?;
         pass!(
             "tick_fire",
             rule!(self.tick_fire(tick, ids, &living, &grid))
@@ -4590,6 +4936,7 @@ impl RotwkRules {
             killed.extend(rule!(self.fade_released_workers(tick, ids))?);
             killed.extend(self.end_burning_deaths(tick, ids));
             killed.extend(map_script_kills);
+            killed.extend(flood_kills);
             rule!(self.resolve_deaths(tick, ids, &killed))
         })?;
         pass!("victory", {
@@ -4600,7 +4947,7 @@ impl RotwkRules {
                         Self::defeat_ids(ids),
                         clock_entity,
                         &self.kinds,
-                        &self.victory_structure_filter,
+                        self.victory_filters(),
                         self.players,
                         &self.alliances,
                     ))?;
@@ -4609,28 +4956,42 @@ impl RotwkRules {
             Ok::<(), mint_sim::Error>(())
         })?;
         pass!("corpses", {
-            rule!(self.run_death_phase_updates(tick, ids))?;
-            rule!(self.remove_corpses(tick, ids, &destroyed))?;
-            crate::portals::reap_dead_portals(
-                tick.state_mut(),
-                ids.portals,
-                self.passability.geometry,
-                self.passability.grid.extent(),
-            );
-            rule!(crate::obstacles::reap_dead_stamps(
-                tick,
-                ids.obstacles,
-                &self.passability.grid,
-                self.passability.geometry,
-                self.passability.grid.extent(),
-            ))?;
-            rule!(crate::wall_layer::reap_dead_stamps(
-                tick,
-                ids.wall_layer,
-                self.passability.geometry,
-                self.passability.grid.extent(),
-            ))?;
-            crate::goal_cells::reap_dead_claims(tick, ids.goal_cells, ids.health);
+            {
+                let _timer = crate::perf::sub(crate::perf::sub_row!("death_phase_updates"));
+                rule!(self.run_death_phase_updates(tick, ids))?;
+            }
+            {
+                let _timer = crate::perf::sub(crate::perf::sub_row!("remove_corpses"));
+                rule!(self.remove_corpses(tick, ids, &destroyed))?;
+            }
+            {
+                let _timer = crate::perf::sub(crate::perf::sub_row!("reap_portals"));
+                crate::portals::reap_dead_portals(tick.state_mut(), ids.portals);
+            }
+            {
+                let _timer = crate::perf::sub(crate::perf::sub_row!("reap_obstacles"));
+                rule!(crate::obstacles::reap_dead_stamps(
+                    tick,
+                    ids.obstacles,
+                    &self.passability.grid,
+                    self.passability.geometry,
+                    self.passability.grid.extent(),
+                ))?;
+            }
+            {
+                let _timer = crate::perf::sub(crate::perf::sub_row!("reap_walls"));
+                rule!(crate::wall_layer::reap_dead_stamps(
+                    tick,
+                    ids.wall_layer,
+                    self.passability.geometry,
+                    self.passability.grid.extent(),
+                ))?;
+            }
+            {
+                let _timer = crate::perf::sub(crate::perf::sub_row!("reap_goal_cells"));
+                crate::goal_cells::reap_dead_claims(tick, ids.goal_cells, ids.health);
+            }
+            let _timer = crate::perf::sub(crate::perf::sub_row!("settle_claims"));
             rule!(self.settle_claims(tick, ids))
         })?;
         pass!("hordes", {
@@ -4684,10 +5045,10 @@ impl RotwkRules {
             rule!(self.expire_timed_holds(tick, ids))?;
             rule!(self.expire_spell_state(tick, ids))?;
             rule!(self.expire_weather(tick, ids))?;
-            rule!(self.expire_defects(tick, ids))?;
-            rule!(self.pulse_modifier_heals(tick, ids))
+            rule!(self.expire_defects(tick, ids))
         });
         pass!("stand_on_terrain", rule!(self.stand_on_terrain(tick, ids)))?;
+        pass!("wading", rule!(self.update_wading(tick, ids)))?;
         result
     }
 }

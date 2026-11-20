@@ -551,6 +551,7 @@ fn a_finished_collapse_stays_down_and_keeps_rubble_without_a_post_collapse_state
     let done = |declared: bool| {
         let mut units = vec![UnitView {
             dying: true,
+            created: 0,
             conditions: Conditions::RUBBLE,
             ..template
         }];

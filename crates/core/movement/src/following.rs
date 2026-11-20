@@ -1,5 +1,5 @@
 use crate::geom::{CellGeometry, Facing, Vec2};
-use crate::grid::{MoverClass, Passability, Portal};
+use crate::grid::{Leg, MoverClass, Passability, Portal};
 use crate::search::CellPath;
 
 mod path;
@@ -11,6 +11,7 @@ pub struct Route {
     pub points: Vec<Vec2>,
     pub extra_distance: f32,
     pub portals: Vec<Option<Portal>>,
+    pub unsearched: bool,
 }
 
 impl Route {
@@ -21,8 +22,38 @@ impl Route {
         Self {
             points,
             extra_distance: 0.0,
+            unsearched: false,
             portals,
         }
+    }
+
+    #[must_use]
+    pub fn crossing_at(&self, waypoint: u32) -> bool {
+        path::crossing(self, waypoint).is_some()
+    }
+
+    #[must_use]
+    pub fn tagged_at(&self, waypoint: u32) -> bool {
+        usize::try_from(waypoint)
+            .ok()
+            .and_then(|at| self.portals.get(at))
+            .is_some_and(Option::is_some)
+    }
+
+    #[must_use]
+    pub fn place_along(&self, from: Vec2, waypoint: u32, distance: f32) -> (Vec2, u32) {
+        let placed = path::walk(self, from, waypoint, distance);
+        (placed.point, placed.waypoint)
+    }
+
+    #[must_use]
+    pub fn past_crossing(&self, waypoint: u32) -> u32 {
+        let last = u32::try_from(self.points.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let mut at = waypoint;
+        while at < last && self.crossing_at(at) {
+            at = at.saturating_add(1);
+        }
+        at.min(last)
     }
 
     #[must_use]
@@ -30,6 +61,7 @@ impl Route {
         Self {
             points: vec![point],
             extra_distance: 0.0,
+            unsearched: false,
             portals: vec![None],
         }
     }
@@ -61,12 +93,34 @@ pub struct MotionLimits {
     pub corner_radius: f32,
     pub turn_pivot: f32,
     pub backs: bool,
+    pub wheel_backing: Option<WheelBacking>,
+    pub backing_speed: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WheelBacking {
+    pub distance_min: f32,
+    pub distance_max: f32,
+    pub angle: f32,
+    pub stop_when_turning: bool,
+    pub moved_since_order: f32,
+    pub turning: bool,
+}
+
+impl WheelBacking {
+    #[must_use]
+    pub fn backs(self, heading_error: f32, path_left: f32) -> bool {
+        let refused = self.moved_since_order > self.distance_min && path_left > self.distance_max;
+        !refused && heading_error.abs() > self.angle
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TurnSlowdown {
     pub cap: f32,
     pub full_at: f32,
+    pub full_at_turn_steps: f32,
+    pub turn_step_seconds: f32,
     pub unhindered_above: Option<f32>,
     pub pivot_below: f32,
 }
@@ -75,23 +129,33 @@ impl TurnSlowdown {
     pub const PROPORTIONAL: Self = Self {
         cap: 1.0,
         full_at: core::f32::consts::FRAC_PI_4,
+        full_at_turn_steps: 0.0,
+        turn_step_seconds: 0.0,
         unhindered_above: None,
         pivot_below: 0.0,
     };
 
     #[must_use]
-    pub fn keep(self, heading_error: f32, speed: f32) -> f32 {
-        let error = if self.unhindered_above.is_some_and(|above| speed > above) {
-            0.0
-        } else if self.pivot_below > 0.0 && speed <= self.pivot_below {
+    pub fn keep(self, heading_error: f32, speed: f32, max_speed: f32, turn_rate: f32) -> f32 {
+        let full_at = if self.full_at_turn_steps > 0.0 {
+            self.full_at_turn_steps * turn_rate * self.turn_step_seconds
+        } else {
+            self.full_at
+        };
+        let error = if self.pivot_below > 0.0 && speed <= self.pivot_below * max_speed {
             heading_error * 2.0
+        } else if self
+            .unhindered_above
+            .is_some_and(|above| speed > above * max_speed)
+        {
+            0.0
         } else {
             heading_error
         };
-        if self.full_at <= 0.0 || !self.full_at.is_finite() {
+        if full_at <= 0.0 || !full_at.is_finite() {
             return 1.0 - self.cap.clamp(0.0, 1.0);
         }
-        1.0 - (error / self.full_at).min(self.cap.clamp(0.0, 1.0))
+        1.0 - (error / full_at).min(self.cap.clamp(0.0, 1.0))
     }
 }
 
@@ -234,6 +298,7 @@ impl MotionPhase {
     pub const WALKING: Self = Self(1 << 4);
     pub const HIGH_SPEED: Self = Self(1 << 5);
     pub const BACKING_UP: Self = Self(1 << 6);
+    pub const CLIMBING: Self = Self(1 << 7);
 
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
@@ -376,6 +441,7 @@ fn distance_to_go(route: &Route, position: Vec2, waypoint: u32, travel: f32) -> 
 pub struct LookAhead {
     pub point: Vec2,
     pub path_left: f32,
+    pub waypoint: u32,
 }
 
 #[must_use]
@@ -389,6 +455,7 @@ pub fn look_ahead(route: &Route, state: MoverState, limits: &MotionLimits) -> Op
     Some(LookAhead {
         point: ahead.point,
         path_left: path::length_left(route, ahead.point, ahead.waypoint, path::octagonal),
+        waypoint: ahead.waypoint,
     })
 }
 
@@ -444,7 +511,11 @@ fn propose_on_path(
     let mut ramp = state.ramp;
     if old <= 0.0 {
         ramp.has_run = false;
+    }
+    if limits.stops_dead || old <= 0.0 {
         ramp.backing = limits.backs;
+    } else if !limits.backs {
+        ramp.backing = false;
     }
 
     let look = path::walk(
@@ -455,7 +526,40 @@ fn propose_on_path(
     );
     let on_path = path::length_left(route, look.point, look.waypoint, path::octagonal)
         + route.extra_distance.max(0.0);
-    let aim_at = if ramp.backing {
+    let crossing = path::crossing(route, look.waypoint);
+    if crossing.is_some_and(|tag| tag.leg == Leg::Halt) {
+        return Err(stopped(MotionStatus::Arrived, state));
+    }
+    let steep = crossing
+        .filter(|tag| tag.leg == Leg::Climb)
+        .and_then(|tag| {
+            let start = usize::try_from(look.waypoint)
+                .ok()
+                .and_then(|at| at.checked_sub(1))
+                .and_then(|i| route.points.get(i))
+                .copied()
+                .unwrap_or(state.position);
+            let end = usize::try_from(look.waypoint)
+                .ok()
+                .and_then(|at| route.points.get(at))
+                .copied()?;
+            path::steep(end.minus(start).length(), tag.rise)
+        });
+    let backing_down = steep == Some(false);
+    if let Some(wheels) = limits.wheel_backing {
+        let toward = look.point.minus(
+            state
+                .position
+                .plus(state.facing.to_vector().scale(limits.turn_pivot)),
+        );
+        let error = Facing::from_vector(toward).map_or(0.0, |aim| state.facing.delta_to(aim));
+        ramp.backing = wheels.backs(error, on_path);
+    }
+    let max_speed = match limits.backing_speed.filter(|_| ramp.backing) {
+        Some(backing) => backing.max(0.0),
+        None => max_speed,
+    };
+    let aim_at = if ramp.backing || backing_down {
         state.position.scale(2.0).minus(look.point)
     } else {
         look.point
@@ -472,7 +576,7 @@ fn propose_on_path(
             Facing::from_vector(to_look).map_or(0.0, |aim| state.facing.delta_to(aim))
         };
     let turn_step = limits.turn_rate.max(0.0) * dt * if at_portal { 0.5 } else { 1.0 };
-    let facing = if limits.turn_while_moving {
+    let facing = if limits.turn_while_moving && crossing.is_none_or(|tag| tag.leg != Leg::Bare) {
         Facing::from_radians(state.facing.radians() + turn_delta.clamp(-turn_step, turn_step))
     } else {
         state.facing
@@ -483,7 +587,18 @@ fn propose_on_path(
     let desired = limits.desired_speed.max(0.0).min(max_speed);
     let stop_dead = limits.stops_dead && desired <= 0.0;
     let old = if stop_dead { 0.0 } else { old };
-    let mut goal = (desired * limits.turn_slowdown.keep(turn_delta.abs(), old)).max(min_speed);
+    let wheels_backing = limits.wheel_backing.filter(|_| ramp.backing);
+    let mut goal = match wheels_backing {
+        Some(wheels) if wheels.stop_when_turning && wheels.turning => 0.0,
+        Some(_) => desired,
+        None => {
+            desired
+                * limits
+                    .turn_slowdown
+                    .keep(turn_delta.abs(), old, max_speed, limits.turn_rate)
+        }
+    }
+    .max(min_speed);
     if old - braking * frame > goal {
         goal = (old - braking * dt).max(braking * frame);
     }
@@ -510,6 +625,17 @@ fn propose_on_path(
         0.0
     };
 
+    let speed = if crossing.is_some() {
+        let ceiling = limits.desired_speed.max(0.0).min(max_speed).max(min_speed);
+        ramp.braking = false;
+        if ceiling > old {
+            (old + limits.acceleration.max(0.0) * dt).min(ceiling)
+        } else {
+            ceiling
+        }
+    } else {
+        speed
+    };
     let mut distance = speed * dt;
     if route.points.len() == 1 {
         let remaining = route
@@ -535,6 +661,18 @@ fn propose_on_path(
     let mut phase = gait(limits, &mut ramp, old, speed, on_path, dt);
     if ramp.backing && speed > 0.0 {
         phase = phase.union(MotionPhase::BACKING_UP);
+    }
+    if let Some(tag) = crossing {
+        phase = match tag.leg {
+            Leg::Bare | Leg::Through => MotionPhase::NONE,
+            _ => MotionPhase::WALKING,
+        };
+        if steep.is_some() {
+            phase = phase.union(MotionPhase::CLIMBING);
+        }
+        if backing_down {
+            phase = phase.union(MotionPhase::BACKING_UP);
+        }
     }
     if limits.turn_while_moving && !at_portal {
         let short_leg = usize::try_from(waypoint).ok().is_some_and(|at| {
@@ -567,14 +705,12 @@ fn propose_on_path(
     }
 
     let position = placed.point;
-    let passable = context
-        .geometry
-        .cell_at(position, context.layer, context.grid.extent())
-        .is_some_and(|cell| context.grid.is_passable(cell, context.mover));
-    let from_blocked = context
-        .geometry
-        .cell_at(state.position, context.layer, context.grid.extent())
-        .is_none_or(|cell| !context.grid.is_passable(cell, context.mover));
+    let passable = crossing.is_some() || passable_at(context, route, position);
+    let from_blocked = crossing.is_none()
+        && context
+            .geometry
+            .cell_at(state.position, context.layer, context.grid.extent())
+            .is_none_or(|cell| !context.grid.is_passable(cell, context.mover));
     Ok(Proposed {
         state: MoverState {
             facing,
@@ -592,6 +728,17 @@ fn propose_on_path(
         arrived,
         phase,
     })
+}
+
+fn passable_at(context: &MoveContext<'_>, route: &Route, point: Vec2) -> bool {
+    let cell = context
+        .geometry
+        .cell_at(point, context.layer, context.grid.extent());
+    if route.unsearched {
+        let mover = context.mover.objects_only();
+        return cell.is_none_or(|cell| context.grid.is_passable(cell, mover));
+    }
+    cell.is_some_and(|cell| context.grid.is_passable(cell, context.mover))
 }
 
 fn gait(
@@ -712,7 +859,12 @@ fn propose_flying(
     let alignment = if limits.turn_circle.is_some() {
         1.0
     } else {
-        limits.turn_slowdown.keep(heading_error, state.speed)
+        limits.turn_slowdown.keep(
+            heading_error,
+            state.speed,
+            limits.max_speed.max(0.0),
+            limits.turn_rate,
+        )
     };
 
     let braking_distance = if limits.braking > 0.0 {
@@ -757,10 +909,7 @@ fn propose_flying(
     let velocity = heading.scale(speed);
     let position = state.position.plus(heading.scale(travel));
 
-    let passable = context
-        .geometry
-        .cell_at(position, context.layer, context.grid.extent())
-        .is_some_and(|cell| context.grid.is_passable(cell, context.mover));
+    let passable = passable_at(context, route, position);
     let from_blocked = context
         .geometry
         .cell_at(state.position, context.layer, context.grid.extent())
@@ -849,12 +998,7 @@ impl Follower for SlidingFollower {
         };
         if !proposed.passable && !proposed.from_blocked {
             let original_position = proposed.state.position;
-            let is_passable_at = |point: Vec2| {
-                context
-                    .geometry
-                    .cell_at(point, context.layer, context.grid.extent())
-                    .is_some_and(|cell| context.grid.is_passable(cell, context.mover))
-            };
+            let is_passable_at = |point: Vec2| passable_at(context, route, point);
             let diagonal = proposed.heading.x.abs() >= MIN_SLIDE_COMPONENT
                 && proposed.heading.y.abs() >= MIN_SLIDE_COMPONENT;
             let slide_x = diagonal.then(|| {

@@ -20,6 +20,8 @@ fn limits() -> MotionLimits {
     MotionLimits {
         turn_pivot: 0.0,
         backs: false,
+        backing_speed: None,
+        wheel_backing: None,
         desired_speed: f32::INFINITY,
         stops_dead: false,
         frame: 0.2,
@@ -96,6 +98,9 @@ fn movement_at_the_design_target() {
         let request = PathRequest {
             corner_radius: 0.0,
             departure: None,
+            approach: None,
+            prune: false,
+            final_goal: true,
             start: Cell::new(2, lane),
             goal: Cell::new(width - 3, lane.saturating_add(9)),
             mover: MOVER,

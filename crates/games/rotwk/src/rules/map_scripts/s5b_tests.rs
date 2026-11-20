@@ -81,6 +81,16 @@ Object Brawler\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 10
   WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Sword\n  End\n  \
   Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes\n  End\n  \
   LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Weapon SlowBow\n  AttackRange = 150\n  DelayBetweenShots = 500\n  ClipSize = 1\n  \
+  ClipReloadTime = 100000\n  \
+  DamageNugget\n    Damage = 1\n    DamageType = PIERCE\n  End\nEnd\n\
+Object Hesitant\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 200\n  \
+  Body = ActiveBody Tag_Body\n    MaxHealth = 4000\n  End\n  \
+  WeaponSet\n    Conditions = None\n    PreferredAgainst = SECONDARY INFANTRY\n    \
+    Weapon = PRIMARY SlowBow\n    Weapon = SECONDARY Sword\n  End\n  \
+  Behavior = AIUpdateInterface Tag_AI\n    AutoAcquireEnemiesWhenIdle = Yes\n  End\n  \
+  LocomotorSet\n    Locomotor = Feet\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 const MINE: PlayerId = PlayerId::new(0);
@@ -115,6 +125,7 @@ fn real(value: f32) -> Parameter {
 fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -141,6 +152,7 @@ fn script(
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: condition_name.to_owned(),
                 params,
@@ -203,7 +215,7 @@ fn simulate_on(
     let data = crate::game::tests::data_from(DATA);
     let names = [
         "Spearman", "Raven", "Quarry", "Camp", "Brute", "Swordbow", "Bowsword", "Fragile",
-        "Lancer", "Brawler",
+        "Lancer", "Brawler", "Hesitant",
     ]
     .map(String::from);
     let (kinds, missing) = KindTable::closure(&data, &names);
@@ -223,15 +235,16 @@ fn simulate_on(
         ("Lip", (Vec2::new(60.0, 5.0), 0.0)),
         ("Out", (Vec2::new(60.0, 170.0), 0.0)),
         ("WardA", (Vec2::new(500.0, 500.0), 0.0)),
-        ("WardB", (Vec2::new(515.0, 515.0), 0.0)),
-        ("WardC", (Vec2::new(521.0, 500.0), 0.0)),
-        ("WardD", (Vec2::new(530.0, 500.0), 0.0)),
+        ("WardB", (Vec2::new(530.0, 520.0), 0.0)),
+        ("WardC", (Vec2::new(536.0, 505.0), 0.0)),
+        ("WardD", (Vec2::new(540.0, 505.0), 0.0)),
         ("WardLeft", (Vec2::new(400.0, 500.0), 0.0)),
         ("WardRight", (Vec2::new(600.0, 500.0), 0.0)),
         ("PostNear", (Vec2::new(500.0, 520.0), 0.0)),
         ("PostFar", (Vec2::new(500.0, 800.0), 0.0)),
         ("Bait", (Vec2::new(500.0, 396.0), 0.0)),
         ("Beside", (Vec2::new(500.0, 560.0), 0.0)),
+        ("FarBy", (Vec2::new(420.0, 60.0), 0.0)),
     ]
     .into_iter()
     .map(|(name, at)| (name.to_owned(), at))
@@ -451,6 +464,44 @@ fn a_stand_ground_unit_does_not_walk_to_a_target_out_of_reach() {
     let held = walked_after_ordered_at_far_target(true);
     assert!(free > 30.0, "the control walked {free}");
     assert!(held < 1.0, "the stand-ground unit walked {held}");
+}
+
+#[test]
+fn stand_ground_keeps_the_target_while_another_slot_reaches_it() {
+    let sim = simulate(
+        vec![
+            script(
+                "Make",
+                None,
+                vec![
+                    make("Walker", "Hesitant", "teamPlayer_1", "Home"),
+                    make("Target", "Quarry", "teamPlayer_2", "Mid"),
+                ],
+            ),
+            after(
+                "Order",
+                "Target",
+                vec![
+                    act("UNIT_STAND_GROUND", vec![text("Walker"), number(1)]),
+                    act(
+                        "TEAM_ATTACK_NAMED",
+                        vec![text("teamPlayer_1"), text("Target")],
+                    ),
+                ],
+            ),
+        ],
+        60,
+    );
+    let ids = sim.rules().ids().unwrap();
+    let walker = named(&sim, "Walker");
+    let held = sim.state().get(ids.armed, walker).and_then(|a| a.target);
+    assert_eq!(held, Some(named(&sim, "Target")));
+    assert!(
+        position_of(&sim, "Walker")
+            .minus(Vec2::new(60.0, 60.0))
+            .length()
+            < 1.0
+    );
 }
 
 fn attack_area_run(area: &str) -> (Simulation<RotwkRules>, Entity) {
@@ -679,6 +730,43 @@ fn an_idle_member_takes_the_target_its_team_attacks() {
     };
     assert_eq!(target_of("Striker"), Some(target));
     assert_eq!(target_of("Idler"), Some(target));
+}
+
+#[test]
+fn a_stand_ground_member_keeps_the_far_common_target_over_the_enemy_beside_it() {
+    let sim = simulate_sides(
+        vec![script(
+            "MakeTarget",
+            None,
+            vec![
+                make("Target", "Quarry", "teamPlayer_1", "Near"),
+                make("Decoy", "Quarry", "teamPlayer_1", "FarBy"),
+            ],
+        )],
+        vec![
+            script(
+                "Make",
+                None,
+                vec![
+                    make("Striker", "Brute", "teamWilds", "Home"),
+                    make("Idler", "Brute", "teamWilds", "Far"),
+                ],
+            ),
+            after(
+                "Hold",
+                "Idler",
+                vec![act("UNIT_STAND_GROUND", vec![text("Idler"), number(1)])],
+            ),
+        ],
+        200,
+        false,
+    );
+    let ids = sim.rules().ids().unwrap();
+    let health = sim
+        .state()
+        .get(ids.health, named(&sim, "Decoy"))
+        .map(|pool| pool.0.current());
+    assert_eq!(health, Some(4000.0));
 }
 
 fn swordbow_walked(stand: bool) -> f32 {
@@ -1003,9 +1091,9 @@ fn guarder_after_ward_moves(to: &str) -> Vec<(GuardState, Vec2)> {
     let ids = sim.rules().ids().unwrap();
     let (guarder, ward) = (named(&sim, "Guarder"), named(&sim, "Ward"));
     let target = match to {
-        "WardB" => Vec2::new(515.0, 515.0),
-        "WardC" => Vec2::new(521.0, 500.0),
-        _ => Vec2::new(530.0, 500.0),
+        "WardB" => Vec2::new(530.0, 520.0),
+        "WardC" => Vec2::new(536.0, 505.0),
+        _ => Vec2::new(540.0, 505.0),
     };
     let mut seen = Vec::new();
     for _ in 0..900 {
@@ -1022,7 +1110,7 @@ fn guarder_after_ward_moves(to: &str) -> Vec<(GuardState, Vec2)> {
 #[test]
 fn an_object_guard_returns_to_a_ward_that_moved() {
     let seen = guarder_after_ward_moves("WardD");
-    let target = Vec2::new(530.0, 500.0);
+    let target = Vec2::new(540.0, 505.0);
     assert!(
         seen.iter()
             .any(|&(state, goal)| state == GuardState::Return && goal == target),

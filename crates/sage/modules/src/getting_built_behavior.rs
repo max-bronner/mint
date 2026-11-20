@@ -1,4 +1,6 @@
 use mint_sage_ini::value::parse_bool;
+
+use crate::special_ability_update::RETAIL_LOGIC_NONZERO;
 use mint_sim::module::{CapabilityMask, ModuleKind};
 use mint_sim::{Component, FieldError, Frame, LogicFrames, ModuleFieldSource, StateHasher};
 
@@ -131,9 +133,10 @@ pub fn getting_built_behavior_from_fields(
     fields: &dyn ModuleFieldSource,
     _now: Frame,
 ) -> Result<GettingBuiltBehavior, FieldError> {
-    let rebuild_time = fields
-        .field_numeric("RebuildTimeSeconds")
-        .map(LogicFrames::from_seconds);
+    let rebuild_time = fields.field_numeric("RebuildTimeSeconds").map(|seconds| {
+        let one_frame = LogicFrames::from_authored_frames(1, RETAIL_LOGIC_NONZERO);
+        LogicFrames::from_authored_seconds_truncated(seconds, RETAIL_LOGIC_NONZERO).max(one_frame)
+    });
     Ok(GettingBuiltBehavior {
         worker_name: fields.field("WorkerName").map(str::to_owned),
         evil_worker_name: fields.field("EvilWorkerName").map(str::to_owned),

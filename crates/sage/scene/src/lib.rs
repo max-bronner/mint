@@ -5,6 +5,7 @@ pub mod animation_state;
 pub mod camera_pose;
 pub mod camera_transform;
 mod client_clock;
+pub mod dynamic_decal;
 pub mod lighting;
 mod objects_present;
 mod once;
@@ -41,8 +42,8 @@ pub use objects_present::{
     replace_placement, rotation_anchors, template_notes, ModelGroup, ObjectScene, TemplateNote,
 };
 pub use particles_present::{
-    attach_particle_bones, follow_particle_bones, BoneFrameMode, BoneReport, ConditionParticles,
-    FireReport, MapGround, ParticleScene,
+    attach_particle_bones, follow_particle_bones, BoneFrameMode, BoneLookup, BoneReport,
+    ConditionParticles, FireReport, MapGround, ParticleScene,
 };
 pub use report::ClassNote;
 pub use roads::{
@@ -61,8 +62,8 @@ pub use terrain_present::{
 };
 pub use units_present::{
     drawable_id, names_part, natural_seconds, part_hidden, template_draws_a_model, Blending,
-    BoneFxFire, GhostLook, LookArt, LookKey, LookTexture, Ride, Skin, UnitDrawStats, UnitDrawable,
-    UnitLook, UnitPose, UnitScene, UnitSceneReport, UnitTemplate, LOOK_STAMP_IDS,
+    BoneFxFire, GhostLook, LookArt, LookKey, LookSubObject, LookTexture, Ride, Skin, UnitDrawStats,
+    UnitDrawable, UnitLook, UnitPose, UnitScene, UnitSceneReport, UnitTemplate, LOOK_STAMP_IDS,
 };
 pub use water_look::WaveRung;
 pub(crate) use water_present::NO_SHROUD_EXTENT;

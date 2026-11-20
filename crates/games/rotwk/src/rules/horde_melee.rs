@@ -24,6 +24,13 @@ const READY_HEIGHT: f32 = 20.0;
 
 const ADJACENT_HEIGHT: f32 = 10.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunningDown;
+
+impl mint_sim::Component for RunningDown {
+    fn hash_into(&self, _hasher: &mut mint_sim::StateHasher) {}
+}
+
 const FLEE_LEAD: f32 = 60.0;
 
 const APPROACH_EXIT_SNAP_SQ: f32 = 12.5;
@@ -100,7 +107,7 @@ impl RotwkRules {
     }
 
     pub(super) fn after(now: Frame, ms: u32) -> Frame {
-        now.checked_add(LogicFrames::from_milliseconds(ms))
+        now.checked_add(mint_sage_modules::retail_duration_ticks(ms))
             .unwrap_or(now)
     }
 
@@ -239,6 +246,7 @@ impl RotwkRules {
         goal: Entity,
         now: Frame,
     ) -> bool {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("member_contact"));
         let world = tick.state();
         let body_of = |entity: Entity| -> Option<(Vec2, f32)> {
             if world
@@ -306,11 +314,106 @@ impl RotwkRules {
     }
 
     pub(super) fn fleeing(&self, tick: &Tick<'_>, ids: Ids, from: Vec2, goal: Entity) -> bool {
+        let goal = tick.state().get(ids.member, goal).map_or(goal, |m| m.horde);
         let Some(body) = tick.state().get(ids.body, goal).map(|b| b.0) else {
             return false;
         };
         let away = body.facing.to_vector().dot(body.position.minus(from)) >= 0.0;
         away && body.speed > 0.25 * self.mover_limits(tick, ids, goal).max_speed
+    }
+
+    fn run_down_gap(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        attacker: Entity,
+        victim: Entity,
+    ) -> Option<(f32, f32)> {
+        let world = tick.state();
+        let (mine, theirs) = (
+            world.get(ids.body, attacker).map(|b| b.0)?,
+            world.get(ids.body, victim).map(|b| b.0)?,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let frame = 1.0 / crate::game_data::RETAIL_LOGIC_HZ as f32;
+        let centre = mine.position.minus(theirs.position).length();
+        let reach = self.object_radius(tick, ids, attacker) + super::loose_melee::RUN_DOWN_REACH;
+        let gap = (centre - reach - self.object_radius(tick, ids, victim) + theirs.speed * frame)
+            .max(0.0);
+        Some((
+            gap,
+            self.mover_limits(tick, ids, attacker).max_speed * frame,
+        ))
+    }
+
+    fn closes_this_frame(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        attacker: Entity,
+        victim: Entity,
+    ) -> bool {
+        self.run_down_gap(tick, ids, attacker, victim)
+            .is_some_and(|(gap, top)| top > gap)
+    }
+
+    pub(super) fn write_running_down(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        on: bool,
+    ) -> Result<()> {
+        let horde = tick
+            .state()
+            .get(ids.member, entity)
+            .map_or(entity, |member| member.horde);
+        let mut targets = vec![entity];
+        if let Some(contain) = tick.state().get(ids.horde, horde) {
+            targets.push(horde);
+            targets.extend(contain.members.iter().copied());
+        }
+        for target in targets {
+            let holds = tick.state().contains(ids.running_down, target);
+            if on && !holds {
+                tick.state_mut()
+                    .insert(ids.running_down, target, RunningDown)?;
+            } else if !on && holds {
+                tick.state_mut().remove(ids.running_down, target);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn update_running_down(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        attacker: Entity,
+        victim: Entity,
+    ) -> Result<()> {
+        let Some(at) = tick.state().get(ids.body, attacker).map(|b| b.0.position) else {
+            return Ok(());
+        };
+        if let (true, Some((gap, top))) = (
+            self.fleeing(tick, ids, at, victim),
+            self.run_down_gap(tick, ids, attacker, victim),
+        ) {
+            self.write_running_down(tick, ids, attacker, top > gap)?;
+            #[allow(clippy::cast_precision_loss)]
+            let per_second = crate::game_data::RETAIL_LOGIC_HZ as f32;
+            tick.state_mut().insert(
+                ids.desired_speed,
+                attacker,
+                crate::unit::DesiredSpeed(gap * per_second),
+            )?;
+        } else {
+            if tick.state().contains(ids.running_down, attacker) {
+                self.write_running_down(tick, ids, attacker, false)?;
+            }
+            tick.state_mut().remove(ids.desired_speed, attacker);
+        }
+        Ok(())
     }
 
     fn pace_to_fleeing(
@@ -433,7 +536,7 @@ impl RotwkRules {
             self.end_melee(tick, ids, horde_entity)?;
         }
         let fresh = existing.is_none_or(|melee| melee.goal != goal);
-        let stands = self.stands_ground(tick.state(), ids, horde_entity);
+        let stands = self.holds_ground(tick.state(), ids, horde_entity);
         let due = crate::horde::decision_stagger(Self::tick_seconds())
             .is_due(MoverId(horde_entity.index()), now.get());
         if !due && !fresh {
@@ -461,9 +564,27 @@ impl RotwkRules {
                 .insert(ids.horde_melee, horde_entity, melee)?;
             return Ok(());
         };
+        if fresh && self.horde_squish_opens(tick, ids, horde_entity, goal) {
+            melee.phase = MeleePhase::Squish { fast: false };
+        }
+        if let MeleePhase::Squish { .. } = melee.phase {
+            if self.run_horde_squish(
+                tick,
+                ids,
+                horde_entity,
+                &mut melee,
+                budgets,
+                now,
+                snapshot.living,
+            )? {
+                return Ok(());
+            }
+        }
         let fleeing = self.fleeing(tick, ids, body.position, goal);
         if melee.phase == MeleePhase::Approach && fleeing {
             self.pace_to_fleeing(tick, ids, horde_entity, goal)?;
+            let on = self.closes_this_frame(tick, ids, horde_entity, goal);
+            self.write_running_down(tick, ids, horde_entity, on)?;
         }
         if melee.phase == MeleePhase::Approach {
             if !fleeing
@@ -588,7 +709,7 @@ impl RotwkRules {
             }
         }
         self.end_group_closing(tick, ids, horde_entity);
-        Ok(())
+        self.write_running_down(tick, ids, horde_entity, false)
     }
 
     fn approach_replan_due(
@@ -760,7 +881,7 @@ impl RotwkRules {
         self.reachable(mover, start, end)
     }
 
-    fn abandon_attack(
+    pub(super) fn abandon_attack(
         &self,
         tick: &mut Tick<'_>,
         ids: Ids,
@@ -918,13 +1039,15 @@ impl RotwkRules {
         only: Option<&[Foe]>,
         snapshot: &Snapshot<'_>,
     ) -> Option<Foe> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("adjacent_enemy"));
         let armed = tick.state().get(ids.armed, member.entity)?;
         let template = self.combat.weapons.get(armed.weapon).filter(|t| t.melee)?;
         let range = self.attack_range_of(tick.state(), ids, member.entity, template);
+        let footprint = self.footprint_of(tick, ids, member.entity);
         let reaches = |foe: &Foe| {
             (foe.z - member.z).abs() <= ADJACENT_HEIGHT
                 && !foe.unattackable
-                && self.melee_in_reach(tick, ids, member, foe, range)
+                && self.melee_in_reach_from(tick, ids, member, footprint, foe)
         };
         let gap = |foe: &Foe| foe.position.minus(member.position).length() - foe.radius;
         let best = |foes: &mut dyn Iterator<Item = Foe>| {
@@ -953,10 +1076,11 @@ impl RotwkRules {
             &mut found,
         );
         found.sort_unstable();
+        let relation = self.relation_from(tick.state(), member.entity);
         let mut candidates = found.into_iter().filter_map(|at| {
             #[allow(clippy::cast_possible_truncation)]
             let (foe, _) = snapshot.living.get(at as usize).copied()?;
-            (self.object_hostile(tick.state(), member.entity, foe.entity)
+            (relation.to(foe.entity) == super::map_scripts::Relation::Enemies
                 && tick.state().get(ids.horde, foe.entity).is_none())
             .then_some(foe)
         });
@@ -973,6 +1097,61 @@ impl RotwkRules {
         tick.state_mut()
             .insert(ids.member_attack, member.entity, MemberAttack::on(victim))?;
         Ok(())
+    }
+
+    pub(super) fn engage_on_spot(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        member: &Foe,
+        preferred: Option<Entity>,
+        living: &[(Foe, PlayerId)],
+    ) -> Result<()> {
+        let Some(armed) = tick.state().get(ids.armed, member.entity) else {
+            return Ok(());
+        };
+        let Some(template) = self.combat.weapons.get(armed.weapon).filter(|t| t.melee) else {
+            return Ok(());
+        };
+        let range = self.attack_range_of(tick.state(), ids, member.entity, template);
+        let footprint = self.footprint_of(tick, ids, member.entity);
+        let near = range + 3.0 * self.passability.geometry.cell_size();
+        let relation = self.relation_from(tick.state(), member.entity);
+        let reached: Vec<Foe> = living
+            .iter()
+            .map(|(foe, _)| *foe)
+            .filter(|foe| {
+                foe.entity != member.entity
+                    && foe.position.minus(member.position).length()
+                        <= near + member.radius + foe.radius
+                    && (foe.z - member.z).abs() <= ADJACENT_HEIGHT
+                    && !foe.unattackable
+                    && relation.to(foe.entity) == super::map_scripts::Relation::Enemies
+                    && !tick.state().contains(ids.horde, foe.entity)
+                    && self.melee_in_reach_from(tick, ids, member, footprint, foe)
+            })
+            .collect();
+        let Some(victim) = reached
+            .iter()
+            .find(|foe| Some(foe.entity) == preferred)
+            .or(reached.last())
+            .copied()
+        else {
+            return Ok(());
+        };
+        let combo = tick
+            .state()
+            .get(ids.member, member.entity)
+            .is_some_and(|entry| {
+                self.has_kind_bit(tick.state(), ids, entry.horde, "COMBO_HORDE")
+                    && !self.is_melee_horde(tick.state(), ids, entry.horde)
+            });
+        if !combo && !self.melee_stand_free(tick, ids, member.entity, victim.entity) {
+            return Ok(());
+        }
+        self.attack_unit(tick, ids, member, victim.entity)?;
+        self.claim_spot(tick, ids, member.entity, member.position);
+        self.stop_to_fire(tick, ids, member.entity)
     }
 
     pub(super) fn claim_spot(&self, tick: &mut Tick<'_>, ids: Ids, member: Entity, spot: Vec2) {
@@ -1295,6 +1474,26 @@ impl RotwkRules {
         Ok(())
     }
 
+    fn engage_hold(reached: bool, walking: bool, no_spot: bool, now: Frame) -> Option<Frame> {
+        (!reached && !walking).then(|| {
+            let ms = if no_spot {
+                crate::melee::NO_SPOT_HOLD_MS
+            } else {
+                crate::melee::GIVE_UP_MS
+            };
+            Self::after(now, ms)
+        })
+    }
+
+    fn engage_fails_on_entry(entering: bool, reached: bool) -> bool {
+        entering && !reached
+    }
+
+    fn drop_member_attack(&self, tick: &mut Tick<'_>, ids: Ids, member: Entity) {
+        tick.state_mut().remove(ids.member_attack, member);
+        tick.state_mut().remove(ids.desired_speed, member);
+    }
+
     pub(super) fn member_attack_victim(
         &self,
         tick: &mut Tick<'_>,
@@ -1314,21 +1513,24 @@ impl RotwkRules {
             .and_then(|at| living.get(at))
             .map(|(foe, _)| *foe);
         let Some(victim) = victim else {
-            tick.state_mut().remove(ids.member_attack, member.entity);
+            self.drop_member_attack(tick, ids, member.entity);
             return Ok(None);
         };
-        let reached = self.melee_in_reach(tick, ids, member, &victim, range);
-        let since = if reached {
-            None
-        } else {
-            Some(attack.out_of_reach_since.unwrap_or(now))
-        };
-        if since.is_some_and(|since| Self::after(since, crate::melee::GIVE_UP_MS) <= now) {
-            tick.state_mut().remove(ids.member_attack, member.entity);
+        if let Some(until) = attack.hold_until {
+            if until <= now {
+                self.drop_member_attack(tick, ids, member.entity);
+            }
             return Ok(None);
         }
+        let part = crate::perf::sub(crate::perf::sub_row!("member_reach"));
+        let reached = self.melee_in_reach(tick, ids, member, &victim);
+        drop(part);
+        if Self::engage_fails_on_entry(attack.planned.is_none(), reached) {
+            self.drop_member_attack(tick, ids, member.entity);
+            return Ok(None);
+        }
+        self.update_running_down(tick, ids, member.entity, victim.entity)?;
         let before = attack;
-        attack.out_of_reach_since = since;
         let standing = attack
             .spot
             .is_none_or(|spot| spot.minus(member.position).length() < 1.0);
@@ -1340,28 +1542,48 @@ impl RotwkRules {
                         && super::movement::goal_moved(member.position, seen, victim.position)
                 }));
         if due {
+            let _part = crate::perf::sub(crate::perf::sub_row!("member_replan"));
             let keep = !standing
                 && attack.spot.is_some_and(|spot| {
                     let there = Foe {
                         position: spot,
                         ..*member
                     };
-                    self.melee_in_reach(tick, ids, &there, &victim, range)
+                    self.melee_in_reach(tick, ids, &there, &victim)
                 });
             if !keep {
                 match self.melee_engage_spot(tick, ids, member.entity, victim.entity, range) {
                     Engage::At(spot) => {
                         attack.spot = Some(spot);
                         attack.waits_until = None;
+                        attack.no_spot = false;
                     }
                     Engage::Wait if reached => {
                         attack.spot = Some(member.position);
                         attack.waits_until =
                             Some(Self::after(now, super::melee_engage::ENGAGE_WAIT_MS));
+                        attack.no_spot = true;
                     }
                     Engage::Wait => {
-                        tick.state_mut().remove(ids.member_attack, member.entity);
-                        return Ok(None);
+                        let walk = self.engage_fallback_point(tick, ids, member, &victim);
+                        let Some(spot) = walk.and_then(|point| {
+                            self.adjust_destination(
+                                tick,
+                                ids,
+                                super::adjust_destination::Request {
+                                    mover: member.entity,
+                                    dest: point,
+                                    group_goal: None,
+                                },
+                                &mut super::adjust_destination::OrderClaims::none(),
+                            )
+                        }) else {
+                            self.drop_member_attack(tick, ids, member.entity);
+                            return Ok(None);
+                        };
+                        attack.spot = Some(spot);
+                        attack.waits_until = None;
+                        attack.no_spot = true;
                     }
                 }
             }
@@ -1370,11 +1592,16 @@ impl RotwkRules {
                 self.claim_spot(tick, ids, member.entity, spot);
             }
         }
+        let walking = tick.state().contains(ids.path, member.entity)
+            || attack
+                .spot
+                .is_some_and(|spot| spot.minus(member.position).length() >= 1.0);
+        attack.hold_until = Self::engage_hold(reached, walking, attack.no_spot, now);
         if attack != before {
             tick.state_mut()
                 .insert(ids.member_attack, member.entity, attack)?;
         }
-        Ok(Some(victim))
+        Ok(attack.hold_until.is_none().then_some(victim))
     }
 }
 
@@ -1392,6 +1619,25 @@ fn idle_effect(member: Entity, conditions: &[String], starting: bool) -> (Entity
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_engage_hold_starts_when_the_walk_has_ended_out_of_reach() {
+        let now = Frame::new(100);
+        let hold =
+            |reached, walking, no_spot| RotwkRules::engage_hold(reached, walking, no_spot, now);
+        assert_eq!(hold(false, true, false), None);
+        assert_eq!(hold(true, false, false), None);
+        let two = hold(false, false, false).unwrap();
+        let five = hold(false, false, true).unwrap();
+        assert!(two > now && five > two, "{two:?} {five:?}");
+    }
+
+    #[test]
+    fn a_member_entering_engage_out_of_reach_fails_at_once() {
+        assert!(RotwkRules::engage_fails_on_entry(true, false));
+        assert!(!RotwkRules::engage_fails_on_entry(true, true));
+        assert!(!RotwkRules::engage_fails_on_entry(false, false));
+    }
 
     #[test]
     fn the_approach_exit_snaps_only_within_the_square_root_of_twelve_and_a_half() {

@@ -2,7 +2,7 @@ use mint_movement::{MoverClass, Vec2};
 use mint_sage_asset::KindOf;
 use mint_sage_combat::{Point3, RadiusAffects, Relation, VictimRuleTable, WeaponId, WeaponStatus};
 use mint_sim::module::DestroyRequests;
-use mint_sim::{Effects, Entity, Frame, LogicFrames, PlayerId, Result, Tick, World};
+use mint_sim::{Effects, Entity, Frame, PlayerId, Result, Tick, World};
 
 use super::{Ids, RotwkRules};
 use crate::combat::{
@@ -22,6 +22,7 @@ const APPROACH_POINT_STEP_CAP: i64 = 1_000;
 pub(crate) struct ResolvedRules {
     special: Option<ObjectFilter>,
     scalars: Vec<(f32, ObjectFilter)>,
+    force_kill: Option<ObjectFilter>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,6 +49,8 @@ impl ResolvedVictims {
                         .iter()
                         .map(|(factor, filter)| (*factor, ObjectFilter::parse(filter)))
                         .collect(),
+                    force_kill: (!rules.force_kill.is_empty())
+                        .then(|| ObjectFilter::parse(&rules.force_kill)),
                 },
             ));
         }
@@ -142,6 +145,48 @@ impl<'a> WorldJudge<'a> {
         )
     }
 
+    fn under_terrain_height(&self, nugget: usize, candidate: Entity) -> bool {
+        let Some(mint_sage_combat::Nugget::Damage(damage)) = self
+            .rules
+            .combat
+            .weapons
+            .get(self.weapon)
+            .and_then(|template| template.nuggets.get(nugget))
+        else {
+            return true;
+        };
+        damage.shape.max_height_above_terrain.is_none_or(|max| {
+            self.world
+                .get(self.ids.ground_offset, candidate)
+                .map_or(0.0, |offset| offset.0)
+                <= max
+        })
+    }
+
+    fn passes_force_kill(&self, nugget: usize, candidate: Entity) -> bool {
+        let Some(filter) = self
+            .rules
+            .victim_rules
+            .get(self.weapon, nugget)
+            .and_then(|rules| rules.force_kill.as_ref())
+        else {
+            return false;
+        };
+        let (relation, same_player) = self.relation(candidate);
+        let entry = self
+            .world
+            .get(self.ids.kind, candidate)
+            .and_then(|kind| self.rules.kinds.get(*kind));
+        let (kind_of, name): (&[String], &str) =
+            entry.map_or((&[], ""), |e| (&e.record.kind_of, &e.record.name));
+        filter.passes(kind_of, name)
+            && filter.passes_relation(
+                same_player,
+                relation == Relation::Allies,
+                relation == Relation::Enemies,
+            )
+    }
+
     fn relation(&self, candidate: Entity) -> (Relation, bool) {
         let owner = self.world.get(self.ids.owner, candidate).map(|o| o.0);
         match (self.attacker_owner, owner) {
@@ -157,8 +202,14 @@ impl<'a> WorldJudge<'a> {
 }
 
 impl Judge for WorldJudge<'_> {
+    fn force_kills(&self, nugget: usize, candidate: Entity) -> bool {
+        self.has_rules && self.passes_force_kill(nugget, candidate)
+    }
+
     fn judge(&self, nugget: usize, candidate: Entity, primary: bool) -> Option<f32> {
-        if !self.inside_damage_arc(nugget, candidate) {
+        if !self.inside_damage_arc(nugget, candidate)
+            || !self.under_terrain_height(nugget, candidate)
+        {
             return None;
         }
         if !self.has_rules && self.affects == RadiusAffects::default() {
@@ -260,6 +311,12 @@ impl RotwkRules {
             }
         }
         names.extend(self.combat.damage_fx.fx_lists().map(str::to_owned));
+        names.extend(
+            self.combat
+                .modifiers
+                .lists()
+                .flat_map(|list| list.fx.iter().chain(&list.end_fx).flatten().cloned()),
+        );
         self.fx_names = crate::fx::FxNames::build(names.iter().map(String::as_str));
         self.weapon_fx = self
             .combat
@@ -986,6 +1043,11 @@ impl RotwkRules {
                 })
                 .unwrap_or_default(),
         );
+        let in_combat =
+            mint_sage_modules::InCombat::from_entities(Self::attackers(tick.state(), ids));
+        let arrow_shots = mint_sage_modules::ArrowStormShots::from_pairs(
+            self.arrow_storm_shots(tick.state(), ids),
+        );
         let neutral = self.neutral_spawners(tick.state(), ids);
         let building = mint_sage_modules::UnderConstruction::from_entities(
             tick.state()
@@ -995,6 +1057,7 @@ impl RotwkRules {
         );
         let slaves = self.slave_views(tick.state(), ids);
         let master_slaves = self.master_slaves(tick.state(), ids);
+        let suspensions = self.suspensions(tick.state(), ids, now);
         self.log_slaves(tick.state(), ids, now);
         {
             let (world, rng) = tick.state_and_rng_mut();
@@ -1018,6 +1081,9 @@ impl RotwkRules {
                     &slaves,
                     &master_slaves,
                     &model_conditions,
+                    &suspensions,
+                    &in_combat,
+                    &arrow_shots,
                 ],
             );
         }
@@ -1034,16 +1100,18 @@ impl RotwkRules {
                     continue;
                 };
                 let target_reach = Self::mover_radius(tick, ids, *target);
-                self.close_on_target(
-                    tick,
-                    ids,
-                    mover,
-                    from,
-                    to,
-                    target_reach,
-                    PathKind::Ability,
-                    budgets,
-                )?;
+                Self::ai_move_with(tick, ids, (entity, mover), |tick| {
+                    self.close_on_target(
+                        tick,
+                        ids,
+                        mover,
+                        from,
+                        to,
+                        target_reach,
+                        PathKind::Ability,
+                        budgets,
+                    )
+                })?;
             } else if let mint_sage_modules::Effect::MoveToApproachPoint { target, max_range } =
                 &effect
             {
@@ -1056,19 +1124,26 @@ impl RotwkRules {
                 };
                 let mover_class = self.mover_class(tick, ids, mover);
                 let at = self.ability_approach_point(tick, ids, from, to, *max_range, mover_class);
-                self.close_on_target(tick, ids, mover, from, at, 0.0, PathKind::Ability, budgets)?;
+                self.ai_move(
+                    tick,
+                    ids,
+                    (entity, mover),
+                    from,
+                    at,
+                    PathKind::Ability,
+                    budgets,
+                )?;
             } else if let mint_sage_modules::Effect::MoveToPosition { at } = &effect {
                 let mover = self.approach_mover(tick, ids, entity);
                 let Some(from) = tick.state().get(ids.body, mover).map(|b| b.0.position) else {
                     continue;
                 };
-                self.close_on_target(
+                self.ai_move(
                     tick,
                     ids,
-                    mover,
+                    (entity, mover),
                     from,
                     Vec2::new(at.0, at.1),
-                    0.0,
                     PathKind::Ability,
                     budgets,
                 )?;
@@ -1100,30 +1175,10 @@ impl RotwkRules {
                     self.begin_recharge(tick, ids, entity, power)?;
                 }
                 self.trigger_special_power(tick, ids, entity, power, None)?;
-            } else if let mint_sage_modules::Effect::Aura {
-                list,
-                radius,
-                affects,
-                sides,
-                allow_self,
-                lasts,
-                while_dead,
-            } = &effect
-            {
-                self.pulse_aura(
-                    tick,
-                    ids,
-                    entity,
-                    list,
-                    *radius,
-                    affects,
-                    *sides,
-                    *allow_self,
-                    *lasts,
-                    *while_dead,
-                    living,
-                    grid,
-                )?;
+            } else if let mint_sage_modules::Effect::UnpackStarted(power) = &effect {
+                self.break_disguise_at_unpack(tick, ids, entity, power)?;
+            } else if matches!(effect, mint_sage_modules::Effect::Aura { .. }) {
+                self.pulse_aura(tick, ids, entity, &effect, living, grid)?;
             } else if let mint_sage_modules::Effect::AutoHeal {
                 amount,
                 radius,
@@ -1137,6 +1192,7 @@ impl RotwkRules {
                 nonstackable,
                 skip_recently_damaged,
                 fx_always,
+                rules,
             } = &effect
             {
                 let pulse = super::regeneration::HealPulse {
@@ -1152,6 +1208,7 @@ impl RotwkRules {
                     nonstackable: *nonstackable,
                     skip_recently_damaged: *skip_recently_damaged,
                     fx_always: *fx_always,
+                    rules,
                 };
                 self.pulse_auto_heal(tick, ids, entity, &pulse, living, grid)?;
             } else {
@@ -1169,6 +1226,8 @@ impl RotwkRules {
             }
         }
         self.step_auto_casts(tick, ids, living, grid)?;
+        self.step_sacrifices(tick, ids)?;
+        self.step_command_monitors(tick, ids)?;
         self.step_ai_special_powers(tick, ids, living, grid)?;
         self.fire_pending(tick, ids, events, living)?;
         self.pulse_dots(tick, ids, events)?;
@@ -1306,18 +1365,93 @@ impl RotwkRules {
                 shot.source.index(),
                 shot.weapon.index()
             );
-            self.fire_at_place(
-                tick,
-                ids,
-                shot.source,
-                shot.weapon,
-                shot.at,
-                shot.owner_if_gone,
-                events,
-                living,
-            )?;
+            let aimed_at =
+                shot.victim
+                    .and_then(|victim| match tick.state().get(ids.horde, victim) {
+                        Some(horde) => horde
+                            .members
+                            .iter()
+                            .find_map(|member| self.foe_of(tick, ids, *member)),
+                        None => self.foe_of(tick, ids, victim),
+                    });
+            match aimed_at {
+                Some(foe) => self.fire_at_object(
+                    tick,
+                    ids,
+                    shot.source,
+                    shot.weapon,
+                    &foe,
+                    shot.owner_if_gone,
+                    events,
+                    living,
+                )?,
+                None => self.fire_at_place(
+                    tick,
+                    ids,
+                    shot.source,
+                    shot.weapon,
+                    shot.at,
+                    shot.owner_if_gone,
+                    events,
+                    living,
+                )?,
+            }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fire_at_object(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        weapon: WeaponId,
+        target: &Foe,
+        owner_if_gone: Option<PlayerId>,
+        events: &mut Vec<DamageEvent>,
+        living: &[(Foe, PlayerId)],
+    ) -> Result<()> {
+        let roll = self.roll_shot(tick, ids, weapon, target);
+        let Some(launch) = self.module_launch(tick, ids, source, None) else {
+            return self.fire_at_place(
+                tick,
+                ids,
+                source,
+                weapon,
+                target.position,
+                owner_if_gone,
+                events,
+                living,
+            );
+        };
+        let shot = Shot {
+            owner_if_gone,
+            ..self.shot_at_foe(weapon, source, launch, target, roll.outcome)
+        };
+        diag!(
+            "weapon: fired from ({:.0},{:.0},{:.0}) at entity {}",
+            launch.x,
+            launch.y,
+            launch.z,
+            target.entity.index()
+        );
+        let melee = self
+            .combat
+            .weapons
+            .get(weapon)
+            .is_some_and(|template| template.melee);
+        let fx = if melee { target.entity } else { source };
+        self.launch_shot(
+            tick,
+            ids,
+            &shot,
+            fx,
+            target.position,
+            roll.passenger_roll,
+            living,
+            events,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1332,6 +1466,21 @@ impl RotwkRules {
         events: &mut Vec<DamageEvent>,
         living: &[(Foe, PlayerId)],
     ) -> Result<()> {
+        if let Some(launch) = self.module_launch(tick, ids, source, None) {
+            let shot = Shot {
+                owner_if_gone,
+                ..Shot::at_ground(weapon, source, launch, at, self.ground_height(at.x, at.y))
+            };
+            diag!(
+                "weapon: fired from ({:.0},{:.0},{:.0}) at the ground at ({:.0},{:.0})",
+                launch.x,
+                launch.y,
+                launch.z,
+                at.x,
+                at.y
+            );
+            return self.launch_shot(tick, ids, &shot, source, at, None, living, events);
+        }
         let shot = Shot {
             weapon,
             attacker: source,
@@ -1343,27 +1492,7 @@ impl RotwkRules {
             owner_if_gone,
         };
         let result = self.fire_shot(tick, ids, &shot, living)?;
-        let shooter_at = tick
-            .state()
-            .get(ids.body, source)
-            .map_or(at, |body| body.0.position);
-        diag!(
-            "weapon: fired at ({:.0},{:.0}); its FireFX plays at the shooter ({:.0},{:.0})",
-            at.x,
-            at.y,
-            shooter_at.x,
-            shooter_at.y
-        );
-        self.emit_weapon_fx(
-            tick,
-            ids,
-            weapon,
-            shooter_at,
-            source,
-            source,
-            Some(at),
-            None,
-        )?;
+        self.emit_weapon_fx(tick, ids, weapon, at, source, source, Some(at), None)?;
         if result.projectiles_unaimed > 0 {
             diag!(
                 "weapon: {} projectile nugget(s) fired at a place with nothing to fly at",
@@ -1373,6 +1502,33 @@ impl RotwkRules {
         self.apply_fire_result(tick, ids, weapon, &shot, result, events)
     }
 
+    pub(super) fn module_launch(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        slot: Option<usize>,
+    ) -> Option<Point3> {
+        let world = tick.state();
+        let position = world.get(ids.body, source)?.0.position;
+        let shape = world.get(ids.shape, source)?;
+        let me = Foe {
+            entity: source,
+            position,
+            z: Self::feet(world, ids, source),
+            radius: shape.radius,
+            height: shape.height,
+            is_structure: shape.kind_of.contains(KindOf::STRUCTURE),
+            airborne: None,
+            unattackable: false,
+            not_autoacquirable: false,
+            enclosed: false,
+            ai_kind_of: None,
+            volume: None,
+        };
+        Some(self.take_launch(tick, source, &me, slot))
+    }
+
     pub(super) fn fire_shot(
         &self,
         tick: &mut Tick<'_>,
@@ -1380,6 +1536,7 @@ impl RotwkRules {
         shot: &Shot,
         living: &[(Foe, PlayerId)],
     ) -> Result<FireResult> {
+        let _perf = crate::perf::sub(crate::perf::sub_row!("fire_shot"));
         let held = self.shooter_upgrades(tick, ids, shot.weapon, shot.attacker);
         let travel = shot
             .victim
@@ -1410,6 +1567,7 @@ impl RotwkRules {
                     due,
                     nugget: None,
                     owner_if_gone: shot.owner_if_gone,
+                    blow: None,
                 },
             )?;
             return Ok(FireResult::default());
@@ -1431,7 +1589,23 @@ impl RotwkRules {
         ))
     }
 
-    fn queue_delayed(&self, tick: &mut Tick<'_>, ids: Ids, hit: DelayedHit) -> Result<()> {
+    pub(super) fn defer_self_hits(attacker: Entity, result: &mut FireResult) {
+        let (own, rest): (Vec<DamageEvent>, Vec<DamageEvent>) = core::mem::take(&mut result.damage)
+            .into_iter()
+            .partition(|hit| hit.victim == attacker);
+        result.damage = rest;
+        let ticks = (mint_sim::SIMULATION_HZ / crate::game_data::RETAIL_LOGIC_HZ).max(1);
+        result
+            .travelling
+            .extend(own.into_iter().map(|hit| (hit, ticks)));
+    }
+
+    pub(super) fn queue_delayed(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        hit: DelayedHit,
+    ) -> Result<()> {
         let Some(clock) = tick
             .state()
             .store(ids.clock)
@@ -1481,6 +1655,10 @@ impl RotwkRules {
                 .insert(ids.delayed_hits, clock, DelayedHits(waiting))?;
         }
         for hit in due {
+            if let Some(blow) = hit.blow {
+                events.push(blow);
+                continue;
+            }
             let victim = hit.victim.and_then(|entity| {
                 living
                     .iter()
@@ -1563,9 +1741,29 @@ impl RotwkRules {
                 .knockbacks
                 .retain(|(victim, _)| !caught.contains(victim));
         }
-        self.hit_passengers(tick, ids, weapon, &result.damage, events)?;
+        self.hit_passengers(tick, ids, weapon, &mut result.damage)?;
         events.extend(result.damage);
         let now = tick.frame();
+        for (blow, frames) in result.travelling {
+            let due = now
+                .checked_add(mint_sim::LogicFrames::from_frames(frames))
+                .unwrap_or(Frame::FOREVER);
+            self.queue_delayed(
+                tick,
+                ids,
+                DelayedHit {
+                    source: shot.attacker,
+                    weapon,
+                    victim: Some(blow.victim),
+                    at: shot.centre,
+                    height: shot.centre_height,
+                    due,
+                    nugget: None,
+                    owner_if_gone: shot.owner_if_gone,
+                    blow: Some(blow),
+                },
+            )?;
+        }
         for nugget in result.delayed {
             let delay = match self
                 .combat
@@ -1595,6 +1793,7 @@ impl RotwkRules {
                     due,
                     nugget: Some(nugget),
                     owner_if_gone: shot.owner_if_gone,
+                    blow: None,
                 },
             )?;
         }
@@ -1605,6 +1804,7 @@ impl RotwkRules {
                     hit.amount,
                     Some(hit.damage_type) == magic,
                     hit.accepts_add,
+                    false,
                 );
             }
             let mut dots = tick
@@ -1628,8 +1828,7 @@ impl RotwkRules {
             let Some(id) = self.combat.modifiers.id(&modifier.list) else {
                 continue;
             };
-            let until = self.list_end(now, id);
-            self.give_timed_list(tick, ids, victim, id, until)?;
+            self.apply_modifier_nugget(tick, ids, shot.attacker, victim, modifier, id)?;
         }
         Ok(())
     }
@@ -1639,8 +1838,7 @@ impl RotwkRules {
         tick: &mut Tick<'_>,
         ids: Ids,
         weapon: WeaponId,
-        hits: &[DamageEvent],
-        events: &mut Vec<DamageEvent>,
+        hits: &mut [DamageEvent],
     ) -> Result<()> {
         let chance = self
             .combat
@@ -1650,18 +1848,41 @@ impl RotwkRules {
         if chance <= 0.0 {
             return Ok(());
         }
-        for hit in hits {
-            if self
-                .first_passenger(tick.state(), ids, hit.victim)
-                .is_none()
-            {
-                continue;
-            }
-            if tick.rng().next_f32() < chance {
-                events.extend(self.passenger_hit(tick.state(), ids, hit));
+        let mut rolled: Vec<(Entity, Option<Entity>)> = Vec::new();
+        for hit in hits.iter_mut() {
+            let target = match rolled.iter().find(|(victim, _)| *victim == hit.victim) {
+                Some((_, target)) => *target,
+                None => {
+                    let target = match self.first_passenger(tick.state(), ids, hit.victim) {
+                        Some(passenger) if tick.rng().next_f32() <= chance => Some(passenger),
+                        _ => None,
+                    };
+                    rolled.push((hit.victim, target));
+                    target
+                }
+            };
+            if let Some(passenger) = target.filter(|_| !self.area_nugget(weapon, hit.nugget)) {
+                diag!(
+                    "weapon: HitPassengerPercentage struck entity {} inside entity {}",
+                    passenger.index(),
+                    hit.victim.index()
+                );
+                hit.victim = passenger;
+                let judge = WorldJudge::new(self, tick.state(), ids, weapon, hit.attacker, None);
+                hit.force_kill = judge.force_kills(usize::from(hit.nugget), passenger);
             }
         }
         Ok(())
+    }
+
+    fn area_nugget(&self, weapon: WeaponId, index: u16) -> bool {
+        matches!(
+            self.combat
+                .weapons
+                .get(weapon)
+                .and_then(|template| template.nuggets.get(usize::from(index))),
+            Some(mint_sage_combat::Nugget::Damage(damage)) if damage.radius > 0.0
+        )
     }
 
     pub(super) fn passenger_hit(
@@ -1670,12 +1891,13 @@ impl RotwkRules {
         ids: Ids,
         hit: &DamageEvent,
     ) -> Option<DamageEvent> {
+        if hit
+            .weapon
+            .is_some_and(|weapon| self.area_nugget(weapon, hit.nugget))
+        {
+            return None;
+        }
         let passenger = self.first_passenger(world, ids, hit.victim)?;
-        diag!(
-            "weapon: HitPassengerPercentage struck entity {} inside entity {}",
-            passenger.index(),
-            hit.victim.index()
-        );
         Some(DamageEvent {
             victim: passenger,
             ..*hit
@@ -1732,11 +1954,19 @@ impl RotwkRules {
             );
         }
         for &victim in &result.slave_attacks {
-            let ordered = self.order_slaves_to_attack(tick, ids, shot.attacker, victim)?;
+            let target = match victim {
+                Some(_) => self
+                    .goal_object(tick.state(), ids, shot.attacker)
+                    .map(super::slave_attack::SlaveTarget::Goal),
+                None => Some(super::slave_attack::SlaveTarget::Point(shot.centre)),
+            };
+            let ordered = match target {
+                Some(target) => self.order_watched_slave(tick, ids, shot.attacker, target)?,
+                None => false,
+            };
             diag!(
-                "nugget: SlaveAttackNugget on entity {} -> {ordered} slave(s) at entity {}",
-                shot.attacker.index(),
-                victim.index()
+                "nugget: SlaveAttackNugget by entity {} -> slave ordered: {ordered}",
+                shot.attacker.index()
             );
         }
         for &(victim, index) in &result.conditions {
@@ -1778,6 +2008,20 @@ impl RotwkRules {
             let Some(EffectNugget::Grab(nugget)) = effect(index) else {
                 continue;
             };
+            if !self.grab_accepts(
+                tick.state(),
+                ids,
+                shot.attacker,
+                victim,
+                nugget.remove_target_from_other_contain,
+            ) {
+                diag!(
+                    "nugget: GrabNugget by entity {} refused entity {}: its contain would not take it",
+                    shot.attacker.index(),
+                    victim.index()
+                );
+                continue;
+            }
             let grabbed = nugget.contain_target_on_effect
                 && self.grab_on_hit(
                     tick,
@@ -1786,9 +2030,9 @@ impl RotwkRules {
                     victim,
                     nugget.remove_target_from_other_contain,
                 )?;
-            let shoved = !grabbed
+            let shoved = !nugget.contain_target_on_effect
                 && nugget.impact_target_on_effect
-                && self.shove(tick, ids, shot, victim, &nugget.shove())?;
+                && self.shove_from_grabber(tick, ids, shot, victim, &nugget.shove())?;
             diag!(
                 "nugget: GrabNugget on weapon {} by entity {} on entity {} -> {}",
                 weapon.index(),
@@ -1802,6 +2046,12 @@ impl RotwkRules {
                     "nothing"
                 }
             );
+        }
+        for &(victim, index) in &result.paralyses {
+            let Some(EffectNugget::Paralyze(nugget)) = effect(index) else {
+                continue;
+            };
+            self.paralyse(tick, ids, shot.attacker, victim, nugget)?;
         }
         for &index in &result.fire_lightings {
             let Some(EffectNugget::FireLogic(nugget)) = effect(index) else {
@@ -1839,6 +2089,7 @@ impl RotwkRules {
                         },
                         (shot.centre.x, shot.centre.y),
                         direction,
+                        &|x, y| self.passability.underwater(Vec2::new(x, y)),
                     );
                     diag!(
                         "fire: FireLogicNugget {} lit at ({:.0},{:.0}), {} cell(s) now burning",
@@ -1910,7 +2161,7 @@ impl RotwkRules {
             .and_then(|list| list.duration_ms)
             .filter(|ms| *ms > 0)
             .map_or(Frame::FOREVER, |ms| {
-                now.checked_add(LogicFrames::from_milliseconds(ms))
+                now.checked_add(mint_sage_modules::retail_duration_ticks(ms))
                     .unwrap_or(Frame::FOREVER)
             })
     }

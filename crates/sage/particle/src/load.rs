@@ -1,6 +1,6 @@
 use mint_sage_ini::{
     BlockTable, Diagnostic, Document, FxListIndex, MemorySources, ParticleIndex, Reader,
-    PARTICLE_DOCUMENTS,
+    DEFINE_DOCUMENTS, PARTICLE_DOCUMENTS,
 };
 use mint_vfs::Vfs;
 
@@ -16,6 +16,14 @@ pub struct ParticleLoadReport {
 
 #[must_use]
 pub fn load_particle_index(vfs: &Vfs) -> (ParticleIndex, FxListIndex, ParticleLoadReport) {
+    load_particle_index_over(vfs, None)
+}
+
+#[must_use]
+pub fn load_particle_index_over(
+    vfs: &Vfs,
+    map_ini: Option<&Document>,
+) -> (ParticleIndex, FxListIndex, ParticleLoadReport) {
     let mut sources = MemorySources::new();
     let mut present = 0usize;
     for path in PARTICLE_DOCUMENTS {
@@ -24,12 +32,17 @@ pub fn load_particle_index(vfs: &Vfs) -> (ParticleIndex, FxListIndex, ParticleLo
             sources.insert(path, bytes);
         }
     }
+    for path in DEFINE_DOCUMENTS {
+        if let Ok(bytes) = vfs.read(path) {
+            sources.insert(path, bytes);
+        }
+    }
 
     let table = BlockTable::particle_path();
     let reader = Reader::new(&sources);
     let mut documents = Vec::new();
     let mut failures = Vec::new();
-    for path in PARTICLE_DOCUMENTS {
+    for path in PARTICLE_DOCUMENTS.into_iter().chain(DEFINE_DOCUMENTS) {
         if sources.paths().all(|held| held != path) {
             continue;
         }
@@ -38,7 +51,10 @@ pub fn load_particle_index(vfs: &Vfs) -> (ParticleIndex, FxListIndex, ParticleLo
             Err(error) => failures.push(format!("{path}: {error}")),
         }
     }
-    let (systems, lists, mut report) = particle_index_from_documents(&documents);
+    let (mut systems, lists, mut report) = particle_index_from_documents(&documents);
+    if let Some(map_ini) = map_ini {
+        systems.insert_override_document(&documents, map_ini);
+    }
     report.documents = present;
     report.failures = failures;
     (systems, lists, report)
@@ -51,6 +67,9 @@ pub fn particle_index_from_documents(
     let mut report = ParticleLoadReport::default();
     let mut systems = ParticleIndex::new();
     let mut lists = FxListIndex::new();
+    for document in documents {
+        lists.insert_defines(document.defines());
+    }
     for path in PARTICLE_DOCUMENTS {
         let Some(document) = documents.iter().find(|document| document.name() == path) else {
             continue;

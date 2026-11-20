@@ -42,6 +42,7 @@ pub struct ListContent {
     pub selected: Option<usize>,
     pub scroll_bar: Option<bool>,
     pub text_inset: f32,
+    pub scroll_to_top: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +93,7 @@ pub struct ListLook<I> {
     pub track: Slot<I>,
     pub thumb: [Thumb<I>; 2],
     pub scroll_bar: bool,
+    pub auto_hide: bool,
 }
 
 pub type ListStyle = ListLook<SurfaceIcon>;
@@ -119,6 +121,7 @@ impl<I> ListLook<I> {
             },
             thumb: [Thumb::default(), Thumb::default()],
             scroll_bar: true,
+            auto_hide: false,
         }
     }
 
@@ -161,6 +164,7 @@ impl<I> ListLook<I> {
             track,
             thumb,
             scroll_bar: self.scroll_bar,
+            auto_hide: self.auto_hide,
         }
     }
 }
@@ -218,6 +222,7 @@ impl ListLook<String> {
             caps: [0.0; 2],
         });
         look.scroll_bar = window.list_box().is_none_or(|data| data.scroll_bar);
+        look.auto_hide = window.window_type() == Some("SCROLLLISTBOX");
         look
     }
 }
@@ -275,6 +280,16 @@ impl ListFrame {
             down,
             track,
         }
+    }
+
+    #[must_use]
+    pub fn hiding_bar_while_content_fits(mut self, heights: &[f32]) -> Self {
+        if row_offset(heights, heights.len()) <= self.display_height() {
+            self.up = None;
+            self.down = None;
+            self.track = None;
+        }
+        self
     }
 
     #[must_use]
@@ -522,6 +537,9 @@ impl ListView {
         if content.selected != self.selected {
             self.selected = content.selected;
             self.reveal = self.selected.is_some();
+        }
+        if content.scroll_to_top {
+            self.display_pos = 0.0;
         }
         self.content = content;
     }

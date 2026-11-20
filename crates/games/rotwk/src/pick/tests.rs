@@ -18,6 +18,7 @@ pub(crate) fn view(entity_index: u32, x: f32, y: f32, kind_of: KindOf, owner: u8
         moving: false,
         health: None,
         dying: false,
+        created: 0,
         visibility: mint_sage_shroud::ObjectVisibility::Clear,
         speed: 0.0,
         weapon_cycle: 0.0,
@@ -431,7 +432,7 @@ fn a_box_over_empty_ground_selects_nothing_and_one_over_a_unit_selects_it() {
 }
 
 #[test]
-fn a_box_selection_comes_back_sorted_by_entity_index() {
+fn a_box_selection_comes_back_newest_created_first() {
     let viewport = (800u32, 600u32);
     let camera = camera_over(0.0, 0.0, 300.0);
     let mut units = vec![
@@ -439,6 +440,9 @@ fn a_box_selection_comes_back_sorted_by_entity_index() {
         view(1, 20.0, 0.0, KindOf::SELECTABLE, 0),
         view(7, -20.0, 0.0, KindOf::SELECTABLE, 0),
     ];
+    for (unit, created) in units.iter_mut().zip([3, 9, 5]) {
+        unit.created = created;
+    }
     units.reverse();
     let rect = ScreenRect::from_corners((0.0, 0.0), (800.0, 600.0));
     let picked = box_select(
@@ -449,10 +453,8 @@ fn a_box_selection_comes_back_sorted_by_entity_index() {
         BoxMode::Centre,
         PlayerId::new(0),
     );
-    let mut sorted = picked.clone();
-    sorted.sort_unstable_by_key(|entity| entity.index());
-    assert_eq!(picked, sorted);
-    assert_eq!(picked.len(), 3);
+    let slots: Vec<u32> = picked.iter().map(|entity| entity.index()).collect();
+    assert_eq!(slots, [1, 7, 4]);
 }
 
 #[test]

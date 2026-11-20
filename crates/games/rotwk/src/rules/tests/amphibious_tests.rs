@@ -63,8 +63,12 @@ fn half_lake_map(width: u32, height: u32) -> (HeightMapData, Water) {
 }
 
 fn scene() -> (Simulation<RotwkRules>, Ids, Entity, crate::unit::Kind) {
+    scene_of(DATA, 100.0)
+}
+
+fn scene_of(data: &str, ferry_x: f32) -> (Simulation<RotwkRules>, Ids, Entity, crate::unit::Kind) {
     let doc =
-        mint_sage_ini::Document::parse("t.ini", DATA, &mint_sage_ini::BlockTable::corpus_path())
+        mint_sage_ini::Document::parse("t.ini", data, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
     assert!(doc.is_balanced(), "{:?}", doc.diagnostics());
     let (data, _) = crate::combat::game_data_from_documents(&[doc], 0, std::time::Instant::now());
@@ -77,7 +81,7 @@ fn scene() -> (Simulation<RotwkRules>, Ids, Entity, crate::unit::Kind) {
         .spawn(
             &data.combat,
             kinds.kind("Ferry").unwrap(),
-            Vec2::new(100.0, 300.0),
+            Vec2::new(ferry_x, 300.0),
             Facing::EAST,
             PLAYER,
         )
@@ -151,4 +155,125 @@ fn a_ferry_ordered_onto_land_taxis_and_unloads_toward_the_click() {
         unloaded,
         "expected at least one Rider to have left the ferry"
     );
+}
+
+#[test]
+fn a_ship_with_no_exit_paths_lands_its_passenger_on_the_shore() {
+    let data = DATA.replace(
+        "ExitOffset = X:30.0 Y:0.0 Z:0.0",
+        "ExitOffset = X:-30.0 Y:0.0 Z:0.0
+    NumberOfExitPaths = 0",
+    );
+    let (mut simulation, ids, ferry, rider_kind) = scene_of(&data, 460.0);
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![ferry],
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    let passenger = simulation
+        .state()
+        .store(ids.contained)
+        .unwrap()
+        .entities()
+        .first()
+        .copied()
+        .unwrap();
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::Exit {
+                passenger: Some(passenger),
+            },
+        )
+        .unwrap();
+    let outside = |simulation: &Simulation<RotwkRules>| {
+        simulation
+            .state()
+            .store(ids.kind)
+            .unwrap()
+            .iter()
+            .filter(|(entity, kind)| {
+                **kind == rider_kind && !simulation.state().contains(ids.contained, *entity)
+            })
+            .map(|(entity, _)| entity)
+            .next()
+    };
+    let mut loaded = false;
+    for _ in 0..1_000 {
+        simulation.tick().unwrap();
+        loaded |= simulation
+            .state()
+            .store(ids.contained)
+            .is_some_and(|s| !s.is_empty());
+        if !loaded {
+            continue;
+        }
+        if let Some(rider) = outside(&simulation) {
+            let at = simulation.state().get(ids.body, rider).unwrap().0.position;
+            assert!(at.x >= 480.0, "landed in the water at x = {}", at.x);
+            return;
+        }
+    }
+    panic!("no rider left the ferry");
+}
+
+#[test]
+fn two_passengers_let_out_of_a_ship_fan_out_along_the_shore() {
+    let data = DATA.replace(
+        "ExitOffset = X:30.0 Y:0.0 Z:0.0",
+        "ExitOffset = X:-30.0 Y:0.0 Z:0.0
+    NumberOfExitPaths = 0",
+    );
+    let (mut simulation, ids, ferry, rider_kind) = scene_of(&data, 460.0);
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units: vec![ferry],
+            },
+        )
+        .unwrap();
+    simulation.tick().unwrap();
+    let passengers: Vec<Entity> = simulation
+        .state()
+        .store(ids.contained)
+        .unwrap()
+        .entities()
+        .to_vec();
+    assert_eq!(passengers.len(), 2);
+    for passenger in passengers {
+        simulation
+            .submit(
+                PLAYER,
+                RotwkCommand::Exit {
+                    passenger: Some(passenger),
+                },
+            )
+            .unwrap();
+    }
+    let mut goals: Vec<(Entity, Vec2)> = Vec::new();
+    for _ in 0..1_000 {
+        simulation.tick().unwrap();
+        for (entity, kind) in simulation.state().store(ids.kind).unwrap().iter() {
+            if *kind == rider_kind
+                && !simulation.state().contains(ids.contained, entity)
+                && !goals.iter().any(|(seen, _)| *seen == entity)
+            {
+                if let Some(path) = simulation.state().get(ids.path, entity) {
+                    goals.push((entity, path.goal));
+                }
+            }
+        }
+        if goals.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(goals.len(), 2, "both riders should have left: {goals:?}");
+    assert_ne!(goals[0].1, goals[1].1, "both sent to {:?}", goals[0].1);
 }

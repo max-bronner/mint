@@ -6,12 +6,15 @@ use mint_sim::Entity;
 use crate::effects::{Effect, Name, Names};
 use crate::script_events::{ScriptEvents, ScriptEventsError};
 
-const BOUND: [&str; 12] = [
+const BOUND: [&str; 15] = [
+    "ObjectSetGeometryActive",
     "ObjectHideSubObjectPermanently",
     "ObjectPlayerSide",
     "ObjectCapturingObjectPlayerSide",
     "ObjectGrantUpgrade",
     "ObjectEnterRampageState",
+    "ObjectEnterRunAwayPanicState",
+    "ObjectEnterCowerState",
     "ObjectBroadcastEventToEnemies",
     "ObjectBroadcastEventToAllies",
     "ObjectBroadcastEventToCivilians",
@@ -72,7 +75,15 @@ impl ObjectScripts {
             Some(other) => Value::Handle(encode_entity(other)),
             None => data.map_or(Value::Nil, Value::string),
         };
-        let supplied = [this, second];
+        let third = source.third.map(|arg| match arg {
+            EventArg::Number(number) => Value::Number(number),
+            EventArg::Bool(flag) => Value::Bool(flag),
+            EventArg::Object(entity) => Value::Handle(encode_entity(entity)),
+        });
+        let supplied: Vec<Value> = [Some(this), Some(second), third]
+            .into_iter()
+            .flatten()
+            .collect();
         let arity = self
             .chunk
             .function(function)
@@ -197,6 +208,14 @@ pub struct ObjectFacts<'a> {
 pub struct EventSource {
     pub this: Option<Entity>,
     pub other: Option<Entity>,
+    pub third: Option<EventArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EventArg {
+    Number(f32),
+    Bool(bool),
+    Object(Entity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +258,7 @@ struct EventHost<'a, 'b> {
 }
 
 impl EventHost<'_, '_> {
-    fn sub_object(&mut self, args: &[Value], hide: bool) -> Result<Value, HostError> {
+    fn sub_object(&mut self, args: &[Value], permanent: bool) -> Result<Value, HostError> {
         let Some(name) = args.get(1).and_then(Value::as_str) else {
             return Err(HostError::new("a sub-object name is needed"));
         };
@@ -255,16 +274,11 @@ impl EventHost<'_, '_> {
         };
         let name: Names = [Name::from(name)].into();
         let empty: Names = [].into();
-        self.effects.push(if hide == on {
-            Effect::SubObjects {
-                show: empty,
-                hide: name,
-            }
-        } else {
-            Effect::SubObjects {
-                show: name,
-                hide: empty,
-            }
+        let (show, hide) = if on { (empty, name) } else { (name, empty) };
+        self.effects.push(Effect::SubObjects {
+            show,
+            hide,
+            permanent,
         });
         Ok(Value::Nil)
     }
@@ -298,7 +312,23 @@ impl Host for EventHost<'_, '_> {
     fn call(&mut self, name: &str, args: &[Value]) -> Result<Value, HostError> {
         match name {
             "ObjectHideSubObjectPermanently" => self.sub_object(args, true),
-            "ObjectHideSubObject" => self.sub_object(args, true),
+            "ObjectHideSubObject" => self.sub_object(args, false),
+            "ObjectSetGeometryActive" => {
+                let (Some(name), Some(Value::Bool(active))) =
+                    (args.get(1).and_then(Value::as_str), args.get(2))
+                else {
+                    return Err(HostError::new("a geometry name and a boolean are needed"));
+                };
+                let name: Names = [Name::from(name)].into();
+                let empty: Names = [].into();
+                let (show, hide) = if *active {
+                    (name, empty)
+                } else {
+                    (empty, name)
+                };
+                self.effects.push(Effect::Geometry { show, hide });
+                Ok(Value::Nil)
+            }
             "ObjectPlayerSide" => Ok(side(self.facts.side)),
             "ObjectCapturingObjectPlayerSide" => Ok(side(self.facts.capturing_side)),
             "ObjectGrantUpgrade" => {
@@ -310,6 +340,16 @@ impl Host for EventHost<'_, '_> {
             }
             "ObjectEnterRampageState" => {
                 self.effects.push(Effect::EnterRampage);
+                Ok(Value::Nil)
+            }
+            "ObjectEnterRunAwayPanicState" => {
+                self.effects
+                    .push(Effect::PulseOwnEmotion(mint_sage_ini::EmotionType::Terror));
+                Ok(Value::Nil)
+            }
+            "ObjectEnterCowerState" => {
+                self.effects
+                    .push(Effect::PulseOwnEmotion(mint_sage_ini::EmotionType::Fear));
                 Ok(Value::Nil)
             }
             "ObjectBroadcastEventToEnemies" => {

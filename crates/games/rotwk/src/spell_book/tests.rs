@@ -88,6 +88,7 @@ PlayerTemplate FactionMen
   Side = Men
   IntrinsicSciencesMP = SCIENCE_MEN
   PurchaseScienceCommandSetMP = MenSpellStoreCommandSet
+  PurchaseScienceCommandSet = CampaignSpellStoreCommandSet
 End
 CommandButton Command_PurchaseSpellHeal
   Command = PURCHASE_SCIENCE
@@ -105,17 +106,23 @@ CommandSet MenSpellStoreCommandSet
   1 = Command_PurchaseSpellHeal
   3 = Command_PurchaseSpellOld
 End
+CommandSet CampaignSpellStoreCommandSet
+  2 = Command_PurchaseSpellOld
+End
 ";
 
 #[test]
 fn the_ini_reads_costs_templates_and_button_sciences() {
     let data = SpellBookData::read(&[parse(INI)]);
-    assert_eq!(data.science("science_heal").and_then(|d| d.cost), Some(5));
-    assert_eq!(data.science("SCIENCE_Old").and_then(|d| d.cost), Some(3));
+    let heal = data.science("science_heal").unwrap();
+    assert_eq!((heal.cost_mp, heal.cost), (Some(5), Some(7)));
+    let old = data.science("SCIENCE_Old").unwrap();
+    assert_eq!((old.cost_mp, old.cost), (None, Some(3)));
     assert_eq!(
         data.template("factionmen"),
         Some(&SpellStoreTemplate {
             command_set: Some("MenSpellStoreCommandSet".to_owned()),
+            command_set_sp: Some("CampaignSpellStoreCommandSet".to_owned()),
         })
     );
     assert_eq!(
@@ -149,7 +156,14 @@ fn the_view_follows_the_command_sets_slots() {
         owned: owned(&["SCIENCE_MEN"]),
         states: vec![("SCIENCE_Heal".to_owned(), SpellState::CantAfford)],
     };
-    let view = spell_book_view(&data, &buttons, &strings, Some("FactionMen"), &holdings);
+    let view = spell_book_view(
+        &data,
+        &buttons,
+        &strings,
+        Some("FactionMen"),
+        true,
+        &holdings,
+    );
     assert_eq!(view.points, 4);
     assert_eq!(view.slots.len(), 3);
     let heal = view.slots[0].as_ref().expect("slot 1");
@@ -163,8 +177,18 @@ fn the_view_follows_the_command_sets_slots() {
     let old = view.slots[2].as_ref().expect("slot 3");
     assert_eq!(old.state, SpellState::Locked);
     assert_eq!(
-        spell_book_view(&data, &buttons, &strings, None, &holdings).slots,
+        spell_book_view(&data, &buttons, &strings, None, true, &holdings).slots,
         Vec::new(),
         "no template, no book"
     );
+    let campaign = spell_book_view(
+        &data,
+        &buttons,
+        &strings,
+        Some("FactionMen"),
+        false,
+        &holdings,
+    );
+    assert_eq!(campaign.slots.len(), 2, "the campaign reads its own set");
+    assert!(campaign.slots[0].is_none() && campaign.slots[1].is_some());
 }

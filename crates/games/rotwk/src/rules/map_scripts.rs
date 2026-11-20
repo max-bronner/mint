@@ -50,6 +50,8 @@ mod emotion_verbs;
 mod endgame;
 mod experience_verbs;
 mod face_teleport;
+#[cfg(test)]
+mod follow_tests;
 mod garrison_verbs;
 mod gate_verbs;
 mod generic;
@@ -59,7 +61,7 @@ mod mission_end;
 mod named;
 mod nearest;
 mod object_status;
-mod orders;
+pub(super) mod orders;
 #[cfg(test)]
 mod p46_tests;
 #[cfg(test)]
@@ -196,6 +198,7 @@ pub(crate) struct MapScriptState {
     pub(crate) mission_end: Option<mint_sage_campaign::MissionEnd>,
     pub(crate) victory_screen_seq: u32,
     pub(crate) carryover: Option<super::carryover::CarryoverRun>,
+    pub(crate) wotr: Option<super::wotr_battle::WotrRun>,
     pub(crate) ever_existed: BTreeSet<String>,
     pub(crate) rt: runtime::ScriptRuntime,
     reveals: reveal::NamedReveals,
@@ -279,6 +282,9 @@ impl Component for MapScriptState {
         hasher.write_u32(self.victory_screen_seq);
         hasher.write_bool(self.carryover.is_some());
         if let Some(run) = &self.carryover {
+            run.hash_into(hasher);
+        }
+        if let Some(run) = &self.wotr {
             run.hash_into(hasher);
         }
         hasher.write_usize(self.ever_existed.len());
@@ -2120,6 +2126,16 @@ const ACTION_REGISTRY: &[ActionRow] = &[
         MODE_STANDARD,
     ),
     ActionRow::new(
+        "NAMED_SET_REPULSOR",
+        object_status::parse_named_set_repulsor,
+        MODE_STANDARD,
+    ),
+    ActionRow::new(
+        "TEAM_SET_REPULSOR",
+        object_status::parse_team_set_repulsor,
+        MODE_STANDARD,
+    ),
+    ActionRow::new(
         "NAMED_SET_STEALTH_ENABLED",
         object_status::parse_set_stealth_enabled,
         MODE_STANDARD,
@@ -2323,6 +2339,7 @@ const ACTION_REGISTRY: &[ActionRow] = &[
         team_orders::parse_wander_in_place,
         MODE_STANDARD,
     ),
+    ActionRow::new("TEAM_WANDER", team_orders::parse_wander, MODE_STANDARD),
     ActionRow::new("TEAM_PANIC", team_orders::parse_panic, MODE_STANDARD),
     ActionRow::new(
         "TEAM_MOVE_TO_NEAREST_OBJECT_OF_TYPE",
@@ -2545,7 +2562,62 @@ fn parse_condition(condition: &Condition, ctx: &ParseCtx<'_>) -> Option<Arc<dyn 
         .iter()
         .chain(test_condition_rows())
         .find(|row| row.name == condition.name)?;
-    (row.parse)(&status::resolve_status_params(&condition.params), ctx)
+    let verb = (row.parse)(&status::resolve_status_params(&condition.params), ctx)?;
+    Some(if condition.negates() {
+        Arc::new(NotCondition(verb))
+    } else {
+        verb
+    })
+}
+
+struct NotCondition(Arc<dyn ConditionVerb>);
+
+impl ConditionVerb for NotCondition {
+    fn eval(
+        &self,
+        rules: &RotwkRules,
+        tick: &Tick<'_>,
+        ids: Ids,
+        state: &MapScriptState,
+        player: Option<PlayerId>,
+    ) -> bool {
+        !self.0.eval(rules, tick, ids, state, player)
+    }
+
+    fn eval_mut(
+        &self,
+        rules: &RotwkRules,
+        tick: &Tick<'_>,
+        ids: Ids,
+        state: &mut MapScriptState,
+        player: Option<PlayerId>,
+    ) -> bool {
+        !self.0.eval_mut(rules, tick, ids, state, player)
+    }
+
+    fn finished_audio_name(&self) -> Option<&str> {
+        self.0.finished_audio_name()
+    }
+
+    fn referenced_unit_name(&self) -> Option<&str> {
+        self.0.referenced_unit_name()
+    }
+
+    fn watched_area(&self) -> Option<&area::Area> {
+        self.0.watched_area()
+    }
+
+    fn team_names(&self) -> Vec<String> {
+        self.0.team_names()
+    }
+
+    fn reads_triggered_powers(&self) -> bool {
+        self.0.reads_triggered_powers()
+    }
+
+    fn reads_completed_upgrades(&self) -> bool {
+        self.0.reads_completed_upgrades()
+    }
 }
 
 #[cfg(test)]
@@ -2650,6 +2722,7 @@ pub(crate) struct MapScriptEngine {
     path_points: Vec<orders::PathPoint>,
     objectives: Vec<(String, bool)>,
     carryover: Option<Arc<super::carryover::CarryoverStart>>,
+    wotr: Option<Arc<super::wotr_battle::WotrStart>>,
     sound_ms: BTreeMap<String, u32>,
     watched_areas: Vec<area::Area>,
     reads_triggered_powers: bool,
@@ -2710,6 +2783,7 @@ fn build_script_def(
     let mut parse_actions = |actions: &[ScriptAction]| -> Vec<Arc<dyn ActionVerb>> {
         actions
             .iter()
+            .filter(|action| action.enabled)
             .filter_map(|action| {
                 match parse_action_in(ACTION_REGISTRY, action, ctx)
                     .or_else(|| parse_action_in(test_action_rows(), action, ctx))
@@ -2886,6 +2960,7 @@ impl MapScriptEngine {
             path_points: Vec::new(),
             objectives: Vec::new(),
             carryover: None,
+            wotr: None,
             sound_ms: BTreeMap::new(),
             generic: Vec::new(),
         }
@@ -2935,8 +3010,16 @@ impl MapScriptEngine {
         self
     }
 
-    fn waypoint(&self, name: &str) -> Option<Vec2> {
-        self.waypoints.get(name).copied()
+    pub(super) fn waypoint(&self, name: &str) -> Option<Vec2> {
+        self.waypoints
+            .get(name)
+            .or_else(|| {
+                self.waypoints
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, at)| at)
+            })
+            .copied()
     }
 
     fn path_points(&self) -> &[orders::PathPoint] {
@@ -2957,6 +3040,16 @@ impl MapScriptEngine {
     pub(crate) fn with_carryover(mut self, start: super::carryover::CarryoverStart) -> Self {
         self.carryover = Some(Arc::new(start));
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_wotr(mut self, start: super::wotr_battle::WotrStart) -> Self {
+        self.wotr = Some(Arc::new(start));
+        self
+    }
+
+    pub(crate) fn wotr_start(&self) -> Option<&Arc<super::wotr_battle::WotrStart>> {
+        self.wotr.as_ref()
     }
 
     pub(crate) fn finished_audio_names(&self) -> Vec<String> {
@@ -2987,7 +3080,7 @@ impl MapScriptEngine {
         &self.watched_areas
     }
 
-    pub(super) fn carryover_start(&self) -> Option<&Arc<super::carryover::CarryoverStart>> {
+    pub(crate) fn carryover_start(&self) -> Option<&Arc<super::carryover::CarryoverStart>> {
         self.carryover.as_ref()
     }
 
@@ -3019,6 +3112,10 @@ impl MapScriptEngine {
                 .carryover
                 .as_ref()
                 .map(|start| super::carryover::CarryoverRun::new(start.carry.clone())),
+            wotr: self.wotr.as_ref().map(|start| super::wotr_battle::WotrRun {
+                arrived: vec![false; start.seats.iter().map(|s| s.armies.len()).sum()],
+                ..super::wotr_battle::WotrRun::default()
+            }),
             ever_existed: BTreeSet::new(),
             rt: runtime::ScriptRuntime {
                 teams: team::Teams::seeded(&self.team_protos),
@@ -3064,6 +3161,14 @@ impl MapScriptEngine {
                 .available()
                 .iter()
                 .map(|record| record.template_name.to_string_lossy())
+        }));
+        names.extend(self.wotr.iter().flat_map(|start| {
+            start.seats.iter().flat_map(|seat| {
+                seat.armies
+                    .iter()
+                    .flat_map(|army| army.units.iter().map(|(name, _, _)| name.clone()))
+                    .chain(seat.structures.iter().map(|s| s.template.clone()))
+            })
         }));
         names.sort();
         names.dedup();
@@ -3135,6 +3240,22 @@ impl RotwkRules {
             .ok()
             .and_then(|offset| self.players.checked_add(offset))
             .map(PlayerId::new)
+    }
+
+    pub(crate) fn seated_side(&self, side_name: &str) -> std::result::Result<PlayerId, String> {
+        self.resolve_side_player(side_name).ok_or_else(|| {
+            let mut seated: Vec<String> = self
+                .map_script_starts
+                .iter()
+                .map(|(start, _)| format!("Player_{}", u16::from(*start).saturating_add(1)))
+                .collect();
+            seated.sort();
+            seated.extend(self.map_players.iter().cloned());
+            format!(
+                "{side_name:?} names no player in this match (it has: {})",
+                seated.join(", ")
+            )
+        })
     }
 
     fn resolve_team_player(&self, team: &str) -> Option<PlayerId> {
@@ -3331,6 +3452,29 @@ impl RotwkRules {
             return Vec::new();
         };
         self.subject_members(tick, ids, state, name, team.then_some(""))
+    }
+
+    pub(super) fn debug_hunt(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        entities: &[Entity],
+    ) -> Result<()> {
+        let found = tick.state().store(ids.map_script_state).and_then(|store| {
+            store
+                .iter()
+                .next()
+                .map(|(anchor, state)| (anchor, state.clone()))
+        });
+        let Some((anchor, mut state)) = found else {
+            return Ok(());
+        };
+        for entity in entities {
+            state.rt.hunters.insert(*entity);
+        }
+        tick.state_mut()
+            .insert(ids.map_script_state, anchor, state)?;
+        Ok(())
     }
 
     pub(super) fn debug_set_script_value(
@@ -3652,7 +3796,9 @@ impl RotwkRules {
         self.step_hunters(tick, ids, engine, &mut state)?;
         self.step_attack_areas(tick, ids, &mut state)?;
         self.step_walks(tick, ids, &mut state);
-        self.step_wanderers(tick, ids, &state)?;
+        self.step_team_walks(tick, ids, &mut state)?;
+        self.step_wanderers(tick, ids, &mut state)?;
+        self.step_path_wanderers(tick, ids, engine, &mut state)?;
         self.step_facings(tick, ids, &mut state)?;
         self.step_generic_scripts(tick, ids, engine, &mut state, &mut kills)?;
         self.sync_count_stamp(tick.state(), ids, &mut state);

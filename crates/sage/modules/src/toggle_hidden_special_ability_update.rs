@@ -11,6 +11,7 @@ use crate::special_ability_update::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToggleHiddenTrigger {
+    pub power: crate::effects::Name,
     pub effect_duration: Option<LogicFrames>,
     pub show_palantir_timer: bool,
 }
@@ -21,6 +22,7 @@ impl Trigger for ToggleHiddenTrigger {
             log.push(
                 entity,
                 Effect::ToggleStealth {
+                    power: self.power.clone(),
                     lasts: self.effect_duration,
                     palantir_timer: self.show_palantir_timer,
                 },
@@ -48,8 +50,15 @@ pub fn toggle_hidden_special_ability_update_from_fields(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let effect_duration = number(fields, "EffectDuration")?
         .filter(|ms| *ms > 0.0)
-        .map(|ms| LogicFrames::from_milliseconds(ms.min(86_400_000.0) as u32));
+        .map(
+            |ms| crate::special_ability_update::retail_duration_ticks(ms.min(86_400_000.0) as u32),
+        );
     let trigger = ToggleHiddenTrigger {
+        power: crate::effects::Name::from(
+            fields
+                .field("SpecialPowerTemplate")
+                .ok_or_else(|| FieldError::new("SpecialPowerTemplate is missing"))?,
+        ),
         effect_duration,
         show_palantir_timer: flag(fields, "ShowPalantirTimer")?.unwrap_or(false),
     };
@@ -144,6 +153,7 @@ mod tests {
                 if let Effect::ToggleStealth {
                     lasts,
                     palantir_timer,
+                    ..
                 } = effect
                 {
                     toggles.push((lasts, palantir_timer));
@@ -152,7 +162,7 @@ mod tests {
         }
         assert_eq!(
             toggles,
-            [(Some(LogicFrames::from_milliseconds(15000)), true)]
+            [(Some(LogicFrames::from_engine_milliseconds(15000)), true)]
         );
     }
 
@@ -221,8 +231,8 @@ mod tests {
         }
         assert_eq!(toggles, 1, "no re-toggle on the second trigger");
         assert_eq!(recharges, 2, "the base machine recharges on both triggers");
-        let one_period = LogicFrames::from_milliseconds(1).get() + 1;
-        let two_periods = one_period + LogicFrames::from_milliseconds(1600).get();
+        let one_period = LogicFrames::from_engine_milliseconds(1).get() + 1;
+        let two_periods = one_period + LogicFrames::from_engine_milliseconds(1600).get();
         assert!(
             packed_at.is_some_and(|frame| frame >= u64::from(two_periods)),
             "must not pack after only the first period ({one_period}): {packed_at:?}"

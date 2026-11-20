@@ -8,7 +8,7 @@ use super::relations::{Attitudes, Relations};
 use super::status::ScriptStatuses;
 use super::team::{TeamId, Teams};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct ScriptRuntime {
     pub(crate) teams: Teams,
     pub(crate) objects: ObjectRefs,

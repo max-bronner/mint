@@ -1793,7 +1793,10 @@ impl Viewer {
                     clip,
                     texture,
                 } => {
-                    let Some(r) = meshes.get(*mesh).and_then(|m| m.runs.get(*run)) else {
+                    let Some(m) = meshes.get(*mesh) else {
+                        continue;
+                    };
+                    let Some(r) = m.runs.get(*run) else {
                         continue;
                     };
                     let mut g = UiGeometry::new()
@@ -1803,6 +1806,9 @@ impl Viewer {
                         .with_color(*color)
                         .with_color_add(*add)
                         .with_clip(*clip);
+                    if let Some(key) = m.retain_key(*run) {
+                        g = g.with_retention(key);
+                    }
                     if let Some((tex, transform, translate)) = texture {
                         g = g.with_texture(*tex, *transform, *translate);
                     }

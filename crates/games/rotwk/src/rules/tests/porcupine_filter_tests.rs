@@ -1,6 +1,6 @@
 use super::*;
 
-const DATA: &str = "\
+pub(super) const DATA: &str = "\
 Locomotor Feet\n  Surfaces = GROUND\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\nEnd\n\
 Weapon Spear\n  AttackRange = 200\n  DelayBetweenShots = 500\n  \
   DamageNugget\n    Damage = 5\n    DamageType = PIERCE\n  End\nEnd\n\
@@ -70,7 +70,7 @@ CommandButton Build_PikeHorde\n  Command = UNIT_BUILD\n  Object = PikeHorde\nEnd
 
 const HOME: Vec2 = Vec2::new(300.0, 300.0);
 
-fn simulation(data: &str, enemies: &[(&str, Vec2)]) -> (Simulation<RotwkRules>, Ids) {
+pub(super) fn simulation(data: &str, enemies: &[(&str, Vec2)]) -> (Simulation<RotwkRules>, Ids) {
     let doc =
         mint_sage_ini::Document::parse("t.ini", data, &mint_sage_ini::BlockTable::corpus_path())
             .unwrap();
@@ -148,7 +148,7 @@ fn simulation(data: &str, enemies: &[(&str, Vec2)]) -> (Simulation<RotwkRules>, 
     (simulation, ids)
 }
 
-fn horde(simulation: &Simulation<RotwkRules>, ids: Ids) -> Entity {
+pub(super) fn horde(simulation: &Simulation<RotwkRules>, ids: Ids) -> Entity {
     simulation.state().store(ids.horde).unwrap().entities()[0]
 }
 

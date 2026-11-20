@@ -61,6 +61,14 @@ fn structure_timer_scales_by_wealth_and_reads_as_zero_when_base_is_zero() {
 }
 
 #[test]
+fn a_structure_timer_truncates_in_retail_frames_before_and_after_the_wealth_rate() {
+    assert_eq!(
+        structure_timer_frames(3.0, 2.0, 0.6, 7_000, 2_000, 8_000),
+        42
+    );
+}
+
+#[test]
 fn rebuild_is_ready_only_after_the_delay_has_elapsed() {
     let delay = mint_sim::LogicFrames::from_seconds(30.0);
     let destroyed_at = Frame::new(100);

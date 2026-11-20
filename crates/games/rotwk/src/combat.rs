@@ -7,8 +7,9 @@ use crate::rules::map_scripts::{
 use mint_movement::{Facing, Vec2};
 use mint_sage_combat::{
     nearest_target, surface_distance_squared_2d, within_attack_range, ArmorId, ArmorTemplate,
-    BezierArc, Candidate, CombatData, DamageFxTypeId, DamageTypeId, EffectNugget, HealthPool,
-    Nugget, Point3, ProjectileFlight, SlowDeathOption, WeaponId, WeaponState, WeaponStatus,
+    BezierArc, Candidate, CombatData, DamageFxTypeId, DamageShape, DamageTypeId, EffectNugget,
+    HealthPool, Nugget, Point3, ProjectileFlight, SlowDeathOption, WeaponId, WeaponState,
+    WeaponStatus,
 };
 use mint_sim::{Component, Entity, Frame, LogicFrames, PlayerId, StateHasher};
 
@@ -19,8 +20,6 @@ pub(crate) use crate::game_data::{
     GameData, MultiplayMultipliers, DEFAULT_GRAVITY, DEFAULT_GROUND_STIFFNESS,
     SHIPPED_ARMOR_BONUS_CAP, SHIPPED_SELL_PERCENTAGE,
 };
-
-const LAUNCH_HEIGHT_FRACTION: f32 = 0.6;
 
 const AIM_HEIGHT_FRACTION: f32 = 0.5;
 
@@ -63,12 +62,14 @@ impl DamageThresholds {
         let max = record
             .max_health
             .filter(|max| max.is_finite() && *max > 0.0);
+        let defaults = record.use_default_damage_settings.unwrap_or(true);
         let ratio = |value: Option<f32>, fallback: f32| match (
             value.filter(|v| v.is_finite() && *v >= 0.0),
             max,
         ) {
-            (Some(value), Some(max)) => (value / max).min(1.0),
-            _ => fallback,
+            (Some(value), Some(max)) if value > 0.0 || !defaults => (value / max).min(1.0),
+            _ if defaults => fallback,
+            _ => 0.0,
         };
         Self {
             damaged: ratio(record.max_health_damaged, global.damaged),
@@ -109,6 +110,8 @@ pub(crate) struct Armed {
     pub(crate) next_acquire: Frame,
     pub(crate) reacquire_ready: Option<Frame>,
     pub(crate) squish_reacquire: bool,
+    pub(crate) position_shot: Option<Vec2>,
+    pub(crate) last_shot_horde: Option<Entity>,
 }
 
 impl Component for Armed {
@@ -143,6 +146,15 @@ impl Component for Armed {
         if self.squish_reacquire {
             hasher.write_u8(2);
         }
+        if let Some(at) = self.position_shot {
+            hasher.write_u8(3);
+            hasher.write_f32(at.x);
+            hasher.write_f32(at.y);
+        }
+        if let Some(horde) = self.last_shot_horde {
+            hasher.write_u8(4);
+            horde.hash_into(hasher);
+        }
     }
 }
 
@@ -151,6 +163,7 @@ impl Armed {
         if self.target != target {
             self.target = target;
             self.winding = false;
+            self.position_shot = None;
             self.shots_at_target = 0;
             self.state.end_leech();
             if target.is_some() {
@@ -190,7 +203,7 @@ pub(crate) struct AttackOrder {
     pub(crate) planned: bool,
     pub(crate) horde: Option<Entity>,
     pub(crate) guard: bool,
-    pub(crate) forced: bool,
+    pub(crate) relation_free: bool,
     pub(crate) order_owner: Option<PlayerId>,
 }
 
@@ -199,7 +212,7 @@ impl Component for AttackOrder {
         self.target.hash_into(hasher);
         hasher.write_bool(self.planned);
         hasher.write_bool(self.guard);
-        hasher.write_bool(self.forced);
+        hasher.write_bool(self.relation_free);
         match self.horde {
             Some(horde) => {
                 hasher.write_u8(1);
@@ -240,21 +253,110 @@ impl Component for HordeTarget {
 pub(crate) struct AttackMoveOrder {
     pub(crate) destination: Vec2,
     pub(crate) facing: Option<Facing>,
+    pub(crate) object: Option<(Entity, Vec2, f32)>,
+    pub(crate) retries_left: u8,
+    pub(crate) hold_until: Option<u64>,
+    pub(crate) short_end: Option<Vec2>,
+    pub(crate) follow: bool,
+    pub(crate) non_final: bool,
+}
+
+impl AttackMoveOrder {
+    const RETRIES: u8 = 5;
+
+    pub(crate) fn new(
+        destination: Vec2,
+        facing: Option<Facing>,
+        object: Option<(Entity, Vec2, f32)>,
+    ) -> Self {
+        Self {
+            destination,
+            facing,
+            object,
+            retries_left: Self::RETRIES,
+            hold_until: None,
+            short_end: None,
+            follow: false,
+            non_final: false,
+        }
+    }
+
+    pub(crate) fn follow_leg(destination: Vec2, non_final: bool) -> Self {
+        Self {
+            retries_left: 0,
+            follow: true,
+            non_final,
+            ..Self::new(destination, None, None)
+        }
+    }
 }
 
 impl Component for AttackMoveOrder {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_f32(self.destination.x);
         hasher.write_f32(self.destination.y);
+        hasher.write_bool(self.object.is_some());
+        if let Some((object, seen, height)) = self.object {
+            object.hash_into(hasher);
+            hasher.write_f32(seen.x);
+            hasher.write_f32(seen.y);
+            hasher.write_f32(height);
+        }
         hasher.write_bool(self.facing.is_some());
         hasher.write_f32(self.facing.map_or(0.0, Facing::radians));
+        hasher.write_u8(self.retries_left);
+        hasher.write_bool(self.follow);
+        hasher.write_bool(self.non_final);
+        hasher.write_bool(self.hold_until.is_some());
+        hasher.write_u64(self.hold_until.unwrap_or(0));
+        hasher.write_bool(self.short_end.is_some());
+        if let Some(end) = self.short_end {
+            hasher.write_f32(end.x);
+            hasher.write_f32(end.y);
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QueuedLeg {
     pub(crate) point: Vec2,
     pub(crate) attack: bool,
+    pub(crate) resolve: bool,
+    pub(crate) tag: Option<OrderTag>,
+    pub(crate) non_final: bool,
+    pub(crate) follow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OrderTag {
+    pub(crate) id: u32,
+    pub(crate) click: Vec2,
+    pub(crate) members: Vec<Entity>,
+    pub(crate) copy_of: Option<u32>,
+    pub(crate) lap_clone: Option<u32>,
+}
+
+impl QueuedLeg {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_f32(self.point.x);
+        hasher.write_f32(self.point.y);
+        hasher.write_bool(self.attack);
+        hasher.write_bool(self.resolve);
+        hasher.write_bool(self.non_final);
+        hasher.write_bool(self.follow);
+        hasher.write_bool(self.tag.is_some());
+        if let Some(tag) = &self.tag {
+            hasher.write_u32(tag.id);
+            hasher.write_f32(tag.click.x);
+            hasher.write_f32(tag.click.y);
+            hasher.write_u32(tag.copy_of.map_or(0, |id| id.saturating_add(1)));
+            hasher.write_u32(tag.lap_clone.map_or(0, |id| id.saturating_add(1)));
+            hasher.write_usize(tag.members.len());
+            for member in &tag.members {
+                member.hash_into(hasher);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -262,23 +364,21 @@ pub(crate) struct OrderQueue {
     pub(crate) current: Option<QueuedLeg>,
     pub(crate) queued: Vec<QueuedLeg>,
     pub(crate) idle_checks: u8,
+    pub(crate) loop_start: Option<usize>,
 }
 
 impl Component for OrderQueue {
     fn hash_into(&self, hasher: &mut StateHasher) {
         hasher.write_bool(self.current.is_some());
-        if let Some(leg) = self.current {
-            hasher.write_f32(leg.point.x);
-            hasher.write_f32(leg.point.y);
-            hasher.write_bool(leg.attack);
+        if let Some(leg) = &self.current {
+            leg.hash_into(hasher);
         }
         hasher.write_usize(self.queued.len());
         for leg in &self.queued {
-            hasher.write_f32(leg.point.x);
-            hasher.write_f32(leg.point.y);
-            hasher.write_bool(leg.attack);
+            leg.hash_into(hasher);
         }
         hasher.write_u8(self.idle_checks);
+        hasher.write_usize(self.loop_start.map_or(0, |at| at.saturating_add(1)));
     }
 }
 
@@ -325,10 +425,25 @@ pub(crate) struct ProjectileKind {
     pub(crate) ground_bounce_weapon: Option<WeaponId>,
     pub(crate) die_on_impact: bool,
     pub(crate) detonate_calls_kill: bool,
-    pub(crate) death_fx: Option<String>,
+    pub(crate) fx_dies: Vec<mint_sage_modules::FxListDie>,
     pub(crate) flight_path_adjust: f32,
     pub(crate) pre_landing: Option<LandingEmotion>,
     pub(crate) post_landing: Option<LandingEmotion>,
+    pub(crate) crush_style: bool,
+    pub(crate) pre_landing_time: LogicFrames,
+    pub(crate) final_stuck: LogicFrames,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CrushHits(pub(crate) Vec<Entity>);
+
+impl Component for CrushHits {
+    fn hash_into(&self, hasher: &mut StateHasher) {
+        hasher.write_usize(self.0.len());
+        for entity in &self.0 {
+            entity.hash_into(hasher);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -355,6 +470,7 @@ pub(crate) struct Flight {
     pub(crate) carried_velocity: mint_sage_combat::Point3,
     pub(crate) carried_ballistic: bool,
     pub(crate) falls_to_death: bool,
+    pub(crate) object: bool,
 }
 
 impl Component for Flight {
@@ -391,6 +507,7 @@ impl Component for Flight {
         self.carried_velocity.hash_into(hasher);
         hasher.write_bool(self.carried_ballistic);
         hasher.write_bool(self.falls_to_death);
+        hasher.write_bool(self.object);
     }
 }
 
@@ -418,6 +535,7 @@ pub(crate) enum DeathNaming {
     #[default]
     Normal,
     Crushed,
+    Detonated,
     Faded,
     Named(mint_sage_combat::DeathTypeId),
 }
@@ -427,6 +545,7 @@ impl DeathNaming {
         match self {
             Self::Normal => hasher.write_u8(0),
             Self::Crushed => hasher.write_u8(1),
+            Self::Detonated => hasher.write_u8(4),
             Self::Faded => hasher.write_u8(3),
             Self::Named(id) => {
                 hasher.write_u8(2);
@@ -457,6 +576,8 @@ pub(crate) struct DamageEvent {
     pub(crate) nugget: u16,
     pub(crate) accepts_add: bool,
     pub(crate) bonuses_applied: bool,
+    pub(crate) force_kill: bool,
+    pub(crate) drain_life: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -489,10 +610,16 @@ pub(crate) struct Foe {
     pub(crate) airborne: Option<crate::templates::AirborneCategory>,
     pub(crate) unattackable: bool,
     pub(crate) not_autoacquirable: bool,
+    pub(crate) enclosed: bool,
     pub(crate) ai_kind_of: Option<mint_sage_modules::AiKindOf>,
+    pub(crate) volume: Option<mint_sage_combat::BoxVolume>,
 }
 
 impl Foe {
+    pub(crate) fn reach_volume(&self) -> ReachVolume {
+        (self.position, self.radius, self.volume)
+    }
+
     pub(crate) fn aim_point(&self) -> Point3 {
         Point3::new(
             self.position.x,
@@ -571,13 +698,39 @@ pub(crate) fn in_range(
     min_range: f32,
     max_range: f32,
 ) -> bool {
-    let distance_squared = surface_distance_squared_2d(
-        Point3::new(shooter.x, shooter.y, 0.0),
-        shooter_radius,
-        Point3::new(target.x, target.y, 0.0),
-        target_radius,
+    in_range_volumes(
+        (shooter, shooter_radius, None),
+        (target, target_radius, None),
+        0.0,
+        min_range,
+        max_range,
+    )
+}
+
+pub(crate) fn on_odd_retail_frame(frame: u64, period: u64) -> bool {
+    frame
+        .checked_div(period)
+        .is_some_and(|retail_frame| retail_frame % 2 == 1)
+}
+
+pub(crate) type ReachVolume = (Vec2, f32, Option<mint_sage_combat::BoxVolume>);
+
+pub(crate) fn in_range_volumes(
+    shooter: ReachVolume,
+    target: ReachVolume,
+    extra: f32,
+    min_range: f32,
+    max_range: f32,
+) -> bool {
+    let distance_squared = mint_sage_combat::border_distance_squared(
+        (shooter.0.x, shooter.0.y),
+        shooter.1,
+        shooter.2.as_ref(),
+        (target.0.x, target.0.y),
+        target.1,
+        target.2.as_ref(),
     );
-    within_attack_range(distance_squared, min_range, max_range)
+    within_attack_range(distance_squared + extra * extra, min_range, max_range)
 }
 
 pub(crate) fn target_allowed(mask: mint_sage_combat::AntiMask, foe: &Foe) -> bool {
@@ -610,6 +763,10 @@ pub(crate) fn class_allowed(
     mask.contains(mint_sage_combat::AntiMask::GROUND)
 }
 
+pub(crate) fn auto_acquirable(relation: mint_sage_combat::victim::Relation) -> bool {
+    matches!(relation, mint_sage_combat::victim::Relation::Enemies)
+}
+
 pub(crate) fn combat_victim(foe: &Foe) -> mint_sage_combat::Victim {
     let mut kind_of = mint_sage_asset::KindOf::NONE;
     if foe.unattackable {
@@ -629,7 +786,7 @@ pub(crate) fn combat_victim(foe: &Foe) -> mint_sage_combat::Victim {
     }
 }
 
-pub(crate) const MOOD_ATTACK_CHECK: LogicFrames = LogicFrames::from_milliseconds(500);
+pub(crate) const MOOD_ATTACK_CHECK: LogicFrames = mint_sage_modules::retail_duration_ticks(500);
 
 pub(crate) fn staggered_first_acquire(entity: Entity, now: Frame) -> Frame {
     let cadence = MOOD_ATTACK_CHECK.get();
@@ -648,15 +805,19 @@ pub(crate) struct GuardRanges {
     pub(crate) enemy_scan: LogicFrames,
     pub(crate) return_scan: LogicFrames,
     pub(crate) repulsed_distance: f32,
+    pub(crate) enable_repulsors: bool,
+    pub(crate) crushes_infantry: bool,
 }
 
 impl Default for GuardRanges {
     fn default() -> Self {
         Self {
-            chase: LogicFrames::from_milliseconds(15_000),
-            enemy_scan: LogicFrames::from_milliseconds(500),
-            return_scan: LogicFrames::from_milliseconds(1_000),
+            chase: mint_sage_modules::retail_duration_ticks(15_000),
+            enemy_scan: mint_sage_modules::retail_duration_ticks(500),
+            return_scan: mint_sage_modules::retail_duration_ticks(1_000),
             repulsed_distance: 120.0,
+            enable_repulsors: true,
+            crushes_infantry: true,
         }
     }
 }
@@ -693,8 +854,9 @@ pub(crate) fn read_guard_ranges(
         ranges.repulsed_distance = value;
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let frames =
-        |value: f32| LogicFrames::from_milliseconds(value.min(f32::from(u16::MAX) * 1000.0) as u32);
+    let frames = |value: f32| {
+        mint_sage_modules::retail_duration_ticks(value.min(f32::from(u16::MAX) * 1000.0) as u32)
+    };
     if let Some(value) = number("GuardChaseUnitsDuration") {
         ranges.chase = frames(value);
     }
@@ -703,6 +865,20 @@ pub(crate) fn read_guard_ranges(
     }
     if let Some(value) = number("GuardEnemyReturnScanRate") {
         ranges.return_scan = frames(value);
+    }
+    if let Some(field) = block.field("EnableRepulsors") {
+        read = read.saturating_add(1);
+        match field.value().and_then(mint_sage_ini::value::parse_bool) {
+            Some(value) => ranges.enable_repulsors = value,
+            None => errors.field("AIData", field, "Yes or No"),
+        }
+    }
+    if let Some(field) = block.field("AICrushesInfantry") {
+        read = read.saturating_add(1);
+        match field.value().and_then(mint_sage_ini::value::parse_bool) {
+            Some(value) => ranges.crushes_infantry = value,
+            None => errors.field("AIData", field, "Yes or No"),
+        }
     }
     (ranges, read)
 }
@@ -713,14 +889,12 @@ pub(crate) struct IdleScan {
     pub(crate) pursues: bool,
     pub(crate) structures: bool,
     pub(crate) cadence: LogicFrames,
-    pub(crate) shape: mint_sage_shroud::VisionShape,
     pub(crate) retaliate_only: bool,
 }
 
 impl IdleScan {
-    pub(crate) fn finds(&self, from: Vec2, radius: f32, to: Vec2, to_radius: f32) -> bool {
-        let fraction = self.shape.fraction(to.x - from.x, to.y - from.y);
-        in_range(from, radius, to, to_radius, 0.0, self.reach * fraction)
+    pub(crate) fn finds(&self, from: ReachVolume, to: ReachVolume) -> bool {
+        in_range_volumes(from, to, 0.0, 0.0, self.reach)
     }
 }
 
@@ -735,7 +909,6 @@ pub(crate) struct ScanInput {
     pub(crate) height_bonus: f32,
     pub(crate) mood_check_ms: Option<f32>,
     pub(crate) computer: bool,
-    pub(crate) shape: mint_sage_shroud::VisionShape,
     pub(crate) attitude: i8,
     pub(crate) ranges: priority::AttitudeRanges,
 }
@@ -768,8 +941,7 @@ pub(crate) fn idle_scan(input: ScanInput) -> Option<IdleScan> {
         reach,
         pursues: true,
         structures: input.computer || input.flags.contains(AutoAcquire::ATTACK_BUILDINGS),
-        cadence: LogicFrames::from_milliseconds(cadence_ms),
-        shape: input.shape,
+        cadence: mint_sage_modules::retail_duration_ticks(cadence_ms),
         retaliate_only: input.attitude == ATTITUDE_PASSIVE,
     })
 }
@@ -1096,6 +1268,8 @@ pub(crate) fn crush_damage_events(
                 nugget: 0,
                 accepts_add: true,
                 bonuses_applied: false,
+                force_kill: false,
+                drain_life: 0.0,
             })
         })
         .collect()
@@ -1106,17 +1280,19 @@ pub(crate) struct FireResult {
     pub(crate) damage: Vec<DamageEvent>,
     pub(crate) projectiles: Vec<PendingProjectile>,
     pub(crate) delayed: Vec<u16>,
+    pub(crate) travelling: Vec<(DamageEvent, u32)>,
     pub(crate) dots: Vec<DotHit>,
     pub(crate) modifiers: Vec<(Entity, usize)>,
     pub(crate) knockbacks: Vec<(Entity, usize)>,
     pub(crate) projectiles_unaimed: usize,
     pub(crate) creation_lists: Vec<usize>,
-    pub(crate) slave_attacks: Vec<Entity>,
+    pub(crate) slave_attacks: Vec<Option<Entity>>,
     pub(crate) conditions: Vec<(Entity, usize)>,
     pub(crate) emotion_pulses: Vec<(Entity, usize)>,
     pub(crate) gates_opened: Vec<Entity>,
     pub(crate) money_stolen: Vec<(Entity, usize)>,
     pub(crate) grabs: Vec<(Entity, usize)>,
+    pub(crate) paralyses: Vec<(Entity, usize)>,
     pub(crate) unmodelled: Vec<usize>,
     pub(crate) fire_lightings: Vec<usize>,
 }
@@ -1145,6 +1321,8 @@ pub(crate) struct PendingProjectile {
     pub(crate) speed: f32,
     pub(crate) source: WeaponId,
     pub(crate) nugget: u16,
+    pub(crate) launch_slot: Option<mint_sage_combat::WeaponSlot>,
+    pub(crate) always_attack_offset: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1245,6 +1423,10 @@ impl Aim {
 
 pub(crate) trait Judge {
     fn judge(&self, nugget: usize, candidate: Entity, primary: bool) -> Option<f32>;
+
+    fn force_kills(&self, _nugget: usize, _candidate: Entity) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1293,16 +1475,60 @@ fn bounding_sphere_radius(foe: &Foe) -> f32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    Cylinder,
+    Sphere,
+    Overlap,
+}
+
+impl Reach {
+    pub(crate) fn of_nugget(cylinder_aoe: bool, radius: f32) -> Self {
+        if cylinder_aoe {
+            Self::Cylinder
+        } else if radius < 10.0 {
+            Self::Sphere
+        } else {
+            Self::Overlap
+        }
+    }
+}
+
+fn overlaps_cylinder(centre: Point3, radius: f32, foe: &Foe) -> bool {
+    let (dx, dy) = (centre.x - foe.position.x, centre.y - foe.position.y);
+    let horizontal = ((dx * dx + dy * dy).sqrt() - foe.radius).max(0.0);
+    let top = foe.z + foe.height;
+    let vertical = if centre.z < foe.z {
+        foe.z - centre.z
+    } else if centre.z > top {
+        centre.z - top
+    } else {
+        0.0
+    };
+    horizontal * horizontal + vertical * vertical <= radius * radius
+}
+
 fn in_radius(
     others: impl Iterator<Item = Foe>,
     centre: Vec2,
     centre_height: f32,
     radius: f32,
+    mode: Reach,
 ) -> Vec<(u32, Entity)> {
+    let _perf = crate::perf::sub(crate::perf::sub_row!("area_victims"));
     let here = Point3::new(centre.x, centre.y, centre_height);
     let mut hit: Vec<(u32, Entity)> = others
+        .filter(|foe| !foe.enclosed)
         .filter(|foe| {
             let there = Point3::new(foe.position.x, foe.position.y, foe.z + foe.height * 0.5);
+            match mode {
+                Reach::Cylinder => {
+                    let reach = radius + foe.radius;
+                    return here.distance_squared_2d(there) <= reach * reach;
+                }
+                Reach::Overlap => return overlaps_cylinder(here, radius, foe),
+                Reach::Sphere => {}
+            }
             let reach = radius + bounding_sphere_radius(foe);
             let reached = here.distance_squared_3d(there) <= reach * reach;
             if here.distance_squared_2d(there) <= reach * reach {
@@ -1336,9 +1562,21 @@ where
     I: Iterator<Item = Foe>,
 {
     if shot.victim.is_none() {
-        in_radius(others, shot.centre, shot.centre_height, radius.max(1.0))
+        in_radius(
+            others,
+            shot.centre,
+            shot.centre_height,
+            radius.max(1.0),
+            Reach::Sphere,
+        )
     } else if radius > 0.0 {
-        in_radius(others, shot.centre, shot.centre_height, radius)
+        in_radius(
+            others,
+            shot.centre,
+            shot.centre_height,
+            radius,
+            Reach::Sphere,
+        )
     } else {
         primary.map(|v| (v.index(), v)).into_iter().collect()
     }
@@ -1404,8 +1642,13 @@ where
                     } else {
                         damage.radius
                     };
-                    let reached =
-                        in_radius(others.clone(), shot.centre, shot.centre_height, radius);
+                    let reached = in_radius(
+                        others.clone(),
+                        shot.centre,
+                        shot.centre_height,
+                        radius,
+                        Reach::of_nugget(damage.shape.cylinder_aoe, radius),
+                    );
                     crate::diag::diag!(
                         "weapon: damage Radius={:.0} at ({:.0},{:.0}) reached {}                          (surface distance, each victim's own sphere added)",
                         radius,
@@ -1421,10 +1664,52 @@ where
                     let Some(scalar) = judge.judge(index, entity, Some(entity) == primary) else {
                         continue;
                     };
-                    result.damage.push(DamageEvent {
+                    let mut amount = damage.damage;
+                    let mut travel = 0_u32;
+                    if damage.shape != DamageShape::default() {
+                        let Some(foe) = others.clone().find(|foe| foe.entity == entity) else {
+                            continue;
+                        };
+                        let (dx, dy) = (
+                            foe.position.x - shot.centre.x,
+                            foe.position.y - shot.centre.y,
+                        );
+                        let flat = (dx * dx + dy * dy).sqrt();
+                        if flat < damage.shape.min_radius
+                            || damage
+                                .shape
+                                .max_height
+                                .is_some_and(|max| foe.z - shot.origin.z > max)
+                        {
+                            continue;
+                        }
+                        if let (Some(rim), true) = (damage.shape.taper_off, damage.radius > 0.0) {
+                            let min = damage.shape.min_radius;
+                            let span = damage.radius - min;
+                            let t = if span > 0.0 {
+                                (flat.clamp(min, damage.radius) - min) / span
+                            } else {
+                                1.0
+                            };
+                            amount = damage.damage - t * (damage.damage - rim);
+                        }
+                        if damage.shape.speed > 0.0 {
+                            let from = foe.position;
+                            let (sx, sy, sz) = (
+                                from.x - shot.origin.x,
+                                from.y - shot.origin.y,
+                                foe.z - shot.origin.z,
+                            );
+                            let far = (sx * sx + sy * sy + sz * sz).sqrt();
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let frames = (far / damage.shape.speed) as u32;
+                            travel = frames;
+                        }
+                    }
+                    let event = DamageEvent {
                         victim: entity,
                         attacker,
-                        amount: damage.damage,
+                        amount,
                         damage_type: damage.damage_type,
                         scalar: damage.damage_scalar * scalar,
                         fx_type: combat.damage_fx_types.for_hit(weapon.index(), index),
@@ -1437,7 +1722,18 @@ where
                         nugget: u16::try_from(index).unwrap_or(u16::MAX),
                         accepts_add: damage.accepts_add,
                         bonuses_applied: false,
-                    });
+                        force_kill: judge.force_kills(index, entity),
+                        drain_life: if damage.shape.drain_life {
+                            damage.shape.drain_multiplier
+                        } else {
+                            0.0
+                        },
+                    };
+                    if travel > 0 {
+                        result.travelling.push((event, travel));
+                    } else {
+                        result.damage.push(event);
+                    }
                 }
             }
             Nugget::Dot(dot) => {
@@ -1462,6 +1758,8 @@ where
                         nugget: u16::try_from(index).unwrap_or(u16::MAX),
                         accepts_add: dot.accepts_add,
                         bonuses_applied: false,
+                        force_kill: false,
+                        drain_life: 0.0,
                     });
                     result.dots.push(DotHit {
                         victim: entity,
@@ -1513,6 +1811,8 @@ where
                     to,
                     speed: template.launch_speed(range.length()),
                     source: weapon,
+                    launch_slot: projectile.launch_slot,
+                    always_attack_offset: projectile.always_attack_offset,
                     nugget: match u16::try_from(index) {
                         Ok(nugget) => nugget,
                         Err(_) => continue,
@@ -1532,6 +1832,7 @@ where
                         shot.centre,
                         shot.centre_height,
                         impact.radius,
+                        Reach::Sphere,
                     )
                 } else {
                     primary.map(|v| (v.index(), v)).into_iter().collect()
@@ -1548,18 +1849,27 @@ where
             Nugget::Unmodelled(_) => {
                 let reached = |radius: f32| -> Vec<(u32, Entity)> {
                     if radius > 0.0 {
-                        in_radius(others.clone(), shot.centre, shot.centre_height, radius)
+                        in_radius(
+                            others.clone(),
+                            shot.centre,
+                            shot.centre_height,
+                            radius,
+                            Reach::Sphere,
+                        )
                     } else {
                         primary.map(|v| (v.index(), v)).into_iter().collect()
                     }
                 };
                 match combat.effects.get(weapon.index(), index) {
                     Some(EffectNugget::WeaponOcl(_)) => result.creation_lists.push(index),
-                    Some(EffectNugget::SlaveAttack) => {
-                        if let Some(victim) = primary {
-                            result.slave_attacks.push(victim);
+                    Some(EffectNugget::SlaveAttack) => match primary {
+                        Some(victim) => {
+                            if judge.judge(index, victim, true).is_some() {
+                                result.slave_attacks.push(Some(victim));
+                            }
                         }
-                    }
+                        None => result.slave_attacks.push(None),
+                    },
                     Some(EffectNugget::SpecialModelCondition(_)) => {
                         for (_, entity) in reached(0.0) {
                             if judge
@@ -1608,12 +1918,30 @@ where
                         }
                     }
                     Some(EffectNugget::FireLogic(_)) => result.fire_lightings.push(index),
+                    Some(EffectNugget::Paralyze(nugget)) => {
+                        let primary_hit = primary
+                            .filter(|victim| judge.judge(index, *victim, true).is_some())
+                            .into_iter();
+                        let area = if nugget.radius > 0.0 {
+                            reached(nugget.radius)
+                        } else {
+                            Vec::new()
+                        };
+                        let area = area.into_iter().map(|(_, entity)| entity).filter(|entity| {
+                            Some(*entity) != primary && judge.judge(index, *entity, false).is_some()
+                        });
+                        for entity in primary_hit.chain(area) {
+                            result.paralyses.push((entity, index));
+                        }
+                    }
                     Some(
                         EffectNugget::HordeAttack(_)
-                        | EffectNugget::Paralyze(_)
-                        | EffectNugget::SpawnAndFade(_),
+                        | EffectNugget::SpawnAndFade(_)
+                        | EffectNugget::DamageContained(_),
                     )
-                    | None => result.unmodelled.push(index),
+                    | None => {
+                        result.unmodelled.push(index);
+                    }
                 }
             }
         }
@@ -1621,12 +1949,8 @@ where
     result
 }
 
-pub(crate) fn launch_point(position: Vec2, feet: f32, height: f32) -> Point3 {
-    Point3::new(
-        position.x,
-        position.y,
-        feet + height * LAUNCH_HEIGHT_FRACTION,
-    )
+pub(crate) fn launch_point(position: Vec2, feet: f32) -> Point3 {
+    Point3::new(position.x, position.y, feet)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

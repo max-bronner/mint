@@ -2,16 +2,18 @@ use thiserror::Error as ThisError;
 
 pub mod device;
 pub mod engine;
+pub mod loopback;
 pub mod mixer;
 #[cfg(windows)]
 mod mpeg;
 pub mod offline;
+pub mod tap;
 
 #[cfg(windows)]
 mod wasapi;
 
-pub use device::{Device, DeviceFormat, Source};
-pub use engine::AudioEngine;
+pub use device::{Device, DeviceFormat, DeviceStats, Source};
+pub use engine::{AudioEngine, PendingClip};
 pub use mixer::{
     Admission, Clip, CullReason, EventKey, Listener, Mixer, MixerConfig, MixerStats, Play,
     Priority, Rolloff, Spatial, VoiceId, MAX_BUSES,

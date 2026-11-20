@@ -1,6 +1,7 @@
 use super::*;
 use mint_sage_combat::{DamageNugget, DotNugget, ModifierNugget, WeaponTemplate};
 use mint_sim::World;
+mod area_tests;
 
 fn entities(count: u32) -> Vec<Entity> {
     let mut world = World::new();
@@ -18,7 +19,9 @@ fn foe_at(entity: Entity, x: f32, y: f32) -> Foe {
         airborne: None,
         unattackable: false,
         not_autoacquirable: false,
+        enclosed: false,
         ai_kind_of: None,
+        volume: None,
     }
 }
 
@@ -196,6 +199,35 @@ fn target_allowed_checks_the_airborne_category_instead_of_ground() {
 }
 
 #[test]
+fn a_member_wind_up_waits_out_an_odd_retail_frame() {
+    assert!(!on_odd_retail_frame(5, 6));
+    assert!(on_odd_retail_frame(6, 6));
+    assert!(on_odd_retail_frame(11, 6));
+    assert!(!on_odd_retail_frame(12, 6));
+}
+
+#[test]
+fn a_box_victim_is_reached_across_its_side_not_its_bounding_circle() {
+    let e = entities(1);
+    let wall = Foe {
+        volume: Some(mint_sage_combat::BoxVolume {
+            major: 50.0,
+            minor: 10.0,
+            cos: 1.0,
+            sin: 0.0,
+        }),
+        radius: 51.0,
+        ..foe_at(e[0], 0.0, 0.0)
+    };
+    let from = |at: Vec2, min: f32, max: f32| {
+        in_range_volumes((at, 5.0, None), wall.reach_volume(), 0.0, min, max)
+    };
+    assert!(from(Vec2::new(0.0, 60.0), 0.0, 45.0));
+    assert!(!from(Vec2::new(0.0, 60.0), 0.0, 44.0));
+    assert!(from(Vec2::new(60.0, 0.0), 0.0, 5.0));
+}
+
+#[test]
 fn range_is_measured_surface_to_surface_rather_than_centre_to_centre() {
     let here = Vec2::new(0.0, 0.0);
     assert!(in_range(here, 5.0, Vec2::new(110.0, 0.0), 5.0, 0.0, 100.0));
@@ -294,6 +326,8 @@ fn damage_events_are_ordered_by_victim_then_attacker_then_nugget_then_amount() {
         nugget,
         accepts_add: true,
         bonuses_applied: false,
+        force_kill: false,
+        drain_life: 0.0,
     };
     let mut events = [
         event(5, 2, 0, 10.0),
@@ -346,6 +380,7 @@ fn a_per_shot_weapon_winds_up_once_and_then_fires() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -362,6 +397,8 @@ fn a_per_shot_weapon_winds_up_once_and_then_fires() {
         next_acquire: Frame::ZERO,
         reacquire_ready: None,
         squish_reacquire: false,
+        position_shot: None,
+        last_shot_horde: None,
     };
     let mut fired_on = Vec::new();
     for frame in 0..24u64 {
@@ -411,6 +448,7 @@ fn a_per_attack_weapon_winds_up_for_its_first_shot_at_a_target_it_walked_to() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -428,6 +466,8 @@ fn a_per_attack_weapon_winds_up_for_its_first_shot_at_a_target_it_walked_to() {
         next_acquire: Frame::ZERO,
         reacquire_ready: None,
         squish_reacquire: false,
+        position_shot: None,
+        last_shot_horde: None,
     };
     let mut rng = mint_sim::Pcg32::new(1);
     let mut fired_on = Vec::new();
@@ -472,6 +512,7 @@ fn a_projectile_weapon_launches_rather_than_damaging_immediately() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -488,6 +529,8 @@ fn a_projectile_weapon_launches_rather_than_damaging_immediately() {
                     projectile_template: Some("Arrow".to_owned()),
                     warhead: "Warhead".to_owned(),
                     requires_upgrade: false,
+                    launch_slot: None,
+                    always_attack_offset: None,
                 })],
                 ..WeaponTemplate::default()
             },
@@ -499,7 +542,7 @@ fn a_projectile_weapon_launches_rather_than_damaging_immediately() {
         &combat,
         bow,
         shooter,
-        launch_point(Vec2::new(0.0, 0.0), 0.0, 18.0),
+        launch_point(Vec2::new(0.0, 0.0), 0.0),
         target,
         Vec2::new(200.0, 0.0),
         18.0,
@@ -547,6 +590,7 @@ fn a_missed_shot_strikes_no_one_and_its_projectile_flies_to_the_landing() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -561,6 +605,8 @@ fn a_missed_shot_strikes_no_one_and_its_projectile_flies_to_the_landing() {
                     projectile_template: Some("Arrow".to_owned()),
                     warhead: "Blade".to_owned(),
                     requires_upgrade: false,
+                    launch_slot: None,
+                    always_attack_offset: None,
                 })],
                 ..WeaponTemplate::default()
             },
@@ -614,11 +660,15 @@ fn two_nuggets_sharing_a_warhead_are_still_told_apart() {
                         projectile_template: Some("GoodFactionArrow".to_owned()),
                         warhead: "Head".to_owned(),
                         requires_upgrade: false,
+                        launch_slot: None,
+                        always_attack_offset: None,
                     }),
                     Nugget::Projectile(mint_sage_combat::ProjectileNugget {
                         projectile_template: Some("EvilFactionArrow".to_owned()),
                         warhead: "Head".to_owned(),
                         requires_upgrade: false,
+                        launch_slot: None,
+                        always_attack_offset: None,
                     }),
                 ],
                 ..WeaponTemplate::default()
@@ -630,7 +680,7 @@ fn two_nuggets_sharing_a_warhead_are_still_told_apart() {
         &combat,
         bow,
         e[0],
-        launch_point(Vec2::new(0.0, 0.0), 0.0, 18.0),
+        launch_point(Vec2::new(0.0, 0.0), 0.0),
         e[1],
         Vec2::new(100.0, 0.0),
         18.0,
@@ -663,11 +713,15 @@ fn a_nugget_requiring_an_upgrade_does_not_fire() {
                         projectile_template: Some("Arrow".to_owned()),
                         warhead: "Head".to_owned(),
                         requires_upgrade: false,
+                        launch_slot: None,
+                        always_attack_offset: None,
                     }),
                     Nugget::Projectile(mint_sage_combat::ProjectileNugget {
                         projectile_template: Some("FireArrow".to_owned()),
                         warhead: "Head".to_owned(),
                         requires_upgrade: true,
+                        launch_slot: None,
+                        always_attack_offset: None,
                     }),
                 ],
                 ..WeaponTemplate::default()
@@ -679,7 +733,7 @@ fn a_nugget_requiring_an_upgrade_does_not_fire() {
         &combat,
         bow,
         e[0],
-        launch_point(Vec2::new(0.0, 0.0), 0.0, 18.0),
+        launch_point(Vec2::new(0.0, 0.0), 0.0),
         e[1],
         Vec2::new(100.0, 0.0),
         18.0,
@@ -714,6 +768,7 @@ fn an_area_nugget_hits_every_body_in_the_radius_once_in_index_order() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -763,6 +818,7 @@ fn an_area_nugget_misses_a_primary_victim_outside_its_radius() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -813,6 +869,7 @@ fn a_shot_with_no_victim_still_hits_by_area_with_its_radius_floored_at_one() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -856,8 +913,8 @@ fn a_shot_with_no_victim_gives_its_dot_and_modifier_nuggets_the_target_on_the_sp
                         damage: 5.0,
                         damage_type: poison,
                         radius: 0.0,
-                        interval: LogicFrames::from_milliseconds(1000),
-                        duration: LogicFrames::from_milliseconds(10_000),
+                        interval: LogicFrames::from_engine_milliseconds(1000),
+                        duration: LogicFrames::from_engine_milliseconds(10_000),
                         death_type: None,
                         sub_type: None,
                         requires_upgrade: false,
@@ -866,6 +923,10 @@ fn a_shot_with_no_victim_gives_its_dot_and_modifier_nuggets_the_target_on_the_sp
                     Nugget::Modifier(ModifierNugget {
                         list: String::from("Root"),
                         radius: 0.0,
+                        affect_horde_members: false,
+                        damage_arc: None,
+                        anti_categories: Vec::new(),
+                        anti_fx: None,
                     }),
                 ],
                 ..WeaponTemplate::default()
@@ -925,6 +986,7 @@ fn an_area_nugget_does_not_double_hit_a_victim_already_present_in_others() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -973,6 +1035,7 @@ fn a_delayed_nugget_lands_later_rather_than_on_the_firing_frame() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -1007,7 +1070,6 @@ fn an_idle_scan_reaches_plain_vision_for_either_owner() {
             computer,
             attitude: 0,
             ranges: priority::AttitudeRanges::default(),
-            shape: mint_sage_shroud::VisionShape::ROUND,
         })
         .expect("a unit with vision scans");
         assert!(
@@ -1034,7 +1096,6 @@ fn an_attitude_changes_what_a_computer_units_idle_scan_reaches() {
             computer: true,
             attitude,
             ranges: priority::AttitudeRanges::default(),
-            shape: mint_sage_shroud::VisionShape::ROUND,
         })
     };
     assert!(scan(ATTITUDE_SLEEP).is_none() && scan(ATTITUDE_PEACEFUL).is_none());
@@ -1057,7 +1118,6 @@ fn only_the_idle_scan_needs_auto_acquire_yes() {
         computer: false,
         attitude: 0,
         ranges: priority::AttitudeRanges::default(),
-        shape: mint_sage_shroud::VisionShape::ROUND,
     };
     assert!(idle_scan(input(true)).is_none());
     assert!(idle_scan(input(false)).is_some());
@@ -1116,6 +1176,7 @@ fn a_hit_carries_the_nuggets_own_death_and_sub_type() {
                     flanking_bonus: 0.0,
                     requires_upgrade: false,
                     accepts_add: true,
+                    shape: Default::default(),
                 })],
                 ..WeaponTemplate::default()
             },
@@ -1147,23 +1208,23 @@ fn an_area_gather_on_a_slope_leaves_out_a_victim_high_above_the_blast() {
             ..foe_at(above, 8.0, 0.0)
         },
     ];
-    let reached = in_radius(foes.into_iter(), Vec2::ZERO, 0.0, 10.0);
+    let reached = in_radius(foes.into_iter(), Vec2::ZERO, 0.0, 10.0, Reach::Sphere);
     assert_eq!(reached, vec![(below.index(), below)]);
 }
 
 #[test]
-fn a_foe_behind_a_short_sighted_rear_is_not_found_where_one_in_front_is() {
+fn a_foe_behind_the_scanner_is_found_at_the_same_reach_as_one_in_front() {
     let scan = crate::combat::IdleScan {
         reach: 300.0,
         pursues: true,
         structures: false,
-        cadence: LogicFrames::from_milliseconds(2000),
-        shape: mint_sage_shroud::VisionShape::new(1.0, 0.0, 0.35, 0.25),
+        cadence: LogicFrames::from_engine_milliseconds(2000),
         retaliate_only: false,
     };
     let here = Vec2::new(0.0, 0.0);
-    assert!(scan.finds(here, 0.0, Vec2::new(180.0, 0.0), 0.0));
-    assert!(!scan.finds(here, 0.0, Vec2::new(-180.0, 0.0), 0.0));
+    assert!(scan.finds((here, 0.0, None), (Vec2::new(180.0, 0.0), 0.0, None)));
+    assert!(scan.finds((here, 0.0, None), (Vec2::new(-270.0, 0.0), 0.0, None)));
+    assert!(!scan.finds((here, 0.0, None), (Vec2::new(-330.0, 0.0), 0.0, None)));
 }
 
 fn ranked(
@@ -1234,10 +1295,12 @@ fn a_chain_modifier_adds_to_the_set_priority_and_minus_one_excludes() {
     let foes = [
         Foe {
             ai_kind_of: Some(AiKindOf::Structure),
+            volume: None,
             ..foe_at(structure, 300.0, 0.0)
         },
         Foe {
             ai_kind_of: Some(AiKindOf::Creep),
+            volume: None,
             ..foe_at(unit, 30.0, 0.0)
         },
     ];
@@ -1248,6 +1311,7 @@ fn a_chain_modifier_adds_to_the_set_priority_and_minus_one_excludes() {
 
     let walls = [Foe {
         ai_kind_of: Some(AiKindOf::Wall),
+        volume: None,
         ..foe_at(structure, 5.0, 0.0)
     }];
     let loud = priority::PrioritySet {
@@ -1481,6 +1545,8 @@ fn a_raised_weapon_bonus_shortens_the_wind_up_and_the_shot_delay() {
             next_acquire: Frame::ZERO,
             reacquire_ready: None,
             squish_reacquire: false,
+            position_shot: None,
+            last_shot_horde: None,
         };
         let mut rng = mint_sim::Pcg32::new(1);
         (0..32u64)
@@ -1503,4 +1569,25 @@ fn a_raised_weapon_bonus_shortens_the_wind_up_and_the_shot_delay() {
         (shots(0), shots(mint_sage_combat::BonusConditions::VETERAN)),
         (vec![10, 30], vec![5, 15, 25])
     );
+}
+
+#[test]
+fn an_absent_damage_rung_takes_the_global_ratio_only_under_use_default_damage_settings() {
+    let record = |use_default: Option<bool>, really: Option<f32>| mint_sage_modules::ObjectRecord {
+        max_health: Some(150.0),
+        max_health_damaged: Some(75.0),
+        max_health_really_damaged: really,
+        use_default_damage_settings: use_default,
+        ..Default::default()
+    };
+    let global = DamageThresholds {
+        damaged: 0.65,
+        really: 0.4,
+    };
+    let rung = |record: &mint_sage_modules::ObjectRecord| {
+        DamageThresholds::of(Some(record), global).rung(30.0 / 150.0)
+    };
+    assert_eq!(rung(&record(Some(false), None)), DamageRung::Damaged);
+    assert_eq!(rung(&record(None, None)), DamageRung::ReallyDamaged);
+    assert_eq!(rung(&record(None, Some(0.0))), DamageRung::ReallyDamaged);
 }

@@ -7,6 +7,7 @@ use crate::effects::{Effect, EffectLog, Name, PowerPlace};
 use crate::special_ability_update::{
     ability_data_from_fields, cap_persistent_count, AbilityTarget, AbilityUpdate, Trigger,
 };
+use crate::world_reads::ArrowStormShots;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrowStormTrigger {
@@ -18,16 +19,43 @@ pub struct ArrowStormTrigger {
     can_shoot_empty_ground: bool,
 }
 
+fn place_of(target: AbilityTarget) -> PowerPlace {
+    match target {
+        AbilityTarget::Object(target) => PowerPlace::Object(target),
+        AbilityTarget::Position(x, y) => PowerPlace::At(x, y),
+        AbilityTarget::None => PowerPlace::Source,
+    }
+}
+
 impl Trigger for ArrowStormTrigger {
+    fn prepare(&self, entity: Entity, target: AbilityTarget, ctx: &mut UpdateContext<'_>) {
+        let Some(log) = ctx.effects.get::<EffectLog>() else {
+            return;
+        };
+        log.push(
+            entity,
+            Effect::ArrowStormPrepare {
+                at: place_of(target),
+                radius: self.radius,
+                shots_per_target: self.shots_per_target,
+                max_shots: self.max_shots,
+            },
+        );
+    }
+
+    fn ends_cast_after_fire(&self, entity: Entity, ctx: &UpdateContext<'_>) -> bool {
+        !self.can_shoot_empty_ground
+            && ctx
+                .reads
+                .get::<ArrowStormShots>()
+                .is_some_and(|shots| shots.left(entity) < self.shots_per_burst)
+    }
+
     fn fire(&self, entity: Entity, target: AbilityTarget, ctx: &mut UpdateContext<'_>) {
         let Some(log) = ctx.effects.get::<EffectLog>() else {
             return;
         };
-        let at = match target {
-            AbilityTarget::Object(target) => PowerPlace::Object(target),
-            AbilityTarget::Position(x, y) => PowerPlace::At(x, y),
-            AbilityTarget::None => PowerPlace::Source,
-        };
+        let at = place_of(target);
         log.push(
             entity,
             Effect::ArrowStorm {

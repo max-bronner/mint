@@ -13,6 +13,7 @@ pub struct AiPowerContext {
     pub rng_unit: f32,
     pub victim_distance: Option<f32>,
     pub weapon_is_melee: bool,
+    pub victim_excluded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,6 +80,7 @@ mod tests {
         rng_unit: 0.0,
         victim_distance: None,
         weapon_is_melee: false,
+        victim_excluded: false,
     };
 
     #[test]

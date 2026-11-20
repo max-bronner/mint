@@ -204,6 +204,7 @@ fn bar_view(world: &mut mint_sim::World, x: f32, y: f32) -> UnitView {
         moving: false,
         health: Some(1.0),
         dying: false,
+        created: 0,
         visibility: mint_sage_shroud::ObjectVisibility::Clear,
         speed: 0.0,
         weapon_cycle: 0.0,
@@ -333,6 +334,33 @@ fn an_infantry_unit_needs_the_all_health_bars_option() {
         ..selected
     };
     assert!(bars_with(&[unselected], 400.0, None, true, HealthBarStyle::Health).is_empty());
+}
+
+#[test]
+fn hovering_one_soldier_draws_that_soldiers_bar_only() {
+    let mut world = mint_sim::World::new();
+    let soldier = |world: &mut mint_sim::World, x: f32| UnitView {
+        selected: false,
+        kind_of: mint_sage_asset::KindOf::SELECTABLE.union(mint_sage_asset::KindOf::INFANTRY),
+        ..bar_view(world, x, 0.0)
+    };
+    let group = [
+        soldier(&mut world, -20.0),
+        soldier(&mut world, 0.0),
+        soldier(&mut world, 20.0),
+    ];
+    let hovered = group[1].entity;
+    let drawn = bars_with(&group, 400.0, Some(hovered), true, HealthBarStyle::Health);
+    assert_eq!(drawn.len(), 6, "one bar is six quads");
+    let selected = group.map(|unit| UnitView {
+        selected: true,
+        ..unit
+    });
+    assert_eq!(
+        bars_with(&selected, 400.0, None, true, HealthBarStyle::Health).len(),
+        18,
+        "a selected group draws every member's bar"
+    );
 }
 
 #[test]
@@ -549,6 +577,7 @@ fn a_unit_the_predicate_refuses_is_drawn_in_a_different_colour() {
         moving: false,
         health: None,
         dying: false,
+        created: 0,
         visibility: mint_sage_shroud::ObjectVisibility::Clear,
         speed: 0.0,
         weapon_cycle: 0.0,
@@ -621,4 +650,34 @@ fn the_caption_size_is_the_floored_width_scaled_point_size() {
     assert_eq!(caption_text_px(12.0, 1536), 18);
     assert_eq!(caption_text_px(12.0, 1920), 22);
     assert_eq!(caption_text_px(12.0, 800), 9);
+}
+
+#[test]
+fn a_loop_section_runs_from_the_loop_start_and_closes_on_it() {
+    let points: Vec<[f32; 3]> = (0..4).map(|i| [i as f32, 0.0, 0.0]).collect();
+    let split = super::queue_lines::sections(&points, Some(1));
+    assert_eq!(split.len(), 2);
+    assert!(!split[0].looped && split[1].looped);
+    assert_eq!(split[0].points, points[..2]);
+    assert_eq!(
+        split[1].points,
+        [points[1], points[2], points[3], points[1]]
+    );
+}
+
+#[test]
+fn the_loop_line_crawls_by_one_minus_the_fraction_of_a_second() {
+    let art = super::queue_lines::QueueArt::untextured();
+    let line = |looped| super::queue_lines::Section {
+        points: Vec::new(),
+        looped,
+    };
+    let active = super::queue_lines::style(&line(false), &art, 12.25);
+    let looped = super::queue_lines::style(&line(true), &art, 12.25);
+    assert_eq!(active.uv_offset, [0.0, 0.0]);
+    assert_eq!(looped.uv_offset, [0.0, 0.75]);
+    for style in [active, looped] {
+        assert_eq!(style.tile, 4.0);
+        assert_eq!(style.depth_test, mint_render::DepthTest::Always);
+    }
 }

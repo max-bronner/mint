@@ -11,7 +11,7 @@ use crate::diag::diag;
 use crate::horde::Horde;
 use crate::unit::Kind;
 
-const BANNER_RESPAWN_QUIET: LogicFrames = LogicFrames::from_milliseconds(4000);
+const BANNER_RESPAWN_QUIET: LogicFrames = LogicFrames::from_engine_milliseconds(4000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HordeCombat(pub(crate) Frame);
@@ -120,7 +120,7 @@ impl RotwkRules {
         }) {
             return Ok(());
         }
-        if super::upgrades::is_moving(tick, ids, source) {
+        if super::upgrades::is_moving(tick, ids, source) || self.awaiting_path(tick, ids, source) {
             return Ok(());
         }
         if self.has_negative_emotion(tick.state(), ids, source) {
@@ -134,18 +134,51 @@ impl RotwkRules {
             else {
                 return Ok(());
             };
-            if tick.state().contains(ids.attack_order, horde) {
+            if Self::holds_attack(tick.state(), ids, source) {
                 return Ok(());
             }
             self.regrow_one(tick, ids, horde, pulse, true)?;
             return Ok(());
         };
         for horde in self.hordes_within(tick, ids, source, radius) {
-            if self.regrow_one(tick, ids, horde, pulse, false)? && !pulse.all_nearby {
+            let short = tick
+                .state()
+                .get(ids.horde, horde)
+                .is_some_and(|found| !found.free.is_empty());
+            self.regrow_one(tick, ids, horde, pulse, false)?;
+            if short && !pulse.all_nearby {
                 break;
             }
         }
         Ok(())
+    }
+
+    pub(super) fn regrow_hordes_near(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        source: Entity,
+        radius: f32,
+        fx: Option<&Name>,
+    ) -> Result<()> {
+        let pulse = Replenishment {
+            melee_free: LogicFrames::ZERO,
+            fx,
+            nearby: None,
+            all_nearby: true,
+            upgrade_required: &UpgradeMask::EMPTY,
+        };
+        for horde in self.hordes_within(tick, ids, source, radius) {
+            self.regrow_one(tick, ids, horde, &pulse, false)?;
+        }
+        Ok(())
+    }
+
+    fn awaiting_path(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> bool {
+        let mover = self.approach_mover(tick, ids, entity);
+        tick.state()
+            .store(ids.path_queue)
+            .is_some_and(|store| store.iter().any(|(_, queue)| queue.contains(mover)))
     }
 
     fn hordes_within(&self, tick: &Tick<'_>, ids: Ids, source: Entity, radius: f32) -> Vec<Entity> {
@@ -164,7 +197,11 @@ impl RotwkRules {
             .filter_map(|(horde, members)| {
                 let position = world.get(ids.body, horde).map(|body| body.0.position)?;
                 let member = members.members.first().copied()?;
-                if world.get(ids.owner, member).map(|owner| owner.0) != Some(owner) {
+                let theirs = world.get(ids.owner, member).map(|owner| owner.0)?;
+                if (theirs != owner && !self.object_allied(world, source, member))
+                    || world.contains(ids.construction, horde)
+                    || world.contains(ids.construction, member)
+                {
                     return None;
                 }
                 let away = position.minus(at);
@@ -229,6 +266,7 @@ impl RotwkRules {
             horde_entity.index(),
             tick.frame().get()
         );
+        self.reform_horde(tick, ids, horde_entity)?;
         if let (Some(list), Some(at)) = (
             pulse.fx,
             tick.state().get(ids.body, spawned).map(|b| b.0.position),
@@ -434,8 +472,57 @@ impl RotwkRules {
         horde.free.retain(|free| *free != slot);
         horde.dirty = true;
         tick.state_mut().insert(ids.horde, horde_entity, horde)?;
-        self.propagate_rank(tick, ids, horde_entity)?;
+        self.raise_member_to_horde(tick, ids, horde_entity, spawned)?;
+        self.seat_from_pool(tick, ids, horde_entity, spawned)?;
+        self.inherit_from_horde(tick, ids, horde_entity, spawned)?;
         Ok(Some(spawned))
+    }
+
+    fn inherit_from_horde(
+        &self,
+        tick: &mut Tick<'_>,
+        ids: Ids,
+        horde_entity: Entity,
+        member: Entity,
+    ) -> Result<()> {
+        let now = tick.frame();
+        if let Some(upgrades) = tick
+            .state()
+            .get(ids.object_upgrades, horde_entity)
+            .map(|held| held.0.clone())
+        {
+            self.grant_object_upgrades(tick, ids, member, &upgrades)?;
+        }
+        let held = tick
+            .state()
+            .get(ids.timed_modifiers, horde_entity)
+            .map(|timed| timed.0.clone())
+            .unwrap_or_default();
+        for (list, end) in held {
+            let until = if end <= now { Frame::FOREVER } else { end };
+            self.give_timed_list(tick, ids, member, list, until)?;
+        }
+        let lifetimes = tick
+            .state()
+            .get(ids.lifetime, horde_entity)
+            .copied()
+            .zip(tick.state().get(ids.lifetime, member).copied());
+        if let Some((horde, own)) =
+            lifetimes.filter(|(horde, own)| horde.set_at.is_some() && own.set_at.is_some())
+        {
+            let left = horde.dies_at.get().saturating_sub(now.get()).max(1);
+            let dies_at = Frame::new(now.get().saturating_add(left));
+            tick.state_mut().insert(
+                ids.lifetime,
+                member,
+                crate::summons::Lifetime {
+                    dies_at,
+                    death: own.death,
+                    set_at: Some(now),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn standing_pose(&self, origin: Vec2, facing: Facing, offset: Vec2) -> Vec2 {

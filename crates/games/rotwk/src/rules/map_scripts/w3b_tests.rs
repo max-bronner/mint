@@ -79,6 +79,7 @@ pub(super) fn number(value: i32) -> Parameter {
 pub(super) fn act(name: &str, params: Vec<Parameter>) -> ScriptAction {
     ScriptAction {
         action_type: 0,
+        enabled: true,
         name: name.to_owned(),
         params,
     }
@@ -105,6 +106,7 @@ pub(super) fn script(
         or_conditions: vec![OrCondition {
             conditions: vec![Condition {
                 condition_type: 0,
+                inverted: false,
                 enabled: true,
                 name: condition_name.to_owned(),
                 params,
@@ -464,6 +466,62 @@ fn named_attack_named_orders_the_attacker_onto_the_target() {
         Some(named(&sim, "Victim")),
         "{order:?}"
     );
+}
+
+#[test]
+fn an_attack_move_to_a_named_object_follows_it_when_it_walks_off() {
+    let objects = [
+        placed("Zapper", "Hitter", (40.0, 120.0), P0),
+        placed("Bystander", "Victim", (200.0, 120.0), P1),
+    ];
+    let scripts = vec![script(
+        "Go",
+        None,
+        vec![
+            act(
+                "ATTACK_MOVE_TEAM_TO_NAMED_OBJECT",
+                vec![text("teamPlayer_1"), text("Victim")],
+            ),
+            act("MOVE_NAMED_UNIT_TO", vec![text("Victim"), text("Far")]),
+        ],
+    )];
+    let sim = simulate(DATA, &objects, scripts, 900);
+    let ids = sim.rules().ids().unwrap();
+    let at = |name: &str| {
+        sim.state()
+            .get(ids.body, named(&sim, name))
+            .unwrap()
+            .0
+            .position
+    };
+    let gap = at("Hitter").minus(at("Victim")).length();
+    assert!(gap < 40.0, "the hitter stopped {gap} from the victim");
+}
+
+#[test]
+fn an_attack_move_to_a_named_object_ends_when_the_object_is_gone() {
+    let objects = [
+        placed("Zapper", "Hitter", (40.0, 120.0), P0),
+        placed("Bystander", "Victim", (300.0, 120.0), P1),
+    ];
+    let scripts = vec![script(
+        "Go",
+        None,
+        vec![
+            act(
+                "ATTACK_MOVE_TEAM_TO_NAMED_OBJECT",
+                vec![text("teamPlayer_1"), text("Victim")],
+            ),
+            act("NAMED_KILL", vec![text("Victim")]),
+        ],
+    )];
+    let sim = simulate(DATA, &objects, scripts, 300);
+    let ids = sim.rules().ids().unwrap();
+    let hitter = named(&sim, "Hitter");
+    let held = sim.state().contains(ids.attack_move_order, hitter);
+    let at = sim.state().get(ids.body, hitter).unwrap().0.position;
+    assert!(!held, "the attack-move should have failed");
+    assert!(at.x < 120.0, "the hitter walked to {at:?}");
 }
 
 const NEAREST_DATA: &str = "\

@@ -83,6 +83,7 @@ impl Component for PassiveAreaEffectBehavior {
 }
 
 impl ModuleKind for PassiveAreaEffectBehavior {
+    const UPDATES_UNDER: u32 = crate::disabled_masks::NEVER;
     const CAPABILITIES: CapabilityMask = CapabilityMask::single(Capability::Update)
         .union(CapabilityMask::single(Capability::Upgrade));
 
@@ -135,6 +136,7 @@ impl ModuleKind for PassiveAreaEffectBehavior {
                         nonstackable: data.nonstackable,
                         skip_recently_damaged: true,
                         fx_always: true,
+                        rules: crate::effects::HealerRules::default(),
                     },
                 );
             }

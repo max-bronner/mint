@@ -239,6 +239,158 @@ fn an_interrupting_request_replaces_the_oldest_instance() {
     assert_eq!(mixer.active(), 1, "the older one was replaced, not added");
 }
 
+fn largest_step(out: &[f32], before: f32) -> f32 {
+    let mut last = before;
+    let mut largest = 0.0f32;
+    for sample in out.iter().step_by(2) {
+        largest = largest.max((sample - last).abs());
+        last = *sample;
+    }
+    largest
+}
+
+fn sounding(config: MixerConfig, key: u32, limit: u16) -> (Mixer, VoiceId, f32) {
+    let mut mixer = Mixer::new(config);
+    let mut loud = Play::new(flat(48_000, 16384, 48_000), EventKey(key));
+    loud.limit = limit;
+    loud.looping = true;
+    let Admission::Started(id) = mixer.play(loud) else {
+        panic!("the first voice must start")
+    };
+    let mut out = vec![0.0f32; 2 * 480];
+    mixer.render(&mut out, 2, 48_000);
+    let level = out[out.len() - 2];
+    assert!(level > 0.3);
+    (mixer, id, level)
+}
+
+#[test]
+fn a_replaced_voice_ramps_to_silence_instead_of_stopping_mid_swing() {
+    let (mut mixer, _, level) = sounding(MixerConfig::default(), 7, 1);
+    let mut quiet = Play::new(flat(48_000, 0, 48_000), EventKey(7));
+    quiet.limit = 1;
+    quiet.interrupt = true;
+    assert!(matches!(mixer.play(quiet), Admission::Started(_)));
+    let mut out = vec![0.0f32; 2 * 480];
+    mixer.render(&mut out, 2, 48_000);
+    assert!(largest_step(&out, level) < 0.01, "no step at the cut");
+    assert_eq!(out[out.len() - 2], 0.0, "silent within the callback");
+}
+
+#[test]
+fn a_gain_change_is_spread_across_the_next_callback() {
+    let (mut mixer, _, level) = sounding(MixerConfig::default(), 1, 0);
+    mixer.set_bus_gain(0, 0.0);
+    let mut out = vec![0.0f32; 2 * 480];
+    mixer.render(&mut out, 2, 48_000);
+    assert!(largest_step(&out, level) < 0.01, "no step at the boundary");
+    assert!(near(out[out.len() - 2], 0.0), "at the new gain by its end");
+}
+
+#[test]
+fn a_fading_voice_frees_its_limit_and_its_channel_at_once() {
+    let (mut mixer, id, _) = sounding(tiny_budget(), 7, 1);
+    let mut other = Play::new(flat(48_000, 16384, 48_000), EventKey(8));
+    other.priority = Priority::Lowest;
+    assert!(matches!(mixer.play(other), Admission::Started(_)));
+    mixer.stop(id);
+
+    let mut again = Play::new(flat(48_000, 16384, 48_000), EventKey(7));
+    again.limit = 1;
+    assert!(
+        matches!(mixer.play(again), Admission::Started(_)),
+        "a non-interrupting replay of a Limit 1 event starts while the stopped one fades"
+    );
+    let mut third = Play::new(flat(48_000, 16384, 48_000), EventKey(9));
+    third.priority = Priority::Lowest;
+    assert_eq!(
+        mixer.play(third),
+        Admission::Culled(CullReason::NoFreeVoice),
+        "the two live voices fill the budget; the fading one is not counted"
+    );
+    assert_eq!(mixer.stats().culled_limit, 0);
+    assert_eq!(mixer.active(), 2);
+}
+
+#[test]
+fn a_fading_voice_answers_to_no_id_key_or_owner() {
+    let mut mixer = Mixer::new(MixerConfig::default());
+    let mut line = Play::new(flat(48_000, 16384, 48_000), EventKey(3));
+    line.owner = Some(42);
+    line.exclusive_owner = true;
+    let Admission::Started(first) = mixer.play(line.clone()) else {
+        panic!("the first line must start")
+    };
+    let mut out = vec![0.0f32; 2 * 480];
+    mixer.render(&mut out, 2, 48_000);
+    mixer.stop_owner_key(42, EventKey(3));
+    assert!(
+        !mixer.is_live(first),
+        "a stopped voice is not live while it fades"
+    );
+
+    let Admission::Started(second) = mixer.play(line) else {
+        panic!("the emitter is free the moment its line is stopped")
+    };
+    mixer.stop(first);
+    mixer.stop_owner(7);
+    assert!(mixer.is_live(second), "the old voice's id reaches nothing");
+    assert_eq!(mixer.stats().culled_owner, 0);
+}
+
+#[test]
+fn an_interrupt_still_counts_only_live_voices() {
+    let mut mixer = Mixer::new(MixerConfig::default());
+    let mut out = vec![0.0f32; 2 * 480];
+    for _ in 0..6 {
+        let mut step = Play::new(flat(48_000, 16384, 48_000), EventKey(5));
+        step.limit = 2;
+        step.interrupt = true;
+        assert!(matches!(mixer.play(step), Admission::Started(_)));
+        mixer.render(&mut out, 2, 48_000);
+        assert!(mixer.active() <= 2);
+    }
+    assert_eq!(mixer.active(), 2);
+    assert_eq!(mixer.stats().started, 6);
+    assert_eq!(
+        mixer.stats().finished,
+        4,
+        "each request past the limit replaced exactly one"
+    );
+    assert_eq!(mixer.stats().culled(), 0);
+}
+
+#[test]
+fn a_stopped_loop_ends_and_never_sounds_again() {
+    let (mut mixer, id, _) = sounding(MixerConfig::default(), 4, 0);
+    mixer.stop(id);
+    let mut out = vec![0.0f32; 2 * 480];
+    mixer.render(&mut out, 2, 48_000);
+    for _ in 0..200 {
+        mixer.render(&mut out, 2, 48_000);
+        assert!(out.iter().all(|s| *s == 0.0), "silent after its 5 ms ramp");
+    }
+    assert!(mixer.releasing.is_empty());
+    assert_eq!(mixer.stats().started, 1);
+}
+
+#[test]
+fn a_held_loop_plays_once_and_carries_on() {
+    let mut mixer = Mixer::new(MixerConfig::default());
+    let mut looped = Play::new(flat(4_800, 16384, 48_000), EventKey(2));
+    looped.looping = true;
+    looped.limit = 3;
+    assert!(matches!(mixer.play(looped), Admission::Started(_)));
+    let mut out = vec![0.0f32; 2 * 480];
+    for _ in 0..100 {
+        mixer.render(&mut out, 2, 48_000);
+        assert!(out[out.len() - 2] > 0.3, "sounding through every wrap");
+    }
+    assert_eq!(mixer.stats().started, 1);
+    assert_eq!(mixer.stats().finished, 0);
+    assert_eq!(mixer.active(), 1);
+}
+
 #[test]
 fn one_voice_per_emitter_unless_it_interrupts() {
     let mut mixer = Mixer::new(MixerConfig::default());
@@ -489,14 +641,16 @@ fn a_paused_voice_holds_its_place_and_a_faded_one_ends() {
     let mut out = vec![0.0f32; 2 * 10];
     mixer.render(&mut out, 2, 1000);
     mixer.pause(id, 0);
+    let mut declick = vec![0.0f32; 2 * 5];
+    mixer.render(&mut declick, 2, 1000);
     let mut held = vec![0.0f32; 2 * 500];
     mixer.render(&mut held, 2, 1000);
     assert!(held.iter().all(|s| *s == 0.0), "silent while held");
     assert!(mixer.is_live(id), "held, not ended");
     mixer.resume(id, 0);
-    let mut back = vec![0.0f32; 2 * 89];
+    let mut back = vec![0.0f32; 2 * 70];
     mixer.render(&mut back, 2, 1000);
-    assert!(mixer.is_live(id), "90 of 100 frames played");
+    assert!(mixer.is_live(id), "85 of 100 frames played");
     mixer.fade_out(id, 5);
     let mut tail = vec![0.0f32; 2 * 8];
     mixer.render(&mut tail, 2, 1000);

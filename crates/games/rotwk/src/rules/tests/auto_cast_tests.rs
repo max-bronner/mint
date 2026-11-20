@@ -8,9 +8,6 @@ ModifierList Rage\n  Category = SPELL\n  Modifier = DAMAGE_MULT 150%\n  Duration
 CommandSet AutoSet\n  1 = Fire_Rage\nEnd\n\
 CommandButton Fire_Rage\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityRage\n  \
   AutoAbility = Yes\nEnd\n\
-CommandSet AutoEnemySet\n  1 = Fire_Rage_Enemy\nEnd\n\
-CommandButton Fire_Rage_Enemy\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityRage\n  \
-  AutoAbility = Yes\n  Options = NEED_TARGET_ENEMY_OBJECT\nEnd\n\
 CommandSet AutoRangedSet\n  1 = Fire_Rage_Ranged\nEnd\n\
 CommandButton Fire_Rage_Ranged\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityRage\n  \
   AutoAbility = Yes\n  PresetRange = 200\nEnd\n\
@@ -26,17 +23,67 @@ Object AutoCasterOn\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet 
     Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
   Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
-Object AutoCasterEnemyOnly\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoEnemySet\n  \
+Object AutoCasterTwoModules\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = DualAutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_AutoA\n    SpecialAbility = SpecialAbilityRage\n    Query = 1 ALL\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_AutoB\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object AutoCasterPair\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoSet\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
     Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
-  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 2 ALL\n    MaxScanRange = 200\n    \
+    StartsActive = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+CommandSet TriggerSet\n  1 = Fire_Rage_Trigger\nEnd\n\
+CommandButton Fire_Rage_Trigger\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityRage\n  \
+  AutoAbility = Yes\n  TriggerWhenReady = Yes\nEnd\n\
+Object AutoCasterTrigger\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = TriggerSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    StartsActive = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object AutoCasterVision\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 100\n  \
+  CommandSet = AutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL ENEMIES\n    StartsActive = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+CommandSet ForbiddenSet\n  1 = Buy_Boost\n  2 = Fire_Rage\nEnd\n\
+Object AutoCasterForbidden\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = ForbiddenSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
+  Behavior = StatusBitsUpgrade Tag_Status\n    TriggeredBy = Upgrade_Boost\n    StatusToSet = DO_NOT_PICK_ME\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL ENEMIES\n    MaxScanRange = 200\n    \
+    ForbiddenStatus = DO_NOT_PICK_ME\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object AutoCasterFree\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL ENEMIES\n    MaxScanRange = 200\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+CommandSet DominateAutoSet\n  1 = Cast_Dominate_Auto\nEnd\n\
+CommandButton Cast_Dominate_Auto\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityDominate\n  \
+  AutoAbility = Yes\n  Options = NEED_TARGET_ENEMY_OBJECT\nEnd\n\
+SpecialPower SpecialAbilityDominate\n  ReloadTime = 0\nEnd\n\
+Object AutoDominator\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 400\n  \
+  CommandSet = DominateAutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Stick\n  End\n  \
+  Behavior = DominateEnemySpecialPower Tag_Dom\n    SpecialPowerTemplate = SpecialAbilityDominate\n    \
+    DominateRadius = 200\n    AttributeModifierAffects = ALL ENEMIES\n    \
+    PermanentlyConvert = Yes\n    IgnoreFacingCheck = Yes\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object AutoCasterRanged\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoRangedSet\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
     Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
-  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL ENEMIES\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object Nearby\n  Side = Mordor\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
@@ -49,6 +96,7 @@ CommandButton Fire_Frenzy_Dual\n  Command = SPECIAL_POWER\n  SpecialPower = Spec
   AutoAbility = Yes\nEnd\n\
 Object AutoCasterDual\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = DualAutoSet\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 CommandSet AutoPosSet\n  1 = Fire_Rage_Pos\nEnd\n\
 CommandButton Fire_Rage_Pos\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityRage\n  \
@@ -87,7 +135,7 @@ Object AutoCasterDamaged\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  Comman
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
     Duration = 3000\n    AttributeModifier = Rage\n  End\n  \
-  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    MaxScanRange = 200\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object DamageableTarget\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
@@ -104,6 +152,20 @@ Object AutoCasterGated\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandS
   Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
   Behavior = ModelConditionUpgrade Tag_Boost\n    TriggeredBy = Upgrade_Boost\n    \
     AddConditionFlags = BOOSTED\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object LockArmed\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Stick\n    Weapon = SECONDARY Stick\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n    LockWeaponSlot = SECONDARY\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object LockUnarmed\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  CommandSet = AutoSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  WeaponSet\n    Conditions = None\n    Weapon = PRIMARY Stick\n  End\n  \
+  Behavior = WeaponModeSpecialPowerUpdate Tag_Rage\n    SpecialPowerTemplate = SpecialAbilityRage\n    \
+    Duration = 3000\n    AttributeModifier = Rage\n    LockWeaponSlot = SECONDARY\n  End\n  \
+  Behavior = AutoAbilityBehavior Tag_Auto\n    Query = 1 ALL\n    StartsActive = Yes\n  End\n  \
   Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n";
 
 struct Match {
@@ -120,7 +182,13 @@ fn load() -> Match {
     let seeds: Vec<String> = [
         "AutoCasterOff",
         "AutoCasterOn",
-        "AutoCasterEnemyOnly",
+        "AutoCasterPair",
+        "AutoCasterTwoModules",
+        "AutoCasterTrigger",
+        "AutoCasterVision",
+        "AutoCasterForbidden",
+        "AutoCasterFree",
+        "AutoDominator",
         "AutoCasterRanged",
         "AutoCasterDual",
         "AutoCasterPos",
@@ -130,6 +198,8 @@ fn load() -> Match {
         "AutoCasterDamaged",
         "DamageableTarget",
         "AutoCasterGated",
+        "LockArmed",
+        "LockUnarmed",
         "Nearby",
     ]
     .into_iter()
@@ -195,6 +265,37 @@ fn only_of(simulation: &Simulation<RotwkRules>, ids: Ids, kind: Kind) -> Entity 
     found[0]
 }
 
+fn all_of(simulation: &Simulation<RotwkRules>, ids: Ids, kind: Kind) -> Vec<Entity> {
+    let mut found: Vec<Entity> = simulation
+        .state()
+        .store(ids.kind)
+        .unwrap()
+        .iter()
+        .filter(|(_, k)| **k == kind)
+        .map(|(entity, _)| entity)
+        .collect();
+    found.sort_unstable_by_key(|entity| entity.index());
+    found
+}
+
+fn on(simulation: &Simulation<RotwkRules>, ids: Ids, entity: Entity) -> bool {
+    simulation
+        .rules()
+        .autocast_on(simulation.state(), ids, entity, "SpecialAbilityRage")
+}
+
+fn select(simulation: &mut Simulation<RotwkRules>, units: Vec<Entity>) {
+    simulation
+        .submit(
+            PLAYER,
+            RotwkCommand::SetSelection {
+                replace: true,
+                units,
+            },
+        )
+        .unwrap();
+}
+
 #[test]
 fn auto_cast_is_off_until_enabled() {
     let m = load();
@@ -246,43 +347,121 @@ fn auto_cast_is_off_until_enabled() {
 }
 
 #[test]
-fn an_enemy_only_button_is_not_auto_cast_on_an_ally() {
+fn a_bare_block_aims_at_the_closest_enemy_not_the_closest_object() {
     let m = load();
-    let kind = m.kinds.kind("AutoCasterEnemyOnly").unwrap();
-    let mut allied = simulation(
+    let kind = m.kinds.kind("AutoDominator").unwrap();
+    let nearby = m.kinds.kind("Nearby").unwrap();
+    let mut simulation = simulation(
         &m,
         &[
-            ("AutoCasterEnemyOnly", 100.0, 100.0, PLAYER),
+            ("AutoDominator", 100.0, 100.0, PLAYER),
+            ("Nearby", 150.0, 100.0, PLAYER),
+            ("Nearby", 200.0, 100.0, OTHER),
+        ],
+    );
+    let ids = simulation.rules().ids().unwrap();
+    let _ = only_of(&simulation, ids, kind);
+    let enemy = all_of(&simulation, ids, nearby)[1];
+    for _ in 0..120 {
+        simulation.tick().unwrap();
+    }
+    assert_eq!(
+        simulation
+            .state()
+            .get(ids.owner, enemy)
+            .map(|owner| owner.0),
+        Some(PLAYER),
+        "the enemy, not the nearer ally, was the target"
+    );
+}
+
+#[test]
+fn a_query_count_includes_the_caster() {
+    let m = load();
+    let kind = m.kinds.kind("AutoCasterPair").unwrap();
+    let mut simulation = simulation(
+        &m,
+        &[
+            ("AutoCasterPair", 100.0, 100.0, PLAYER),
             ("Nearby", 150.0, 100.0, PLAYER),
         ],
     );
-    let ids = allied.rules().ids().unwrap();
-    let caster = only_of(&allied, ids, kind);
+    let ids = simulation.rules().ids().unwrap();
+    let caster = only_of(&simulation, ids, kind);
     for _ in 0..10 {
-        allied.tick().unwrap();
+        simulation.tick().unwrap();
     }
-    assert_eq!(
-        damage_mult(&allied, ids, caster),
-        1.0,
-        "the only candidate is an ally - an enemy-only button must not fire on it"
-    );
+    assert!((damage_mult(&simulation, ids, caster) - 1.5).abs() < 1e-6);
+}
 
-    let mut hostile = simulation(
+#[test]
+fn an_unranged_block_scans_the_casters_vision_range() {
+    let m = load();
+    let kind = m.kinds.kind("AutoCasterVision").unwrap();
+    let run = |enemy_at: f32| {
+        let mut simulation = simulation(
+            &m,
+            &[
+                ("AutoCasterVision", 100.0, 100.0, PLAYER),
+                ("Nearby", 100.0 + enemy_at, 100.0, OTHER),
+            ],
+        );
+        let ids = simulation.rules().ids().unwrap();
+        let caster = only_of(&simulation, ids, kind);
+        for _ in 0..10 {
+            simulation.tick().unwrap();
+        }
+        damage_mult(&simulation, ids, caster)
+    };
+    assert_eq!(run(150.0), 1.0, "past the vision range of 100");
+    assert!((run(80.0) - 1.5).abs() < 1e-6, "inside the vision range");
+}
+
+#[test]
+fn forbidden_status_is_read_on_the_caster() {
+    let m = load();
+    let forbidden = m.kinds.kind("AutoCasterForbidden").unwrap();
+    let free = m.kinds.kind("AutoCasterFree").unwrap();
+    let mut simulation = simulation(
         &m,
         &[
-            ("AutoCasterEnemyOnly", 100.0, 100.0, PLAYER),
+            ("AutoCasterForbidden", 100.0, 100.0, PLAYER),
+            ("AutoCasterFree", 100.0, 200.0, PLAYER),
             ("Nearby", 150.0, 100.0, OTHER),
+            ("Nearby", 150.0, 200.0, OTHER),
         ],
     );
-    let ids = hostile.rules().ids().unwrap();
-    let caster = only_of(&hostile, ids, kind);
-    for _ in 0..10 {
-        hostile.tick().unwrap();
+    let ids = simulation.rules().ids().unwrap();
+    let forbidden = only_of(&simulation, ids, forbidden);
+    let free = only_of(&simulation, ids, free);
+    select(&mut simulation, vec![forbidden, free]);
+    simulation
+        .submit(PLAYER, RotwkCommand::ObjectUpgrade { button: 0 })
+        .unwrap();
+    for _ in 0..40 {
+        simulation.tick().unwrap();
     }
-    assert!(
-        (damage_mult(&hostile, ids, caster) - 1.5).abs() < 1e-6,
-        "an enemy is now present - the enemy-only button must fire on it"
-    );
+    simulation
+        .submit(PLAYER, RotwkCommand::ToggleAutoCast { button: 0 })
+        .unwrap();
+    for _ in 0..60 {
+        simulation.tick().unwrap();
+    }
+    assert!((damage_mult(&simulation, ids, free) - 1.5).abs() < 1e-6);
+    assert_eq!(damage_mult(&simulation, ids, forbidden), 1.0);
+}
+
+#[test]
+fn trigger_when_ready_casts_without_a_target() {
+    let m = load();
+    let kind = m.kinds.kind("AutoCasterTrigger").unwrap();
+    let mut simulation = simulation(&m, &[("AutoCasterTrigger", 100.0, 100.0, PLAYER)]);
+    let ids = simulation.rules().ids().unwrap();
+    let caster = only_of(&simulation, ids, kind);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    assert!((damage_mult(&simulation, ids, caster) - 1.5).abs() < 1e-6);
 }
 
 #[test]
@@ -293,7 +472,7 @@ fn an_unranged_block_scans_the_buttons_preset_range() {
         &m,
         &[
             ("AutoCasterRanged", 100.0, 100.0, PLAYER),
-            ("Nearby", 2_100.0, 100.0, PLAYER),
+            ("Nearby", 2_100.0, 100.0, OTHER),
         ],
     );
     let ids = far.rules().ids().unwrap();
@@ -310,7 +489,7 @@ fn an_unranged_block_scans_the_buttons_preset_range() {
         &m,
         &[
             ("AutoCasterRanged", 100.0, 100.0, PLAYER),
-            ("Nearby", 250.0, 100.0, PLAYER),
+            ("Nearby", 250.0, 100.0, OTHER),
         ],
     );
     let ids = near.rules().ids().unwrap();
@@ -344,26 +523,24 @@ fn enabling_a_second_button_takes_the_slot_from_the_first() {
         .submit(PLAYER, RotwkCommand::ToggleAutoCast { button: 0 })
         .unwrap();
     simulation.tick().unwrap();
-    assert_eq!(
-        simulation
-            .rules()
-            .autocast_holder(simulation.state(), ids, entity)
-            .as_deref(),
-        Some("specialabilityrage"),
+    assert!(
+        on(&simulation, ids, entity),
         "the first button took the slot"
     );
     simulation
         .submit(PLAYER, RotwkCommand::ToggleAutoCast { button: 1 })
         .unwrap();
     simulation.tick().unwrap();
-    assert_eq!(
-        simulation
-            .rules()
-            .autocast_holder(simulation.state(), ids, entity)
-            .as_deref(),
-        Some("specialabilityfrenzy"),
+    assert!(
+        !on(&simulation, ids, entity),
         "the second button took the slot from the first"
     );
+    assert!(simulation.rules().autocast_on(
+        simulation.state(),
+        ids,
+        entity,
+        "SpecialAbilityFrenzy"
+    ));
 }
 
 #[test]
@@ -386,19 +563,13 @@ fn toggling_the_holder_off_leaves_the_slot_empty() {
         .submit(PLAYER, RotwkCommand::ToggleAutoCast { button: 0 })
         .unwrap();
     simulation.tick().unwrap();
-    assert!(simulation
-        .rules()
-        .autocast_holder(simulation.state(), ids, entity)
-        .is_some());
+    assert!(on(&simulation, ids, entity));
     simulation
         .submit(PLAYER, RotwkCommand::ToggleAutoCast { button: 0 })
         .unwrap();
     simulation.tick().unwrap();
-    assert_eq!(
-        simulation
-            .rules()
-            .autocast_holder(simulation.state(), ids, entity),
-        None,
+    assert!(
+        !on(&simulation, ids, entity),
         "the holder's own button turns the slot off"
     );
 }
@@ -642,7 +813,7 @@ fn need_damaged_target_refuses_an_undamaged_candidate_then_fires_once_hurt() {
 }
 
 #[test]
-fn enable_on_model_condition_gates_the_scan_until_the_upgrade_sets_it() {
+fn a_failed_button_gate_switches_the_module_off_until_toggled_again() {
     let m = load();
     let kind = m.kinds.kind("AutoCasterGated").unwrap();
     let mut simulation = simulation(
@@ -657,11 +828,75 @@ fn enable_on_model_condition_gates_the_scan_until_the_upgrade_sets_it() {
     for _ in 0..10 {
         simulation.tick().unwrap();
     }
+    assert_eq!(damage_mult(&simulation, ids, caster), 1.0, "gate closed");
+    assert!(
+        !on(&simulation, ids, caster),
+        "the failed gate cleared the switch"
+    );
+    select(&mut simulation, vec![caster]);
+    simulation
+        .submit(PLAYER, RotwkCommand::ObjectUpgrade { button: 0 })
+        .unwrap();
+    for _ in 0..80 {
+        simulation.tick().unwrap();
+    }
     assert_eq!(
         damage_mult(&simulation, ids, caster),
         1.0,
-        "EnableOnModelCondition must refuse the scan before BOOSTED is held"
+        "BOOSTED is held now, but the switch stays off"
     );
+    simulation
+        .submit(PLAYER, RotwkCommand::ToggleAutoCast { button: 0 })
+        .unwrap();
+    for _ in 0..40 {
+        simulation.tick().unwrap();
+    }
+    assert!((damage_mult(&simulation, ids, caster) - 1.5).abs() < 1e-6);
+}
+
+#[test]
+fn each_module_keeps_its_own_active_button() {
+    let m = load();
+    let kind = m.kinds.kind("AutoCasterTwoModules").unwrap();
+    let mut simulation = simulation(&m, &[("AutoCasterTwoModules", 100.0, 100.0, PLAYER)]);
+    let ids = simulation.rules().ids().unwrap();
+    let entity = only_of(&simulation, ids, kind);
+    select(&mut simulation, vec![entity]);
+    for button in [0, 1] {
+        simulation
+            .submit(PLAYER, RotwkCommand::ToggleAutoCast { button })
+            .unwrap();
+        simulation.tick().unwrap();
+    }
+    let both = ["SpecialAbilityRage", "SpecialAbilityFrenzy"]
+        .iter()
+        .all(|power| {
+            simulation
+                .rules()
+                .autocast_on(simulation.state(), ids, entity, power)
+        });
+    assert!(
+        both,
+        "the configured module serves one power, the bare module the other"
+    );
+}
+
+#[test]
+fn one_held_flag_of_several_opens_enable_and_closes_disable() {
+    let m = load();
+    let kind = m.kinds.kind("AutoCasterGated").unwrap();
+    let mut simulation = simulation(&m, &[("AutoCasterGated", 100.0, 100.0, PLAYER)]);
+    let ids = simulation.rules().ids().unwrap();
+    let caster = only_of(&simulation, ids, kind);
+    let flags = ["USER_1".to_owned(), "BOOSTED".to_owned()];
+    let gate = |simulation: &Simulation<RotwkRules>, enable: &[String], disable: &[String]| {
+        simulation
+            .rules()
+            .model_condition_gate(simulation.state(), caster, enable, disable)
+    };
+    simulation.tick().unwrap();
+    assert!(!gate(&simulation, &flags, &[]), "nothing held yet");
+    assert!(gate(&simulation, &[], &flags));
     simulation
         .submit(
             PLAYER,
@@ -674,11 +909,41 @@ fn enable_on_model_condition_gates_the_scan_until_the_upgrade_sets_it() {
     simulation
         .submit(PLAYER, RotwkCommand::ObjectUpgrade { button: 0 })
         .unwrap();
-    for _ in 0..80 {
+    for _ in 0..40 {
         simulation.tick().unwrap();
     }
-    assert!(
-        (damage_mult(&simulation, ids, caster) - 1.5).abs() < 1e-6,
-        "once BOOSTED is held the auto-cast must fire"
+    assert!(gate(&simulation, &flags, &[]), "BOOSTED alone opens it");
+    assert!(!gate(&simulation, &[], &flags), "BOOSTED alone closes it");
+}
+
+#[test]
+fn a_weapon_lock_closes_its_condition_gate_only_on_an_armed_slot() {
+    let m = load();
+    let armed = m.kinds.kind("LockArmed").unwrap();
+    let unarmed = m.kinds.kind("LockUnarmed").unwrap();
+    let mut simulation = simulation(
+        &m,
+        &[
+            ("LockArmed", 100.0, 100.0, PLAYER),
+            ("LockUnarmed", 100.0, 200.0, PLAYER),
+            ("Nearby", 150.0, 100.0, PLAYER),
+            ("Nearby", 150.0, 200.0, PLAYER),
+        ],
     );
+    let ids = simulation.rules().ids().unwrap();
+    let armed = only_of(&simulation, ids, armed);
+    let unarmed = only_of(&simulation, ids, unarmed);
+    for _ in 0..10 {
+        simulation.tick().unwrap();
+    }
+    let lock = ["WEAPONLOCK_SECONDARY".to_owned()];
+    let open = |entity: Entity| {
+        simulation
+            .rules()
+            .model_condition_gate(simulation.state(), entity, &[], &lock)
+    };
+    assert!((damage_mult(&simulation, ids, armed) - 1.5).abs() < 1e-6);
+    assert!(!open(armed), "the locked slot's condition closes the gate");
+    assert!((damage_mult(&simulation, ids, unarmed) - 1.5).abs() < 1e-6);
+    assert!(open(unarmed), "an empty slot refuses the lock");
 }

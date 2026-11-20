@@ -7,8 +7,8 @@ use mint_sim::{
 };
 
 use crate::effects::{
-    build_modifier_rule, names, CreateLocation, Effect, EffectLog, ModifierFieldValues,
-    ModifierRule, Name, PowerPlace, WeatherKind,
+    build_modifier_rule, names, recipient_rule, CreateLocation, Effect, EffectLog,
+    ModifierFieldValues, ModifierRule, Name, PowerPlace, WeatherKind,
 };
 use crate::object_filter::ObjectFilter;
 
@@ -33,7 +33,7 @@ fn weather_duration(fields: &dyn ModuleFieldSource) -> mint_sim::LogicFrames {
         .min(86_400_000.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let whole = ms as u32;
-    mint_sim::LogicFrames::from_milliseconds(whole)
+    crate::special_ability_update::retail_duration_ticks(whole)
 }
 
 fn change_weather(fields: &dyn ModuleFieldSource) -> Result<Option<WeatherKind>, FieldError> {
@@ -86,6 +86,8 @@ struct OclData {
     power: Name,
     list: Name,
     location: CreateLocation,
+    upgrade_lists: Vec<(Name, Name)>,
+    grants: Vec<Name>,
     fx: Option<Name>,
     re_enable: bool,
     weather: Option<WeatherKind>,
@@ -127,15 +129,24 @@ impl ModuleKind for OclSpecialPower {
                 },
             );
         }
-        push(
-            ctx,
-            Effect::CreateObjects {
-                list: Name::clone(&self.0.list),
-                location: self.0.location.clone(),
-                at: PowerPlace::of(activation),
-                from: crate::effects::OclFrom::Location,
-            },
-        );
+        let create = Effect::CreateObjects {
+            list: Name::clone(&self.0.list),
+            location: self.0.location.clone(),
+            at: PowerPlace::of(activation),
+            from: crate::effects::OclFrom::Location,
+        };
+        if self.0.upgrade_lists.is_empty() && self.0.grants.is_empty() {
+            push(ctx, create);
+        } else {
+            push(
+                ctx,
+                Effect::UpgradedCreateObjects {
+                    create: Box::new(create),
+                    upgrade_lists: self.0.upgrade_lists.clone(),
+                    grants: self.0.grants.clone(),
+                },
+            );
+        }
     }
 }
 
@@ -175,10 +186,26 @@ pub fn ocl_special_power_from_fields(
         .field("CreateLocation")
         .map_or(CreateLocation::AtEdgeNearSource, CreateLocation::parse);
     let location = refine_create_location(location, fields);
+    let upgrade_lists = fields
+        .field_args_each("UpgradeOCL")
+        .into_iter()
+        .filter_map(|pair| match pair.as_slice() {
+            [upgrade, list, ..] => Some((Name::from(*upgrade), Name::from(*list))),
+            _ => None,
+        })
+        .collect();
+    let grants = fields
+        .field_args_each("UpgradeName")
+        .into_iter()
+        .flatten()
+        .map(Name::from)
+        .collect();
     Ok(OclSpecialPower(Arc::new(OclData {
         power,
         list,
         location,
+        upgrade_lists,
+        grants,
         fx: trigger_fx(fields),
         re_enable: flag(fields, "ReEnableAntiCategory").unwrap_or(false),
         weather: change_weather(fields)?,
@@ -334,7 +361,11 @@ fn modifier_rule_from_fields(fields: &dyn ModuleFieldSource) -> Option<ModifierR
     if flag(fields, "AttributeModifierWeatherBased").unwrap_or(false) {
         return None;
     }
-    build_modifier_rule(ModifierFieldValues {
+    build_modifier_rule(modifier_values(fields))
+}
+
+fn modifier_values(fields: &dyn ModuleFieldSource) -> ModifierFieldValues {
+    ModifierFieldValues {
         list: fields.field("AttributeModifier").map(Name::from),
         range: fields
             .field_numeric("AttributeModifierRange")
@@ -369,19 +400,13 @@ fn modifier_rule_from_fields(fields: &dyn ModuleFieldSource) -> Option<ModifierR
         affect_good: flag(fields, "AffectGood").unwrap_or(false),
         affect_evil: flag(fields, "AffectEvil").unwrap_or(false),
         affect_allies: flag(fields, "AffectAllies").unwrap_or(true),
-    })
-}
-
-#[derive(Debug, PartialEq)]
-struct RefreshRecipients {
-    range: f32,
-    affects: crate::effects::Names,
+    }
 }
 
 #[derive(Debug, PartialEq)]
 struct RefreshData {
     base: Arc<PowerData>,
-    recipients: Option<RefreshRecipients>,
+    recipients: ModifierRule,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,20 +436,10 @@ impl ModuleKind for SpecialPowerTimerRefreshSpecialPower {
                 );
             }
         }
-        let (range, affects) = self
-            .0
-            .recipients
-            .as_ref()
-            .map_or((0.0, crate::effects::Names::from(Vec::new())), |r| {
-                (r.range, crate::effects::Names::clone(&r.affects))
-            });
         push(
             ctx,
             Effect::RefreshOtherPowers {
-                except: Name::clone(&self.0.base.power),
-                affect_allies: self.0.recipients.is_some(),
-                range,
-                affects,
+                rule: self.0.recipients.clone(),
             },
         );
     }
@@ -435,19 +450,7 @@ pub fn special_power_timer_refresh_special_power_from_fields(
     now: Frame,
 ) -> Result<SpecialPowerTimerRefreshSpecialPower, FieldError> {
     let SpecialPowerModule(base) = special_power_module_from_fields(fields, now)?;
-    let recipients = (flag(fields, "AffectAllies") == Some(true)).then(|| RefreshRecipients {
-        range: fields
-            .field_numeric("AttributeModifierRange")
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .unwrap_or(0.0),
-        affects: names(
-            fields
-                .field_args("AttributeModifierAffects")
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        ),
-    });
+    let recipients = recipient_rule(modifier_values(fields));
     Ok(SpecialPowerTimerRefreshSpecialPower(Arc::new(
         RefreshData { base, recipients },
     )))
@@ -584,7 +587,7 @@ mod tests {
                 Effect::ClearWeatherEffect,
                 Effect::ChangeWeather {
                     kind: WeatherKind::Sunny,
-                    lasts: mint_sim::LogicFrames::from_milliseconds(5000),
+                    lasts: mint_sim::LogicFrames::from_engine_milliseconds(5000),
                 },
                 Effect::CreateObjects {
                     list: Name::from("OCL_Sunflare"),
@@ -871,51 +874,30 @@ mod tests {
     }
 
     #[test]
-    fn a_timer_refresh_power_refreshes_every_other_power() {
+    fn a_timer_refresh_power_reports_the_recipient_walk() {
         let mut module = special_power_timer_refresh_special_power_from_fields(
             &fields(&[
                 ("SpecialPowerTemplate", "SpecialAbilityElrondRestoration"),
                 ("AttributeModifierRange", "150"),
                 ("AttributeModifierAffects", "ALL -ElvenElrond ALLIES"),
-                ("AffectAllies", "Yes"),
             ]),
             Frame::ZERO,
         )
         .unwrap();
         assert!(module.is_for_power("SpecialAbilityElrondRestoration"));
+        let effects = fire(&mut module, &AT);
+        let [Effect::RefreshOtherPowers { rule }] = effects.as_slice() else {
+            panic!("one refresh effect expected, got {effects:?}");
+        };
+        assert_eq!(rule.radius, 150.0);
+        assert!(rule.affect_allies && !rule.affects_self);
         assert_eq!(
-            fire(&mut module, &AT),
-            vec![Effect::RefreshOtherPowers {
-                except: Name::from("SpecialAbilityElrondRestoration"),
-                affect_allies: true,
-                range: 150.0,
-                affects: names(vec![
-                    "ALL".to_owned(),
-                    "-ElvenElrond".to_owned(),
-                    "ALLIES".to_owned(),
-                ]),
-            }]
-        );
-    }
-
-    #[test]
-    fn without_affect_allies_the_refresh_reports_no_recipients() {
-        let mut module = special_power_timer_refresh_special_power_from_fields(
-            &fields(&[
-                ("SpecialPowerTemplate", "P"),
-                ("AttributeModifierRange", "150"),
-            ]),
-            Frame::ZERO,
-        )
-        .unwrap();
-        assert_eq!(
-            fire(&mut module, &AT),
-            vec![Effect::RefreshOtherPowers {
-                except: Name::from("P"),
-                affect_allies: false,
-                range: 0.0,
-                affects: names(Vec::new()),
-            }]
+            rule.affects,
+            names(vec![
+                "ALL".to_owned(),
+                "-ElvenElrond".to_owned(),
+                "ALLIES".to_owned(),
+            ])
         );
     }
 

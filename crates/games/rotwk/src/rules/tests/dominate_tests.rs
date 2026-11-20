@@ -41,6 +41,28 @@ Object DominatorBroad\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRan
 CommandSet BroadSet\n  1 = Cast_Object\nEnd\n\
 CommandButton Cast_Object\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityDominate\n  \
   Options = NEED_TARGET_ENEMY_OBJECT\nEnd\n\
+Object DominatorSweep\n  Side = Men\n  KindOf = INFANTRY SELECTABLE\n  VisionRange = 400\n  \
+  CommandSet = SweepSet\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  Behavior = DominateEnemySpecialPower Tag_Dom\n    SpecialPowerTemplate = SpecialAbilityDominate\n    \
+    DominateRadius = 200\n    AttributeModifierAffects = ALL ENEMIES NEUTRAL\n    \
+    PermanentlyConvert = Yes\n    IgnoreFacingCheck = Yes\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+CommandSet SweepSet\n  1 = Cast_Area\n  2 = Cast_Neutral\nEnd\n\
+CommandButton Cast_Neutral\n  Command = SPECIAL_POWER\n  SpecialPower = SpecialAbilityDominate\n  \
+  Options = NEED_TARGET_NEUTRAL_OBJECT\nEnd\n\
+Locomotor HighFlyer\n  Surfaces = AIR\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\n  \
+  PreferredHeight = 60\n  AirborneTargetingHeight = 25\n  ZAxisBehavior = SURFACE_RELATIVE_HEIGHT\nEnd\n\
+Locomotor LowFlyer\n  Surfaces = AIR\n  Acceleration = 500\n  Braking = 500\n  TurnTime = 100\n  \
+  PreferredHeight = 60\n  AirborneTargetingHeight = 500\n  ZAxisBehavior = SURFACE_RELATIVE_HEIGHT\nEnd\n\
+Object HighBird\n  Side = Other\n  KindOf = MONSTER SELECTABLE\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  LocomotorSet\n    Locomotor = HighFlyer\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
+Object LowBird\n  Side = Other\n  KindOf = MONSTER SELECTABLE\n  \
+  Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
+  LocomotorSet\n    Locomotor = LowFlyer\n    Condition = SET_NORMAL\n    Speed = 60\n  End\n  \
+  Geometry = CYLINDER\n  GeometryMajorRadius = 5\n  GeometryHeight = 16\nEnd\n\
 Object Victim\n  Side = Other\n  KindOf = INFANTRY SELECTABLE\n  \
   Body = ActiveBody Tag_01\n    MaxHealth = 100\n  End\n  \
   Behavior = TemporarilyDefectUpdate Tag_Defect\n    DefectDuration = 30000\n  End\n  \
@@ -74,6 +96,9 @@ fn load() -> Match {
         "DominatorFiltered",
         "DominatorBroad",
         "DominatorDefect",
+        "DominatorSweep",
+        "HighBird",
+        "LowBird",
         "Victim",
     ]
     .into_iter()
@@ -110,6 +135,11 @@ fn simulation(m: &Match, placed: &[(&str, f32, f32, PlayerId)]) -> Simulation<Ro
     let passability = Passability::build(&map, 5.0 / 128.0).unwrap();
     let rules = RotwkRules::new(passability, spawns)
         .with_players(2)
+        .with_map_players(
+            2,
+            vec!["Civilians".to_owned()],
+            vec![crate::alliance::MapRelations::default()],
+        )
         .with_hordes(m.data.formations.tables().to_vec(), Vec::new())
         .with_combat(m.data.combat.clone())
         .with_construction(Arc::clone(&m.kinds), production.clone())
@@ -353,4 +383,72 @@ fn a_defection_ends_early_when_its_dominator_dies_and_does_not_refresh() {
          dominator is dead"
     );
     assert!(simulation.frame().get() < first.until.get());
+}
+
+const NEUTRAL: PlayerId = PlayerId::new(2);
+
+fn owner_of(simulation: &Simulation<RotwkRules>, ids: Ids, entity: Entity) -> Option<PlayerId> {
+    simulation.state().get(ids.owner, entity).map(|o| o.0)
+}
+
+fn fire(
+    simulation: &mut Simulation<RotwkRules>,
+    caster: Entity,
+    button: u8,
+    target: Option<Entity>,
+    at: Option<(f32, f32)>,
+) {
+    select_and_submit(
+        simulation,
+        caster,
+        RotwkCommand::FireSpecialPower { button, target, at },
+    );
+    for _ in 0..5 {
+        simulation.tick().unwrap();
+    }
+}
+
+#[test]
+fn an_area_dominate_takes_enemies_only_but_a_click_takes_a_neutral() {
+    let m = load();
+    let mut simulation = simulation(
+        &m,
+        &[
+            ("DominatorSweep", 200.0, 200.0, PLAYER),
+            ("Raider", 230.0, 200.0, OTHER),
+            ("Raider", 230.0, 230.0, NEUTRAL),
+        ],
+    );
+    let ids = simulation.rules().ids().unwrap();
+    let enemy = of_kind_owned(&m, &simulation, ids, "Raider", OTHER);
+    let neutral = of_kind_owned(&m, &simulation, ids, "Raider", NEUTRAL);
+    let caster = of_kind_owned(&m, &simulation, ids, "DominatorSweep", PLAYER);
+    fire(&mut simulation, caster, 0, None, Some((230.0, 215.0)));
+    assert_eq!(owner_of(&simulation, ids, enemy), Some(PLAYER));
+    assert_eq!(owner_of(&simulation, ids, neutral), Some(NEUTRAL));
+    fire(&mut simulation, caster, 1, Some(neutral), None);
+    assert_eq!(owner_of(&simulation, ids, neutral), Some(PLAYER));
+}
+
+#[test]
+fn a_dominate_passes_over_a_flyer_above_its_targeting_height() {
+    let m = load();
+    let mut simulation = simulation(
+        &m,
+        &[
+            ("DominatorSweep", 200.0, 200.0, PLAYER),
+            ("HighBird", 230.0, 200.0, OTHER),
+            ("LowBird", 230.0, 230.0, OTHER),
+        ],
+    );
+    let ids = simulation.rules().ids().unwrap();
+    let high = of_kind_owned(&m, &simulation, ids, "HighBird", OTHER);
+    let low = of_kind_owned(&m, &simulation, ids, "LowBird", OTHER);
+    let caster = of_kind_owned(&m, &simulation, ids, "DominatorSweep", PLAYER);
+    for _ in 0..(10 * SIMULATION_HZ) {
+        simulation.tick().unwrap();
+    }
+    fire(&mut simulation, caster, 0, None, Some((230.0, 215.0)));
+    assert_eq!(owner_of(&simulation, ids, high), Some(OTHER));
+    assert_eq!(owner_of(&simulation, ids, low), Some(PLAYER));
 }

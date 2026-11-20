@@ -1234,3 +1234,31 @@ fn flammability_reads_its_quartet_and_refuses_an_out_of_range_value() {
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0].field, "Resistance");
 }
+
+#[test]
+fn signed_set_conditions_edit_the_empty_list_and_a_mixed_line_is_refused() {
+    let text = "Object Mod\n  \
+        WeaponSet\n    Conditions = WEAPONSET_TOGGLE_1\n    Weapon = PRIMARY Bow\n  End\n  \
+        WeaponSet\n    Conditions = -WEAPONSET_TOGGLE_1\n    Weapon = PRIMARY Spear\n  End\n  \
+        WeaponSet\n    Conditions = +MOUNTED -CLOSE_RANGE\n    Weapon = PRIMARY Lance\n  End\n  \
+        WeaponSet\n    Conditions = +MOUNTED CLOSE_RANGE\n    Weapon = PRIMARY Mixed\n  End\n\
+        End\n";
+    let (record, refused) = read(text, "Mod");
+    let record = record.unwrap();
+    assert_eq!(record.weapon.as_deref(), Some("Spear"));
+    let conditions: Vec<&[String]> = record
+        .weapon_sets
+        .iter()
+        .map(|set| set.conditions.as_slice())
+        .collect();
+    assert_eq!(
+        conditions,
+        [
+            &["WEAPONSET_TOGGLE_1".to_owned()][..],
+            &[],
+            &["MOUNTED".to_owned()],
+            &[]
+        ]
+    );
+    assert_eq!(refused.len(), 1, "{refused:?}");
+}

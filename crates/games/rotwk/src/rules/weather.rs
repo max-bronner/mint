@@ -45,7 +45,7 @@ impl RotwkRules {
                 .filter(|ms| *ms > 0)
                 .map_or(Frame::FOREVER, |ms| {
                     tick.frame()
-                        .checked_add(LogicFrames::from_milliseconds(ms))
+                        .checked_add(mint_sage_modules::retail_duration_ticks(ms))
                         .unwrap_or(Frame::FOREVER)
                 });
             self.give_timed_list(tick, ids, entity, id, until)?;
@@ -75,16 +75,7 @@ impl RotwkRules {
         anti: &Names,
     ) -> Result<()> {
         if let Some(id) = list {
-            if let Some(mut timed) = tick.state().get(ids.timed_modifiers, entity).cloned() {
-                if timed.remove(id) {
-                    if timed.0.is_empty() {
-                        tick.state_mut().remove(ids.timed_modifiers, entity);
-                    } else {
-                        tick.state_mut()
-                            .insert(ids.timed_modifiers, entity, timed)?;
-                    }
-                }
-            }
+            self.remove_timed_list(tick, ids, entity, id)?;
         }
         if !anti.is_empty() {
             if let Some(mut suppressed) = tick.state().get(ids.suppressed, entity).cloned() {

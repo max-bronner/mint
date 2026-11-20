@@ -734,8 +734,15 @@ fn last_using_ability_cleared(seen: &[(u64, Effect)]) -> Option<u64> {
     })
 }
 
+fn ai_busy_issued(seen: &[(u64, Effect)]) -> Option<(u64, LogicFrames)> {
+    seen.iter().find_map(|(frame, effect)| match effect {
+        Effect::AiBusy(frames) => Some((*frame, *frames)),
+        _ => None,
+    })
+}
+
 #[test]
-fn paralyze_duration_when_completed_holds_is_using_ability_past_the_end() {
+fn paralyze_duration_when_completed_makes_the_ai_busy_after_the_end() {
     let mut world = World::new();
     let mut registry = ModuleRegistry::new(&mut world);
     registry.register::<SpecialAbilityUpdate>(&mut world, "SpecialAbilityUpdate");
@@ -781,7 +788,12 @@ fn paralyze_duration_when_completed_holds_is_using_ability_past_the_end() {
         );
         seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
     }
-    assert_eq!(last_using_ability_cleared(&seen), Some(12), "{seen:?}");
+    assert_eq!(last_using_ability_cleared(&seen), Some(6), "{seen:?}");
+    assert_eq!(
+        ai_busy_issued(&seen),
+        Some((6, LogicFrames::from_frames(6))),
+        "{seen:?}"
+    );
 }
 
 #[test]
@@ -838,7 +850,70 @@ fn paralyze_duration_when_aborted_applies_on_a_cancelled_cast() {
         );
         seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
     }
-    assert_eq!(last_using_ability_cleared(&seen), Some(9), "{seen:?}");
+    assert_eq!(last_using_ability_cleared(&seen), Some(3), "{seen:?}");
+    assert_eq!(
+        ai_busy_issued(&seen),
+        Some((3, LogicFrames::from_frames(6))),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn skip_packing_with_no_target_spares_a_targetless_cast_its_unpack_and_pack() {
+    let mut world = World::new();
+    let mut registry = ModuleRegistry::new(&mut world);
+    registry.register::<SpecialAbilityUpdate>(&mut world, "SpecialAbilityUpdate");
+    let holder = world.spawn().unwrap();
+    let module = special_ability_update_from_fields(
+        &fields(&[
+            ("SpecialPowerTemplate", "P"),
+            ("UnpackTime", "300"),
+            ("PreparationTime", "100"),
+            ("PackTime", "300"),
+            ("SkipPackingWithNoTarget", "Yes"),
+        ]),
+        Frame::ZERO,
+    )
+    .unwrap();
+    registry
+        .attach(&mut world, holder, Frame::ZERO, module)
+        .unwrap();
+    let mut log = EffectLog::new();
+    let activation = Activation {
+        power: "P",
+        target: None,
+        at: None,
+    };
+    assert!(registry.activate(
+        &mut world,
+        holder,
+        &activation,
+        Frame::ZERO,
+        Effects::into_sink(&mut log)
+    ));
+    let mut rng = Pcg32::new(1);
+    let mut destroy = DestroyRequests::new();
+    let mut seen = Vec::new();
+    for frame in 0..40u64 {
+        let mut log = EffectLog::new();
+        registry.update_with_reads(
+            &mut world,
+            Frame::new(frame),
+            &mut rng,
+            &mut destroy,
+            Effects::into_sink(&mut log),
+            Reads::none(),
+        );
+        seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
+    }
+    let raised = |name: &str| {
+        seen.iter().any(|(_, effect)| {
+            matches!(effect, Effect::ModelConditions { add, .. } if add.iter().any(|n| &**n == name))
+        })
+    };
+    assert!(!raised("UNPACKING"), "{seen:?}");
+    assert!(!raised("PACKING"), "{seen:?}");
+    assert_eq!(last_using_ability_cleared(&seen), Some(6), "{seen:?}");
 }
 
 #[test]
@@ -1546,8 +1621,8 @@ fn an_approach_gives_up_after_ten_tries_against_a_target_that_has_not_moved() {
     ]);
     let mut rng = Pcg32::new(1);
     let mut destroy = DestroyRequests::new();
-    let mut approaches = 0usize;
-    for frame in 0..20u64 {
+    let mut gave_up_at = None;
+    for frame in 0..100u64 {
         let mut log = EffectLog::new();
         registry.update_with_reads(
             &mut world,
@@ -1558,14 +1633,21 @@ fn an_approach_gives_up_after_ten_tries_against_a_target_that_has_not_moved() {
             Reads::from_snapshot(&positions),
         );
         for (_, effect) in log.drain() {
-            if matches!(effect, Effect::MoveToObject { .. }) {
-                approaches += 1;
+            if matches!(
+                effect,
+                Effect::CastEdge {
+                    edge: CastEdge::Finish { .. },
+                    ..
+                }
+            ) {
+                gave_up_at.get_or_insert(frame);
             }
         }
     }
     assert_eq!(
-        approaches, 11,
-        "retail gives up after 11 idle approaches to a target that has not moved"
+        gave_up_at,
+        Some(66),
+        "approaches count once per retail frame (frames 0, 6, ... 60): the eleventh is past ten"
     );
 }
 
@@ -2119,4 +2201,186 @@ fn do_capture_fx_flashes_only_on_even_phase_crossings() {
     }
     assert!(expected > 0, "the test window must see at least one edge");
     assert_eq!(flashes, expected);
+}
+
+fn cast_losing_target(
+    pairs: &[(&'static str, &'static str)],
+    lost_at: u64,
+    frames: u64,
+) -> Vec<(u64, Effect)> {
+    let mut world = World::new();
+    let mut registry = ModuleRegistry::new(&mut world);
+    registry.register::<SpecialAbilityUpdate>(&mut world, "SpecialAbilityUpdate");
+    let holder = world.spawn().unwrap();
+    let target = world.spawn().unwrap();
+    let module = special_ability_update_from_fields(&fields(pairs), Frame::ZERO).unwrap();
+    registry
+        .attach(&mut world, holder, Frame::ZERO, module)
+        .unwrap();
+    let activation = Activation {
+        power: "P",
+        target: Some(target),
+        at: None,
+    };
+    let mut log = EffectLog::new();
+    assert!(registry.activate(
+        &mut world,
+        holder,
+        &activation,
+        Frame::ZERO,
+        Effects::into_sink(&mut log)
+    ));
+    let alive = Positions::from_pairs([
+        (holder, (0.0, 0.0, 0.0, 0.0)),
+        (target, (10.0, 0.0, 0.0, 0.0)),
+    ]);
+    let dead = Positions::from_pairs([(holder, (0.0, 0.0, 0.0, 0.0))]);
+    let mut rng = Pcg32::new(1);
+    let mut destroy = DestroyRequests::new();
+    let mut seen = Vec::new();
+    for frame in 0..frames {
+        let positions = if frame < lost_at { &alive } else { &dead };
+        let mut log = EffectLog::new();
+        registry.update_with_reads(
+            &mut world,
+            Frame::new(frame),
+            &mut rng,
+            &mut destroy,
+            Effects::into_sink(&mut log),
+            Reads::from_snapshot(positions),
+        );
+        seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
+    }
+    seen
+}
+
+fn triggered(seen: &[(u64, Effect)]) -> bool {
+    seen.iter().any(|(_, effect)| {
+        matches!(
+            effect,
+            Effect::CastEdge {
+                edge: CastEdge::Trigger,
+                ..
+            }
+        )
+    })
+}
+
+#[test]
+fn a_target_lost_during_the_unpack_ends_the_cast_after_it_and_during_the_pack_not_at_all() {
+    let unpack = u64::from(retail_duration_ticks(1000).get());
+    let seen = cast_losing_target(
+        &[
+            ("SpecialPowerTemplate", "P"),
+            ("StartAbilityRange", "50"),
+            ("UnpackTime", "1000"),
+            ("PreparationTime", "1000"),
+            ("IgnoreFacingCheck", "Yes"),
+        ],
+        10,
+        100,
+    );
+    assert!(!triggered(&seen), "{seen:?}");
+    let ended = last_using_ability_cleared(&seen).unwrap();
+    assert!(
+        ended >= unpack,
+        "ended at {ended}, the unpack runs {unpack}"
+    );
+
+    let pack = u64::from(retail_duration_ticks(1000).get());
+    let seen = cast_losing_target(
+        &[
+            ("SpecialPowerTemplate", "P"),
+            ("StartAbilityRange", "50"),
+            ("PreparationTime", "100"),
+            ("PackTime", "1000"),
+            ("IgnoreFacingCheck", "Yes"),
+        ],
+        10,
+        100,
+    );
+    assert!(triggered(&seen), "{seen:?}");
+    let ended = last_using_ability_cleared(&seen).unwrap();
+    assert!(ended >= pack, "ended at {ended}, the pack runs {pack}");
+}
+
+#[test]
+fn a_teleports_busy_window_opens_at_the_unpack_start() {
+    use crate::teleport_special_ability_update::{
+        teleport_special_ability_update_from_fields, TeleportSpecialAbilityUpdate,
+    };
+    let mut world = World::new();
+    let mut registry = ModuleRegistry::new(&mut world);
+    registry.register::<TeleportSpecialAbilityUpdate>(&mut world, "TeleportSpecialAbilityUpdate");
+    let holder = world.spawn().unwrap();
+    let module = teleport_special_ability_update_from_fields(
+        &fields(&[
+            ("SpecialPowerTemplate", "P"),
+            ("StartAbilityRange", "50"),
+            ("UnpackTime", "1800"),
+            ("PreparationTime", "1"),
+            ("PackTime", "1300"),
+            ("BusyForDuration", "1800"),
+            ("IgnoreFacingCheck", "Yes"),
+        ]),
+        Frame::ZERO,
+    )
+    .unwrap();
+    registry
+        .attach(&mut world, holder, Frame::ZERO, module)
+        .unwrap();
+    let activation = Activation {
+        power: "P",
+        target: None,
+        at: Some((10.0, 0.0)),
+    };
+    let mut log = EffectLog::new();
+    assert!(registry.activate(
+        &mut world,
+        holder,
+        &activation,
+        Frame::ZERO,
+        Effects::into_sink(&mut log)
+    ));
+    let positions = Positions::from_pairs([(holder, (0.0, 0.0, 0.0, 0.0))]);
+    let ordered = PlayerOrdered::from_entities([holder]);
+    let unpack = u64::from(retail_duration_ticks(1800).get());
+    let mut rng = Pcg32::new(1);
+    let mut destroy = DestroyRequests::new();
+    let mut seen = Vec::new();
+    let both: [&dyn std::any::Any; 2] = [&positions, &ordered];
+    for frame in 0..200u64 {
+        let mut log = EffectLog::new();
+        let reads = if frame > unpack + 12 {
+            Reads::from_snapshots(&both)
+        } else {
+            Reads::from_snapshot(&positions)
+        };
+        registry.update_with_reads(
+            &mut world,
+            Frame::new(frame),
+            &mut rng,
+            &mut destroy,
+            Effects::into_sink(&mut log),
+            reads,
+        );
+        seen.extend(log.drain().into_iter().map(|(_, effect)| (frame, effect)));
+    }
+    let windows: Vec<u64> = seen
+        .iter()
+        .filter(|(_, effect)| matches!(effect, Effect::IgnoreOrdersFor(_)))
+        .map(|(frame, _)| *frame)
+        .collect();
+    let jumped = seen
+        .iter()
+        .find(|(_, effect)| matches!(effect, Effect::Teleport { .. }))
+        .map(|(frame, _)| *frame)
+        .unwrap();
+    assert_eq!(windows.len(), 1, "{seen:?}");
+    assert!(windows[0] < jumped, "window {windows:?}, jump {jumped}");
+    let ended = last_using_ability_cleared(&seen).unwrap();
+    assert!(
+        ended < jumped + u64::from(retail_duration_ticks(1300).get()),
+        "the order ended the pack early: {ended}"
+    );
 }

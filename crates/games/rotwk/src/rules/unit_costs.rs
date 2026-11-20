@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mint_movement::{Cell, CellFlags, GridExtent, Passability, Vec2};
 use mint_sim::{Entity, Tick, World};
@@ -15,6 +15,8 @@ const FIXED_ALLIES: u32 = 14;
 
 const OTHER_GOAL: u32 = 30;
 
+const BURNING: u32 = 10;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BodySight {
     each_other: bool,
@@ -23,13 +25,22 @@ pub(super) struct BodySight {
     large: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+impl BodySight {
+    fn passes(self, each_other: bool, infantry: bool, large: bool, ally: bool) -> bool {
+        self.submarine
+            || (ally && self.each_other && each_other)
+            || (self.through_infantry && infantry)
+            || (ally && self.large && !large)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Bodies {
     refused: bool,
     allied: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct BodyCells {
     width: usize,
     height: usize,
@@ -58,6 +69,22 @@ impl BodyCells {
         self.cells
             .get_mut(y.checked_mul(self.width)?.checked_add(x)?)
     }
+
+    fn mark(&mut self, extent: GridExtent, rect: goal_cells::CellRect, enemy: bool) {
+        let (x0, y0, x1, y1) = rect.span();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let Some(held) = self.entry(extent, x, y) else {
+                    continue;
+                };
+                if enemy {
+                    held.refused = true;
+                } else {
+                    held.allied = true;
+                }
+            }
+        }
+    }
 }
 
 struct Claim {
@@ -68,6 +95,17 @@ struct Claim {
     flat: bool,
     position: Vec2,
     speed: f32,
+    charged: bool,
+}
+
+fn claim_is_flat(claimant_top_speed: f32, at_goal: bool, own_locomotor: bool) -> Option<bool> {
+    if at_goal || !own_locomotor {
+        Some(true)
+    } else if claimant_top_speed <= 0.0 {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 pub(super) struct UnitCostView<'a> {
@@ -78,11 +116,13 @@ pub(super) struct UnitCostView<'a> {
     side: i32,
     shift: u32,
     geometry: mint_movement::CellGeometry,
+    footprint: Footprint,
     position: Vec2,
     speed: f32,
     bodies: BodyCells,
     exempt: Vec<Cell>,
     attack_path: bool,
+    burning: BTreeSet<(i32, i32)>,
 }
 
 impl Passability for UnitCostView<'_> {
@@ -99,7 +139,33 @@ impl Passability for UnitCostView<'_> {
         self.inner
             .extra_cost(cell)
             .saturating_add(self.unit_cost(cell))
-            .saturating_add(if allied { FIXED_ALLIES } else { 0 })
+            .saturating_add(if self.is_burning(cell) { BURNING } else { 0 })
+            .saturating_add(if allied {
+                mint_sage_passability::halved_when_extra_passable(
+                    self.inner.flags(cell),
+                    FIXED_ALLIES,
+                )
+            } else {
+                0
+            })
+    }
+
+    fn goal_extra_cost(&self, cell: Cell, goal: Option<Cell>) -> u32 {
+        self.inner.goal_extra_cost(cell, goal)
+    }
+
+    fn tail_clear(&self, cell: Cell, mover: mint_movement::MoverClass) -> bool {
+        self.inner.tail_clear(cell, mover) && !self.is_burning(cell)
+    }
+
+    fn line_clear(&self, cell: Cell, mover: mint_movement::MoverClass) -> bool {
+        self.is_passable(cell, mover)
+            && !self.flags(cell).intersects(mover.line_barred)
+            && !self.is_burning(cell)
+    }
+
+    fn straight_clear(&self, cell: Cell, mover: mint_movement::MoverClass) -> bool {
+        self.inner.straight_clear(cell, mover) && !self.is_burning(cell)
     }
 
     fn admits(&self, cell: Cell, asker: mint_movement::Asker) -> bool {
@@ -115,6 +181,10 @@ impl Passability for UnitCostView<'_> {
     fn portal_at(&self, cell: Cell) -> Option<mint_movement::Portal> {
         self.inner.portal_at(cell)
     }
+
+    fn portal_links(&self, cell: Cell) -> &[mint_movement::PortalLink] {
+        self.inner.portal_links(cell)
+    }
 }
 
 impl UnitCostView<'_> {
@@ -123,9 +193,11 @@ impl UnitCostView<'_> {
         self
     }
 
-    pub(super) fn for_attack_path(mut self) -> Self {
-        self.attack_path = true;
-        self
+    fn is_burning(&self, cell: Cell) -> bool {
+        !self.burning.is_empty()
+            && self
+                .burning
+                .contains(&(i32::from(cell.x), i32::from(cell.y)))
     }
 
     fn bodies_on(&self, cell: Cell) -> Option<&Bodies> {
@@ -139,33 +211,43 @@ impl UnitCostView<'_> {
         let x0 = i32::from(cell.x) - self.half;
         let y0 = i32::from(cell.y) - self.half;
         let (x1, y1) = (x0 + self.side, y0 + self.side);
-        let centre = self.geometry.centre_of(cell);
-        let own = centre.minus(self.position).length() / self.speed.max(f32::EPSILON);
-        let mut seen: Vec<usize> = Vec::new();
+        let point = goal_cells::answer_point(
+            self.geometry,
+            (i32::from(cell.x), i32::from(cell.y)),
+            self.footprint,
+        );
+        let own = point.minus(self.position).length() / self.speed.max(f32::EPSILON);
         let mut total = 0u32;
         let mut claimed = false;
-        for bx in x0.div_euclid(BUCKET)..=(x1 - 1).div_euclid(BUCKET) {
-            for by in y0.div_euclid(BUCKET)..=(y1 - 1).div_euclid(BUCKET) {
+        let (first_bx, first_by) = (x0.div_euclid(BUCKET), y0.div_euclid(BUCKET));
+        for bx in first_bx..=(x1 - 1).div_euclid(BUCKET) {
+            for by in first_by..=(y1 - 1).div_euclid(BUCKET) {
                 let Some(list) = self.buckets.get(&(bx, by)) else {
                     continue;
                 };
                 for &index in list {
-                    if seen.contains(&index) {
-                        continue;
-                    }
-                    seen.push(index);
                     let Some(claim) = self.claims.get(index) else {
                         continue;
                     };
+                    let first = (
+                        first_bx.max(claim.x0.div_euclid(BUCKET)),
+                        first_by.max(claim.y0.div_euclid(BUCKET)),
+                    );
+                    if (bx, by) != first {
+                        continue;
+                    }
                     let w = x1.min(claim.x1) - x0.max(claim.x0);
                     let h = y1.min(claim.y1) - y0.max(claim.y0);
                     if w <= 0 || h <= 0 {
                         continue;
                     }
                     claimed = true;
+                    if !claim.charged {
+                        continue;
+                    }
                     let charge = if claim.flat {
                         AT_GOAL
-                    } else if centre.minus(claim.position).length() / claim.speed.max(f32::EPSILON)
+                    } else if point.minus(claim.position).length() / claim.speed.max(f32::EPSILON)
                         < own
                     {
                         ARRIVES_FIRST
@@ -178,7 +260,10 @@ impl UnitCostView<'_> {
             }
         }
         if self.attack_path && claimed {
-            total = total.saturating_add(OTHER_GOAL);
+            total = total.saturating_add(mint_sage_passability::halved_when_extra_passable(
+                self.inner.flags(cell),
+                OTHER_GOAL,
+            ));
         }
         total
     }
@@ -237,6 +322,17 @@ impl RotwkRules {
         self.unit_cost_view_for(tick, ids, entity, inner, footprint)
     }
 
+    pub(super) fn attack_cost_view<'a>(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        inner: &'a dyn Passability,
+    ) -> UnitCostView<'a> {
+        let footprint = self.path_footprint(tick, ids, entity);
+        self.cost_view(tick, ids, entity, inner, footprint, true)
+    }
+
     pub(super) fn unit_cost_view_for<'a>(
         &self,
         tick: &Tick<'_>,
@@ -244,6 +340,18 @@ impl RotwkRules {
         entity: Entity,
         inner: &'a dyn Passability,
         footprint: Footprint,
+    ) -> UnitCostView<'a> {
+        self.cost_view(tick, ids, entity, inner, footprint, false)
+    }
+
+    fn cost_view<'a>(
+        &self,
+        tick: &Tick<'_>,
+        ids: Ids,
+        entity: Entity,
+        inner: &'a dyn Passability,
+        footprint: Footprint,
+        attack_path: bool,
     ) -> UnitCostView<'a> {
         let _perf = crate::perf::sub(crate::perf::sub_row!("unit_cost_view"));
         let world = tick.state();
@@ -276,12 +384,19 @@ impl RotwkRules {
                 {
                     continue;
                 }
-                if owner.is_some() && relation.to(other) == super::map_scripts::Relation::Enemies {
+                let mut charged = !(owner.is_some()
+                    && relation.to(other) == super::map_scripts::Relation::Enemies);
+                if !charged && !attack_path {
                     continue;
                 }
+                let part = crate::perf::sub(crate::perf::sub_row!("unit_cost_limits"));
                 let limits = self.mover_limits(tick, ids, other);
-                if limits.max_speed <= 0.0 || self.path_priority(tick, ids, other) < own_priority {
-                    continue;
+                drop(part);
+                if self.path_priority(tick, ids, other) < own_priority {
+                    charged = false;
+                    if !attack_path {
+                        continue;
+                    }
                 }
                 let Some(body) = world.get(ids.body, other) else {
                     continue;
@@ -295,14 +410,23 @@ impl RotwkRules {
                 let y0 = cell.1 - their_half;
                 let their_side = i32::from(theirs.side());
                 let other_at_goal = goal.minus(body.0.position).length() <= geometry.cell_size();
+                let flat = match claim_is_flat(limits.max_speed, other_at_goal, own_locomotor) {
+                    Some(flat) => flat,
+                    None if attack_path => {
+                        charged = false;
+                        false
+                    }
+                    None => continue,
+                };
                 let claim = Claim {
                     x0,
                     y0,
                     x1: x0 + their_side,
                     y1: y0 + their_side,
-                    flat: other_at_goal || !own_locomotor || limits.max_speed <= 0.0,
+                    flat,
                     position: body.0.position,
                     speed: limits.max_speed,
+                    charged,
                 };
                 let index = claims.len();
                 for bx in claim.x0.div_euclid(BUCKET)..=(claim.x1 - 1).div_euclid(BUCKET) {
@@ -314,6 +438,10 @@ impl RotwkRules {
             }
         }
         let bodies = self.body_cells(tick, ids, entity);
+        let burning = super::terrain_fire::singleton_of(world, ids.fire_grid)
+            .and_then(|fire| world.get(ids.fire_grid, fire))
+            .map(super::terrain_fire::FireGrid::burning_cells)
+            .unwrap_or_default();
         let exempt = self.passability.cell_at(position).into_iter().collect();
         UnitCostView {
             inner,
@@ -323,11 +451,13 @@ impl RotwkRules {
             side,
             shift,
             geometry,
+            footprint,
             position,
             speed,
             bodies,
             exempt,
-            attack_path: false,
+            attack_path,
+            burning,
         }
     }
 
@@ -350,25 +480,21 @@ impl RotwkRules {
         ally: bool,
     ) -> bool {
         let facts = self.kind_facts(world, ids, other);
-        sight.submarine
-            || (ally && sight.each_other && facts.path_through_each_other)
-            || (sight.through_infantry && facts.infantry)
-            || (ally && sight.large && !facts.large_rectangle_pathfind)
+        sight.passes(
+            facts.path_through_each_other,
+            facts.infantry,
+            facts.large_rectangle_pathfind,
+            ally,
+        )
     }
 
     fn body_cells(&self, tick: &Tick<'_>, ids: Ids, entity: Entity) -> BodyCells {
         let _perf = crate::perf::sub(crate::perf::sub_row!("body_cells"));
         let world = tick.state();
-        let mut cells = BodyCells::default();
         let Some(_) = world.get(ids.owner, entity).map(|owner| owner.0) else {
-            return cells;
+            return BodyCells::default();
         };
-        let geometry = self.passability.geometry;
-        let extent = self.passability.grid.extent();
         let record = self.record_of(tick, ids, entity);
-        let hero = self.kind_facts(world, ids, entity).hero;
-        let crusher = record.map_or(0, |record| record.crush.crusher_level);
-        let sight = self.body_sight(world, ids, entity);
         let target = world
             .get(ids.attack_order, entity)
             .map(|order| order.target)
@@ -379,14 +505,78 @@ impl RotwkRules {
             })
             .or_else(|| world.get(ids.horde_melee, entity).map(|melee| melee.goal))
             .or_else(|| world.get(ids.armed, entity).and_then(|armed| armed.target));
-        let horde_of = |of: Entity| world.get(ids.member, of).map(|member| member.horde);
-        let target_horde = target.map(|target| horde_of(target).unwrap_or(target));
+        let target_horde = target.map(|target| {
+            world
+                .get(ids.member, target)
+                .map_or(target, |member| member.horde)
+        });
+        let asker = BodyAsker {
+            entity,
+            hero: self.kind_facts(world, ids, entity).hero,
+            crusher: record.map_or(0, |record| record.crush.crusher_level),
+            sight: self.body_sight(world, ids, entity),
+            target,
+            target_horde,
+        };
+        let rows = self.mover_rows.try_borrow_mut().ok();
+        let synced = rows.and_then(|mut rows| {
+            rows.sync(self, tick, ids).then(|| {
+                let relation = self.relation_from(world, entity);
+                let mut cells = BodyCells::default();
+                let extent = self.passability.grid.extent();
+                for row in rows.listed() {
+                    if row.entity == entity {
+                        continue;
+                    }
+                    let enemy = relation.to_owned_by(row.entity, row.owner)
+                        == super::map_scripts::Relation::Enemies;
+                    if asker
+                        .sight
+                        .passes(row.each_other, row.infantry, row.large, !enemy)
+                    {
+                        continue;
+                    }
+                    if enemy
+                        && (asker.hero
+                            || Some(row.entity) == asker.target
+                            || Some(row.horde.unwrap_or(row.entity)) == asker.target_horde
+                            || row
+                                .crushable
+                                .is_some_and(|theirs| i16::from(asker.crusher) > theirs))
+                    {
+                        continue;
+                    }
+                    if let Some(rect) = row.rect {
+                        cells.mark(extent, rect, enemy);
+                    }
+                }
+                cells
+            })
+        });
+        match synced {
+            Some(cells) => {
+                debug_assert_eq!(
+                    cells,
+                    self.body_cells_walk(tick, ids, &asker),
+                    "the mover rows differ from the full walk for {entity:?}"
+                );
+                cells
+            }
+            None => self.body_cells_walk(tick, ids, &asker),
+        }
+    }
+
+    fn body_cells_walk(&self, tick: &Tick<'_>, ids: Ids, asker: &BodyAsker) -> BodyCells {
+        let world = tick.state();
+        let mut cells = BodyCells::default();
+        let geometry = self.passability.geometry;
+        let extent = self.passability.grid.extent();
         let Some(store) = world.store(ids.shape) else {
             return cells;
         };
-        let relation = self.relation_from(world, entity);
+        let relation = self.relation_from(world, asker.entity);
         for (other, shape) in store.iter() {
-            if other == entity
+            if other == asker.entity
                 || world.contains(ids.horde, other)
                 || shape.kind_of.contains(super::KindOf::IMMOBILE)
                 || world.contains(ids.flight, other)
@@ -405,15 +595,16 @@ impl RotwkRules {
                 continue;
             }
             let enemy = relation.to(other) == super::map_scripts::Relation::Enemies;
-            if self.sees_past(world, ids, sight, other, !enemy) {
+            if self.sees_past(world, ids, asker.sight, other, !enemy) {
                 continue;
             }
             if enemy {
-                let walked_into = hero
-                    || Some(other) == target
-                    || Some(horde_of(other).unwrap_or(other)) == target_horde
+                let horde_of = |of: Entity| world.get(ids.member, of).map(|member| member.horde);
+                let walked_into = asker.hero
+                    || Some(other) == asker.target
+                    || Some(horde_of(other).unwrap_or(other)) == asker.target_horde
                     || self.record_of(tick, ids, other).is_some_and(|theirs| {
-                        i16::from(crusher) > i16::from(theirs.crush.crushable_level)
+                        i16::from(asker.crusher) > i16::from(theirs.crush.crushable_level)
                     });
                 if walked_into {
                     continue;
@@ -427,22 +618,19 @@ impl RotwkRules {
             ) else {
                 continue;
             };
-            let (x0, y0, x1, y1) = rect.span();
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let Some(held) = cells.entry(extent, x, y) else {
-                        continue;
-                    };
-                    if enemy {
-                        held.refused = true;
-                    } else {
-                        held.allied = true;
-                    }
-                }
-            }
+            cells.mark(extent, rect, enemy);
         }
         cells
     }
+}
+
+struct BodyAsker {
+    entity: Entity,
+    hero: bool,
+    crusher: u8,
+    sight: BodySight,
+    target: Option<Entity>,
+    target_horde: Option<Entity>,
 }
 
 #[cfg(test)]
@@ -463,17 +651,20 @@ mod tests {
                 flat: true,
                 position: Vec2::new(0.0, 0.0),
                 speed: 1.0,
+                charged: true,
             }],
             buckets,
             half: 0,
             side: 1,
             shift: 0,
             geometry: CellGeometry::new(10.0, Vec2::new(0.0, 0.0)).unwrap(),
+            footprint: Footprint::ONE_CENTRED,
             position: Vec2::new(0.0, 0.0),
             speed: 1.0,
             bodies: BodyCells::default(),
             exempt: Vec::new(),
             attack_path,
+            burning: BTreeSet::new(),
         }
     }
 
@@ -492,19 +683,83 @@ mod tests {
                 flat: true,
                 position: Vec2::new(0.0, 0.0),
                 speed: 1.0,
+                charged: true,
             }],
             buckets,
             half: 2,
             side: 4,
             shift: 0,
             geometry: CellGeometry::new(10.0, Vec2::new(0.0, 0.0)).unwrap(),
+            footprint: Footprint::ONE_CENTRED,
             position: Vec2::new(0.0, 0.0),
             speed: 1.0,
             bodies: BodyCells::default(),
             exempt: Vec::new(),
             attack_path: false,
+            burning: BTreeSet::new(),
         };
         assert_eq!(view.extra_cost(Cell::new(6, 5)), AT_GOAL * 3);
+    }
+
+    #[test]
+    fn an_allied_body_costs_half_on_an_extra_passable_cell() {
+        let mut grid = CostGrid::new(GridExtent::new(10, 10).unwrap());
+        grid.set_flags(Cell::new(2, 2), mint_sage_passability::EXTRA_PASSABLE)
+            .unwrap();
+        let mut ally_view = view(&grid, false);
+        for cell in [Cell::new(1, 1), Cell::new(2, 2)] {
+            if let Some(held) =
+                ally_view
+                    .bodies
+                    .entry(grid.extent(), i32::from(cell.x), i32::from(cell.y))
+            {
+                held.allied = true;
+            }
+        }
+        assert_eq!(
+            (
+                ally_view.extra_cost(Cell::new(1, 1)),
+                ally_view.extra_cost(Cell::new(2, 2))
+            ),
+            (FIXED_ALLIES, FIXED_ALLIES / 2)
+        );
+    }
+
+    #[test]
+    fn a_zero_speed_claimant_is_charged_at_its_goal_only() {
+        assert_eq!(claim_is_flat(0.0, true, true), Some(true));
+        assert_eq!(claim_is_flat(0.0, false, true), None);
+        assert_eq!(claim_is_flat(5.0, false, true), Some(false));
+        assert_eq!(claim_is_flat(5.0, false, false), Some(true));
+    }
+
+    #[test]
+    fn claimants_are_timed_to_the_movers_footprint_anchor() {
+        let grid = CostGrid::new(GridExtent::new(10, 10).unwrap());
+        let mut anchored = view(&grid, false);
+        anchored.claims[0].flat = false;
+        anchored.claims[0].position = Vec2::new(3.0, 3.0);
+        anchored.claims[0].x0 = 0;
+        anchored.claims[0].y0 = 0;
+        anchored.claims[0].x1 = 1;
+        anchored.claims[0].y1 = 1;
+        anchored.position = Vec2::new(6.0, 6.0);
+        anchored.footprint = Footprint::RADIUS_ONE;
+        anchored.half = 0;
+        assert_eq!(anchored.extra_cost(Cell::new(0, 0)), ARRIVES_FIRST);
+    }
+
+    #[test]
+    fn a_burning_cell_costs_ten_more_and_bars_a_straightened_leg() {
+        let grid = CostGrid::new(GridExtent::new(10, 10).unwrap());
+        let mut burning_view = view(&grid, false);
+        burning_view.claims.clear();
+        burning_view.burning.insert((3, 3));
+        let mover = mint_movement::MoverClass::default();
+        assert_eq!(burning_view.extra_cost(Cell::new(3, 3)), BURNING);
+        assert_eq!(burning_view.extra_cost(Cell::new(4, 3)), 0);
+        assert!(!burning_view.line_clear(Cell::new(3, 3), mover));
+        assert!(burning_view.line_clear(Cell::new(4, 3), mover));
     }
 
     #[test]
@@ -515,5 +770,19 @@ mod tests {
         assert_eq!(view(&grid, false).extra_cost(claimed), AT_GOAL);
         assert_eq!(view(&grid, true).extra_cost(claimed), AT_GOAL + OTHER_GOAL);
         assert_eq!(view(&grid, true).extra_cost(unclaimed), 0);
+    }
+
+    #[test]
+    fn the_goal_flag_ignores_who_holds_the_claim_and_is_halved_when_extra_passable() {
+        let mut grid = CostGrid::new(GridExtent::new(10, 10).unwrap());
+        let claimed = Cell::new(5, 5);
+        let mut uncharged = view(&grid, true);
+        uncharged.claims[0].charged = false;
+        assert_eq!(uncharged.extra_cost(claimed), OTHER_GOAL);
+        grid.add_flags(claimed, mint_sage_passability::EXTRA_PASSABLE)
+            .unwrap();
+        let mut halved = view(&grid, true);
+        halved.claims[0].charged = false;
+        assert_eq!(halved.extra_cost(claimed), OTHER_GOAL / 2);
     }
 }

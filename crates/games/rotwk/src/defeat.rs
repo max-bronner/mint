@@ -7,6 +7,30 @@ use crate::unit::{Kind, Owner};
 
 pub(crate) use mint_sage_modules::ObjectFilter;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DefeatMode {
+    #[default]
+    UnitFilter,
+    Dozer,
+}
+
+impl DefeatMode {
+    pub(crate) const fn of_match(wotr: bool) -> Self {
+        if wotr {
+            Self::Dozer
+        } else {
+            Self::UnitFilter
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VictoryFilters<'a> {
+    pub(crate) structure: &'a ObjectFilter,
+    pub(crate) unit: &'a ObjectFilter,
+    pub(crate) mode: DefeatMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MatchOutcome {
     pub(crate) winner: PlayerId,
@@ -35,9 +59,27 @@ pub(crate) struct DefeatFacts {
     frame: Frame,
     newly_defeated: Vec<PlayerId>,
     reported: Vec<bool>,
+    latched: Vec<bool>,
 }
 
 impl DefeatFacts {
+    fn is_latched(&self, player: PlayerId) -> bool {
+        self.latched
+            .get(usize::from(player.get()))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn latch(&mut self, player: PlayerId) {
+        let slot = usize::from(player.get());
+        if self.latched.len() <= slot {
+            self.latched.resize(slot.saturating_add(1), false);
+        }
+        if let Some(flag) = self.latched.get_mut(slot) {
+            *flag = true;
+        }
+    }
+
     fn mark(&mut self, now: Frame, player: PlayerId) {
         if self.frame != now {
             self.newly_defeated.clear();
@@ -75,6 +117,12 @@ impl Component for DefeatFacts {
         for seen in &self.reported {
             hasher.write_bool(*seen);
         }
+        if self.latched.iter().any(|flag| *flag) {
+            hasher.write_usize(self.latched.len());
+            for flag in &self.latched {
+                hasher.write_bool(*flag);
+            }
+        }
     }
 }
 
@@ -90,7 +138,7 @@ pub(crate) fn advance_victory(
     ids: DefeatIds,
     clock: Entity,
     kinds: &KindTable,
-    structure_filter: &ObjectFilter,
+    filters: VictoryFilters<'_>,
     players: u8,
     alliances: &crate::alliance::Alliances,
 ) -> Result<()> {
@@ -100,7 +148,7 @@ pub(crate) fn advance_victory(
     let mut remaining: Vec<PlayerId> = Vec::new();
     for slot in 0..players {
         let player = PlayerId::new(slot);
-        if has_passing_structure(tick.state(), ids, kinds, structure_filter, player) {
+        if is_alive(tick.state(), ids, kinds, filters, player) {
             remaining.push(player);
         } else {
             kill_every_object_of(tick, ids, player)?;
@@ -129,23 +177,44 @@ fn mark_newly_defeated(
     Ok(())
 }
 
+pub(crate) fn latch_defeat(tick: &mut Tick<'_>, ids: DefeatIds, player: PlayerId) -> Result<()> {
+    let Some((clock, mut facts)) = tick
+        .state()
+        .store(ids.facts)
+        .and_then(|store| store.iter().next())
+        .map(|(entity, facts)| (entity, facts.clone()))
+    else {
+        return Ok(());
+    };
+    facts.latch(player);
+    tick.state_mut().insert(ids.facts, clock, facts)?;
+    Ok(())
+}
+
 pub(crate) fn has_been_defeated(
     world: &World,
     ids: DefeatIds,
     kinds: &KindTable,
-    filter: &ObjectFilter,
+    filters: VictoryFilters<'_>,
     player: PlayerId,
 ) -> bool {
-    !has_passing_structure(world, ids, kinds, filter, player)
+    !is_alive(world, ids, kinds, filters, player)
 }
 
-fn has_passing_structure(
+fn is_alive(
     world: &World,
     ids: DefeatIds,
     kinds: &KindTable,
-    filter: &ObjectFilter,
+    filters: VictoryFilters<'_>,
     player: PlayerId,
 ) -> bool {
+    if world
+        .store(ids.facts)
+        .and_then(|store| store.iter().next())
+        .is_some_and(|(_, facts)| facts.is_latched(player))
+    {
+        return false;
+    }
     let Some(store) = world.store(ids.owner) else {
         return false;
     };
@@ -168,14 +237,32 @@ fn has_passing_structure(
         let Some(entry) = kinds.get(*kind) else {
             continue;
         };
-        if filter.passes(&entry.record.kind_of, &entry.record.name) {
+        let record = &entry.record;
+        if record.has_kind("PROJECTILE") || record.has_kind("IGNORE_FOR_VICTORY") {
+            continue;
+        }
+        let passes = |filter: &ObjectFilter| filter.passes(&record.kind_of, &record.name);
+        if !record.has_kind("MINE") && passes(filters.structure) {
             return true;
+        }
+        if !record.has_kind("STRUCTURE") {
+            let unit_alive = match filters.mode {
+                DefeatMode::UnitFilter => filters.unit.matches_something() && passes(filters.unit),
+                DefeatMode::Dozer => record.has_kind("DOZER"),
+            };
+            if unit_alive {
+                return true;
+            }
         }
     }
     false
 }
 
-fn kill_every_object_of(tick: &mut Tick<'_>, ids: DefeatIds, player: PlayerId) -> Result<()> {
+pub(crate) fn kill_every_object_of(
+    tick: &mut Tick<'_>,
+    ids: DefeatIds,
+    player: PlayerId,
+) -> Result<()> {
     let now = tick.frame();
     let entities: Vec<Entity> = tick
         .state()

@@ -13,6 +13,16 @@ impl Footprint {
         centred: true,
     };
 
+    pub(crate) const ONE_CENTRED: Self = Self {
+        half: 0,
+        centred: true,
+    };
+
+    pub(crate) const RADIUS_ONE: Self = Self {
+        half: 1,
+        centred: false,
+    };
+
     pub(crate) const EIGHT: Self = Self {
         half: 4,
         centred: false,
@@ -172,16 +182,27 @@ pub(crate) fn anchor_point(geometry: CellGeometry, cell: (i32, i32), footprint: 
     at
 }
 
-pub(crate) fn overlaps_grown(
+pub(crate) fn answer_point(geometry: CellGeometry, cell: (i32, i32), footprint: Footprint) -> Vec2 {
+    let size = geometry.cell_size();
+    let offset = if footprint.centred { 0.5 } else { 0.05 };
+    #[allow(clippy::cast_precision_loss)]
+    let at = Vec2::new(
+        geometry.origin().x + (cell.0 as f32 + offset) * size,
+        geometry.origin().y + (cell.1 as f32 + offset) * size,
+    );
+    at
+}
+
+pub(crate) fn within_gap(
     at_a: (i32, i32),
     a: Footprint,
     at_b: (i32, i32),
     b: Footprint,
-    grow: i32,
+    gap: i32,
 ) -> bool {
     let (ax0, ay0, ax1, ay1) = span(at_a, a);
     let (bx0, by0, bx1, by1) = span(at_b, b);
-    ax0 - grow < bx1 && bx0 < ax1 + grow && ay0 - grow < by1 && by0 < ay1 + grow
+    ax0 - gap <= bx1 && bx0 <= ax1 + gap && ay0 - gap <= by1 && by0 <= ay1 + gap
 }
 
 pub(crate) fn rings_hold(
@@ -413,6 +434,12 @@ mod tests {
         assert_eq!((overridden.side(), overridden.centred), (4, false));
         let plain = Footprint::of(8.0, false, 10.0, None);
         assert_eq!((plain.side(), plain.centred), (2, false));
+    }
+
+    #[test]
+    fn a_large_footprint_is_not_cut_to_five_cells() {
+        assert_eq!(Footprint::of(40.0, true, 10.0, None).side(), 8);
+        assert_eq!(Footprint::of(40.0, false, 10.0, None).side(), 5);
     }
 
     #[test]

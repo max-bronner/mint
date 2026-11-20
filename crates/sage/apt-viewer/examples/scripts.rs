@@ -17,7 +17,12 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    let mut library = MovieLibrary::new(PathBuf::from(install));
+    let mut roots = vec![PathBuf::from(install)];
+    roots.extend(args.windows(2).filter_map(|w| match w {
+        [flag, root] if flag == "--also" => Some(PathBuf::from(root)),
+        _ => None,
+    }));
+    let mut library = MovieLibrary::new_with_roots(roots);
     let names = library.list_available();
 
     let mode = args.get(1).map(String::as_str).unwrap_or("");
@@ -44,6 +49,7 @@ fn main() -> ExitCode {
             scan_movie(&mut library, &movie.to_ascii_lowercase(), filter, true);
         }
         "--pushdata" => pushdata_census(&mut library, &names),
+        "--attach" => attach_census(&mut library, &names),
         "--props" => property_census(&mut library, &names),
         "--hit" => {
             let only = args.get(2).map(|m| m.to_ascii_lowercase());
@@ -525,6 +531,168 @@ fn pushdata_census(library: &mut MovieLibrary, names: &[String]) {
     for (index, count) in regs.iter().take(12) {
         println!("    register {index:<4} written x{count}");
     }
+}
+
+enum Pushed {
+    Text(String),
+    Number,
+    Other,
+}
+
+fn attach_census(library: &mut MovieLibrary, names: &[String]) {
+    for name in names {
+        let _ = library.ensure_loaded(name);
+    }
+    let mut exporters: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in names {
+        if let Some(movie) = library.movie(name) {
+            for e in &movie.exports {
+                exporters
+                    .entry(e.name.to_ascii_lowercase())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
+    let (mut total, mut literal, mut own_export, mut own_import, mut elsewhere, mut nowhere) =
+        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    for name in names {
+        let Some(movie) = library.movie(name).cloned() else {
+            continue;
+        };
+        let Some(assets) = library.assets(name) else {
+            continue;
+        };
+        let apt = assets.apt.clone();
+        let consts = assets.consts.clone();
+        for site in sites(&apt, &movie) {
+            let Ok(block) = decode_block(&apt, site.offset, &DecodeLimits::default()) else {
+                continue;
+            };
+            let mut regions: Vec<&[Instruction]> = vec![&block.code];
+            for function in &block.functions {
+                regions.push(&function.body);
+            }
+            let mut pool: Vec<String> = Vec::new();
+            for region in regions {
+                let mut log: Vec<Pushed> = Vec::new();
+                for instruction in region {
+                    let method_is_attach = match &instruction.op {
+                        Op::ConstantPool(list) => {
+                            pool = list
+                                .iter()
+                                .map(|i| match consts.get(*i as usize) {
+                                    Some(ConstItem::Text(t)) => t.clone(),
+                                    _ => String::new(),
+                                })
+                                .collect();
+                            false
+                        }
+                        Op::EaPushString(s) => {
+                            log.push(Pushed::Text(s.clone()));
+                            false
+                        }
+                        Op::EaPushConstant(i) => {
+                            log.push(
+                                pool.get(usize::from(*i))
+                                    .cloned()
+                                    .map_or(Pushed::Other, Pushed::Text),
+                            );
+                            false
+                        }
+                        Op::EaPushWordConstant(i) => {
+                            log.push(
+                                pool.get(usize::from(*i))
+                                    .cloned()
+                                    .map_or(Pushed::Other, Pushed::Text),
+                            );
+                            false
+                        }
+                        Op::PushData(list) => {
+                            for i in list {
+                                log.push(match consts.get(*i as usize) {
+                                    Some(ConstItem::Text(t)) => Pushed::Text(t.clone()),
+                                    Some(ConstItem::Number(_)) => Pushed::Number,
+                                    None => Pushed::Other,
+                                });
+                            }
+                            false
+                        }
+                        Op::EaPushByte(_)
+                        | Op::EaPushShort(_)
+                        | Op::EaPushFloat(_)
+                        | Op::EaPushLong(_)
+                        | Op::EaPushZero
+                        | Op::EaPushOne => {
+                            log.push(Pushed::Number);
+                            false
+                        }
+                        Op::CallMethod | Op::EaCallMethod | Op::EaCallMethodPop => {
+                            matches!(log.iter().rev().find_map(|p| match p {
+                                Pushed::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            }), Some(t) if t.eq_ignore_ascii_case("attachMovie"))
+                        }
+                        Op::EaCallNamedMethod(i)
+                        | Op::EaCallNamedMethodPop(i)
+                        | Op::EaCallNamedFunction(i)
+                        | Op::EaCallNamedFunctionPop(i) => pool
+                            .get(usize::from(*i))
+                            .is_some_and(|t| t.eq_ignore_ascii_case("attachMovie")),
+                        _ => false,
+                    };
+                    if !method_is_attach {
+                        continue;
+                    }
+                    total += 1;
+                    let export = log.iter().enumerate().rev().find_map(|(j, p)| {
+                        let (Pushed::Number, Some(Pushed::Text(export))) =
+                            (p, j.checked_sub(1).and_then(|k| log.get(k)))
+                        else {
+                            return None;
+                        };
+                        Some(export.clone())
+                    });
+                    let Some(export) = export else {
+                        println!("{name}: {} @ {:#x}: non-literal", site.label, site.offset);
+                        continue;
+                    };
+                    literal += 1;
+                    let lower = export.to_ascii_lowercase();
+                    let verdict = if movie
+                        .exports
+                        .iter()
+                        .any(|e| e.name.eq_ignore_ascii_case(&lower))
+                    {
+                        own_export += 1;
+                        "own export".to_owned()
+                    } else if movie
+                        .imports
+                        .iter()
+                        .any(|i| i.name.eq_ignore_ascii_case(&lower))
+                    {
+                        own_import += 1;
+                        "OWN IMPORT (the root fallback never saw it)".to_owned()
+                    } else if let Some(list) = exporters.get(&lower) {
+                        elsewhere += 1;
+                        format!("exported only by {list:?}")
+                    } else {
+                        nowhere += 1;
+                        "exported by no movie".to_owned()
+                    };
+                    println!(
+                        "{name}: {} @ {:#x}: {export:?}: {verdict}",
+                        site.label, site.offset
+                    );
+                }
+            }
+        }
+    }
+    println!(
+        "attachMovie sites {total}: literal {literal} (own export {own_export}, own import \
+         {own_import}, ancestor export {elsewhere}, no exporter {nowhere}), non-literal {}",
+        total.saturating_sub(literal)
+    );
 }
 
 struct Site {

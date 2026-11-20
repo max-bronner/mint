@@ -92,6 +92,7 @@ impl RotwkRules {
         };
         match name {
             "STAND_GROUND" => state.rt.stand_ground.set(entity, on),
+            "REPULSOR" => self.set_repulsor(tick, ids, entity, on)?,
             "HUNT_WHEN_IDLE" if on => state.rt.hunters.insert(entity),
             "HUNT_WHEN_IDLE" => state.rt.hunters.forget(entity),
             "DESTROYED" | "UNDER_CONSTRUCTION" | "IS_ATTACKING" | "HORDE_MEMBER" => {
@@ -210,10 +211,13 @@ impl RotwkRules {
     ) -> Result<()> {
         match flag {
             "Enabled" => {
-                state
+                if state
                     .rt
                     .statuses
-                    .set(entity, ScriptStatusBit::Disabled, !on);
+                    .set(entity, ScriptStatusBit::Disabled, !on)
+                {
+                    self.pause_special_powers(tick, ids, entity, !on)?;
+                }
             }
             "Powered" => {
                 state
@@ -379,6 +383,27 @@ pub(super) fn parse_team_change_status(
     ctx: &ParseCtx<'_>,
 ) -> Option<Arc<dyn ActionVerb>> {
     action(Target::parse(params, ctx, true), status_op(params))
+}
+
+fn repulsor_op(params: &[Parameter]) -> Option<Op> {
+    Some(Op::Status {
+        index: super::status::status_index("REPULSOR"),
+        on: parameter_int(params, 1)? != 0,
+    })
+}
+
+pub(super) fn parse_named_set_repulsor(
+    params: &[Parameter],
+    ctx: &ParseCtx<'_>,
+) -> Option<Arc<dyn ActionVerb>> {
+    action(Target::parse(params, ctx, false), repulsor_op(params))
+}
+
+pub(super) fn parse_team_set_repulsor(
+    params: &[Parameter],
+    ctx: &ParseCtx<'_>,
+) -> Option<Arc<dyn ActionVerb>> {
+    action(Target::parse(params, ctx, true), repulsor_op(params))
 }
 
 pub(super) fn parse_unit_panel_flags(

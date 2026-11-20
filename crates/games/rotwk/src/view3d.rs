@@ -1,16 +1,19 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mint_app::OrbitCamera;
 use mint_render::{
-    transformed_bounds, Aabb, Blend, Camera, DirectionalLight, Instance, Mat4, RenderTargetHandle,
-    Renderer, Scene, Vec3, MAX_DIRECTIONAL_LIGHTS,
+    transformed_bounds, Aabb, Blend, Camera, DirectionalLight, Instance, Mat4, Renderer, Scene,
+    Vec3, MAX_DIRECTIONAL_LIGHTS,
 };
 
 const UI_FOV_Y: f32 = 0.1;
-use mint_sage_apt_player::{InstanceId, MovieId, RenderCommand, RenderList, RenderOptions};
+use mint_sage_apt_player::InstanceId;
 use mint_sage_apt_viewer::host::{stage_space_aspect, MovieView, SurfaceContent, SurfaceIcon};
+use mint_sage_apt_viewer::scene_surface::{
+    surfaces_of_type, target_size, SceneSurfaces, SurfaceKey,
+};
 use mint_sage_ini::{AnimationFlags, AnimationMode, AnimationSource, DefaultAnimation};
 use mint_sage_model::{CachedModel, ModelAnimation, ModelCache, PartPose, Resolver};
 use mint_vfs::Vfs;
@@ -45,9 +48,17 @@ impl Framing {
 }
 
 fn bone_camera(bone: Mat4, aspect: f32) -> Option<Camera> {
-    let eye = bone.transform_point(Vec3::ZERO);
-    let forward = bone.transform_vector(Vec3::new(0.0, 0.0, -1.0)).normalize();
-    let up = bone.transform_vector(Vec3::new(0.0, 1.0, 0.0)).normalize();
+    lens_camera(bone, aspect, 1.0, 100_000.0)
+}
+
+fn lens_camera(transform: Mat4, aspect: f32, near: f32, far: f32) -> Option<Camera> {
+    let eye = transform.transform_point(Vec3::ZERO);
+    let forward = transform
+        .transform_vector(Vec3::new(0.0, 0.0, -1.0))
+        .normalize();
+    let up = transform
+        .transform_vector(Vec3::new(0.0, 1.0, 0.0))
+        .normalize();
     if !(eye.is_finite() && forward.is_finite() && up.is_finite()) || aspect <= 0.0 {
         return None;
     }
@@ -57,9 +68,36 @@ fn bone_camera(bone: Mat4, aspect: f32) -> Option<Camera> {
         target: eye + forward,
         up,
         fov_y: 2.0 * mint_math::f32::atan(half_vertical),
-        near: 1.0,
-        far: 100_000.0,
+        near,
+        far,
     })
+}
+
+struct NativeModel {
+    surface_type: &'static str,
+    model: &'static str,
+    camera: [[f32; 4]; 4],
+    near: f32,
+    far: f32,
+}
+
+const NATIVE_MODELS: &[NativeModel] = &[NativeModel {
+    surface_type: "AptPalantir::RenderGlobe",
+    model: "palantir",
+    camera: [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 160.0, 0.0, 1.0],
+    ],
+    near: 0.1,
+    far: 5000.0,
+}];
+
+fn native_model(surface_type: &str) -> Option<&'static NativeModel> {
+    NATIVE_MODELS
+        .iter()
+        .find(|m| m.surface_type.eq_ignore_ascii_case(surface_type))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,18 +166,14 @@ struct RenderObject {
     instances: Vec<Instance>,
 }
 
-type SurfaceKey = (MovieId, InstanceId);
-
 pub(crate) struct View3d {
     vfs: Arc<Vfs>,
     resolver: Resolver,
     cache: ModelCache,
     objects: BTreeMap<String, Option<RenderObject>>,
-    targets: HashMap<SurfaceKey, (RenderTargetHandle, u32, u32)>,
-    free: Vec<RenderTargetHandle>,
+    surfaces: SceneSurfaces,
     framing: Framing,
     clock: f32,
-    list: RenderList,
 }
 
 impl View3d {
@@ -149,11 +183,9 @@ impl View3d {
             resolver: Resolver::new(),
             cache: ModelCache::new(),
             objects: BTreeMap::new(),
-            targets: HashMap::new(),
-            free: Vec::new(),
+            surfaces: SceneSurfaces::new(),
             framing: Framing::default(),
             clock: 0.0,
-            list: RenderList::default(),
         }
     }
 
@@ -171,35 +203,86 @@ impl View3d {
 
     pub(crate) fn draw(&mut self, renderer: &mut Renderer, view: &mut MovieView) {
         let movie = view.movie_id();
-        self.list.commands.clear();
-        view.player
-            .render_with(&mut self.list, RenderOptions { surfaces: true });
-        let surfaces: Vec<InstanceId> = self
-            .list
-            .commands
-            .iter()
-            .filter_map(|command| match command {
-                RenderCommand::Surface { instance, .. } => Some(*instance),
-                _ => None,
-            })
-            .filter(|&id| view.player.own_string(id, "_type").as_deref() == Some("View3D"))
-            .collect();
+        let surfaces = surfaces_of_type(view, |t| t == "View3D" || native_model(t).is_some());
         for &id in &surfaces {
-            let content = self.draw_surface(renderer, view, id);
+            let native = view
+                .player
+                .own_string(id, "_type")
+                .and_then(|t| native_model(&t));
+            let content = match native {
+                Some(native) => self.draw_native(renderer, view, id, native),
+                None => self.draw_surface(renderer, view, id),
+            };
             view.set_surface(id, content);
         }
-        let gone: Vec<SurfaceKey> = self
-            .targets
-            .keys()
-            .filter(|(m, id)| *m == movie && !surfaces.contains(id))
-            .copied()
-            .collect();
-        for key in gone {
-            if let Some((target, _, _)) = self.targets.remove(&key) {
-                if renderer.resize_render_target(target, 1, 1).is_ok() {
-                    self.free.push(target);
-                }
+        self.surfaces.retain(renderer, movie, &surfaces);
+    }
+
+    fn draw_native(
+        &mut self,
+        renderer: &mut Renderer,
+        view: &mut MovieView,
+        id: InstanceId,
+        native: &NativeModel,
+    ) -> Option<SurfaceContent> {
+        let size = target_size(view.slot_rect(id)?);
+        #[allow(clippy::cast_precision_loss)]
+        let aspect = size.0 as f32 / size.1 as f32;
+        let camera = lens_camera(
+            Mat4::from_cols(native.camera),
+            aspect,
+            native.near,
+            native.far,
+        )?;
+        let clock = self.clock;
+        let object = self.object(renderer, native.model)?;
+        object.clock.shown = true;
+        object.instances.clear();
+        object.model.place_many_posed(
+            &[mint_render::Mat4::IDENTITY],
+            &object.poses,
+            &mut object.instances,
+        );
+        let _ = object
+            .model
+            .apply_uv_mappers(1, &mut object.instances, clock);
+        let instances = std::mem::take(&mut object.instances);
+        let rendered = self.render(renderer, (view.movie_id(), id), size, camera, &instances);
+        self.give_back(native.model, instances);
+        match rendered {
+            Ok(icon) => Some(SurfaceContent::Icon(SurfaceIcon {
+                ignores_color_transform: true,
+                ..icon
+            })),
+            Err(error) => {
+                println!("view3d: {} did not render ({error})", native.model);
+                None
             }
+        }
+    }
+
+    fn render(
+        &mut self,
+        renderer: &mut Renderer,
+        key: SurfaceKey,
+        size: (u32, u32),
+        camera: Camera,
+        instances: &[Instance],
+    ) -> mint_render::Result<SurfaceIcon> {
+        let mut scene = Scene::new(camera).with_instances(instances);
+        scene.lights = [DirectionalLight::default(); MAX_DIRECTIONAL_LIGHTS];
+        scene.ambient_color = [1.0, 1.0, 1.0];
+        scene.clear_color = [0.0, 0.0, 0.0, 0.0];
+        self.surfaces.render(renderer, key, size, &scene)
+    }
+
+    fn give_back(&mut self, name: &str, instances: Vec<Instance>) {
+        if let Some(object) = self
+            .objects
+            .get_mut(&name.to_ascii_lowercase())
+            .and_then(Option::as_mut)
+        {
+            object.instances = instances;
         }
     }
 
@@ -285,63 +368,17 @@ impl View3d {
             (rh * aspect / crop).round().clamp(1.0, 8192.0) as u32,
             (rh / crop).round().clamp(1.0, 8192.0) as u32,
         );
-        let target = self.target(renderer, (view.movie_id(), id), w, h);
-        let rendered = target.and_then(|target| {
-            let mut scene = Scene::new(camera).with_instances(&instances);
-            scene.lights = [DirectionalLight::default(); MAX_DIRECTIONAL_LIGHTS];
-            scene.ambient_color = [1.0, 1.0, 1.0];
-            scene.clear_color = [0.0, 0.0, 0.0, 0.0];
-            match renderer.render_to_target(target, &scene) {
-                Ok(()) => renderer.render_target_texture(target),
-                Err(error) => {
-                    println!("view3d: {name} did not render ({error})");
-                    None
-                }
-            }
-        });
-        if let Some(object) = self
-            .objects
-            .get_mut(&name.to_ascii_lowercase())
-            .and_then(Option::as_mut)
-        {
-            object.instances = instances;
-        }
+        let rendered = self.render(renderer, (view.movie_id(), id), (w, h), camera, &instances);
+        self.give_back(&name, instances);
         let margin = (1.0 - crop) * 0.5;
-        rendered.map(|texture| {
-            SurfaceContent::Icon(SurfaceIcon {
-                texture,
+        match rendered {
+            Ok(icon) => Some(SurfaceContent::Icon(SurfaceIcon {
                 uv_rect: [margin, margin, crop, crop],
-                tint: [1.0, 1.0, 1.0, 1.0],
-                premultiplied: true,
-                rotated: false,
-            })
-        })
-    }
-
-    fn target(
-        &mut self,
-        renderer: &mut Renderer,
-        id: SurfaceKey,
-        w: u32,
-        h: u32,
-    ) -> Option<RenderTargetHandle> {
-        match self.targets.get(&id).copied() {
-            Some((target, tw, th)) if (tw, th) == (w, h) => Some(target),
-            Some((target, _, _)) => {
-                renderer.resize_render_target(target, w, h).ok()?;
-                self.targets.insert(id, (target, w, h));
-                Some(target)
-            }
-            None => {
-                let target = match self.free.pop() {
-                    Some(target) => {
-                        renderer.resize_render_target(target, w, h).ok()?;
-                        target
-                    }
-                    None => renderer.create_render_target(w, h).ok()?,
-                };
-                self.targets.insert(id, (target, w, h));
-                Some(target)
+                ..icon
+            })),
+            Err(error) => {
+                println!("view3d: {name} did not render ({error})");
+                None
             }
         }
     }
